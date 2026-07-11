@@ -304,6 +304,18 @@ func (c ChangeSet) Validate() error {
 			if ch.Before == nil || ch.After == nil {
 				return fmt.Errorf("%w: %s %q requires before and after", ErrInvalidDocument, ch.Operation, ch.ID)
 			}
+			if ch.Operation == OperationRename {
+				beforeName, afterName := ch.Before.Name, ch.After.Name
+				sameName := beforeName.Catalog == afterName.Catalog && beforeName.Schema == afterName.Schema && beforeName.Name == afterName.Name && beforeName.Parent == afterName.Parent
+				if ch.Before.Kind != ch.After.Kind || sameName {
+					return fmt.Errorf("%w: rename %q requires the same kind and a changed name", ErrInvalidDocument, ch.ID)
+				}
+				// Stable resource identity includes the logical name, so a rename
+				// necessarily changes the snapshot ID. resource_id names the result.
+				if ch.ResourceID != ch.After.ID {
+					return fmt.Errorf("%w: rename %q resource_id must match the after snapshot", ErrInvalidDocument, ch.ID)
+				}
+			}
 		default:
 			return fmt.Errorf("%w: change %q has unsupported operation %q", ErrInvalidDocument, ch.ID, ch.Operation)
 		}
@@ -315,7 +327,7 @@ func (c ChangeSet) Validate() error {
 				if r.Name.Name == "" || r.ID == "" || r.ID != StableID(r.Kind, r.Name) {
 					return fmt.Errorf("%w: change %q contains invalid resource identity", ErrInvalidDocument, ch.ID)
 				}
-				if ch.ResourceID != r.ID {
+				if ch.Operation != OperationRename && ch.ResourceID != r.ID {
 					return fmt.Errorf("%w: change %q resource_id does not match snapshot", ErrInvalidDocument, ch.ID)
 				}
 				if len(r.Spec) > 0 && !validJSONObject(r.Spec) {
