@@ -13,4 +13,6 @@ fail comparisons. JSON numbers retain `json.Number` precision and equality uses
 exact rational comparison across JSON and Go numeric representations. Recursive
 values are restricted to JSON-compatible scalars, arrays, and string-keyed maps;
 depth, item count, aggregate bytes, numeric digits, and exponent magnitude are
-metered before comparison or rational allocation.
+metered before comparison or rational allocation. Map entries consume those
+budgets before keys are retained for deterministic sorting, and numeric literals
+pass a hard raw-byte gate before lexical scanning.

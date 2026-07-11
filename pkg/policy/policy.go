@@ -90,6 +90,7 @@ type Limits struct {
 	MaxValueBytes      int
 	MaxNumericDigits   int
 	MaxNumericExponent int
+	MaxNumericBytes    int
 	Timeout            time.Duration
 }
 
@@ -101,6 +102,8 @@ const (
 	defaultMaxValueBytes      = 1 << 20
 	defaultMaxNumericDigits   = 1024
 	defaultMaxNumericExponent = 1024
+	defaultMaxNumericBytes    = 4096
+	hardMaxNumericBytes       = 4096
 )
 
 type Evaluator struct {
@@ -410,6 +413,9 @@ func (ev Evaluator) Evaluate(ctx context.Context, doc Document, schema, migratio
 	if lim.MaxNumericExponent <= 0 {
 		lim.MaxNumericExponent = defaultMaxNumericExponent
 	}
+	if lim.MaxNumericBytes <= 0 || lim.MaxNumericBytes > hardMaxNumericBytes {
+		lim.MaxNumericBytes = defaultMaxNumericBytes
+	}
 	if lim.Timeout <= 0 {
 		lim.Timeout = 5 * time.Second
 	}
@@ -714,7 +720,16 @@ func number(m *meter, v any) (*big.Rat, bool, error) {
 		return r, r != nil, nil
 	case json.Number:
 		s := string(n)
-		digits, exp, ok := numericShape(s)
+		if err := m.charge(1); err != nil {
+			return nil, false, err
+		}
+		if len(s) > m.limit.MaxNumericBytes {
+			return nil, false, fmt.Errorf("%w: numeric literal bytes (%d > %d)", ErrLimitExceeded, len(s), m.limit.MaxNumericBytes)
+		}
+		digits, exp, ok, err := numericShape(m, s)
+		if err != nil {
+			return nil, false, err
+		}
 		if !ok {
 			return nil, false, fmt.Errorf("%w: invalid number", ErrUnsupportedValue)
 		}
@@ -776,31 +791,30 @@ func validateValue(m *meter, v any, depth int) error {
 		}
 		return nil
 	case map[string]any:
-		keys := make([]string, 0, len(x))
+		keys := make([]string, 0, min(len(x), m.limit.MaxValueItems))
 		for k := range x {
+			if err := m.consumeValue(len(k)); err != nil {
+				return err
+			}
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
-			if err := m.consumeValue(len(k)); err != nil {
-				return err
-			}
 			if err := validateValue(m, x[k], depth+1); err != nil {
 				return err
 			}
 		}
 		return nil
 	case map[string]string:
-		keys := make([]string, 0, len(x))
+		keys := make([]string, 0, min(len(x), m.limit.MaxValueItems))
 		for k := range x {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
 			if err := m.consumeValue(len(k) + len(x[k])); err != nil {
 				return err
 			}
+			keys = append(keys, k)
 		}
+		sort.Strings(keys)
+		_ = keys
 		return nil
 	default:
 		return fmt.Errorf("%w: %T", ErrUnsupportedValue, v)
@@ -908,41 +922,51 @@ func equalValue(m *meter, a, b any, depth int) (bool, error) {
 	}
 }
 
-func numericShape(s string) (digits, absExp int, ok bool) {
+func numericShape(m *meter, s string) (digits, absExp int, ok bool, err error) {
 	e := strings.IndexAny(s, "eE")
 	mant, exp := s, ""
 	if e >= 0 {
 		mant, exp = s[:e], s[e+1:]
 	}
-	for _, c := range mant {
+	for i, c := range mant {
+		if i%64 == 0 {
+			if err := m.charge(1); err != nil {
+				return 0, 0, false, err
+			}
+		}
 		if c >= '0' && c <= '9' {
 			digits++
 		} else if c != '-' && c != '.' {
-			return 0, 0, false
+			return 0, 0, false, nil
 		}
 	}
 	if digits == 0 {
-		return 0, 0, false
+		return 0, 0, false, nil
 	}
 	if exp != "" {
 		if len(exp) > 1 && (exp[0] == '+' || exp[0] == '-') {
 			exp = exp[1:]
 		}
 		if len(exp) == 0 || len(exp) > 6 {
-			return 0, 0, false
+			return 0, 0, false, nil
 		}
-		for _, c := range exp {
+		for i, c := range exp {
+			if i%64 == 0 {
+				if err := m.charge(1); err != nil {
+					return 0, 0, false, err
+				}
+			}
 			if c < '0' || c > '9' {
-				return 0, 0, false
+				return 0, 0, false, nil
 			}
 		}
 		n, err := strconv.Atoi(exp)
 		if err != nil {
-			return 0, 0, false
+			return 0, 0, false, nil
 		}
 		absExp = n
 	}
-	return digits, absExp, true
+	return digits, absExp, true, nil
 }
 
 func meteredContains(m *meter, xs []string, s string) (bool, error) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -274,6 +275,58 @@ func TestHugeNumbersAndEqualityMeterFailBoundedly(t *testing.T) {
 	}}).Evaluate(context.Background(), doc, []Resource{{Kind: "table", Name: "t"}}, nil)
 	if !errors.Is(err, ErrLimitExceeded) {
 		t.Fatalf("timeout: %v", err)
+	}
+}
+
+func TestHugeMapsRejectBeforeKeyCollection(t *testing.T) {
+	huge := make(map[string]any, 100000)
+	for i := 0; i < 100000; i++ {
+		huge[fmt.Sprintf("key-%06d", i)] = i
+	}
+	doc := Document{Version: "v1", Rules: []Rule{{Name: "m", Target: "all", Message: "x", Assert: Expression{Exists: "resource.attributes.huge"}}}}
+	clock := time.Unix(0, 0)
+	calls := 0
+	_, err := (Evaluator{Limits: Limits{MaxValueItems: 4, MaxSteps: 1000, Timeout: time.Second}, Now: func() time.Time {
+		calls++
+		if calls > 30 {
+			return clock.Add(2 * time.Second)
+		}
+		return clock
+	}}).Evaluate(context.Background(), doc, []Resource{{Kind: "table", Name: "t", Attributes: map[string]any{"huge": huge}}}, nil)
+	if !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("map bound: %v", err)
+	}
+	if calls > 20 {
+		t.Fatalf("map traversed too far before rejection: clock calls=%d", calls)
+	}
+	hugeStrings := make(map[string]string, 100000)
+	for i := 0; i < 100000; i++ {
+		hugeStrings[fmt.Sprintf("key-%06d", i)] = "value"
+	}
+	calls = 0
+	_, err = (Evaluator{Limits: Limits{MaxValueItems: 4, MaxSteps: 1000, Timeout: time.Second}, Now: func() time.Time { calls++; return clock }}).Evaluate(context.Background(), doc, []Resource{{Kind: "table", Name: "t", Attributes: map[string]any{"huge": hugeStrings}}}, nil)
+	if !errors.Is(err, ErrLimitExceeded) || calls > 20 {
+		t.Fatalf("string map bound err=%v calls=%d", err, calls)
+	}
+}
+
+func TestOversizedNumberRejectsBeforeLexicalScan(t *testing.T) {
+	huge := json.Number(strings.Repeat("9", 1<<20))
+	doc := Document{Version: "v1", Rules: []Rule{{Name: "n", Target: "all", Message: "x", Assert: Expression{Eq: []any{huge, 0}}}}}
+	clock := time.Unix(0, 0)
+	calls := 0
+	_, err := (Evaluator{Limits: Limits{MaxNumericBytes: 32, MaxSteps: 1000, Timeout: time.Second}, Now: func() time.Time {
+		calls++
+		if calls > 30 {
+			return clock.Add(2 * time.Second)
+		}
+		return clock
+	}}).Evaluate(context.Background(), doc, []Resource{{Kind: "table", Name: "t"}}, nil)
+	if !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("numeric byte bound: %v", err)
+	}
+	if calls > 20 {
+		t.Fatalf("numeric literal scanned before rejection: clock calls=%d", calls)
 	}
 }
 
