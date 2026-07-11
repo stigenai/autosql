@@ -15,7 +15,7 @@ var (
 	secretKey             = regexp.MustCompile(`(?i)^(?:.*[_-])?(?:password|passwd|pwd|token|secret|api[_-]?key|credential)(?:[_-].*)?$`)
 	quotedSecret          = regexp.MustCompile(`(?i)(password|passwd|pwd|token|secret|api[_-]?key|credential)\s*[:=]\s*(?:"(?:\\.|[^"\\])*"|'(?:''|[^'])*')`)
 	plainSecret           = regexp.MustCompile(`(?i)(password|passwd|pwd|token|secret|api[_-]?key|credential)\s*[:=]\s*[^\s,;]+`)
-	connectionCredentials = regexp.MustCompile(`(?i)(?:postgres|postgresql)://[^@\r\n]*@`)
+	connectionCredentials = regexp.MustCompile(`(?i)[a-z][a-z0-9+.-]*://[^@\r\n]*@`)
 )
 
 func redact(s string) string {
@@ -128,9 +128,25 @@ func redactValue(key string, value any) any {
 		}
 		return out
 	}
-	// Properties are extension points and may contain named map or slice types.
+	// Properties are extension points and may contain named scalars, interfaces,
+	// pointers, structs with JSON tags, or arbitrary nested collection types.
+	// Normalize composite values through encoding/json, then recursively inspect
+	// the resulting keys and strings. Values that cannot be inspected are
+	// rejected from the report rather than passed through unsanitized.
 	rv := reflect.ValueOf(value)
-	if rv.IsValid() && (rv.Kind() == reflect.Map || rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array) {
+	if !rv.IsValid() {
+		return nil
+	}
+	if rv.Kind() == reflect.String {
+		return redact(rv.String())
+	}
+	if rv.Kind() == reflect.Pointer || rv.Kind() == reflect.Interface {
+		if rv.IsNil() {
+			return nil
+		}
+		return redactValue(key, rv.Elem().Interface())
+	}
+	if rv.Kind() == reflect.Map || rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array || rv.Kind() == reflect.Struct {
 		raw, err := json.Marshal(value)
 		if err == nil {
 			var decoded any
@@ -138,6 +154,7 @@ func redactValue(key string, value any) any {
 				return redactValue(key, decoded)
 			}
 		}
+		return "[REDACTED]"
 	}
 	return value
 }

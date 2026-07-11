@@ -81,7 +81,7 @@ func (CompatibilityAnalyzer) Analyze(_ context.Context, in Input) ([]Diagnostic,
 		}
 	}
 	for _, st := range in.Statements {
-		if hasWords(st.SQL, "truncate") {
+		if hasCommand(st.SQL, func(tokens []string) bool { return len(tokens) > 0 && tokens[0] == "truncate" }) {
 			if ch, ok := findChange(in.Changes, st.ChangeID); ok {
 				out = append(out, Diagnostic{Rule: RuleTruncate, Severity: SeverityError, Message: "table is truncated", Object: objectFor(ch), Source: st.Source, Impact: "Definite deletion of all table rows.", Remediation: "Use a reviewed, bounded data migration with a recoverable backup.", Confidence: ConfidenceHigh})
 			}
@@ -154,20 +154,21 @@ func (PostgreSQLAnalyzer) Analyze(_ context.Context, in Input) ([]Diagnostic, er
 			sev, props := assessRisk(severity, in.Thresholds, lock, scan, false, stats, haveStats)
 			out = append(out, Diagnostic{Rule: rule, Severity: sev, Message: msg, Object: obj, Source: st.Source, Impact: impact, Remediation: fix, Confidence: confidence, Assumptions: assumptions, Properties: props})
 		}
-		if hasWords(st.SQL, "create") && hasWords(st.SQL, "index") && !hasWords(st.SQL, "index", "concurrently") {
+		blockingIndex, concurrentIndex := indexCommands(st.SQL)
+		if blockingIndex {
 			add(RuleIndexBuild, SeverityWarning, "index is built without CONCURRENTLY", "Writes are blocked for the duration of the index build.", "Use CREATE INDEX CONCURRENTLY outside a transaction and monitor progress.", LockShare, true)
 		}
-		if hasWords(st.SQL, "index", "concurrently") && (hasWords(st.SQL, "create") || hasWords(st.SQL, "drop")) {
+		if concurrentIndex {
 			out = append(out, Diagnostic{Rule: RuleTransaction, Severity: SeverityError, Message: "concurrent index operation cannot run in a transaction block", Object: obj, Source: st.Source, Impact: "Execution in the migration transaction fails.", Remediation: "Run this statement in an explicitly non-transactional migration step.", Confidence: confidence, Assumptions: assumptions})
 		}
-		if hasWords(st.SQL, "alter", "type") && hasWords(st.SQL, "add", "value") {
+		if hasCommand(st.SQL, enumAddValueCommand) {
 			severity, message, impact, fix := SeverityWarning, "new enum value is unavailable until commit", "Using the new value in the same transaction fails.", "Commit the enum change before statements that use the new value."
 			if !versionKnown || version < 12 {
 				severity, message, impact, fix = SeverityError, "enum ADD VALUE cannot safely run in the migration transaction", "PostgreSQL versions before 12 reject this statement in a transaction block.", "Run the enum change in a non-transactional step; commit it before use."
 			}
 			out = append(out, Diagnostic{Rule: RuleTransaction, Severity: severity, Message: message, Object: obj, Source: st.Source, Impact: impact, Remediation: fix, Confidence: confidence, Assumptions: assumptions})
 		}
-		if hasWords(st.SQL, "validate", "constraint") {
+		if hasCommand(st.SQL, validateConstraintCommand) {
 			add(RuleValidationScan, SeverityWarning, "constraint validation scans the table", "A full scan consumes I/O and holds SHARE UPDATE EXCLUSIVE lock.", "Validate during a controlled window and cap statement duration.", LockShareUpdateExclusive, true)
 		}
 	}
@@ -296,12 +297,12 @@ func classifyDefault(raw json.RawMessage) defaultClass {
 	if n == "" {
 		return defaultLiteral
 	}
-	for _, marker := range []string{"random(", "clock_timestamp(", "statement_timestamp(", "transaction_timestamp(", "timeofday(", "nextval(", "gen_random_uuid(", "uuid_generate_v"} {
+	for _, marker := range []string{"random(", "clock_timestamp(", "timeofday(", "nextval(", "gen_random_uuid(", "uuid_generate_v"} {
 		if strings.Contains(n, marker) {
 			return defaultVolatile
 		}
 	}
-	for _, marker := range []string{"now(", "current_timestamp", "current_date", "current_time", "localtimestamp", "localtime"} {
+	for _, marker := range []string{"now(", "statement_timestamp(", "transaction_timestamp(", "current_timestamp", "current_date", "current_time", "localtimestamp", "localtime"} {
 		if strings.Contains(n, marker) {
 			return defaultStable
 		}
@@ -376,11 +377,20 @@ func findChange(cs schema.ChangeSet, id string) (schema.Change, bool) {
 	return schema.Change{}, false
 }
 
-// normalizeSQL removes comments, string literals, quoted identifiers, and
-// dollar-quoted bodies before keyword matching. It is intentionally a small
-// lexer rather than a SQL parser, but avoids treating user data as DDL.
-func normalizeSQL(sql string) string {
+// sqlCommands tokenizes each SQL statement independently. Comments and literal
+// bodies are discarded, while quoted identifiers become an opaque identifier
+// token. Command recognizers below inspect grammar positions rather than global
+// keyword presence, preventing tokens from unrelated statements from combining.
+func sqlCommands(sql string) [][]string {
+	var commands [][]string
 	var out strings.Builder
+	flush := func() {
+		fields := strings.Fields(out.String())
+		if len(fields) > 0 {
+			commands = append(commands, fields)
+		}
+		out.Reset()
+	}
 	for i := 0; i < len(sql); {
 		switch {
 		case i+1 < len(sql) && sql[i] == '-' && sql[i+1] == '-':
@@ -431,7 +441,7 @@ func normalizeSQL(sql string) string {
 				}
 				i++
 			}
-			out.WriteByte(' ')
+			out.WriteString(" identifier ")
 		case sql[i] == '$':
 			tagEnd := i + 1
 			for tagEnd < len(sql) && (unicode.IsLetter(rune(sql[tagEnd])) || unicode.IsDigit(rune(sql[tagEnd])) || sql[tagEnd] == '_') {
@@ -450,6 +460,9 @@ func normalizeSQL(sql string) string {
 				out.WriteByte(' ')
 				i++
 			}
+		case sql[i] == ';':
+			flush()
+			i++
 		default:
 			r := rune(sql[i])
 			if unicode.IsLetter(r) || unicode.IsDigit(r) || sql[i] == '_' {
@@ -460,9 +473,66 @@ func normalizeSQL(sql string) string {
 			i++
 		}
 	}
-	return strings.Join(strings.Fields(out.String()), " ")
+	flush()
+	return commands
 }
-func hasWords(sql string, words ...string) bool {
-	n := " " + normalizeSQL(sql) + " "
-	return strings.Contains(n, " "+strings.Join(words, " ")+" ")
+
+func hasCommand(sql string, match func([]string) bool) bool {
+	for _, command := range sqlCommands(sql) {
+		if match(command) {
+			return true
+		}
+	}
+	return false
+}
+
+func indexCommands(sql string) (blockingCreate, concurrentOperation bool) {
+	for _, tokens := range sqlCommands(sql) {
+		if len(tokens) < 2 {
+			continue
+		}
+		switch tokens[0] {
+		case "create":
+			i := 1
+			if i < len(tokens) && tokens[i] == "unique" {
+				i++
+			}
+			if i < len(tokens) && tokens[i] == "index" {
+				if i+1 < len(tokens) && tokens[i+1] == "concurrently" {
+					concurrentOperation = true
+				} else {
+					blockingCreate = true
+				}
+			}
+		case "drop":
+			if tokens[1] == "index" && len(tokens) > 2 && tokens[2] == "concurrently" {
+				concurrentOperation = true
+			}
+		}
+	}
+	return blockingCreate, concurrentOperation
+}
+
+func enumAddValueCommand(tokens []string) bool {
+	if len(tokens) < 5 || tokens[0] != "alter" || tokens[1] != "type" {
+		return false
+	}
+	for i := 2; i+1 < len(tokens); i++ {
+		if tokens[i] == "add" && tokens[i+1] == "value" {
+			return true
+		}
+	}
+	return false
+}
+
+func validateConstraintCommand(tokens []string) bool {
+	if len(tokens) < 5 || tokens[0] != "alter" || tokens[1] != "table" {
+		return false
+	}
+	for i := 2; i+1 < len(tokens); i++ {
+		if tokens[i] == "validate" && tokens[i+1] == "constraint" {
+			return true
+		}
+	}
+	return false
 }

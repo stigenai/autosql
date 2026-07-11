@@ -13,6 +13,12 @@ import (
 	"autosql/pkg/schema"
 )
 
+type namedSecret string
+type reportSecret struct {
+	Credential namedSecret `json:"credential"`
+	Nested     any         `json:"nested"`
+}
+
 func resource(kind schema.Kind, name, specJSON string) *schema.Resource {
 	r := &schema.Resource{Kind: kind, Name: schema.Name{Schema: "public", Name: name}, Spec: json.RawMessage(specJSON)}
 	r.ID = schema.StableID(kind, r.Name)
@@ -179,10 +185,13 @@ func TestTruncateAndSQLLexing(t *testing.T) {
 		want bool
 	}{
 		{"TRUNCATE TABLE accounts", true},
+		{"SELECT 1; TRUNCATE TABLE accounts", true},
 		{"SELECT 'TRUNCATE TABLE accounts'", false},
 		{"-- TRUNCATE accounts\nSELECT 1", false},
 		{"SELECT $$ TRUNCATE accounts $$", false},
 		{"SELECT \"truncate\" FROM accounts", false},
+		{"SELECT truncate() FROM accounts", false},
+		{"SELECT truncate FROM keywords", false},
 	} {
 		ds, err := (Runner{Analyzers: []Analyzer{CompatibilityAnalyzer{}}}).Run(context.Background(), Input{Changes: cs, Statements: []Statement{{ChangeID: "table", SQL: tc.sql}}})
 		if err != nil {
@@ -201,8 +210,14 @@ func TestDefaultVolatilityAndUnknownVersion(t *testing.T) {
 		rewrite     bool
 	}{
 		{"literal fast default", `"ready"`, 16, false},
+		{"statement timestamp stable", `"statement_timestamp()"`, 11, false},
+		{"transaction timestamp stable", `"transaction_timestamp()"`, 11, false},
+		{"current timestamp stable", `"CURRENT_TIMESTAMP"`, 11, false},
+		{"current date stable", `"CURRENT_DATE"`, 16, false},
 		{"stable fast default", `"now()"`, 16, false},
 		{"volatile default", `"random()"`, 16, true},
+		{"clock timestamp volatile", `"clock_timestamp()"`, 16, true},
+		{"sequence volatile", `"nextval('seq')"`, 16, true},
 		{"unknown expression", `"custom_default()"`, 16, true},
 		{"unknown version fails conservatively", `"ready"`, 0, true},
 	}
@@ -285,7 +300,7 @@ func TestRewriteAndLockThresholds(t *testing.T) {
 func TestOperationalSQLIgnoresCommentsAndLiterals(t *testing.T) {
 	r := resource(schema.KindIndex, "idx", `{}`)
 	cs := schema.ChangeSet{Version: schema.ChangeVersion, Changes: []schema.Change{change("idx", schema.OperationCreate, nil, r)}}
-	for _, sql := range []string{"SELECT 'CREATE INDEX idx ON t(id)'", "/* CREATE INDEX idx ON t(id) */ SELECT 1", "SELECT $$ DROP INDEX CONCURRENTLY idx $$"} {
+	for _, sql := range []string{"SELECT 'CREATE INDEX idx ON t(id)'", "/* CREATE INDEX idx ON t(id) */ SELECT 1", "SELECT $$ DROP INDEX CONCURRENTLY idx $$", "SELECT create, index FROM keyword_columns", "SELECT create_index()", "CREATE TABLE index (id int)", "SELECT create FROM a; SELECT index FROM b", "SELECT alter, type FROM a; SELECT add, value FROM b"} {
 		ds, err := (Runner{Analyzers: []Analyzer{PostgreSQLAnalyzer{}}}).Run(context.Background(), Input{Changes: cs, Statements: []Statement{{ChangeID: "idx", SQL: sql}}, Target: Target{Version: 16}})
 		if err != nil {
 			t.Fatal(err)
@@ -293,6 +308,18 @@ func TestOperationalSQLIgnoresCommentsAndLiterals(t *testing.T) {
 		if len(ds) != 0 {
 			t.Fatalf("SQL %q: %#v", sql, ds)
 		}
+	}
+}
+
+func TestOperationalCommandsAreMatchedPerStatement(t *testing.T) {
+	r := resource(schema.KindIndex, "idx", `{}`)
+	cs := schema.ChangeSet{Version: schema.ChangeVersion, Changes: []schema.Change{change("idx", schema.OperationCreate, nil, r)}}
+	ds, err := (Runner{Analyzers: []Analyzer{PostgreSQLAnalyzer{}}}).Run(context.Background(), Input{Changes: cs, Statements: []Statement{{ChangeID: "idx", SQL: "SELECT 1; CREATE UNIQUE INDEX idx ON t(id); DROP INDEX CONCURRENTLY old_idx"}}, Target: Target{Version: 16}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := rules(ds), "AUTOSQL103,AUTOSQL105"; got != want {
+		t.Fatalf("rules=%s want=%s", got, want)
 	}
 }
 
@@ -365,10 +392,12 @@ func TestDeterministicIndependentAnalyzers(t *testing.T) {
 }
 
 func TestReportsRedactAndParse(t *testing.T) {
-	d := Diagnostic{Rule: "X", Severity: SeverityError, Message: `password="two words" postgres://user:pass with spaces@host/db`, Object: Object{ID: "id", Kind: schema.KindTable, Name: "users"}, Source: &schema.SourceLocation{URI: "migration.sql", Extra: map[string]json.RawMessage{"password": json.RawMessage(`"source secret"`)}}, Impact: "token='quoted token'", Remediation: "rotate", Confidence: ConfidenceHigh, Properties: map[string]any{
+	d := Diagnostic{Rule: "X", Severity: SeverityError, Message: `password="two words" https://webuser:webpass@example.test/path`, Object: Object{ID: "id", Kind: schema.KindTable, Name: "users"}, Source: &schema.SourceLocation{URI: "mysql://dbuser:dbpass@host/db", Extra: map[string]json.RawMessage{"password": json.RawMessage(`"source secret"`)}}, Impact: "token='quoted token'", Remediation: "rotate", Confidence: ConfidenceHigh, Properties: map[string]any{
 		"password": "top secret", "nested": []any{map[string]any{"api_key": "key value", "note": "pwd=inside"}, json.RawMessage(`{"token":"raw token","list":["secret=deep value"]}`)},
+		"struct": any(&reportSecret{Credential: namedSecret("struct secret"), Nested: &reportSecret{Credential: namedSecret("pointer secret")}}),
+		"named":  namedSecret("token=named secret"),
 	}}
-	forbidden := []string{"two words", "user:pass", "pass with spaces", "quoted token", "top secret", "key value", "inside", "raw token", "deep value", "source secret"}
+	forbidden := []string{"two words", "webuser:webpass", "dbuser:dbpass", "quoted token", "top secret", "key value", "inside", "raw token", "deep value", "source secret", "struct secret", "pointer secret", "named secret"}
 	for _, f := range []string{"human", "json", "sarif"} {
 		out, err := ReportString(f, []Diagnostic{d})
 		if err != nil {
