@@ -81,7 +81,7 @@ func renderChange(change schema.Change, resources map[string]schema.Resource, op
 	parentOnlyRename := change.Operation == schema.OperationRename && change.Before != nil && change.After != nil && change.Before.Name.Name == change.After.Name.Name && change.Before.Name.Parent != change.After.Name.Parent
 	projectionChild := r.Kind == schema.KindColumn && isManagedProjectionParent(r.Name.Parent, resources)
 	if !parentOnlyRename && !projectionChild {
-		if err := plugin.RequireManaged(New().Info(), r.Kind); err != nil {
+		if err := plugin.RequireManagedOperation(New().Info(), r.Kind, change.Operation); err != nil {
 			return nil, err
 		}
 	}
@@ -746,11 +746,15 @@ func validateProjectionTopology(request plugin.RenderRequest) (map[string]bool, 
 				if e != nil {
 					return nil, e
 				}
-				if beforeSig != afterSig {
+				needsRebuild := r.Kind == schema.KindMaterializedView || beforeSig != afterSig
+				if needsRebuild {
 					if !enabled(request.Options, "allow_rebuild", false) {
 						return nil, unsupported(*r, "view output shape change requires allow_rebuild=true")
 					}
 					rebuilds[change.ID] = true
+					if e := validateRebuildDependents(current, desired, change.Before.ID, request.Changes); e != nil {
+						return nil, e
+					}
 				}
 			}
 			continue
@@ -802,6 +806,43 @@ func validateProjectionTopology(request plugin.RenderRequest) (map[string]bool, 
 	}
 	return rebuilds, nil
 }
+func validateRebuildDependents(current, desired map[string]schema.Resource, parent string, changes schema.ChangeSet) error {
+	drops := map[string]schema.Change{}
+	creates := map[string]schema.Change{}
+	for _, change := range changes.Changes {
+		if change.Operation == schema.OperationDrop && change.Before != nil {
+			drops[change.Before.ID] = change
+		}
+		if change.Operation == schema.OperationCreate && change.After != nil {
+			creates[change.After.ID] = change
+		}
+	}
+	for _, r := range current {
+		if r.Kind == schema.KindColumn && r.Name.Parent == parent {
+			continue
+		}
+		dependent := r.Name.Parent == parent
+		for _, dep := range r.Dependencies {
+			dependent = dependent || dep.Target == parent && (dep.Type == schema.DependencyReferences || dep.Type == schema.DependencyOwns)
+		}
+		if !dependent {
+			continue
+		}
+		if _, ok := drops[r.ID]; !ok {
+			return unsupported(r, "unchanged dependent blocks parent rebuild")
+		}
+		if _, ok := creates[r.ID]; !ok {
+			return unsupported(r, "dependent must have a complete managed drop/recreate transition")
+		}
+		if e := plugin.RequireManagedOperation(New().Info(), r.Kind, schema.OperationDrop); e != nil {
+			return unsupported(r, "dependent drop is not managed")
+		}
+		if e := plugin.RequireManagedOperation(New().Info(), desired[r.ID].Kind, schema.OperationCreate); e != nil {
+			return unsupported(r, "dependent recreate is not managed")
+		}
+	}
+	return nil
+}
 func validateManagedDocuments(request plugin.RenderRequest) error {
 	for _, doc := range []schema.Document{request.Current, request.Desired} {
 		resources := resourceMapForRender(doc)
@@ -809,6 +850,9 @@ func validateManagedDocuments(request plugin.RenderRequest) error {
 			mode := New().Info().Capability(r.Kind).Mode
 			if mode == plugin.Managed {
 				if e := validateManagedMetadata(r); e != nil {
+					return e
+				}
+				if e := validateCanonicalIdentity(r, resources); e != nil {
 					return e
 				}
 				s := spec(r)
@@ -837,6 +881,27 @@ func validateManagedDocuments(request plugin.RenderRequest) error {
 					if e := validateProjectionShape(r, resources); e != nil {
 						return unsupported(r, e.Error())
 					}
+				case schema.KindColumn:
+					if !allowedKeys(s, "type", "default", "not_null", "ordinal") {
+						return unsupported(r, "unknown column semantics")
+					}
+					if _, ok := s["type"].(string); !ok {
+						return unsupported(r, "column type must be a string")
+					}
+					if _, ok := s["not_null"].(bool); !ok {
+						return unsupported(r, "column not_null must be boolean")
+					}
+					if ordinal, ok := s["ordinal"].(float64); !ok || ordinal < 1 || ordinal != float64(int(ordinal)) {
+						return unsupported(r, "column ordinal must be a positive integer")
+					}
+					if e := validateNativeAtom(stringValue(s, "type")); e != nil {
+						return unsupported(r, "unsafe column type")
+					}
+					if d := stringValue(s, "default"); d != "" {
+						if e := validateNativeAtom(d); e != nil {
+							return unsupported(r, "unsafe column default")
+						}
+					}
 				}
 			} else if r.Kind == schema.KindColumn && isManagedProjectionParent(r.Name.Parent, resources) {
 				if e := validateManagedMetadata(r); e != nil {
@@ -847,6 +912,90 @@ func validateManagedDocuments(request plugin.RenderRequest) error {
 				}
 			}
 		}
+	}
+	return nil
+}
+func validateCanonicalIdentity(r schema.Resource, resources map[string]schema.Resource) error {
+	if r.Name.Catalog != "" {
+		return unsupported(r, "catalog must be empty")
+	}
+	switch r.Kind {
+	case schema.KindSchema:
+		if r.Name.Schema != "" || r.Name.Parent != "" || len(r.Dependencies) != 0 {
+			return unsupported(r, "schema name/parent/dependencies are noncanonical")
+		}
+	case schema.KindTable, schema.KindView, schema.KindMaterializedView:
+		parent, ok := resources[r.Name.Parent]
+		if !ok || parent.Kind != schema.KindSchema || parent.Name.Name != r.Name.Schema || r.Name.Schema == "" {
+			return unsupported(r, "schema parent is noncanonical")
+		}
+		contains := 0
+		for _, dep := range r.Dependencies {
+			if dep.Target == parent.ID && dep.Type == schema.DependencyContains {
+				contains++
+				continue
+			}
+			if (r.Kind == schema.KindView || r.Kind == schema.KindMaterializedView) && dep.Type == schema.DependencyReferences {
+				if _, ok := resources[dep.Target]; ok {
+					continue
+				}
+			}
+			return unsupported(r, "dependencies are noncanonical")
+		}
+		if contains != 1 {
+			return unsupported(r, "exactly one schema containment dependency is required")
+		}
+	case schema.KindColumn:
+		parent, ok := resources[r.Name.Parent]
+		if !ok || (parent.Kind != schema.KindTable && parent.Kind != schema.KindView && parent.Kind != schema.KindMaterializedView) || r.Name.Schema != parent.Name.Schema {
+			return unsupported(r, "column parent is noncanonical")
+		}
+		contains := 0
+		for _, dep := range r.Dependencies {
+			if dep.Target == parent.ID && dep.Type == schema.DependencyContains {
+				contains++
+				continue
+			}
+			if dep.Type == schema.DependencyUses {
+				if _, ok := resources[dep.Target]; ok {
+					continue
+				}
+			}
+			return unsupported(r, "column dependencies are noncanonical")
+		}
+		if contains != 1 {
+			return unsupported(r, "column requires exactly one parent containment dependency")
+		}
+	}
+	return nil
+}
+func validateNativeAtom(value string) error {
+	if strings.TrimSpace(value) == "" {
+		return fmt.Errorf("empty")
+	}
+	quoted := byte(0)
+	for i := 0; i < len(value); i++ {
+		b := value[i]
+		if quoted != 0 {
+			if b == quoted {
+				if i+1 < len(value) && value[i+1] == quoted {
+					i++
+					continue
+				}
+				quoted = 0
+			}
+			continue
+		}
+		if b == '\'' || b == '"' {
+			quoted = b
+			continue
+		}
+		if b == ';' || b == '$' || b == '\n' || b == '\r' || i+1 < len(value) && (value[i:i+2] == "--" || value[i:i+2] == "/*") {
+			return fmt.Errorf("unsafe token")
+		}
+	}
+	if quoted != 0 {
+		return fmt.Errorf("unterminated quote")
 	}
 	return nil
 }

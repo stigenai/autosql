@@ -219,6 +219,118 @@ func TestSchemaAndTableRenameTopologyConverges(t *testing.T) {
 	assertFingerprint(t, final, desiredTable)
 }
 
+func TestMaterializedViewRebuildRejectsUnmanagedDependents(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	_, err = conn.Exec(ctx, `
+drop schema if exists autosql_dependents cascade;
+create schema autosql_dependents;
+create table autosql_dependents.widgets(id bigint not null);
+create materialized view autosql_dependents.widget_mv as select id from autosql_dependents.widgets;
+create index widget_mv_id_idx on autosql_dependents.widget_mv(id);
+create view autosql_dependents.widget_view as select id from autosql_dependents.widget_mv;
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Exec(context.Background(), `drop schema if exists autosql_dependents cascade`)
+	current, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_dependents"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err = postgres.New().Normalize(ctx, current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired := current
+	desired.Graph.Resources = append([]schema.Resource(nil), current.Graph.Resources...)
+	for i := range desired.Graph.Resources {
+		r := &desired.Graph.Resources[i]
+		if r.Kind == schema.KindMaterializedView && r.Name.Name == "widget_mv" {
+			r.Spec = json.RawMessage(`{"definition":"SELECT id FROM autosql_dependents.widgets WHERE id >= 0"}`)
+		}
+	}
+	desired, err = postgres.New().Normalize(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := plan.Build(ctx, postgres.New(), current, desired, plan.Options{Render: map[string]string{"allow_rebuild": "true"}})
+	if err == nil {
+		t.Fatalf("unmanaged index and dependent view should block rebuild: %+v", p)
+	}
+	if len(p.Steps) != 0 {
+		t.Fatalf("failed rebuild returned executable steps: %+v", p.Steps)
+	}
+}
+
+func TestNativeDocumentCreateReinspectConverges(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	_, err = conn.Exec(ctx, `drop schema if exists autosql_native cascade`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Exec(context.Background(), `drop schema if exists autosql_native cascade`)
+	current, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_native"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err = postgres.New().Normalize(ctx, current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ns := schema.Resource{Kind: schema.KindSchema, Name: schema.Name{Name: "autosql_native"}, Spec: json.RawMessage(`{}`)}
+	ns.ID = schema.StableID(ns.Kind, ns.Name)
+	table := schema.Resource{Kind: schema.KindTable, Name: schema.Name{Schema: "autosql_native", Name: "widgets", Parent: ns.ID}, Dependencies: []schema.Dependency{{Target: ns.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{}`)}
+	table.ID = schema.StableID(table.Kind, table.Name)
+	column := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: "autosql_native", Name: "label", Parent: table.ID}, Dependencies: []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{"type":"text","not_null":false,"ordinal":1}`)}
+	column.ID = schema.StableID(column.Kind, column.Name)
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, column}}}
+	desired, err = postgres.New().Normalize(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := plan.Build(ctx, postgres.New(), current, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, p)
+	actual, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_native"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err = postgres.New().Normalize(ctx, actual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFingerprint(t, actual, desired)
+	noop, err := plan.Build(ctx, postgres.New(), actual, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(noop.Changes.Changes) != 0 || len(noop.Steps) != 0 {
+		t.Fatalf("native document second plan not empty: %+v", noop)
+	}
+}
+
 func renameFixture(doc schema.Document, newSchemaName, newTableName string) (schema.Document, string, string, string, string) {
 	var oldSchema, oldTable schema.Resource
 	for _, r := range doc.Graph.Resources {

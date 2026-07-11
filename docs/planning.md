@@ -16,12 +16,21 @@ guarded executor; they are never silently moved into a transaction.
 
 ## PostgreSQL rendering
 
-The PostgreSQL driver currently advertises managed lifecycle support only for
-schemas, tables, views, and materialized views. Other inspected kinds remain read-only
-until their entire canonical transition matrix and guarded phase execution are
-available. View definitions are replaceable, while materialized-view changes
-require the explicit `allow_rebuild=true` strategy. Concurrent/nontransactional
-rendering is rejected until a phase-aware guarded executor is available.
+The PostgreSQL driver advertises managed lifecycle support for schemas, tables,
+columns, views, and materialized views. Capabilities list the exact operations
+and supported semantic features for each kind; all other inspected kinds remain
+read-only. Schemas support create, drop, and rename. The table subset is limited
+to permanent, non-partitioned tables plus row-level-security state and managed
+child columns. Core columns support type, default, nullability, and canonical
+ordinal metadata. Create, alter, drop, and rename are available for tables,
+columns, views, and materialized views within those feature subsets.
+
+View definitions are replaceable, while materialized-view changes require the
+explicit `allow_rebuild=true` strategy. A shape-changing view replacement also
+requires explicit rebuild. Before either rebuild, every non-projection dependent
+must have a complete managed drop transition; unchanged indexes, triggers,
+grants, or dependent views fail planning. Concurrent/nontransactional rendering
+is rejected until a phase-aware guarded executor is available.
 View and materialized-view output columns remain canonical resources. The SQL
 source normalizer derives them only for a conservative round-trip subset:
 simple projections, expanded wildcards over known tables, and aliased integer

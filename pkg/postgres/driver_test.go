@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -14,10 +15,25 @@ func TestDriverMetadata(t *testing.T) {
 	if err := plugin.ValidateDriver(d); err != nil {
 		t.Fatalf("ValidateDriver: %v", err)
 	}
-	for kind, want := range map[schema.Kind]plugin.Mode{schema.KindSchema: plugin.Managed, schema.KindView: plugin.Managed, schema.KindMaterializedView: plugin.Managed, schema.KindTable: plugin.Managed, schema.KindColumn: plugin.ReadOnly, schema.KindIndex: plugin.ReadOnly, schema.KindEnum: plugin.ReadOnly, schema.KindPolicy: plugin.ReadOnly, schema.KindRole: plugin.ReadOnly, schema.KindGrant: plugin.ReadOnly} {
+	for kind, want := range map[schema.Kind]plugin.Mode{schema.KindSchema: plugin.Managed, schema.KindView: plugin.Managed, schema.KindMaterializedView: plugin.Managed, schema.KindTable: plugin.Managed, schema.KindColumn: plugin.Managed, schema.KindIndex: plugin.ReadOnly, schema.KindEnum: plugin.ReadOnly, schema.KindPolicy: plugin.ReadOnly, schema.KindRole: plugin.ReadOnly, schema.KindGrant: plugin.ReadOnly} {
 		if got := d.Info().Capability(kind).Mode; got != want {
 			t.Errorf("capability %s = %s, want %s", kind, got, want)
 		}
+	}
+	all := []schema.Operation{schema.OperationCreate, schema.OperationAlter, schema.OperationDrop, schema.OperationRename}
+	for kind, want := range map[schema.Kind][]schema.Operation{
+		schema.KindSchema:           {schema.OperationCreate, schema.OperationDrop, schema.OperationRename},
+		schema.KindTable:            all,
+		schema.KindColumn:           all,
+		schema.KindView:             all,
+		schema.KindMaterializedView: all,
+	} {
+		if got := d.Info().Capability(kind).Operations; !reflect.DeepEqual(got, want) {
+			t.Errorf("operations %s = %v, want %v", kind, got, want)
+		}
+	}
+	if got := d.Info().Capability(schema.KindIndex).Operations; len(got) != 0 {
+		t.Fatalf("read-only index advertises operations: %v", got)
 	}
 }
 

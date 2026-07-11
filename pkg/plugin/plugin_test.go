@@ -34,6 +34,13 @@ func TestCapabilityModes(t *testing.T) {
 	if err := plugin.RequireManaged(i, schema.KindRole); !errors.Is(err, plugin.ErrUnsupported) {
 		t.Fatalf("got %v", err)
 	}
+	explicit := plugin.Info{Capabilities: []plugin.Capability{{Kind: schema.KindTable, Mode: plugin.Managed, Operations: []schema.Operation{schema.OperationCreate}}}}
+	if err := plugin.RequireManagedOperation(explicit, schema.KindTable, schema.OperationCreate); err != nil {
+		t.Fatal(err)
+	}
+	if err := plugin.RequireManagedOperation(explicit, schema.KindTable, schema.OperationAlter); !errors.Is(err, plugin.ErrUnsupported) {
+		t.Fatalf("unsupported operation got %v", err)
+	}
 }
 
 func TestVersionNegotiation(t *testing.T) {

@@ -61,14 +61,20 @@ func (*Driver) Info() plugin.Info {
 		schema.KindTrigger, schema.KindPolicy, schema.KindRole, schema.KindGrant,
 	}
 	caps := make([]plugin.Capability, 0, len(kinds))
-	// Managed is restricted to the lifecycle-complete transition matrix.
-	managed := map[schema.Kind]bool{schema.KindSchema: true, schema.KindTable: true, schema.KindView: true, schema.KindMaterializedView: true}
+	all := []schema.Operation{schema.OperationCreate, schema.OperationAlter, schema.OperationDrop, schema.OperationRename}
+	profiles := map[schema.Kind]plugin.Capability{
+		schema.KindSchema:           {Kind: schema.KindSchema, Mode: plugin.Managed, Operations: []schema.Operation{schema.OperationCreate, schema.OperationDrop, schema.OperationRename}, Features: []string{"namespace.lifecycle"}},
+		schema.KindTable:            {Kind: schema.KindTable, Mode: plugin.Managed, Operations: all, Features: []string{"table.permanent_nonpartitioned", "table.rls", "table.child_columns"}},
+		schema.KindColumn:           {Kind: schema.KindColumn, Mode: plugin.Managed, Operations: all, Features: []string{"column.type", "column.default", "column.not_null", "column.ordinal_metadata"}},
+		schema.KindView:             {Kind: schema.KindView, Mode: plugin.Managed, Operations: all, Features: []string{"view.provable_projection"}},
+		schema.KindMaterializedView: {Kind: schema.KindMaterializedView, Mode: plugin.Managed, Operations: all, Features: []string{"materialized_view.provable_projection", "alter.explicit_rebuild"}},
+	}
 	for _, kind := range kinds {
-		mode := plugin.ReadOnly
-		if managed[kind] {
-			mode = plugin.Managed
+		if capability, ok := profiles[kind]; ok {
+			caps = append(caps, capability)
+		} else {
+			caps = append(caps, plugin.Capability{Kind: kind, Mode: plugin.ReadOnly})
 		}
-		caps = append(caps, plugin.Capability{Kind: kind, Mode: mode})
 	}
 	return plugin.Info{Name: "postgres", Version: version, APIVersion: plugin.HostAPIVersion, Capabilities: caps}
 }
@@ -115,7 +121,7 @@ func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Documen
 	return doc, nil
 }
 
-var simpleViewFrom = regexp.MustCompile(`(?i)^SELECT\s+(.+)\s+FROM\s+([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)$`)
+var simpleViewFrom = regexp.MustCompile(`(?i)^SELECT\s+(.+?)\s+FROM\s+([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)(?:\s+WHERE\s+.+)?$`)
 var simpleLiteralView = regexp.MustCompile(`(?i)^SELECT\s+(.+)\s+AS\s+([a-z_][a-z0-9_]*)$`)
 
 func augmentProjectionColumns(doc *schema.Document) {
@@ -144,6 +150,13 @@ func augmentProjectionColumns(doc *schema.Document) {
 			table, ok := tables[match[2]+"."+match[3]]
 			if !ok {
 				continue
+			}
+			hasReference := false
+			for _, dep := range r.Dependencies {
+				hasReference = hasReference || dep.Target == table.ID && dep.Type == schema.DependencyReferences
+			}
+			if !hasReference {
+				r.Dependencies = append(r.Dependencies, schema.Dependency{Target: table.ID, Type: schema.DependencyReferences})
 			}
 			items := strings.Split(match[1], ",")
 			if strings.TrimSpace(match[1]) == "*" {
@@ -231,9 +244,17 @@ func normalizePostgresSpecForKind(kind schema.Kind, spec map[string]any) {
 				return
 			}
 			delete(spec, "options")
+		}
+		if _, ok := spec["partitioned"]; !ok {
 			spec["partitioned"] = false
+		}
+		if _, ok := spec["persistence"]; !ok {
 			spec["persistence"] = "p"
+		}
+		if _, ok := spec["row_security"]; !ok {
 			spec["row_security"] = false
+		}
+		if _, ok := spec["force_row_security"]; !ok {
 			spec["force_row_security"] = false
 		}
 	}

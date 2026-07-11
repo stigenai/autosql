@@ -84,12 +84,13 @@ func TestConcurrentRenderingRejectedWithoutGuardedPhaseExecutor(t *testing.T) {
 }
 
 func TestMaterializedViewAlterRequiresExplicitRebuild(t *testing.T) {
-	before := renderResource(schema.KindMaterializedView, schema.Name{Schema: "public", Name: "users_mv"}, `{"definition":"SELECT 1 AS value"}`)
+	s := renderResource(schema.KindSchema, schema.Name{Name: "public"}, `{}`)
+	before := renderResource(schema.KindMaterializedView, schema.Name{Schema: "public", Name: "users_mv", Parent: s.ID}, `{"definition":"SELECT 1 AS value"}`, schema.Dependency{Target: s.ID, Type: schema.DependencyContains})
 	after := before
 	after.Spec = json.RawMessage(`{"definition":"SELECT 2 AS value"}`)
 	column := projection(before, "value", "integer")
-	current := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{before, column}}}
-	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{after, column}}}
+	current := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{s, before, column}}}
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{s, after, column}}}
 	changes, _ := schema.Diff(current, desired, schema.DiffOptions{})
 	out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Current: current, Desired: desired})
 	if err == nil || len(out) != 0 {
@@ -181,13 +182,48 @@ func TestManagedMetadataAndIdentifierControlsFailClosed(t *testing.T) {
 	}
 }
 
+func TestManagedResourcesRequireCanonicalIdentityAndDependencies(t *testing.T) {
+	app := renderResource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
+	other := renderResource(schema.KindSchema, schema.Name{Name: "other"}, `{}`)
+	base := renderResource(schema.KindTable, schema.Name{Schema: "app", Name: "widgets", Parent: app.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: app.ID, Type: schema.DependencyContains})
+	cases := map[string]schema.Resource{}
+	wrongParent := base
+	wrongParent.Name.Parent = other.ID
+	cases["schema parent mismatch"] = wrongParent
+	missingContains := base
+	missingContains.Dependencies = nil
+	cases["missing contains"] = missingContains
+	extraDependency := base
+	extraDependency.Dependencies = append(extraDependency.Dependencies, schema.Dependency{Target: other.ID, Type: schema.DependencyReferences})
+	cases["ignored reference"] = extraDependency
+	for name, table := range cases {
+		t.Run(name, func(t *testing.T) {
+			doc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{app, other, table}}}
+			changes := schema.ChangeSet{Version: schema.ChangeVersion, Changes: []schema.Change{{ID: "c", Operation: schema.OperationCreate, ResourceID: table.ID, After: &table}}}
+			out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Desired: doc})
+			if err == nil || len(out) != 0 {
+				t.Fatalf("out=%+v err=%v", out, err)
+			}
+		})
+	}
+	schemaWithDependency := app
+	schemaWithDependency.Dependencies = []schema.Dependency{{Target: other.ID, Type: schema.DependencyReferences}}
+	doc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{other, schemaWithDependency}}}
+	changes := schema.ChangeSet{Version: schema.ChangeVersion, Changes: []schema.Change{{ID: "c", Operation: schema.OperationCreate, ResourceID: app.ID, After: &schemaWithDependency}}}
+	out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Desired: doc})
+	if err == nil || len(out) != 0 {
+		t.Fatalf("schema dependency out=%+v err=%v", out, err)
+	}
+}
+
 func TestViewAlterOutputShapePolicy(t *testing.T) {
-	view := renderResource(schema.KindView, schema.Name{Schema: "public", Name: "v"}, `{"definition":"SELECT 1 AS value"}`)
+	s := renderResource(schema.KindSchema, schema.Name{Name: "public"}, `{}`)
+	view := renderResource(schema.KindView, schema.Name{Schema: "public", Name: "v", Parent: s.ID}, `{"definition":"SELECT 1 AS value"}`, schema.Dependency{Target: s.ID, Type: schema.DependencyContains})
 	column := projection(view, "value", "integer")
-	current := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{view, column}}}
+	current := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{s, view, column}}}
 	same := view
 	same.Spec = json.RawMessage(`{"definition":"SELECT 2 AS value"}`)
-	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{same, column}}}
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{s, same, column}}}
 	changes, _ := schema.Diff(current, desired, schema.DiffOptions{})
 	out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Current: current, Desired: desired})
 	if err != nil || len(out) != 1 {
@@ -204,7 +240,7 @@ func TestViewAlterOutputShapePolicy(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			v, c := view, column
 			mutate(&v, &c)
-			target := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{v, c}}}
+			target := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{s, v, c}}}
 			cs, _ := schema.Diff(current, target, schema.DiffOptions{})
 			result, e := New().Render(context.Background(), plugin.RenderRequest{Changes: cs, Current: current, Desired: target})
 			if e == nil || len(result) != 0 {
@@ -215,10 +251,11 @@ func TestViewAlterOutputShapePolicy(t *testing.T) {
 }
 
 func TestIndependentOrMalformedProjectionChangesFailClosed(t *testing.T) {
-	view := renderResource(schema.KindView, schema.Name{Schema: "public", Name: "v"}, `{"definition":"SELECT 1 AS value"}`)
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "public"}, `{}`)
+	view := renderResource(schema.KindView, schema.Name{Schema: "public", Name: "v", Parent: ns.ID}, `{"definition":"SELECT 1 AS value"}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
 	column := projection(view, "value", "integer")
-	current := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{view}}}
-	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{view, column}}}
+	current := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, view}}}
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, view, column}}}
 	changes, _ := schema.Diff(current, desired, schema.DiffOptions{})
 	out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Current: current, Desired: desired})
 	if err == nil || len(out) != 0 {
@@ -226,7 +263,7 @@ func TestIndependentOrMalformedProjectionChangesFailClosed(t *testing.T) {
 	}
 	bad := column
 	bad.Spec = json.RawMessage(`{"future":true,"not_null":false,"ordinal":1,"type":"integer"}`)
-	desired.Graph.Resources = []schema.Resource{view, bad}
+	desired.Graph.Resources = []schema.Resource{ns, view, bad}
 	changes, _ = schema.Diff(current, desired, schema.DiffOptions{})
 	out, err = New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Current: current, Desired: desired})
 	if err == nil || len(out) != 0 {
@@ -234,7 +271,7 @@ func TestIndependentOrMalformedProjectionChangesFailClosed(t *testing.T) {
 	}
 	bad = column
 	bad.Dependencies = []schema.Dependency{{Target: view.ID, Type: schema.DependencyReferences}}
-	desired.Graph.Resources = []schema.Resource{view, bad}
+	desired.Graph.Resources = []schema.Resource{ns, view, bad}
 	changes, _ = schema.Diff(current, desired, schema.DiffOptions{})
 	out, err = New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Current: current, Desired: desired})
 	if err == nil || len(out) != 0 {

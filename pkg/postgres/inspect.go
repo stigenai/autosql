@@ -41,6 +41,7 @@ func inspect(ctx context.Context, req plugin.InspectRequest) (schema.Document, e
 		{"types", "USAGE on the selected schemas and types", i.inspectTypes},
 		{"sequences", "USAGE on the selected schemas", i.inspectSequences},
 		{"relations", "USAGE on schemas and SELECT on catalog metadata", i.inspectRelations},
+		{"relation dependencies", "USAGE on schemas and SELECT on catalog dependency metadata", i.inspectRelationDependencies},
 		{"columns", "USAGE on schemas and SELECT on catalog metadata", i.inspectColumns},
 		{"constraints", "USAGE on schemas and SELECT on catalog metadata", i.inspectConstraints},
 		{"indexes", "USAGE on schemas and SELECT on catalog metadata", i.inspectIndexes},
@@ -77,6 +78,37 @@ func inspect(ctx context.Context, req plugin.InspectRequest) (schema.Document, e
 		return schema.Document{}, fmt.Errorf("inspect PostgreSQL database: build canonical document: %w", err)
 	}
 	return doc, nil
+}
+
+func (i *inspector) inspectRelationDependencies(ctx context.Context) error {
+	rows, err := i.conn.Query(ctx, `select distinct rw.ev_class::oid,d.refobjid::oid from pg_rewrite rw join pg_depend d on d.classid='pg_rewrite'::regclass and d.objid=rw.oid join pg_class v on v.oid=rw.ev_class where v.relkind in ('v','m') and d.refclassid='pg_class'::regclass and d.deptype='n' and d.refobjid<>rw.ev_class order by 1,2`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var from, to uint32
+		if err := rows.Scan(&from, &to); err != nil {
+			return err
+		}
+		fromID, toID := i.byOID[from], i.byOID[to]
+		if fromID == "" || toID == "" {
+			continue
+		}
+		for idx := range i.resources {
+			if i.resources[idx].ID != fromID {
+				continue
+			}
+			exists := false
+			for _, dep := range i.resources[idx].Dependencies {
+				exists = exists || dep.Target == toID && dep.Type == schema.DependencyReferences
+			}
+			if !exists {
+				i.resources[idx].Dependencies = append(i.resources[idx].Dependencies, schema.Dependency{Target: toID, Type: schema.DependencyReferences})
+			}
+		}
+	}
+	return rows.Err()
 }
 
 func safeError(action, dsn string, err error) error {

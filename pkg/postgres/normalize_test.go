@@ -67,6 +67,15 @@ func TestNormalizeSQLSourceMatchesInspectorManagedShapes(t *testing.T) {
 	viewColumn := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: "app", Name: "id", Parent: view.ID}, Dependencies: []schema.Dependency{{Target: view.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{"position":1,"type":"bigint","not_null":false}`)}
 	viewColumn.ID = schema.StableID(viewColumn.Kind, viewColumn.Name)
 	inspected.Graph.Resources = append(inspected.Graph.Resources, viewColumn)
+	for idx := range inspected.Graph.Resources {
+		if inspected.Graph.Resources[idx].Kind == schema.KindView {
+			for _, resource := range inspected.Graph.Resources {
+				if resource.Kind == schema.KindTable {
+					inspected.Graph.Resources[idx].Dependencies = append(inspected.Graph.Resources[idx].Dependencies, schema.Dependency{Target: resource.ID, Type: schema.DependencyReferences})
+				}
+			}
+		}
+	}
 	a, err := New().Normalize(context.Background(), fromSQL)
 	if err != nil {
 		t.Fatal(err)
@@ -128,6 +137,11 @@ func TestPostgresRepresentativeTransitionsGolden(t *testing.T) {
 	actual, err := changes.MarshalCanonical()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if os.Getenv("UPDATE_GOLDEN") == "1" {
+		if err := os.WriteFile("testdata/representative_transitions.golden.json", actual, 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 	expected, err := os.ReadFile("testdata/representative_transitions.golden.json")
 	if err != nil || string(actual) != string(expected) {

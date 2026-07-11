@@ -28,9 +28,10 @@ const (
 // Capability declares support for one canonical resource kind. Plugins must
 // explicitly list every kind they understand; omitted kinds are unsupported.
 type Capability struct {
-	Kind     schema.Kind `json:"kind"`
-	Mode     Mode        `json:"mode"`
-	Features []string    `json:"features,omitempty"`
+	Kind       schema.Kind        `json:"kind"`
+	Mode       Mode               `json:"mode"`
+	Features   []string           `json:"features,omitempty"`
+	Operations []schema.Operation `json:"operations,omitempty"`
 }
 
 // Info is immutable plugin identity and negotiation metadata.
@@ -181,6 +182,18 @@ func validateInfo(i Info) error {
 		default:
 			return fmt.Errorf("%w: capability %q has mode %q", ErrInvalidPlugin, c.Kind, c.Mode)
 		}
+		seenOps := map[schema.Operation]bool{}
+		for _, op := range c.Operations {
+			if seenOps[op] {
+				return fmt.Errorf("%w: duplicate operation %q for %q", ErrInvalidPlugin, op, c.Kind)
+			}
+			seenOps[op] = true
+			switch op {
+			case schema.OperationCreate, schema.OperationAlter, schema.OperationDrop, schema.OperationRename:
+			default:
+				return fmt.Errorf("%w: unknown operation %q", ErrInvalidPlugin, op)
+			}
+		}
 	}
 	return nil
 }
@@ -275,4 +288,22 @@ func RequireManaged(i Info, k schema.Kind) error {
 	default:
 		return fmt.Errorf("%w: plugin %q does not support %q", ErrUnsupported, i.Name, k)
 	}
+}
+
+// RequireManagedOperation checks an explicitly negotiated kind/operation pair.
+// Empty Operations retains compatibility with legacy managed plugins.
+func RequireManagedOperation(i Info, k schema.Kind, op schema.Operation) error {
+	capability := i.Capability(k)
+	if capability.Mode != Managed {
+		return RequireManaged(i, k)
+	}
+	if len(capability.Operations) == 0 {
+		return nil
+	}
+	for _, supported := range capability.Operations {
+		if supported == op {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: plugin %q cannot %s %q", ErrUnsupported, i.Name, op, k)
 }
