@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -27,6 +28,9 @@ func (*Driver) Render(ctx context.Context, request plugin.RenderRequest) ([]plug
 		return nil, fmt.Errorf("render PostgreSQL changes: %w", err)
 	}
 	if err := validateColumnOrdinalTransitions(request); err != nil {
+		return nil, fmt.Errorf("render PostgreSQL changes: %w", err)
+	}
+	if err := validateColumnDependentTransitions(request); err != nil {
 		return nil, fmt.Errorf("render PostgreSQL changes: %w", err)
 	}
 	rebuilds, err := validateProjectionTopology(request)
@@ -1044,12 +1048,12 @@ func validateManagedDocuments(request plugin.RenderRequest) error {
 					if ordinal, ok := s["ordinal"].(float64); !ok || ordinal < 1 || ordinal != float64(int(ordinal)) {
 						return unsupported(r, "column ordinal must be a positive integer")
 					}
-					if e := validateNativeAtom(stringValue(s, "type")); e != nil {
-						return unsupported(r, "unsafe column type")
+					if e := validateCoreColumnType(r, resources); e != nil {
+						return e
 					}
 					if d := stringValue(s, "default"); d != "" {
-						if e := validateNativeAtom(d); e != nil {
-							return unsupported(r, "unsafe column default")
+						if e := validateCoreDefault(r, d); e != nil {
+							return e
 						}
 					}
 				}
@@ -1059,6 +1063,72 @@ func validateManagedDocuments(request plugin.RenderRequest) error {
 				}
 				if e := validateProjectionResource(r, r.Name.Parent); e != nil {
 					return e
+				}
+			}
+		}
+	}
+	return nil
+}
+func validateCoreColumnType(r schema.Resource, resources map[string]schema.Resource) error {
+	for _, dep := range r.Dependencies {
+		if dep.Type == schema.DependencyUses {
+			return nil
+		}
+	}
+	typ := stringValue(spec(r), "type")
+	base := strings.TrimSuffix(typ, "[]")
+	allowed := map[string]bool{"smallint": true, "integer": true, "bigint": true, "real": true, "double precision": true, "numeric": true, "boolean": true, "text": true, "character varying": true, "date": true, "timestamp": true, "timestamptz": true, "uuid": true, "json": true, "jsonb": true, "bytea": true}
+	if !allowed[base] || typ != base && typ != base+"[]" {
+		return unsupported(r, "column type is outside canonical core grammar")
+	}
+	return nil
+}
+func validateCoreDefault(r schema.Resource, value string) error {
+	typ := strings.TrimSuffix(stringValue(spec(r), "type"), "[]")
+	if strings.HasSuffix(stringValue(spec(r), "type"), "[]") {
+		return unsupported(r, "array defaults are not modeled")
+	}
+	integer := regexp.MustCompile(`^-?[0-9]+$`)
+	numeric := regexp.MustCompile(`^-?[0-9]+(?:\.[0-9]+)?$`)
+	quoted := regexp.MustCompile(`^'(?:''|[^'])*'$`)
+	ok := false
+	switch typ {
+	case "smallint", "integer", "bigint":
+		ok = integer.MatchString(value)
+	case "real", "double precision", "numeric":
+		ok = numeric.MatchString(value)
+	case "boolean":
+		ok = value == "true" || value == "false"
+	case "text", "character varying":
+		ok = quoted.MatchString(value)
+	case "timestamp", "timestamptz":
+		ok = value == "CURRENT_TIMESTAMP"
+	}
+	if !ok {
+		return unsupported(r, "column default is outside canonical core grammar")
+	}
+	return nil
+}
+func validateColumnDependentTransitions(request plugin.RenderRequest) error {
+	current, desired := resourceMapForRender(request.Current), resourceMapForRender(request.Desired)
+	for _, change := range request.Changes.Changes {
+		if change.Before == nil || change.Before.Kind != schema.KindColumn || (change.Operation != schema.OperationDrop && change.Operation != schema.OperationRename) {
+			continue
+		}
+		table := change.Before.Name.Parent
+		for _, dependent := range current {
+			if dependent.Kind == schema.KindColumn {
+				continue
+			}
+			mayDepend := dependent.Name.Parent == table
+			for _, dep := range dependent.Dependencies {
+				if dep.Target == table && dep.Type == schema.DependencyReferences {
+					mayDepend = true
+				}
+			}
+			if mayDepend {
+				if _, retained := desired[dependent.ID]; retained {
+					return unsupported(dependent, "retained read-only object may depend on changed column")
 				}
 			}
 		}

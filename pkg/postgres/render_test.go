@@ -424,6 +424,30 @@ func TestDirectProjectionQualifierAndWildcardRules(t *testing.T) {
 	}
 }
 
+func TestCoreColumnGrammarRejectsClauseSmugglingAndNoncanonicalForms(t *testing.T) {
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "app", Name: "widgets", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	for name, fixture := range map[string]struct{ typ, def string }{
+		"embedded not null": {"text NOT NULL", ""}, "collation": {"text COLLATE C", ""}, "constraint": {"integer CHECK (value>0)", ""},
+		"char variant": {"char(4)", ""}, "decimal variant": {"decimal(10,2)", ""}, "timestamp precision": {"timestamp(3)", ""}, "array keyword": {"integer ARRAY", ""},
+		"function default": {"integer", "nextval('x')"}, "cast default": {"integer", "'1'::integer"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			spec := map[string]any{"type": fixture.typ, "not_null": false, "ordinal": 1}
+			if fixture.def != "" {
+				spec["default"] = fixture.def
+			}
+			raw, _ := json.Marshal(spec)
+			column := renderResource(schema.KindColumn, schema.Name{Schema: "app", Name: "value", Parent: table.ID}, string(raw), schema.Dependency{Target: table.ID, Type: schema.DependencyContains})
+			desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, column}}}
+			changes := schema.ChangeSet{Version: schema.ChangeVersion, Changes: []schema.Change{{ID: "c", Operation: schema.OperationCreate, ResourceID: column.ID, After: &column}}}
+			if out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Desired: desired}); err == nil || len(out) != 0 {
+				t.Fatalf("out=%+v err=%v", out, err)
+			}
+		})
+	}
+}
+
 func TestViewAlterOutputShapePolicy(t *testing.T) {
 	s := renderResource(schema.KindSchema, schema.Name{Name: "public"}, `{}`)
 	view := renderResource(schema.KindView, schema.Name{Schema: "public", Name: "v", Parent: s.ID}, `{"definition":"SELECT 1 AS value"}`, schema.Dependency{Target: s.ID, Type: schema.DependencyContains})

@@ -26,6 +26,11 @@ ordinal metadata, and only a narrow set of known implicit or assignment-safe
 type casts; other conversions fail planning because no validated `USING`
 expression is available. Create, alter, drop, and rename are available for tables,
 columns, views, and materialized views within those feature subsets.
+Native core types use a strict canonical allowlist rather than arbitrary SQL
+fragments. Length/precision variants, `ARRAY` keyword spelling, collation,
+constraints, and embedded clauses are rejected. Defaults are modeled per type:
+simple numeric, boolean, quoted text, and canonical current-timestamp values;
+casts, functions, array defaults, and other expressions fail closed.
 Column ordinals describe canonical relative order. PostgreSQL can physically
 append and drop columns but cannot insert or reorder them, so the planner proves
 the complete sibling sequence: append and drop consequences are topology-only,
@@ -33,6 +38,10 @@ while middle insertion, reorder, or a simultaneous ordinal-and-attribute change
 fails until a table rebuild strategy exists.
 Column rename hints preserve the same physical slot (including nonfinal columns)
 and cannot be combined with hidden attribute changes.
+Column drop and rename also fail when a retained read-only table child or
+table-referencing object might depend on the affected column. This deliberately
+conservative guard remains until inspection can prove exact column-level edges
+and complete dependent transitions.
 
 View definitions are replaceable, while materialized-view changes require the
 explicit `allow_rebuild=true` strategy. A shape-changing view replacement also

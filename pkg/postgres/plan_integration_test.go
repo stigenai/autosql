@@ -376,7 +376,15 @@ func TestNativeDocumentCreateReinspectConverges(t *testing.T) {
 	z.ID = schema.StableID(z.Kind, z.Name)
 	a := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: "autosql_native", Name: "a", Parent: table.ID}, Dependencies: []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{"type":"text","not_null":false,"ordinal":2}`)}
 	a.ID = schema.StableID(a.Kind, a.Name)
-	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, z, a}}}
+	defaults := []schema.Resource{}
+	for index, fixture := range []struct{ name, typ, value string }{{"count", "integer", "7"}, {"label", "text", "'x'"}, {"enabled", "boolean", "true"}, {"created_at", "timestamptz", "CURRENT_TIMESTAMP"}} {
+		column := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: "autosql_native", Name: fixture.name, Parent: table.ID}, Dependencies: []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(fmt.Sprintf(`{"type":%q,"default":%q,"not_null":false,"ordinal":%d}`, fixture.typ, fixture.value, index+3))}
+		column.ID = schema.StableID(column.Kind, column.Name)
+		defaults = append(defaults, column)
+	}
+	desiredResources := []schema.Resource{ns, table, z, a}
+	desiredResources = append(desiredResources, defaults...)
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: desiredResources}}
 	desired, err = postgres.New().Normalize(ctx, desired)
 	if err != nil {
 		t.Fatal(err)
@@ -608,6 +616,65 @@ func TestNonfinalColumnRenamePreservesOrdinal(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertFingerprint(t, actual, desired)
+}
+
+func TestColumnTransitionsRejectRetainedReadOnlyDependents(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	_, err = conn.Exec(ctx, `drop schema if exists autosql_coldeps cascade; create schema autosql_coldeps; create table autosql_coldeps.widgets(a text unique,b text); create index widgets_b_idx on autosql_coldeps.widgets(b);`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Exec(context.Background(), `drop schema if exists autosql_coldeps cascade`)
+	current, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_coldeps"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err = postgres.New().Normalize(ctx, current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, columnName := range map[string]string{"drop unique column": "a", "rename indexed column": "b"} {
+		t.Run(name, func(t *testing.T) {
+			desired := current
+			desired.Graph.Resources = nil
+			var oldID, newID string
+			for _, original := range current.Graph.Resources {
+				r := original
+				if r.Kind == schema.KindColumn && r.Name.Name == columnName {
+					oldID = r.ID
+					if columnName == "a" {
+						continue
+					}
+					r.Name.Name = "x"
+					r.ID = schema.StableID(r.Kind, r.Name)
+					newID = r.ID
+				}
+				desired.Graph.Resources = append(desired.Graph.Resources, r)
+			}
+			desired, err = postgres.New().Normalize(ctx, desired)
+			if err != nil {
+				t.Fatal(err)
+			}
+			options := plan.Options{}
+			if newID != "" {
+				options.Diff.RenameHints = []schema.RenameHint{{From: oldID, To: newID}}
+			}
+			failed, buildErr := plan.Build(ctx, postgres.New(), current, desired, options)
+			if buildErr == nil || len(failed.Steps) != 0 {
+				t.Fatalf("planned=%+v err=%v", failed, buildErr)
+			}
+		})
+	}
 }
 
 func renameFixture(doc schema.Document, newSchemaName, newTableName string) (schema.Document, string, string, string, string) {
