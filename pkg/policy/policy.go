@@ -81,10 +81,17 @@ type Violation struct {
 }
 
 type Limits struct {
-	MaxSteps     int
-	MaxResources int
-	Timeout      time.Duration
+	MaxSteps        int
+	MaxResources    int
+	MaxPatternBytes int
+	MaxTextBytes    int
+	Timeout         time.Duration
 }
+
+const (
+	defaultMaxPatternBytes = 4096
+	defaultMaxTextBytes    = 1 << 20
+)
 
 type Evaluator struct {
 	Limits Limits
@@ -132,6 +139,7 @@ func ParsePack(data []byte) (*RulePack, error) {
 
 func strictUnmarshal(data []byte, dst any) error {
 	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
 		offset := int(dec.InputOffset())
@@ -179,25 +187,56 @@ func strictUnmarshal(data []byte, dst any) error {
 }
 
 func validate(doc *Document) error {
+	return validateBounded(doc, nil, defaultMaxPatternBytes)
+}
+
+func validateBounded(doc *Document, m *meter, maxPatternBytes int) error {
+	step := func(n int) error {
+		if m == nil {
+			return nil
+		}
+		return m.charge(n)
+	}
+	if err := step(1); err != nil {
+		return err
+	}
 	if doc.Version != LanguageVersion {
 		return source("$.version", "unsupported language version %q", doc.Version)
 	}
 	seen := map[string]bool{}
 	predicateNames := make([]string, 0, len(doc.Predicates))
 	for name := range doc.Predicates {
+		if err := step(1); err != nil {
+			return err
+		}
 		predicateNames = append(predicateNames, name)
 	}
+	if err := step(1); err != nil {
+		return err
+	}
 	sort.Strings(predicateNames)
+	if err := step(1); err != nil {
+		return err
+	}
 	for _, name := range predicateNames {
+		if err := step(1); err != nil {
+			return err
+		}
 		expr := doc.Predicates[name]
 		if strings.TrimSpace(name) == "" {
 			return source("$.predicates", "predicate names cannot be empty")
 		}
-		if err := validateExpr(expr, doc.Predicates, map[string]bool{name: true}); err != nil {
+		if err := validateExprBounded(expr, doc.Predicates, map[string]bool{name: true}, m, maxPatternBytes); err != nil {
+			if errors.Is(err, ErrLimitExceeded) || (m != nil && m.ctx.Err() != nil) {
+				return err
+			}
 			return source("$.predicates."+name, "%v", err)
 		}
 	}
 	for i, rule := range doc.Rules {
+		if err := step(1); err != nil {
+			return err
+		}
 		path := fmt.Sprintf("$.rules[%d]", i)
 		if rule.Name == "" || seen[rule.Name] {
 			return source(path+".name", "rule name is empty or duplicated")
@@ -206,10 +245,21 @@ func validate(doc *Document) error {
 		if rule.Target != "schema" && rule.Target != "migration" && rule.Target != "all" {
 			return source(path+".target", "target must be schema, migration, or all")
 		}
+		if err := step(1); err != nil {
+			return err
+		}
+		for range rule.Kinds {
+			if err := step(1); err != nil {
+				return err
+			}
+		}
 		if rule.Message == "" {
 			return source(path+".message", "message is required")
 		}
-		if err := validateExpr(rule.Assert, doc.Predicates, nil); err != nil {
+		if err := validateExprBounded(rule.Assert, doc.Predicates, nil, m, maxPatternBytes); err != nil {
+			if errors.Is(err, ErrLimitExceeded) || (m != nil && m.ctx.Err() != nil) {
+				return err
+			}
 			return source(path+".assert", "%v", err)
 		}
 	}
@@ -217,6 +267,15 @@ func validate(doc *Document) error {
 }
 
 func validateExpr(e Expression, predicates map[string]Expression, stack map[string]bool) error {
+	return validateExprBounded(e, predicates, stack, nil, defaultMaxPatternBytes)
+}
+
+func validateExprBounded(e Expression, predicates map[string]Expression, stack map[string]bool, m *meter, maxPatternBytes int) error {
+	if m != nil {
+		if err := m.charge(1); err != nil {
+			return err
+		}
+	}
 	n := 0
 	if len(e.All) > 0 {
 		n++
@@ -250,17 +309,22 @@ func validateExpr(e Expression, predicates map[string]Expression, stack map[stri
 	}
 	for _, list := range [][]Expression{e.All, e.Any} {
 		for _, x := range list {
-			if err := validateExpr(x, predicates, stack); err != nil {
+			if err := validateExprBounded(x, predicates, stack, m, maxPatternBytes); err != nil {
 				return err
 			}
 		}
 	}
 	if e.Not != nil {
-		if err := validateExpr(*e.Not, predicates, stack); err != nil {
+		if err := validateExprBounded(*e.Not, predicates, stack, m, maxPatternBytes); err != nil {
 			return err
 		}
 	}
 	if e.Predicate != "" {
+		if m != nil {
+			if err := m.charge(1); err != nil {
+				return err
+			}
+		}
 		p, ok := predicates[e.Predicate]
 		if !ok {
 			return fmt.Errorf("unknown predicate %q", e.Predicate)
@@ -273,7 +337,7 @@ func validateExpr(e Expression, predicates map[string]Expression, stack map[stri
 			next[k] = v
 		}
 		next[e.Predicate] = true
-		if err := validateExpr(p, predicates, next); err != nil {
+		if err := validateExprBounded(p, predicates, next, m, maxPatternBytes); err != nil {
 			return err
 		}
 	}
@@ -282,8 +346,24 @@ func validateExpr(e Expression, predicates map[string]Expression, stack map[stri
 	}
 	if len(e.Matches) == 2 {
 		if pattern, ok := e.Matches[1].(string); ok && !strings.HasPrefix(pattern, "resource.") && !strings.HasPrefix(pattern, "variables.") {
+			if len(pattern) > maxPatternBytes {
+				if m != nil {
+					return fmt.Errorf("%w: regex pattern bytes (%d > %d)", ErrLimitExceeded, len(pattern), maxPatternBytes)
+				}
+				return fmt.Errorf("regular expression exceeds %d bytes", maxPatternBytes)
+			}
+			if m != nil {
+				if err := m.charge(1); err != nil {
+					return err
+				}
+			}
 			if _, err := regexp.Compile(pattern); err != nil {
 				return fmt.Errorf("invalid regular expression: %v", err)
+			}
+			if m != nil {
+				if err := m.charge(1); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -298,6 +378,12 @@ func (ev Evaluator) Evaluate(ctx context.Context, doc Document, schema, migratio
 	if lim.MaxResources <= 0 {
 		lim.MaxResources = 10000
 	}
+	if lim.MaxPatternBytes <= 0 {
+		lim.MaxPatternBytes = defaultMaxPatternBytes
+	}
+	if lim.MaxTextBytes <= 0 {
+		lim.MaxTextBytes = defaultMaxTextBytes
+	}
 	if lim.Timeout <= 0 {
 		lim.Timeout = 5 * time.Second
 	}
@@ -310,10 +396,7 @@ func (ev Evaluator) Evaluate(ctx context.Context, doc Document, schema, migratio
 	}
 	start := now()
 	m := &meter{ctx: ctx, limit: lim, start: start, now: now}
-	if err := validate(&doc); err != nil {
-		return nil, err
-	}
-	if err := m.charge(1 + len(doc.Rules) + len(doc.Predicates)); err != nil {
+	if err := validateBounded(&doc, m, lim.MaxPatternBytes); err != nil {
 		return nil, err
 	}
 	var out []Violation
@@ -471,6 +554,12 @@ func eval(e Expression, r Resource, vars map[string]any, preds map[string]Expres
 		if !ok || !textOK || !patternOK {
 			return false, nil
 		}
+		if len(pattern) > m.limit.MaxPatternBytes {
+			return false, fmt.Errorf("%w: regex pattern bytes (%d > %d)", ErrLimitExceeded, len(pattern), m.limit.MaxPatternBytes)
+		}
+		if len(text) > m.limit.MaxTextBytes {
+			return false, fmt.Errorf("%w: regex text bytes (%d > %d)", ErrLimitExceeded, len(text), m.limit.MaxTextBytes)
+		}
 		if err := m.charge(1); err != nil {
 			return false, err
 		}
@@ -565,6 +654,9 @@ func number(v any) (*big.Rat, bool) {
 	case float64:
 		r := new(big.Rat).SetFloat64(n)
 		return r, r != nil
+	case json.Number:
+		r, ok := new(big.Rat).SetString(string(n))
+		return r, ok
 	default:
 		return nil, false
 	}

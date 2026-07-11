@@ -9,6 +9,8 @@ their own roles. Plan authors, apply requesters, and approvers are separated.
 Every decision is persisted before mutation through a `Chain` backed by a
 `DurableSink`. Records include sequence and previous-record hashes. `FileSink`
 validates the complete chain, appends JSON lines, and synchronizes file and
-directory storage before success. Persistence, context, or final expiry failure
+directory storage before success. An OS file lock makes head comparison and
+append atomic across processes; a stale contender fails with a chain conflict.
+Persistence, conflict, context, or final expiry failure
 is fail-closed. `GuardedApply` rechecks plan and approval expiry after audit and
 immediately before calling the mutation adapter.

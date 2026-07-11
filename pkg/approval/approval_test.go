@@ -2,8 +2,10 @@ package approval
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -29,10 +31,11 @@ func (a fakeAuthority) VerifyApproval(_ context.Context, approval Approval) (Ver
 }
 
 type durableMemorySink struct {
-	mu      sync.Mutex
-	records []AuditRecord
-	fail    bool
-	cancel  context.CancelFunc
+	mu       sync.Mutex
+	records  []AuditRecord
+	fail     bool
+	conflict bool
+	cancel   context.CancelFunc
 }
 
 func (s *durableMemorySink) Tail(context.Context) (*AuditRecord, error) {
@@ -49,6 +52,9 @@ func (s *durableMemorySink) AppendDurable(_ context.Context, expected string, re
 	defer s.mu.Unlock()
 	if s.fail {
 		return errors.New("persistence failure")
+	}
+	if s.conflict {
+		return ErrAuditConflict
 	}
 	actual := ""
 	if len(s.records) > 0 {
@@ -165,6 +171,11 @@ func TestEveryGateFailurePreventsMutation(t *testing.T) {
 		"persistence failure": func(g Gate, r Request, s *durableMemorySink) (Gate, Request) {
 			r.Override = &EmergencyOverride{Identity: "deployer", Reason: "incident"}
 			s.fail = true
+			return g, r
+		},
+		"append conflict": func(g Gate, r Request, s *durableMemorySink) (Gate, Request) {
+			r.Override = &EmergencyOverride{Identity: "deployer", Reason: "incident"}
+			s.conflict = true
 			return g, r
 		},
 		"tampered audit tail": func(g Gate, r Request, s *durableMemorySink) (Gate, Request) {
@@ -294,5 +305,57 @@ func TestFileSinkPersistsAndDetectsTampering(t *testing.T) {
 	}
 	if _, err := (&FileSink{Path: path}).Tail(context.Background()); err == nil {
 		t.Fatal("tampering was not detected")
+	}
+}
+
+func TestFileSinkProcessHelper(t *testing.T) {
+	path := os.Getenv("AUTOSQL_AUDIT_HELPER_PATH")
+	if path == "" {
+		return
+	}
+	var record AuditRecord
+	if json.Unmarshal([]byte(os.Getenv("AUTOSQL_AUDIT_HELPER_RECORD")), &record) != nil {
+		os.Exit(20)
+	}
+	if err := (&FileSink{Path: path}).AppendDurable(context.Background(), os.Getenv("AUTOSQL_AUDIT_HELPER_EXPECTED"), record); err != nil {
+		os.Exit(21)
+	}
+	os.Exit(0)
+}
+
+func TestFileSinkCrossProcessCompareAndAppendIsAtomic(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	chain := &Chain{Sink: &FileSink{Path: path}}
+	first, err := chain.AppendDurable(context.Background(), Event{At: time.Unix(1, 0), Type: "first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	makeRecord := func(actor string) AuditRecord {
+		r := AuditRecord{Sequence: 2, PreviousHash: first.Hash, Event: Event{At: time.Unix(2, 0).UTC(), Type: "second", Actor: actor}}
+		r.Hash = hashRecord(r)
+		return r
+	}
+	commands := make([]*exec.Cmd, 2)
+	for i, actor := range []string{"one", "two"} {
+		raw, _ := json.Marshal(makeRecord(actor))
+		cmd := exec.Command(os.Args[0], "-test.run=^TestFileSinkProcessHelper$")
+		cmd.Env = append(os.Environ(), "AUTOSQL_AUDIT_HELPER_PATH="+path, "AUTOSQL_AUDIT_HELPER_EXPECTED="+first.Hash, "AUTOSQL_AUDIT_HELPER_RECORD="+string(raw))
+		commands[i] = cmd
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	success := 0
+	for _, cmd := range commands {
+		if cmd.Wait() == nil {
+			success++
+		}
+	}
+	if success != 1 {
+		t.Fatalf("successors appended=%d want 1", success)
+	}
+	tail, err := (&FileSink{Path: path}).Tail(context.Background())
+	if err != nil || tail == nil || tail.Sequence != 2 || tail.PreviousHash != first.Hash || !verifyHash(*tail) {
+		t.Fatalf("tail=%+v err=%v", tail, err)
 	}
 }

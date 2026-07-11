@@ -2,6 +2,7 @@ package policy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -164,6 +165,52 @@ func TestNumericComparisonDoesNotLoseIntegerPrecision(t *testing.T) {
 	}
 	if len(v) != 1 {
 		t.Fatalf("large integers compared equal: %+v", v)
+	}
+}
+
+func TestJSONPolicyNumbersPreserveAdjacentLargeIntegers(t *testing.T) {
+	doc, err := Parse([]byte(`{"version":"v1","rules":[{"name":"exact","target":"all","message":"different","assert":{"eq":[9007199254740992,9007199254740993]}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, literal := range doc.Rules[0].Assert.Eq {
+		if _, ok := literal.(json.Number); !ok {
+			t.Fatalf("literal %d decoded as %T", i, literal)
+		}
+	}
+	v, err := (Evaluator{}).Evaluate(context.Background(), *doc, []Resource{{Kind: "table", Name: "t"}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v) != 1 {
+		t.Fatalf("adjacent large integers compared equal: %+v", v)
+	}
+}
+
+func TestValidationAndRegexAreBounded(t *testing.T) {
+	doc := Document{Version: "v1", Predicates: map[string]Expression{"p": {All: []Expression{{Eq: []any{1, 1}}, {Eq: []any{2, 2}}, {Eq: []any{3, 3}}}}}, Rules: []Rule{{Name: "r", Target: "schema", Kinds: []string{"table", "view"}, Message: "x", Assert: Expression{Predicate: "p"}}}}
+	if _, err := (Evaluator{Limits: Limits{MaxSteps: 5}}).Evaluate(context.Background(), doc, nil, nil); !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("validation not metered: %v", err)
+	}
+	clock := time.Unix(0, 0)
+	calls := 0
+	_, err := (Evaluator{Limits: Limits{MaxSteps: 1000, Timeout: time.Second}, Now: func() time.Time {
+		calls++
+		if calls > 3 {
+			return clock.Add(2 * time.Second)
+		}
+		return clock
+	}}).Evaluate(context.Background(), doc, nil, nil)
+	if !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("validation timeout not enforced: %v", err)
+	}
+	regexDoc := Document{Version: "v1", Rules: []Rule{{Name: "r", Target: "all", Message: "x", Assert: Expression{Matches: []any{"resource.name", "abcdef"}}}}}
+	if _, err = (Evaluator{Limits: Limits{MaxPatternBytes: 4}}).Evaluate(context.Background(), regexDoc, []Resource{{Kind: "table", Name: "x"}}, nil); !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("pattern bound: %v", err)
+	}
+	regexDoc.Rules[0].Assert.Matches = []any{"resource.name", ".*"}
+	if _, err = (Evaluator{Limits: Limits{MaxTextBytes: 4}}).Evaluate(context.Background(), regexDoc, []Resource{{Kind: "table", Name: "too-long"}}, nil); !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("text bound: %v", err)
 	}
 }
 

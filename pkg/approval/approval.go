@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -195,18 +196,27 @@ func (s *FileSink) Tail(ctx context.Context) (*AuditRecord, error) {
 	lock := auditFileLock(s.Path)
 	lock.Lock()
 	defer lock.Unlock()
-	records, err := s.load(ctx)
-	if err != nil || len(records) == 0 {
-		return nil, err
-	}
-	tail := records[len(records)-1]
-	return &tail, nil
+	var tail *AuditRecord
+	err := s.withOSLock(ctx, func() error {
+		records, err := s.load(ctx)
+		if err != nil || len(records) == 0 {
+			return err
+		}
+		r := records[len(records)-1]
+		tail = &r
+		return nil
+	})
+	return tail, err
 }
 
 func (s *FileSink) AppendDurable(ctx context.Context, expected string, record AuditRecord) error {
 	lock := auditFileLock(s.Path)
 	lock.Lock()
 	defer lock.Unlock()
+	return s.withOSLock(ctx, func() error { return s.appendLocked(ctx, expected, record) })
+}
+
+func (s *FileSink) appendLocked(ctx context.Context, expected string, record AuditRecord) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -244,6 +254,32 @@ func (s *FileSink) AppendDurable(ctx context.Context, expected string, record Au
 		}
 	}
 	return err
+}
+
+func (s *FileSink) withOSLock(ctx context.Context, fn func() error) error {
+	lockFile, err := os.OpenFile(s.Path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	defer lockFile.Close()
+	for {
+		err = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			break
+		}
+		if err != syscall.EWOULDBLOCK && err != syscall.EAGAIN {
+			return err
+		}
+		timer := time.NewTimer(5 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	return fn()
 }
 
 func (s *FileSink) load(ctx context.Context) ([]AuditRecord, error) {
