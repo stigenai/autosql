@@ -134,3 +134,35 @@ create policy user_read on autosql_inspect.users for select to public using (tru
 		}
 	}
 }
+
+func TestManagedColumnCastMatrixMatchesTargetPostgres(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	safe := [][2]string{{"smallint", "integer"}, {"smallint", "bigint"}, {"smallint", "numeric"}, {"integer", "bigint"}, {"integer", "numeric"}, {"bigint", "numeric"}, {"real", "double precision"}, {"character varying", "text"}, {"character", "text"}}
+	for _, pair := range safe {
+		var context string
+		err := conn.QueryRow(ctx, `select castcontext::text from pg_cast where castsource=$1::regtype and casttarget=$2::regtype`, pair[0], pair[1]).Scan(&context)
+		if err != nil {
+			t.Fatalf("cast %s -> %s missing: %v", pair[0], pair[1], err)
+		}
+		if context != "i" && context != "a" || !safeAssignmentCast(pair[0], pair[1]) {
+			t.Fatalf("cast %s -> %s context=%q is inconsistent with capability", pair[0], pair[1], context)
+		}
+	}
+	var unsafeContext string
+	if err := conn.QueryRow(ctx, `select coalesce((select castcontext::text from pg_cast where castsource='text'::regtype and casttarget='integer'::regtype),'e')`).Scan(&unsafeContext); err != nil {
+		t.Fatal(err)
+	}
+	if unsafeContext != "e" || safeAssignmentCast("text", "integer") {
+		t.Fatalf("text -> integer context=%q must remain explicit-only", unsafeContext)
+	}
+}

@@ -122,6 +122,39 @@ func TestSQLSourcePlanApplyReinspectConverges(t *testing.T) {
 	if len(empty.Changes.Changes) != 0 || len(empty.Steps) != 0 {
 		t.Fatalf("second plan not empty: %+v", empty)
 	}
+	for name, mutate := range map[string]func(*schema.Resource, schema.Document){
+		"missing actual reference": func(view *schema.Resource, _ schema.Document) {
+			filtered := view.Dependencies[:0]
+			for _, dep := range view.Dependencies {
+				if dep.Type != schema.DependencyReferences {
+					filtered = append(filtered, dep)
+				}
+			}
+			view.Dependencies = filtered
+		},
+		"extra unrelated reference": func(view *schema.Resource, doc schema.Document) {
+			for _, candidate := range doc.Graph.Resources {
+				if candidate.Kind == schema.KindView && candidate.Name.Name == "literal_view" {
+					view.Dependencies = append(view.Dependencies, schema.Dependency{Target: candidate.ID, Type: schema.DependencyReferences})
+				}
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			bad := actual
+			bad.Graph.Resources = append([]schema.Resource(nil), actual.Graph.Resources...)
+			for i := range bad.Graph.Resources {
+				if bad.Graph.Resources[i].Kind == schema.KindView && bad.Graph.Resources[i].Name.Name == "widget_view" {
+					bad.Graph.Resources[i].Dependencies = append([]schema.Dependency(nil), bad.Graph.Resources[i].Dependencies...)
+					mutate(&bad.Graph.Resources[i], bad)
+				}
+			}
+			failed, buildErr := plan.Build(ctx, postgres.New(), actual, bad, plan.Options{})
+			if buildErr == nil || len(failed.Steps) != 0 {
+				t.Fatalf("dependency mismatch planned: %+v err=%v", failed, buildErr)
+			}
+		})
+	}
 	raw, _ := json.Marshal(actual)
 	var sameShape schema.Document
 	_ = json.Unmarshal(raw, &sameShape)
@@ -301,9 +334,11 @@ func TestNativeDocumentCreateReinspectConverges(t *testing.T) {
 	ns.ID = schema.StableID(ns.Kind, ns.Name)
 	table := schema.Resource{Kind: schema.KindTable, Name: schema.Name{Schema: "autosql_native", Name: "widgets", Parent: ns.ID}, Dependencies: []schema.Dependency{{Target: ns.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{}`)}
 	table.ID = schema.StableID(table.Kind, table.Name)
-	column := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: "autosql_native", Name: "label", Parent: table.ID}, Dependencies: []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{"type":"text","not_null":false,"ordinal":1}`)}
-	column.ID = schema.StableID(column.Kind, column.Name)
-	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, column}}}
+	z := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: "autosql_native", Name: "z", Parent: table.ID}, Dependencies: []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{"type":"smallint","not_null":false,"ordinal":1}`)}
+	z.ID = schema.StableID(z.Kind, z.Name)
+	a := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: "autosql_native", Name: "a", Parent: table.ID}, Dependencies: []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{"type":"text","not_null":false,"ordinal":2}`)}
+	a.ID = schema.StableID(a.Kind, a.Name)
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, z, a}}}
 	desired, err = postgres.New().Normalize(ctx, desired)
 	if err != nil {
 		t.Fatal(err)
@@ -311,6 +346,13 @@ func TestNativeDocumentCreateReinspectConverges(t *testing.T) {
 	p, err := plan.Build(ctx, postgres.New(), current, desired, plan.Options{})
 	if err != nil {
 		t.Fatal(err)
+	}
+	var createSQL strings.Builder
+	for _, step := range p.Steps {
+		createSQL.WriteString(step.SQL)
+	}
+	if strings.Index(createSQL.String(), `"z" smallint`) > strings.Index(createSQL.String(), `"a" text`) {
+		t.Fatalf("column creates are not in desired ordinal order: %s", createSQL.String())
 	}
 	applyTestPlan(t, ctx, conn, p)
 	actual, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_native"}})
@@ -328,6 +370,74 @@ func TestNativeDocumentCreateReinspectConverges(t *testing.T) {
 	}
 	if len(noop.Changes.Changes) != 0 || len(noop.Steps) != 0 {
 		t.Fatalf("native document second plan not empty: %+v", noop)
+	}
+	safe := desired
+	safe.Graph.Resources = append([]schema.Resource(nil), desired.Graph.Resources...)
+	for i := range safe.Graph.Resources {
+		if safe.Graph.Resources[i].ID == z.ID {
+			safe.Graph.Resources[i].Spec = json.RawMessage(`{"type":"integer","not_null":false,"ordinal":1}`)
+		}
+	}
+	safe, err = postgres.New().Normalize(ctx, safe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	safePlan, err := plan.Build(ctx, postgres.New(), actual, safe, plan.Options{})
+	if err != nil {
+		t.Fatalf("safe smallint to integer cast: %v", err)
+	}
+	applyTestPlan(t, ctx, conn, safePlan)
+	actual, err = postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_native"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err = postgres.New().Normalize(ctx, actual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFingerprint(t, actual, safe)
+	unsafe := safe
+	unsafe.Graph.Resources = append([]schema.Resource(nil), safe.Graph.Resources...)
+	for i := range unsafe.Graph.Resources {
+		if unsafe.Graph.Resources[i].ID == a.ID {
+			unsafe.Graph.Resources[i].Spec = json.RawMessage(`{"type":"integer","not_null":false,"ordinal":2}`)
+		}
+	}
+	unsafe, err = postgres.New().Normalize(ctx, unsafe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failed, buildErr := plan.Build(ctx, postgres.New(), actual, unsafe, plan.Options{}); buildErr == nil || len(failed.Steps) != 0 {
+		t.Fatalf("unsafe text to integer cast planned: %+v err=%v", failed, buildErr)
+	}
+	dropped := safe
+	dropped.Graph.Resources = nil
+	for _, r := range safe.Graph.Resources {
+		if r.ID != z.ID {
+			dropped.Graph.Resources = append(dropped.Graph.Resources, r)
+		}
+	}
+	dropped, err = postgres.New().Normalize(ctx, dropped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dropPlan, err := plan.Build(ctx, postgres.New(), actual, dropped, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, dropPlan)
+	actual, err = postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_native"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err = postgres.New().Normalize(ctx, actual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFingerprint(t, actual, dropped)
+	secondDrop, err := plan.Build(ctx, postgres.New(), actual, dropped, plan.Options{})
+	if err != nil || len(secondDrop.Steps) != 0 {
+		t.Fatalf("nonfinal drop second plan=%+v err=%v", secondDrop, err)
 	}
 }
 

@@ -65,7 +65,7 @@ func (*Driver) Info() plugin.Info {
 	profiles := map[schema.Kind]plugin.Capability{
 		schema.KindSchema:           {Kind: schema.KindSchema, Mode: plugin.Managed, Operations: []schema.Operation{schema.OperationCreate, schema.OperationDrop, schema.OperationRename}, Features: []string{"namespace.lifecycle"}},
 		schema.KindTable:            {Kind: schema.KindTable, Mode: plugin.Managed, Operations: all, Features: []string{"table.permanent_nonpartitioned", "table.rls", "table.child_columns"}},
-		schema.KindColumn:           {Kind: schema.KindColumn, Mode: plugin.Managed, Operations: all, Features: []string{"column.type", "column.default", "column.not_null", "column.ordinal_metadata"}},
+		schema.KindColumn:           {Kind: schema.KindColumn, Mode: plugin.Managed, Operations: all, Features: []string{"column.type_safe_casts", "column.default", "column.not_null", "column.ordinal_metadata"}},
 		schema.KindView:             {Kind: schema.KindView, Mode: plugin.Managed, Operations: all, Features: []string{"view.provable_projection"}},
 		schema.KindMaterializedView: {Kind: schema.KindMaterializedView, Mode: plugin.Managed, Operations: all, Features: []string{"materialized_view.provable_projection", "alter.explicit_rebuild"}},
 	}
@@ -113,12 +113,59 @@ func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Documen
 			r.Spec = normalized
 		}
 	}
+	if err := canonicalizeColumnOrdinals(&doc); err != nil {
+		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
+	}
 	augmentProjectionColumns(&doc)
 	doc.Normalize()
 	if err := doc.Validate(); err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
 	return doc, nil
+}
+
+func canonicalizeColumnOrdinals(doc *schema.Document) error {
+	groups := map[string][]*schema.Resource{}
+	for i := range doc.Graph.Resources {
+		r := &doc.Graph.Resources[i]
+		if r.Kind == schema.KindColumn {
+			groups[r.Name.Parent] = append(groups[r.Name.Parent], r)
+		}
+	}
+	for _, columns := range groups {
+		seen := map[int]bool{}
+		maxOrdinal := 0
+		for _, column := range columns {
+			ordinal := numberAsInt(specMap(column.Spec), "ordinal")
+			if ordinal < 1 {
+				continue
+			}
+			if seen[ordinal] {
+				return fmt.Errorf("columns under %q require unique positive ordinals", column.Name.Parent)
+			}
+			seen[ordinal] = true
+			if ordinal > maxOrdinal {
+				maxOrdinal = ordinal
+			}
+		}
+		for _, column := range columns {
+			s := specMap(column.Spec)
+			if numberAsInt(s, "ordinal") < 1 {
+				maxOrdinal++
+				s["ordinal"] = maxOrdinal
+				column.Spec, _ = json.Marshal(s)
+			}
+		}
+		sort.SliceStable(columns, func(i, j int) bool {
+			return numberAsInt(specMap(columns[i].Spec), "ordinal") < numberAsInt(specMap(columns[j].Spec), "ordinal")
+		})
+		for i, column := range columns {
+			s := specMap(column.Spec)
+			s["ordinal"] = i + 1
+			column.Spec, _ = json.Marshal(s)
+		}
+	}
+	return nil
 }
 
 var simpleViewFrom = regexp.MustCompile(`(?i)^SELECT\s+(.+?)\s+FROM\s+([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)(?:\s+WHERE\s+.+)?$`)
@@ -133,7 +180,7 @@ func augmentProjectionColumns(doc *schema.Document) {
 			children[r.Name.Parent] = true
 			columns[r.Name.Parent] = append(columns[r.Name.Parent], r)
 		}
-		if r.Kind == schema.KindTable {
+		if r.Kind == schema.KindTable || r.Kind == schema.KindView || r.Kind == schema.KindMaterializedView {
 			tables[r.Name.Schema+"."+r.Name.Name] = r
 		}
 	}

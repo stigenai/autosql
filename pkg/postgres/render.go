@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -86,6 +87,9 @@ func renderChange(change schema.Change, resources map[string]schema.Resource, op
 		}
 	}
 	if parentOnlyRename || projectionChild {
+		return []plugin.Statement{{ChangeID: change.ID, Transactional: true, Kind: plugin.StatementTopology}}, nil
+	}
+	if change.Operation == schema.OperationAlter && r.Kind == schema.KindColumn && columnOrdinalOnly(*change.Before, *change.After) {
 		return []plugin.Statement{{ChangeID: change.ID, Transactional: true, Kind: plugin.StatementTopology}}, nil
 	}
 	var sqls []string
@@ -344,6 +348,9 @@ func renderAlter(before, after schema.Resource, resources map[string]schema.Reso
 			if atype == "" {
 				return nil, unsupported(after, "column type")
 			}
+			if !safeAssignmentCast(btype, atype) {
+				return nil, unsupported(after, "column type change is not a known implicit or assignment-safe cast")
+			}
 			out = append(out, "ALTER TABLE "+parent+" ALTER COLUMN "+quote(after.Name.Name)+" TYPE "+atype)
 		}
 		bd, ad := stringValue(bs, "default"), stringValue(as, "default")
@@ -495,6 +502,38 @@ func renderAlter(before, after schema.Resource, resources map[string]schema.Reso
 		return out, nil
 	default:
 		return nil, unsupported(after, "alter")
+	}
+}
+
+func columnOrdinalOnly(before, after schema.Resource) bool {
+	bs, as := spec(before), spec(after)
+	if numberAsInt(bs, "ordinal") == numberAsInt(as, "ordinal") {
+		return false
+	}
+	delete(bs, "ordinal")
+	delete(as, "ordinal")
+	return slices.Equal(canonicalMapEntries(bs), canonicalMapEntries(as))
+}
+
+func canonicalMapEntries(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for key, value := range m {
+		keys = append(keys, fmt.Sprintf("%s=%v", key, value))
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func safeAssignmentCast(before, after string) bool {
+	normalize := func(value string) string { return strings.ToLower(strings.TrimSpace(value)) }
+	pair := normalize(before) + "->" + normalize(after)
+	switch pair {
+	case "smallint->integer", "smallint->bigint", "smallint->numeric",
+		"integer->bigint", "integer->numeric", "bigint->numeric",
+		"real->double precision", "character varying->text", "character->text":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -846,6 +885,9 @@ func validateRebuildDependents(current, desired map[string]schema.Resource, pare
 func validateManagedDocuments(request plugin.RenderRequest) error {
 	for _, doc := range []schema.Document{request.Current, request.Desired} {
 		resources := resourceMapForRender(doc)
+		if e := validateCoreColumnOrdinals(resources); e != nil {
+			return e
+		}
 		for _, r := range doc.Graph.Resources {
 			mode := New().Info().Capability(r.Kind).Mode
 			if mode == plugin.Managed {
@@ -853,6 +895,9 @@ func validateManagedDocuments(request plugin.RenderRequest) error {
 					return e
 				}
 				if e := validateCanonicalIdentity(r, resources); e != nil {
+					return e
+				}
+				if e := validateSemanticDependencies(r, resources); e != nil {
 					return e
 				}
 				s := spec(r)
@@ -912,6 +957,73 @@ func validateManagedDocuments(request plugin.RenderRequest) error {
 				}
 			}
 		}
+	}
+	return nil
+}
+func validateCoreColumnOrdinals(resources map[string]schema.Resource) error {
+	groups := map[string][]schema.Resource{}
+	for _, r := range resources {
+		if r.Kind == schema.KindColumn && resources[r.Name.Parent].Kind == schema.KindTable {
+			groups[r.Name.Parent] = append(groups[r.Name.Parent], r)
+		}
+	}
+	for _, columns := range groups {
+		sort.Slice(columns, func(i, j int) bool {
+			return numberAsInt(spec(columns[i]), "ordinal") < numberAsInt(spec(columns[j]), "ordinal")
+		})
+		for i, column := range columns {
+			if numberAsInt(spec(column), "ordinal") != i+1 {
+				return unsupported(column, "table column ordinals must be contiguous and unique")
+			}
+		}
+	}
+	return nil
+}
+func validateSemanticDependencies(r schema.Resource, resources map[string]schema.Resource) error {
+	expectedType := schema.DependencyUses
+	var expected []string
+	switch r.Kind {
+	case schema.KindView, schema.KindMaterializedView:
+		expectedType = schema.DependencyReferences
+		definition := stringValue(spec(r), "definition")
+		if match := simpleViewFrom.FindStringSubmatch(definition); match != nil {
+			for id, candidate := range resources {
+				if (candidate.Kind == schema.KindTable || candidate.Kind == schema.KindView || candidate.Kind == schema.KindMaterializedView) && candidate.Name.Schema == match[2] && candidate.Name.Name == match[3] {
+					expected = append(expected, id)
+				}
+			}
+			if len(expected) != 1 {
+				return unsupported(r, "view source dependency is not provable")
+			}
+		} else if !simpleLiteralView.MatchString(definition) {
+			return unsupported(r, "view dependencies are not provable from definition")
+		}
+	case schema.KindColumn:
+		if parent := resources[r.Name.Parent]; parent.Kind != schema.KindTable {
+			return nil
+		}
+		typ := stringValue(spec(r), "type")
+		for id, candidate := range resources {
+			switch candidate.Kind {
+			case schema.KindEnum, schema.KindDomain, schema.KindComposite:
+				if typ == candidate.Name.Schema+"."+candidate.Name.Name {
+					expected = append(expected, id)
+				}
+			}
+		}
+	default:
+		return nil
+	}
+	var actual []string
+	for _, dep := range r.Dependencies {
+		if dep.Type == expectedType {
+			actual = append(actual, dep.Target)
+		}
+	}
+	sort.Strings(expected)
+	sort.Strings(actual)
+	if !slices.Equal(expected, actual) {
+		return unsupported(r, "declared dependencies do not exactly match rendered semantics")
 	}
 	return nil
 }

@@ -21,8 +21,10 @@ columns, views, and materialized views. Capabilities list the exact operations
 and supported semantic features for each kind; all other inspected kinds remain
 read-only. Schemas support create, drop, and rename. The table subset is limited
 to permanent, non-partitioned tables plus row-level-security state and managed
-child columns. Core columns support type, default, nullability, and canonical
-ordinal metadata. Create, alter, drop, and rename are available for tables,
+child columns. Core columns support default, nullability, canonical relative
+ordinal metadata, and only a narrow set of known implicit or assignment-safe
+type casts; other conversions fail planning because no validated `USING`
+expression is available. Create, alter, drop, and rename are available for tables,
 columns, views, and materialized views within those feature subsets.
 
 View definitions are replaceable, while materialized-view changes require the
@@ -38,6 +40,12 @@ or text literals. Output name, type, nullability, dependency, and ordinal are
 validated. Shape-changing view alters require an explicit proven rebuild;
 independent projection-child changes fail closed. Other definitions fail closed
 instead of planning drift.
+
+Reference and type-use dependencies are part of rendered semantics, not advisory
+metadata. For managed views and columns, the declared `references`/`uses` sets
+must exactly match the dependencies derivable from the conservative definition
+and type subset. Missing, extra, or unprovable dependencies fail planning so a
+post-apply inspection cannot silently change the target graph.
 
 `postgres.RenderDocument` renders a full desired document from an empty schema
 projection when every resource is in the managed matrix. Read-only kinds make

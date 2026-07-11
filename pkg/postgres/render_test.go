@@ -216,6 +216,73 @@ func TestManagedResourcesRequireCanonicalIdentityAndDependencies(t *testing.T) {
 	}
 }
 
+func TestRenderedDependenciesMustExactlyMatchSemantics(t *testing.T) {
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "app", Name: "widgets", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	unrelated := renderResource(schema.KindTable, schema.Name{Schema: "app", Name: "other", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	tableColumn := renderResource(schema.KindColumn, schema.Name{Schema: "app", Name: "id", Parent: table.ID}, `{"type":"integer","not_null":false,"ordinal":1}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains})
+	base := renderResource(schema.KindView, schema.Name{Schema: "app", Name: "v", Parent: ns.ID}, `{"definition":"SELECT id FROM app.widgets"}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains}, schema.Dependency{Target: table.ID, Type: schema.DependencyReferences})
+	for name, mutate := range map[string]func(*schema.Resource){
+		"missing actual reference": func(view *schema.Resource) { view.Dependencies = view.Dependencies[:1] },
+		"extra unrelated reference": func(view *schema.Resource) {
+			view.Dependencies = append(view.Dependencies, schema.Dependency{Target: unrelated.ID, Type: schema.DependencyReferences})
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			view := base
+			view.Dependencies = append([]schema.Dependency(nil), base.Dependencies...)
+			mutate(&view)
+			column := projection(view, "id", "integer")
+			doc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, tableColumn, unrelated, view, column}}}
+			changes := schema.ChangeSet{Version: schema.ChangeVersion, Changes: []schema.Change{{ID: "c", Operation: schema.OperationCreate, ResourceID: view.ID, After: &view}}}
+			out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Desired: doc})
+			if err == nil || len(out) != 0 {
+				t.Fatalf("out=%+v err=%v", out, err)
+			}
+		})
+	}
+	status := renderResource(schema.KindEnum, schema.Name{Schema: "app", Name: "status", Parent: ns.ID}, `{"values":["new"]}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	otherType := renderResource(schema.KindEnum, schema.Name{Schema: "app", Name: "other_status", Parent: ns.ID}, `{"values":["new"]}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	baseColumn := renderResource(schema.KindColumn, schema.Name{Schema: "app", Name: "status", Parent: table.ID}, `{"type":"app.status","not_null":false,"ordinal":2}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: status.ID, Type: schema.DependencyUses})
+	for name, mutate := range map[string]func(*schema.Resource){
+		"missing type use": func(column *schema.Resource) { column.Dependencies = column.Dependencies[:1] },
+		"extra type use": func(column *schema.Resource) {
+			column.Dependencies = append(column.Dependencies, schema.Dependency{Target: otherType.ID, Type: schema.DependencyUses})
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			column := baseColumn
+			column.Dependencies = append([]schema.Dependency(nil), baseColumn.Dependencies...)
+			mutate(&column)
+			doc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, tableColumn, status, otherType, column}}}
+			changes := schema.ChangeSet{Version: schema.ChangeVersion, Changes: []schema.Change{{ID: "c", Operation: schema.OperationCreate, ResourceID: column.ID, After: &column}}}
+			out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Desired: doc})
+			if err == nil || len(out) != 0 {
+				t.Fatalf("out=%+v err=%v", out, err)
+			}
+		})
+	}
+}
+
+func TestColumnTypeAlterAllowsOnlyKnownSafeCasts(t *testing.T) {
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "app", Name: "widgets", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	before := renderResource(schema.KindColumn, schema.Name{Schema: "app", Name: "value", Parent: table.ID}, `{"type":"text","not_null":false,"ordinal":1}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains})
+	for name, typ := range map[string]string{"unsafe text integer": "integer", "safe text varchar is assignment-direction unsafe": "character varying"} {
+		t.Run(name, func(t *testing.T) {
+			after := before
+			after.Spec = json.RawMessage(`{"type":"` + typ + `","not_null":false,"ordinal":1}`)
+			current := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, before}}}
+			desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, after}}}
+			changes, _ := schema.Diff(current, desired, schema.DiffOptions{})
+			out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Current: current, Desired: desired})
+			if err == nil || len(out) != 0 {
+				t.Fatalf("out=%+v err=%v", out, err)
+			}
+		})
+	}
+}
+
 func TestViewAlterOutputShapePolicy(t *testing.T) {
 	s := renderResource(schema.KindSchema, schema.Name{Name: "public"}, `{}`)
 	view := renderResource(schema.KindView, schema.Name{Schema: "public", Name: "v", Parent: s.ID}, `{"definition":"SELECT 1 AS value"}`, schema.Dependency{Target: s.ID, Type: schema.DependencyContains})
