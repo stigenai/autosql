@@ -13,15 +13,14 @@ guarded executor; they are never silently moved into a transaction.
 
 ## PostgreSQL rendering
 
-The PostgreSQL driver manages schemas, extensions, enums, domains, composite
-types, sequences, tables, columns, primary/unique/check/foreign-key constraints,
-indexes, views, and materialized views. It quotes identifiers and rejects
-transitions it cannot express safely. Column type/default/nullability changes,
-append-only enum changes, and replaceable view definitions are supported.
-Index alteration is an explicit drop/create strategy and requires
-`allow_rebuild=true`. Concurrent index operations use
-`concurrent_indexes=true` and are marked transaction-prohibited.
+The PostgreSQL driver currently advertises managed lifecycle support only for
+schemas, tables, views, and materialized views. Other inspected kinds remain read-only
+until their entire canonical transition matrix and guarded phase execution are
+available. View definitions are replaceable, while materialized-view changes
+require the explicit `allow_rebuild=true` strategy. Concurrent/nontransactional
+rendering is rejected until a phase-aware guarded executor is available.
 
 `postgres.RenderDocument` renders a full desired document from an empty schema
-projection. Rendering never executes SQL and returns no partial statement list
-when any resource or transition is unsupported.
+projection when every resource is in the managed matrix. Read-only kinds make
+the operation fail closed. Rendering never executes SQL and returns no partial
+statement list when any resource or transition is unsupported.

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -106,6 +107,11 @@ func Build(ctx context.Context, driver plugin.Driver, current, desired schema.Do
 	if err != nil {
 		return Plan{}, fmt.Errorf("%w: %w", ErrUnsupportedTransition, err)
 	}
+	for _, statement := range statements {
+		if !statement.Transactional {
+			return Plan{}, fmt.Errorf("%w: transaction-prohibited execution requires a phase-aware guarded executor", ErrUnsupportedTransition)
+		}
+	}
 	steps, err := bindSteps(changes, statements)
 	if err != nil {
 		return Plan{}, err
@@ -123,7 +129,7 @@ func Build(ctx context.Context, driver plugin.Driver, current, desired schema.Do
 }
 
 func (p Plan) Validate() error {
-	if p.Version != Version || p.PlannerVersion == "" || p.Driver.Name == "" || p.Driver.Version == "" || p.FromFingerprint == "" || p.ToFingerprint == "" || p.Digest == "" {
+	if p.Version != Version || p.PlannerVersion != PlannerVersion || p.Driver.Name == "" || p.Driver.Version == "" || !validFingerprint(p.FromFingerprint) || !validFingerprint(p.ToFingerprint) || p.Digest == "" {
 		return fmt.Errorf("%w: incomplete identity", ErrInvalidPlan)
 	}
 	if err := p.Changes.Validate(); err != nil {
@@ -141,7 +147,17 @@ func (p Plan) Validate() error {
 		if s.Transaction != TransactionRequired && s.Transaction != TransactionProhibited {
 			return fmt.Errorf("%w: transaction mode", ErrInvalidPlan)
 		}
+		if s.Lock != LockNone && s.Lock != LockShare && s.Lock != LockExclusive {
+			return fmt.Errorf("%w: lock level", ErrInvalidPlan)
+		}
 		stepIDs[s.ID] = true
+	}
+	rebuilt, err := bindSteps(p.Changes, p.Statements())
+	if err != nil || !reflect.DeepEqual(rebuilt, p.Steps) {
+		return fmt.Errorf("%w: step identity, coverage, order, or topology", ErrInvalidPlan)
+	}
+	if expected := phases(p.Steps); !reflect.DeepEqual(expected, p.Phases) {
+		return fmt.Errorf("%w: phase identity, coverage, or order", ErrInvalidPlan)
 	}
 	for _, s := range p.Steps {
 		for _, dep := range s.DependsOn {
@@ -155,6 +171,14 @@ func (p Plan) Validate() error {
 		return fmt.Errorf("%w: digest mismatch", ErrInvalidPlan)
 	}
 	return nil
+}
+
+func validFingerprint(value string) bool {
+	if !strings.HasPrefix(value, "sha256:") || len(value) != 71 {
+		return false
+	}
+	_, err := hex.DecodeString(strings.TrimPrefix(value, "sha256:"))
+	return err == nil
 }
 
 func (p Plan) MarshalCanonical() ([]byte, error) {
@@ -211,9 +235,11 @@ func bindSteps(changes schema.ChangeSet, statements []plugin.Statement) ([]Step,
 		id := stableID("step", statement.ChangeID, fmt.Sprint(idx), statement.SQL, string(mode))
 		deps := []string{}
 		for _, dep := range change.DependsOn {
-			if step := lastByChange[dep]; step != "" {
-				deps = append(deps, step)
+			step := lastByChange[dep]
+			if step == "" {
+				return nil, fmt.Errorf("%w: change dependency %s is not planned earlier", ErrInvalidPlan, dep)
 			}
+			deps = append(deps, step)
 		}
 		if previous := lastByChange[change.ID]; previous != "" {
 			deps = append(deps, previous)
@@ -246,6 +272,9 @@ func phases(steps []Step) []Phase {
 }
 
 func lockFor(c schema.Change, sql string) LockLevel {
+	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(sql)), "-- AUTOSQL TOPOLOGY:") {
+		return LockNone
+	}
 	if strings.Contains(strings.ToUpper(sql), "CONCURRENTLY") {
 		return LockShare
 	}
@@ -256,7 +285,53 @@ func lockFor(c schema.Change, sql string) LockLevel {
 }
 func impactFor(c schema.Change, sql string) Impact {
 	u := strings.ToUpper(sql)
-	return Impact{Destructive: c.Operation == schema.OperationDrop || strings.HasPrefix(strings.TrimSpace(u), "DROP "), Rewrites: strings.Contains(u, " TYPE ") || strings.Contains(u, "SET DATA TYPE"), Scans: strings.Contains(u, "VALIDATE") || strings.Contains(u, "CREATE INDEX")}
+	impact := Impact{Destructive: c.Operation == schema.OperationDrop || strings.HasPrefix(strings.TrimSpace(u), "DROP "), Rewrites: strings.Contains(u, " TYPE ") || strings.Contains(u, "SET DATA TYPE"), Scans: strings.Contains(u, "VALIDATE") || strings.Contains(u, "CREATE INDEX")}
+	r := c.After
+	if r == nil {
+		r = c.Before
+	}
+	if r != nil {
+		s := map[string]any{}
+		_ = json.Unmarshal(r.Spec, &s)
+		if r.Kind == schema.KindColumn {
+			if d, _ := s["default"].(string); d != "" && !simpleDefault(d) {
+				impact.Rewrites = true
+			}
+			if c.Before != nil && c.After != nil {
+				b := map[string]any{}
+				a := map[string]any{}
+				_ = json.Unmarshal(c.Before.Spec, &b)
+				_ = json.Unmarshal(c.After.Spec, &a)
+				bn, _ := b["not_null"].(bool)
+				an, _ := a["not_null"].(bool)
+				if !bn && an {
+					impact.Scans = true
+				}
+			}
+		}
+		switch r.Kind {
+		case schema.KindPrimaryKey, schema.KindUniqueConstraint, schema.KindCheckConstraint, schema.KindForeignKey:
+			if c.Operation == schema.OperationCreate || c.Operation == schema.OperationAlter {
+				impact.Scans = true
+			}
+		}
+	}
+	return impact
+}
+func simpleDefault(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "true" || value == "false" || value == "NULL" {
+		return true
+	}
+	if len(value) >= 2 && value[0] == '\'' && value[len(value)-1] == '\'' && !strings.Contains(value[1:len(value)-1], "'") {
+		return true
+	}
+	for _, r := range value {
+		if (r < '0' || r > '9') && r != '.' && r != '-' {
+			return false
+		}
+	}
+	return value != ""
 }
 func stableID(domain string, values ...string) string {
 	h := sha256.New()

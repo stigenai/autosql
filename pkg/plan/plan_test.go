@@ -24,9 +24,8 @@ func resource(kind schema.Kind, name schema.Name, spec string, deps ...schema.De
 func documents() (schema.Document, schema.Document) {
 	empty := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{}}}
 	s := resource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
-	table := resource(schema.KindTable, schema.Name{Schema: "app", Name: "users", Parent: s.ID}, `{}`, schema.Dependency{Target: s.ID, Type: schema.DependencyContains})
-	column := resource(schema.KindColumn, schema.Name{Schema: "app", Name: "id", Parent: table.ID}, `{"type":"bigint","not_null":true}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains})
-	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{column, table, s}}}
+	view := resource(schema.KindView, schema.Name{Schema: "app", Name: "users", Parent: s.ID}, `{"definition":"SELECT 1"}`, schema.Dependency{Target: s.ID, Type: schema.DependencyContains})
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{view, s}}}
 	return empty, desired
 }
 
@@ -65,9 +64,9 @@ func TestBuildDeterministicAndBound(t *testing.T) {
 }
 
 func TestUnsupportedReturnsZeroPlan(t *testing.T) {
-	r := resource(schema.KindTable, schema.Name{Schema: "public", Name: "users"}, `{"persistence":"p"}`)
+	r := resource(schema.KindEnum, schema.Name{Schema: "public", Name: "status"}, `{"values":["new"]}`)
 	current := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{r}}}
-	r.Spec = json.RawMessage(`{"persistence":"u"}`)
+	r.Spec = json.RawMessage(`{"values":["new","done"]}`)
 	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{r}}}
 	p, err := plan.Build(context.Background(), postgres.New(), current, desired, plan.Options{})
 	if !errors.Is(err, plan.ErrUnsupportedTransition) || !reflect.DeepEqual(p, plan.Plan{}) {
@@ -94,7 +93,7 @@ func TestPlanIsInputIndependentAndGuardrailCompatible(t *testing.T) {
 		t.Fatal(err)
 	}
 	before, _ := p.MarshalCanonical()
-	desired.Graph.Resources[0].Spec = json.RawMessage(`{"type":"text"}`)
+	desired.Graph.Resources[0].Spec = json.RawMessage(`{"definition":"SELECT 2"}`)
 	after, _ := p.MarshalCanonical()
 	if string(before) != string(after) {
 		t.Fatal("plan retained mutable input")
@@ -132,5 +131,31 @@ func TestRendererDiscardsEarlierStatementsOnLaterFailure(t *testing.T) {
 	out, err := postgres.New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Current: empty, Desired: desired})
 	if err == nil || len(out) != 0 {
 		t.Fatalf("partial output=%+v err=%v", out, err)
+	}
+}
+
+func TestValidateRecomputesAllDerivedTopology(t *testing.T) {
+	mutations := map[string]func(*plan.Plan){
+		"planner version":   func(p *plan.Plan) { p.PlannerVersion = "9" },
+		"step id":           func(p *plan.Plan) { p.Steps[0].ID = "step:wrong" },
+		"step lock":         func(p *plan.Plan) { p.Steps[0].Lock = "mystery" },
+		"phase id":          func(p *plan.Plan) { p.Phases[0].ID = "phase:wrong" },
+		"phase coverage":    func(p *plan.Plan) { p.Phases[0].StepIDs = nil },
+		"phase transaction": func(p *plan.Plan) { p.Phases[0].Transaction = "mystery" },
+		"change coverage":   func(p *plan.Plan) { p.Steps = p.Steps[:len(p.Steps)-1] },
+		"step order":        func(p *plan.Plan) { p.Steps[0], p.Steps[1] = p.Steps[1], p.Steps[0] },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			current, desired := documents()
+			p, err := plan.Build(context.Background(), postgres.New(), current, desired, plan.Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			mutate(&p)
+			if !errors.Is(p.Validate(), plan.ErrInvalidPlan) {
+				t.Fatal("mutated plan validated")
+			}
+		})
 	}
 }

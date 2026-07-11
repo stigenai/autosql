@@ -19,14 +19,13 @@ func renderResource(kind schema.Kind, name schema.Name, spec string, deps ...sch
 
 func TestRenderDocumentQuotesAndOrders(t *testing.T) {
 	s := renderResource(schema.KindSchema, schema.Name{Name: `Odd"Schema`}, `{}`)
-	table := renderResource(schema.KindTable, schema.Name{Schema: s.Name.Name, Name: "select", Parent: s.ID}, `{}`, schema.Dependency{Target: s.ID, Type: schema.DependencyContains})
-	column := renderResource(schema.KindColumn, schema.Name{Schema: s.Name.Name, Name: `a"b`, Parent: table.ID}, `{"type":"character varying(8)","default":"'x'","not_null":true}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains})
-	doc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{column, table, s}}}
+	view := renderResource(schema.KindView, schema.Name{Schema: s.Name.Name, Name: `a"b`, Parent: s.ID}, `{"definition":"SELECT 1"}`, schema.Dependency{Target: s.ID, Type: schema.DependencyContains})
+	doc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{view, s}}}
 	out, err := RenderDocument(context.Background(), doc, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{`CREATE SCHEMA "Odd""Schema";`, `CREATE TABLE "Odd""Schema"."select" ();`, `ALTER TABLE "Odd""Schema"."select" ADD COLUMN "a""b" character varying(8) DEFAULT 'x' NOT NULL;`}
+	want := []string{`CREATE SCHEMA "Odd""Schema";`, `CREATE VIEW "Odd""Schema"."a""b" AS SELECT 1;`}
 	if len(out) != len(want) {
 		t.Fatalf("out=%+v", out)
 	}
@@ -39,9 +38,8 @@ func TestRenderDocumentQuotesAndOrders(t *testing.T) {
 
 func TestRenderDocumentGolden(t *testing.T) {
 	s := renderResource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
-	table := renderResource(schema.KindTable, schema.Name{Schema: "app", Name: "widgets", Parent: s.ID}, `{}`, schema.Dependency{Target: s.ID, Type: schema.DependencyContains})
-	column := renderResource(schema.KindColumn, schema.Name{Schema: "app", Name: "id", Parent: table.ID}, `{"type":"bigint","not_null":true}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains})
-	doc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{column, table, s}}}
+	view := renderResource(schema.KindView, schema.Name{Schema: "app", Name: "widgets", Parent: s.ID}, `{"definition":"SELECT 1"}`, schema.Dependency{Target: s.ID, Type: schema.DependencyContains})
+	doc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{view, s}}}
 	out, err := RenderDocument(context.Background(), doc, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -60,28 +58,24 @@ func TestRenderDocumentGolden(t *testing.T) {
 	}
 }
 
-func TestConcurrentIndexIsTransactionProhibited(t *testing.T) {
+func TestConcurrentRenderingRejectedWithoutGuardedPhaseExecutor(t *testing.T) {
 	table := renderResource(schema.KindTable, schema.Name{Schema: "public", Name: "users"}, `{}`)
 	idx := renderResource(schema.KindIndex, schema.Name{Schema: "public", Name: "users_email_idx", Parent: table.ID}, `{"definition":"(email)"}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains})
 	empty := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{}}}
 	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{table, idx}}}
 	changes, _ := schema.Diff(empty, desired, schema.DiffOptions{})
 	out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Current: empty, Desired: desired, Options: map[string]string{"concurrent_indexes": "true"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if out[len(out)-1].Transactional || !strings.Contains(out[len(out)-1].SQL, "CONCURRENTLY") {
-		t.Fatalf("out=%+v", out)
+	if err == nil || len(out) != 0 {
+		t.Fatalf("out=%+v err=%v", out, err)
 	}
 }
 
-func TestIndexAlterRequiresExplicitRebuild(t *testing.T) {
-	table := renderResource(schema.KindTable, schema.Name{Schema: "public", Name: "users"}, `{}`)
-	before := renderResource(schema.KindIndex, schema.Name{Schema: "public", Name: "users_idx", Parent: table.ID}, `{"definition":"(id)"}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains})
+func TestMaterializedViewAlterRequiresExplicitRebuild(t *testing.T) {
+	before := renderResource(schema.KindMaterializedView, schema.Name{Schema: "public", Name: "users_mv"}, `{"definition":"SELECT 1"}`)
 	after := before
-	after.Spec = json.RawMessage(`{"definition":"(email)"}`)
-	current := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{table, before}}}
-	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{table, after}}}
+	after.Spec = json.RawMessage(`{"definition":"SELECT 2"}`)
+	current := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{before}}}
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{after}}}
 	changes, _ := schema.Diff(current, desired, schema.DiffOptions{})
 	out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Current: current, Desired: desired})
 	if err == nil || len(out) != 0 {
@@ -93,7 +87,7 @@ func TestIndexAlterRequiresExplicitRebuild(t *testing.T) {
 	}
 }
 
-func TestEveryManagedKindHasSafeCreateRendering(t *testing.T) {
+func TestCreateHelpersRemainDeterministicForInspectedKinds(t *testing.T) {
 	s := renderResource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
 	table := renderResource(schema.KindTable, schema.Name{Schema: "app", Name: "users", Parent: s.ID}, `{}`, schema.Dependency{Target: s.ID, Type: schema.DependencyContains})
 	resources := map[string]schema.Resource{s.ID: s, table.ID: table}
@@ -122,4 +116,64 @@ func TestEveryManagedKindHasSafeCreateRendering(t *testing.T) {
 			t.Errorf("create %s: %v", r.Kind, err)
 		}
 	}
+}
+
+func TestNativeViewFragmentsRejectInjection(t *testing.T) {
+	for _, fragment := range []string{"SELECT 1; DROP TABLE users", "SELECT 1 -- hidden", "SELECT /* hidden */ 1", "SELECT $tag$payload$tag$"} {
+		t.Run(fragment, func(t *testing.T) {
+			r := renderResource(schema.KindView, schema.Name{Schema: "public", Name: "v"}, `{}`)
+			raw, _ := json.Marshal(map[string]string{"definition": fragment})
+			r.Spec = raw
+			changes := schema.ChangeSet{Version: schema.ChangeVersion, Changes: []schema.Change{{ID: "c", Operation: schema.OperationCreate, ResourceID: r.ID, After: &r}}}
+			out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes})
+			if err == nil || len(out) != 0 {
+				t.Fatalf("out=%+v err=%v", out, err)
+			}
+		})
+	}
+}
+
+func TestManagedLifecycleMatrix(t *testing.T) {
+	s := renderResource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
+	s2 := renderResource(schema.KindSchema, schema.Name{Name: "app2"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "app", Name: "users", Parent: s.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: s.ID, Type: schema.DependencyContains})
+	table2 := table
+	table2.Spec = json.RawMessage(`{"partitioned":false,"persistence":"p","row_security":true,"force_row_security":false}`)
+	tableRenamed := table
+	tableRenamed.Name.Name = "users2"
+	tableRenamed.ID = schema.StableID(tableRenamed.Kind, tableRenamed.Name)
+	view := renderResource(schema.KindView, schema.Name{Schema: "app", Name: "v", Parent: s.ID}, `{"definition":"SELECT 1"}`, schema.Dependency{Target: s.ID, Type: schema.DependencyContains})
+	view2 := view
+	view2.Spec = json.RawMessage(`{"definition":"SELECT 2"}`)
+	viewRenamed := view
+	viewRenamed.Name.Name = "v2"
+	viewRenamed.ID = schema.StableID(viewRenamed.Kind, viewRenamed.Name)
+	mv := renderResource(schema.KindMaterializedView, schema.Name{Schema: "app", Name: "mv", Parent: s.ID}, `{"definition":"SELECT 1"}`, schema.Dependency{Target: s.ID, Type: schema.DependencyContains})
+	mv2 := mv
+	mv2.Spec = json.RawMessage(`{"definition":"SELECT 2"}`)
+	mvRenamed := mv
+	mvRenamed.Name.Name = "mv2"
+	mvRenamed.ID = schema.StableID(mvRenamed.Kind, mvRenamed.Name)
+	resources := map[string]schema.Resource{s.ID: s, s2.ID: s2, table.ID: table, tableRenamed.ID: tableRenamed, view.ID: view, viewRenamed.ID: viewRenamed, mv.ID: mv, mvRenamed.ID: mvRenamed}
+	tests := []struct {
+		name    string
+		change  schema.Change
+		options map[string]string
+	}{{"schema create", schema.Change{ID: "c1", Operation: schema.OperationCreate, ResourceID: s.ID, After: &s}, nil}, {"schema drop", schema.Change{ID: "c2", Operation: schema.OperationDrop, ResourceID: s.ID, Before: &s}, nil}, {"schema rename", schema.Change{ID: "c3", Operation: schema.OperationRename, ResourceID: s2.ID, Before: &s, After: &s2}, nil}, {"table create", schema.Change{ID: "c4", Operation: schema.OperationCreate, ResourceID: table.ID, After: &table}, nil}, {"table drop", schema.Change{ID: "c5", Operation: schema.OperationDrop, ResourceID: table.ID, Before: &table}, nil}, {"table alter", schema.Change{ID: "c6", Operation: schema.OperationAlter, ResourceID: table.ID, Before: &table, After: &table2}, nil}, {"table rename", schema.Change{ID: "c11", Operation: schema.OperationRename, ResourceID: tableRenamed.ID, Before: &table, After: &tableRenamed}, nil}, {"view create", schema.Change{ID: "c7", Operation: schema.OperationCreate, ResourceID: view.ID, After: &view}, nil}, {"view drop", schema.Change{ID: "c8", Operation: schema.OperationDrop, ResourceID: view.ID, Before: &view}, nil}, {"view alter", schema.Change{ID: "c9", Operation: schema.OperationAlter, ResourceID: view.ID, Before: &view, After: &view2}, nil}, {"view rename", schema.Change{ID: "c12", Operation: schema.OperationRename, ResourceID: viewRenamed.ID, Before: &view, After: &viewRenamed}, nil}, {"mv create", schema.Change{ID: "c13", Operation: schema.OperationCreate, ResourceID: mv.ID, After: &mv}, nil}, {"mv drop", schema.Change{ID: "c14", Operation: schema.OperationDrop, ResourceID: mv.ID, Before: &mv}, nil}, {"mv rename", schema.Change{ID: "c15", Operation: schema.OperationRename, ResourceID: mvRenamed.ID, Before: &mv, After: &mvRenamed}, nil}, {"mv rebuild", schema.Change{ID: "c10", Operation: schema.OperationAlter, ResourceID: mv.ID, Before: &mv, After: &mv2}, map[string]string{"allow_rebuild": "true"}}}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cs := schema.ChangeSet{Version: schema.ChangeVersion, Changes: []schema.Change{tc.change}}
+			out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: cs, Current: schema.Document{Graph: schema.Graph{Resources: mapValues(resources)}}, Desired: schema.Document{Graph: schema.Graph{Resources: mapValues(resources)}}, Options: tc.options})
+			if err != nil || len(out) == 0 {
+				t.Fatalf("out=%+v err=%v", out, err)
+			}
+		})
+	}
+}
+func mapValues(values map[string]schema.Resource) []schema.Resource {
+	out := make([]schema.Resource, 0, len(values))
+	for _, r := range values {
+		out = append(out, r)
+	}
+	return out
 }

@@ -18,6 +18,9 @@ func (*Driver) Render(ctx context.Context, request plugin.RenderRequest) ([]plug
 	if err := request.Changes.Validate(); err != nil {
 		return nil, fmt.Errorf("render PostgreSQL changes: %w", err)
 	}
+	if enabled(request.Options, "concurrent_indexes", false) {
+		return nil, fmt.Errorf("render PostgreSQL changes: %w: nontransactional execution is unavailable until phase-aware guarded apply", plugin.ErrUnsupported)
+	}
 	resources := map[string]schema.Resource{}
 	for _, doc := range []schema.Document{request.Current, request.Desired} {
 		for _, r := range doc.Graph.Resources {
@@ -54,8 +57,11 @@ func renderChange(change schema.Change, resources map[string]schema.Resource, op
 	if r == nil {
 		return nil, fmt.Errorf("%w: change %s has no resource", plugin.ErrUnsupported, change.ID)
 	}
-	if err := plugin.RequireManaged(New().Info(), r.Kind); err != nil {
-		return nil, err
+	parentOnlyRename := change.Operation == schema.OperationRename && change.Before != nil && change.After != nil && change.Before.Name.Name == change.After.Name.Name && change.Before.Name.Parent != change.After.Name.Parent
+	if !parentOnlyRename {
+		if err := plugin.RequireManaged(New().Info(), r.Kind); err != nil {
+			return nil, err
+		}
 	}
 	var sqls []string
 	var err error
@@ -87,6 +93,9 @@ func renderCreate(r schema.Resource, resources map[string]schema.Resource, optio
 	parent, err := parentName(r, resources)
 	switch r.Kind {
 	case schema.KindSchema:
+		if !allowedKeys(s) {
+			return nil, unsupported(r, "unknown schema semantics")
+		}
 		return []string{"CREATE SCHEMA " + quote(r.Name.Name)}, nil
 	case schema.KindExtension:
 		q := "CREATE EXTENSION " + quote(r.Name.Name)
@@ -150,6 +159,9 @@ func renderCreate(r schema.Resource, resources map[string]schema.Resource, optio
 		}
 		return []string{q}, nil
 	case schema.KindTable:
+		if !allowedKeys(s, "partitioned", "persistence", "row_security", "force_row_security") {
+			return nil, unsupported(r, "unknown table semantics")
+		}
 		if boolValue(s, "partitioned") {
 			return nil, unsupported(r, "partitioned table requires an explicit partition strategy")
 		}
@@ -195,9 +207,15 @@ func renderCreate(r schema.Resource, resources map[string]schema.Resource, optio
 		}
 		return renderCreateIndex(r, parent, options)
 	case schema.KindView, schema.KindMaterializedView:
+		if !allowedKeys(s, "definition") {
+			return nil, unsupported(r, "unknown view semantics")
+		}
 		d := stringValue(s, "definition")
 		if d == "" {
 			return nil, unsupported(r, "view definition")
+		}
+		if e := validateSQLFragment(d); e != nil {
+			return nil, unsupported(r, "unsafe view definition: "+e.Error())
 		}
 		kind := "VIEW"
 		if r.Kind == schema.KindMaterializedView {
@@ -249,6 +267,9 @@ func renderDrop(r schema.Resource, resources map[string]schema.Resource, options
 }
 
 func renderRename(before, after schema.Resource, resources map[string]schema.Resource) ([]string, error) {
+	if before.Name.Name == after.Name.Name && before.Name.Parent != after.Name.Parent {
+		return []string{"-- AutoSQL topology: " + string(after.Kind) + " " + quote(after.Name.Name) + " follows its renamed parent"}, nil
+	}
 	old, newName := qualified(before.Name), quote(after.Name.Name)
 	parent, err := parentName(after, resources)
 	switch after.Kind {
@@ -345,9 +366,15 @@ func renderAlter(before, after schema.Resource, resources map[string]schema.Reso
 		}
 		return out, nil
 	case schema.KindView:
+		if !allowedKeys(bs, "definition") || !allowedKeys(as, "definition") {
+			return nil, unsupported(after, "unknown view semantics")
+		}
 		d := stringValue(as, "definition")
 		if d == "" {
 			return nil, unsupported(after, "view definition")
+		}
+		if e := validateSQLFragment(d); e != nil {
+			return nil, unsupported(after, "unsafe view definition: "+e.Error())
 		}
 		return []string{"CREATE OR REPLACE VIEW " + name + " AS " + d}, nil
 	case schema.KindIndex:
@@ -400,6 +427,9 @@ func renderAlter(before, after schema.Resource, resources map[string]schema.Reso
 		}
 		return []string{q}, nil
 	case schema.KindTable:
+		if !allowedKeys(bs, "partitioned", "persistence", "row_security", "force_row_security") || !allowedKeys(as, "partitioned", "persistence", "row_security", "force_row_security") {
+			return nil, unsupported(after, "unknown table semantics")
+		}
 		if stringValue(bs, "persistence") != stringValue(as, "persistence") || boolValue(bs, "partitioned") != boolValue(as, "partitioned") {
 			return nil, unsupported(after, "table storage alteration")
 		}
@@ -539,4 +569,60 @@ func terminate(sql string) string {
 }
 func unsupported(r schema.Resource, what string) error {
 	return fmt.Errorf("%w: %s %s %s", plugin.ErrUnsupported, r.Kind, r.Name.String(), what)
+}
+func allowedKeys(values map[string]any, keys ...string) bool {
+	allowed := map[string]bool{}
+	for _, key := range keys {
+		allowed[key] = true
+	}
+	for key := range values {
+		if !allowed[key] {
+			return false
+		}
+	}
+	return true
+}
+
+func validateSQLFragment(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fmt.Errorf("empty fragment")
+	}
+	var quoted byte
+	for i := 0; i < len(value); i++ {
+		b := value[i]
+		if quoted != 0 {
+			if b == quoted {
+				if i+1 < len(value) && value[i+1] == quoted {
+					i++
+					continue
+				}
+				quoted = 0
+			}
+			continue
+		}
+		if b == '\'' || b == '"' {
+			quoted = b
+			continue
+		}
+		if b == ';' || b == '$' || i+1 < len(value) && (value[i:i+2] == "--" || value[i:i+2] == "/*") {
+			return fmt.Errorf("multiple statements, comments, and dollar quotes are forbidden")
+		}
+	}
+	if quoted != 0 {
+		return fmt.Errorf("unterminated quote")
+	}
+	first := strings.ToUpper(strings.Fields(value)[0])
+	switch first {
+	case "SELECT", "WITH", "VALUES", "TABLE":
+	default:
+		return fmt.Errorf("view definition must be one query expression")
+	}
+	upper := strings.ToUpper(value)
+	for _, keyword := range []string{" DROP ", " ALTER ", " CREATE ", " INSERT ", " UPDATE ", " DELETE ", " GRANT ", " REVOKE ", " COPY ", " CALL ", " DO "} {
+		if strings.Contains(" "+upper+" ", keyword) {
+			return fmt.Errorf("non-query keyword %s is forbidden", strings.TrimSpace(keyword))
+		}
+	}
+	return nil
 }

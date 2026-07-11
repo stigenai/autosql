@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"autosql/pkg/schema"
+	"autosql/pkg/source"
 )
 
 func TestPostgresSemanticDiffGolden(t *testing.T) {
@@ -36,6 +37,50 @@ func TestPostgresSemanticDiffGolden(t *testing.T) {
 	}
 	if string(actual) != string(expected) {
 		t.Fatalf("golden mismatch\nactual: %s\nexpected: %s", actual, expected)
+	}
+}
+
+func TestNormalizeSQLSourceMatchesInspectorManagedShapes(t *testing.T) {
+	fromSQL, err := source.ParseSQL("schema.sql", `CREATE TABLE app.widgets(id bigint NOT NULL); CREATE VIEW app.widget_view AS SELECT id FROM app.widgets;`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspected := fromSQL
+	inspected.Graph.Resources = append([]schema.Resource(nil), fromSQL.Graph.Resources...)
+	var view schema.Resource
+	for i := range inspected.Graph.Resources {
+		r := &inspected.Graph.Resources[i]
+		r.Source = nil
+		var spec map[string]any
+		_ = json.Unmarshal(r.Spec, &spec)
+		switch r.Kind {
+		case schema.KindTable:
+			spec = map[string]any{"partitioned": false, "persistence": "p", "row_security": false, "force_row_security": false}
+		case schema.KindColumn:
+			spec = map[string]any{"position": 1, "type": "bigint", "not_null": true}
+		case schema.KindView:
+			spec = map[string]any{"definition": "SELECT id FROM app.widgets;"}
+			view = *r
+		}
+		r.Spec, _ = json.Marshal(spec)
+	}
+	viewColumn := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: "app", Name: "id", Parent: view.ID}, Dependencies: []schema.Dependency{{Target: view.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{"position":1,"type":"bigint","not_null":false}`)}
+	viewColumn.ID = schema.StableID(viewColumn.Kind, viewColumn.Name)
+	inspected.Graph.Resources = append(inspected.Graph.Resources, viewColumn)
+	a, err := New().Normalize(context.Background(), fromSQL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := New().Normalize(context.Background(), inspected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	af, _ := schema.SemanticFingerprint(a)
+	bf, _ := schema.SemanticFingerprint(b)
+	if af != bf {
+		aj, _ := a.MarshalCanonical()
+		bj, _ := b.MarshalCanonical()
+		t.Fatalf("source/inspect mismatch\n%s\n%s", aj, bj)
 	}
 }
 

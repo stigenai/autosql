@@ -14,7 +14,7 @@ func TestDriverMetadata(t *testing.T) {
 	if err := plugin.ValidateDriver(d); err != nil {
 		t.Fatalf("ValidateDriver: %v", err)
 	}
-	for kind, want := range map[schema.Kind]plugin.Mode{schema.KindTable: plugin.Managed, schema.KindPolicy: plugin.ReadOnly, schema.KindRole: plugin.ReadOnly, schema.KindGrant: plugin.ReadOnly} {
+	for kind, want := range map[schema.Kind]plugin.Mode{schema.KindSchema: plugin.Managed, schema.KindView: plugin.Managed, schema.KindMaterializedView: plugin.Managed, schema.KindTable: plugin.Managed, schema.KindColumn: plugin.ReadOnly, schema.KindIndex: plugin.ReadOnly, schema.KindEnum: plugin.ReadOnly, schema.KindPolicy: plugin.ReadOnly, schema.KindRole: plugin.ReadOnly, schema.KindGrant: plugin.ReadOnly} {
 		if got := d.Info().Capability(kind).Mode; got != want {
 			t.Errorf("capability %s = %s, want %s", kind, got, want)
 		}

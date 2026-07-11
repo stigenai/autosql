@@ -58,14 +58,8 @@ func (*Driver) Info() plugin.Info {
 		schema.KindTrigger, schema.KindPolicy, schema.KindRole, schema.KindGrant,
 	}
 	caps := make([]plugin.Capability, 0, len(kinds))
-	managed := map[schema.Kind]bool{
-		schema.KindSchema: true, schema.KindExtension: true, schema.KindEnum: true,
-		schema.KindDomain: true, schema.KindComposite: true, schema.KindSequence: true,
-		schema.KindTable: true, schema.KindColumn: true, schema.KindPrimaryKey: true,
-		schema.KindUniqueConstraint: true, schema.KindCheckConstraint: true,
-		schema.KindForeignKey: true, schema.KindIndex: true, schema.KindView: true,
-		schema.KindMaterializedView: true,
-	}
+	// Managed is restricted to the lifecycle-complete transition matrix.
+	managed := map[schema.Kind]bool{schema.KindSchema: true, schema.KindTable: true, schema.KindView: true, schema.KindMaterializedView: true}
 	for _, kind := range kinds {
 		mode := plugin.ReadOnly
 		if managed[kind] {
@@ -88,6 +82,18 @@ func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Documen
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
+	parents := map[string]schema.Kind{}
+	for _, r := range doc.Graph.Resources {
+		parents[r.ID] = r.Kind
+	}
+	filtered := doc.Graph.Resources[:0]
+	for _, r := range doc.Graph.Resources {
+		if r.Kind == schema.KindColumn && (parents[r.Name.Parent] == schema.KindView || parents[r.Name.Parent] == schema.KindMaterializedView) {
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+	doc.Graph.Resources = filtered
 	for idx := range doc.Graph.Resources {
 		r := &doc.Graph.Resources[idx]
 		// Serialized/public annotations are not trusted provenance.
@@ -95,7 +101,7 @@ func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Documen
 		delete(r.Annotations, "autosql.io/name-origin")
 		var spec map[string]any
 		if len(r.Spec) > 0 && json.Unmarshal(r.Spec, &spec) == nil {
-			normalizePostgresSpec(spec)
+			normalizePostgresSpecForKind(r.Kind, spec)
 			normalized, e := json.Marshal(spec)
 			if e != nil {
 				return schema.Document{}, e
@@ -108,6 +114,38 @@ func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Documen
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
 	return doc, nil
+}
+
+func normalizePostgresSpecForKind(kind schema.Kind, spec map[string]any) {
+	normalizePostgresSpec(spec)
+	if kind == schema.KindColumn {
+		if nullable, ok := spec["nullable"].(bool); ok {
+			spec["not_null"] = !nullable
+			delete(spec, "nullable")
+		}
+		delete(spec, "position")
+	}
+	if kind == schema.KindTable {
+		if options, ok := spec["options"].(string); ok {
+			if strings.TrimSpace(options) != "" {
+				return
+			}
+			delete(spec, "options")
+			spec["partitioned"] = false
+			spec["persistence"] = "p"
+			spec["row_security"] = false
+			spec["force_row_security"] = false
+		}
+	}
+	if kind == schema.KindView || kind == schema.KindMaterializedView {
+		if definition, ok := spec["definition"].(string); ok {
+			definition = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(definition), ";"))
+			if len(definition) >= 2 && strings.EqualFold(definition[:2], "AS") && (len(definition) == 2 || definition[2] == ' ') {
+				definition = strings.TrimSpace(definition[2:])
+			}
+			spec["definition"] = normalizeSQLSpace(definition)
+		}
+	}
 }
 
 func normalizePostgresSpec(spec map[string]any) {
