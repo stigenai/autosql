@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"sort"
 	"strings"
 
 	"autosql/pkg/approval"
@@ -48,22 +49,27 @@ func (e *SafetyError) Error() string {
 }
 func (e *SafetyError) Unwrap() error { return ErrSafety }
 
-type PolicyError struct{ Violations []policy.Violation }
+type PolicyError struct{ Count int }
 
 func (e *PolicyError) Error() string {
-	return fmt.Sprintf("%v: %d violations", ErrPolicy, len(e.Violations))
+	return fmt.Sprintf("%v: %d violations", ErrPolicy, e.Count)
 }
 func (e *PolicyError) Unwrap() error { return ErrPolicy }
 
 type StageError struct {
-	Kind  error
-	Stage string
-	Err   error
+	Kind     error
+	Stage    string
+	canceled bool
+	deadline bool
 }
 
-func (e *StageError) Error() string        { return fmt.Sprintf("%v during %s", e.Kind, e.Stage) }
-func (e *StageError) Unwrap() error        { return e.Err }
-func (e *StageError) Is(target error) bool { return target == e.Kind || errors.Is(e.Err, target) }
+func (e *StageError) Error() string { return fmt.Sprintf("%v during %s", e.Kind, e.Stage) }
+func (e *StageError) Is(target error) bool {
+	return target == e.Kind || e.canceled && target == context.Canceled || e.deadline && target == context.DeadlineExceeded
+}
+func stageError(kind error, stage string, cause error) *StageError {
+	return &StageError{Kind: kind, Stage: stage, canceled: errors.Is(cause, context.Canceled), deadline: errors.Is(cause, context.DeadlineExceeded)}
+}
 
 // RiskConfig derives approval risk from trusted configuration and unsuppressed
 // diagnostics. Missing severity entries use the conservative defaults.
@@ -89,43 +95,143 @@ type Input struct {
 	Changes            schema.ChangeSet
 	Safety             safety.Input
 	Policy             policy.Document
+	PolicyIdentity     string
 	SchemaResources    []policy.Resource
 	MigrationResources []policy.Resource
 	Precheck           precheck.Plan
 	Approval           approval.Request
 	Database           precheck.DB
+	StatementBindings  []StatementBinding
 }
 
+// StatementBinding attributes one exact SQL command to one exact change.
+type StatementBinding struct{ SQL, ChangeID, ChangeHash string }
+
 type Result struct {
-	ChangeDigest   string
-	ApprovalDigest string
-	Risk           approval.Risk
-	Diagnostics    []safety.Diagnostic
-	Violations     []policy.Violation
-	Checks         []precheck.Result
+	ChangeDigest string
+	BundleDigest string
+	Risk         approval.Risk
+	Diagnostics  []safety.Diagnostic
+	Violations   []policy.Violation
+	Checks       []precheck.Result
 }
 
 // ChangeDigest hashes the canonical, versioned ChangeSet representation.
 func ChangeDigest(changes schema.ChangeSet) (string, error) {
 	canonical, err := changes.MarshalCanonical()
 	if err != nil {
-		return "", fmt.Errorf("%w: canonical changes: %v", ErrBinding, err)
+		return "", fmt.Errorf("%w: canonical changes invalid", ErrBinding)
 	}
 	sum := sha256.Sum256(canonical)
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
-// ApprovalDigest binds the exact changes, exact live-check plan, and deployment
-// environment with an unambiguous length-prefixed, domain-separated encoding.
-func ApprovalDigest(changeDigest, precheckDigest, environment string) (string, error) {
-	if strings.TrimSpace(changeDigest) == "" || strings.TrimSpace(precheckDigest) == "" || strings.TrimSpace(environment) == "" {
-		return "", fmt.Errorf("%w: approval digest inputs are required", ErrBinding)
+type enforcementBundle struct {
+	Version            string               `json:"version"`
+	ChangeDigest       string               `json:"change_digest"`
+	PrecheckDigest     string               `json:"precheck_digest"`
+	Environment        string               `json:"environment"`
+	Author             string               `json:"author"`
+	Requester          string               `json:"requester"`
+	PolicyIdentity     string               `json:"policy_identity"`
+	Policy             policy.Document      `json:"policy"`
+	SchemaResources    []policy.Resource    `json:"schema_resources"`
+	MigrationResources []policy.Resource    `json:"migration_resources"`
+	FailOn             safety.Severity      `json:"fail_on"`
+	Risk               RiskConfig           `json:"risk"`
+	Target             safety.Target        `json:"target"`
+	Thresholds         safety.Thresholds    `json:"thresholds"`
+	Analyzers          []string             `json:"analyzers"`
+	Suppressions       []safety.Suppression `json:"suppressions"`
+	Statements         []StatementBinding   `json:"statements"`
+}
+
+// BundleDigest returns the one digest that approval.Plan.Digest must equal.
+func (g Guardrail) BundleDigest(in Input) (string, error) {
+	if err := validateConfig(g.Config); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(in.PolicyIdentity) == "" {
+		return "", fmt.Errorf("%w: policy identity is required", ErrConfig)
+	}
+	if strings.TrimSpace(in.Approval.Plan.Author) == "" || strings.TrimSpace(in.Approval.RequestedBy) == "" {
+		return "", fmt.Errorf("%w: author and requester are required", ErrConfig)
+	}
+	names, err := analyzerIdentities(g.Safety.Analyzers)
+	if err != nil {
+		return "", err
+	}
+	changeDigest, err := ChangeDigest(in.Changes)
+	if err != nil {
+		return "", err
+	}
+	bundle := enforcementBundle{Version: "autosql.guardrail.bundle/v1", ChangeDigest: changeDigest, PrecheckDigest: in.Precheck.Digest, Environment: g.Config.Environment, Author: in.Approval.Plan.Author, Requester: in.Approval.RequestedBy, PolicyIdentity: in.PolicyIdentity, Policy: in.Policy, SchemaResources: in.SchemaResources, MigrationResources: in.MigrationResources, FailOn: g.Config.FailOn, Risk: g.Config.Risk, Target: in.Safety.Target, Thresholds: in.Safety.Thresholds, Analyzers: names, Suppressions: g.Safety.Suppressions, Statements: in.StatementBindings}
+	raw, err := json.Marshal(bundle)
+	if err != nil {
+		return "", fmt.Errorf("%w: bundle is not canonical JSON", ErrBinding)
 	}
 	h := sha256.New()
-	writeField(h, "autosql.guardrail.approval/v1")
-	writeField(h, changeDigest)
-	writeField(h, precheckDigest)
-	writeField(h, environment)
+	writeField(h, "autosql.guardrail.bundle-digest/v1")
+	writeField(h, string(raw))
+	return "sha256:" + hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func analyzerIdentities(analyzers []safety.Analyzer) ([]string, error) {
+	if len(analyzers) == 0 {
+		return nil, fmt.Errorf("%w: at least one analyzer is required", ErrConfig)
+	}
+	names := make([]string, 0, len(analyzers))
+	seen := map[string]bool{}
+	for _, analyzer := range analyzers {
+		if analyzer == nil {
+			return nil, fmt.Errorf("%w: analyzer is required", ErrConfig)
+		}
+		first := strings.TrimSpace(analyzer.Name())
+		second := strings.TrimSpace(analyzer.Name())
+		if first == "" || first != second {
+			return nil, fmt.Errorf("%w: analyzer identity is empty or unstable", ErrConfig)
+		}
+		if seen[first] {
+			return nil, fmt.Errorf("%w: duplicate analyzer identity", ErrConfig)
+		}
+		seen[first] = true
+		names = append(names, first)
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// BuildStatementBindings canonically attributes every safety statement.
+func BuildStatementBindings(changes schema.ChangeSet, statements []safety.Statement) ([]StatementBinding, error) {
+	if err := changes.Validate(); err != nil {
+		return nil, fmt.Errorf("%w: invalid changes", ErrBinding)
+	}
+	byID := map[string]schema.Change{}
+	for _, change := range changes.Changes {
+		byID[change.ID] = change
+	}
+	out := make([]StatementBinding, len(statements))
+	for i, statement := range statements {
+		change, ok := byID[statement.ChangeID]
+		if !ok {
+			return nil, &BindingError{Field: fmt.Sprintf("statement %d change", i+1)}
+		}
+		hash, err := changeHash(change)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = StatementBinding{SQL: statement.SQL, ChangeID: statement.ChangeID, ChangeHash: hash}
+	}
+	return out, nil
+}
+func changeHash(change schema.Change) (string, error) {
+	raw, err := json.Marshal(change)
+	if err != nil {
+		return "", fmt.Errorf("%w: change hash", ErrBinding)
+	}
+	h := sha256.New()
+	writeField(h, "autosql.guardrail.statement-change/v1")
+	_, _ = h.Write(raw)
 	return "sha256:" + hex.EncodeToString(h.Sum(nil)), nil
 }
 
@@ -155,7 +261,7 @@ func (g Guardrail) Apply(ctx context.Context, in Input) (Result, error) {
 	}
 	wantPrecheck, err := precheck.Digest(in.Precheck)
 	if err != nil {
-		return result, &StageError{Kind: ErrBinding, Stage: "precheck digest", Err: err}
+		return result, stageError(ErrBinding, "precheck digest", err)
 	}
 	if in.Precheck.Digest != wantPrecheck {
 		return result, &BindingError{Field: "precheck plan digest"}
@@ -168,14 +274,14 @@ func (g Guardrail) Apply(ctx context.Context, in Input) (Result, error) {
 			return result, &BindingError{Field: fmt.Sprintf("assertion %d plan digest", i+1)}
 		}
 	}
-	if err := validateSafetyStatements(in.Safety.Statements, in.Precheck.Statements, in.Changes); err != nil {
+	if err := validateSafetyStatements(in.StatementBindings, in.Safety.Statements, in.Precheck.Statements, in.Changes); err != nil {
 		return result, err
 	}
-	wantApproval, err := ApprovalDigest(changeDigest, wantPrecheck, g.Config.Environment)
+	wantApproval, err := g.BundleDigest(in)
 	if err != nil {
 		return result, err
 	}
-	result.ApprovalDigest = wantApproval
+	result.BundleDigest = wantApproval
 	if in.Approval.Plan.Digest != wantApproval {
 		return result, &BindingError{Field: "approval plan digest"}
 	}
@@ -187,11 +293,11 @@ func (g Guardrail) Apply(ctx context.Context, in Input) (Result, error) {
 	safetyInput.Changes = in.Changes
 	diagnostics, err := g.Safety.Run(ctx, safetyInput)
 	if err != nil {
-		return result, &StageError{Kind: ErrSafety, Stage: "analysis", Err: err}
+		return result, stageError(ErrSafety, "analysis", err)
 	}
 	publicDiagnostics, err := redactedDiagnostics(diagnostics)
 	if err != nil {
-		return result, &StageError{Kind: ErrSafety, Stage: "diagnostic redaction", Err: err}
+		return result, stageError(ErrSafety, "diagnostic redaction", err)
 	}
 	result.Diagnostics = publicDiagnostics
 	result.Risk = deriveRisk(g.Config.Risk, publicDiagnostics)
@@ -203,13 +309,13 @@ func (g Guardrail) Apply(ctx context.Context, in Input) (Result, error) {
 	violations, err := g.Policy.Evaluate(ctx, in.Policy, in.SchemaResources, in.MigrationResources)
 	result.Violations = violations
 	if err != nil {
-		return result, &StageError{Kind: ErrPolicy, Stage: "evaluation", Err: err}
+		return result, stageError(ErrPolicy, "evaluation", err)
 	}
 	if len(violations) > 0 {
-		return result, &PolicyError{Violations: violations}
+		return result, &PolicyError{Count: len(violations)}
 	}
 	if in.Database == nil {
-		return result, &StageError{Kind: ErrConfig, Stage: "database", Err: errors.New("database is required")}
+		return result, stageError(ErrConfig, "database", nil)
 	}
 
 	req := in.Approval
@@ -224,27 +330,30 @@ func (g Guardrail) Apply(ctx context.Context, in Input) (Result, error) {
 	})
 	if gateErr != nil {
 		if callbackRan {
-			return result, &StageError{Kind: ErrPrecheck, Stage: "live checks or mutation", Err: gateErr}
+			return result, stageError(ErrPrecheck, "live checks or mutation", gateErr)
 		}
-		return result, &StageError{Kind: ErrApproval, Stage: "authorization or audit", Err: gateErr}
+		return result, stageError(ErrApproval, "authorization or audit", gateErr)
 	}
 	return result, nil
 }
 
-func validateSafetyStatements(got []safety.Statement, statements []string, changes schema.ChangeSet) error {
+func validateSafetyStatements(bindings []StatementBinding, got []safety.Statement, statements []string, changes schema.ChangeSet) error {
 	if len(got) != len(statements) {
 		return &BindingError{Field: "safety statement count"}
 	}
-	changeIDs := make(map[string]bool, len(changes.Changes))
-	for _, change := range changes.Changes {
-		changeIDs[change.ID] = true
+	expected, err := BuildStatementBindings(changes, got)
+	if err != nil {
+		return err
+	}
+	if len(bindings) != len(expected) {
+		return &BindingError{Field: "canonical statement binding count"}
 	}
 	for i, statement := range got {
 		if statement.SQL != statements[i] {
 			return &BindingError{Field: fmt.Sprintf("safety statement %d SQL", i+1)}
 		}
-		if !changeIDs[statement.ChangeID] {
-			return &BindingError{Field: fmt.Sprintf("safety statement %d change", i+1)}
+		if bindings[i] != expected[i] {
+			return &BindingError{Field: fmt.Sprintf("canonical statement binding %d", i+1)}
 		}
 	}
 	return nil
@@ -267,7 +376,7 @@ func validateConfig(c Config) error {
 		return fmt.Errorf("%w: environment is required", ErrConfig)
 	}
 	if _, ok := severityRank(c.FailOn); !ok {
-		return fmt.Errorf("%w: invalid safety threshold %q", ErrConfig, c.FailOn)
+		return fmt.Errorf("%w: invalid safety threshold", ErrConfig)
 	}
 	if !validRisk(c.Risk.Baseline) {
 		return fmt.Errorf("%w: invalid baseline risk", ErrConfig)
@@ -307,9 +416,6 @@ func deriveRisk(c RiskConfig, ds []safety.Diagnostic) approval.Risk {
 	risk := c.Baseline
 	defaults := map[safety.Severity]approval.Risk{safety.SeverityInfo: approval.RiskLow, safety.SeverityWarning: approval.RiskMedium, safety.SeverityError: approval.RiskHigh}
 	for _, d := range ds {
-		if d.Suppressed != nil {
-			continue
-		}
 		mapped, ok := c.BySeverity[d.Severity]
 		if !ok {
 			mapped = defaults[d.Severity]

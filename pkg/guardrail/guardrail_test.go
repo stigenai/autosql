@@ -104,7 +104,7 @@ func testChanges() schema.ChangeSet {
 	return schema.ChangeSet{Version: schema.ChangeVersion, Changes: []schema.Change{{ID: "create-widgets", Operation: schema.OperationCreate, ResourceID: r.ID, After: &r}}}
 }
 
-func boundInput(t *testing.T, environment string) (Input, string) {
+func boundInput(t *testing.T, g Guardrail, environment string) (Input, string) {
 	t.Helper()
 	changes := testChanges()
 	changeDigest, err := ChangeDigest(changes)
@@ -117,12 +117,17 @@ func boundInput(t *testing.T, environment string) (Input, string) {
 		t.Fatal(err)
 	}
 	p.Assertions[0].PlanDigest = p.Digest
-	approvalDigest, err := ApprovalDigest(changeDigest, p.Digest, environment)
+	req := approval.Request{Plan: approval.Plan{Environment: environment, Author: "author", Risk: approval.RiskCritical}, RequestedBy: "deployer"}
+	in := Input{Changes: changes, Safety: safety.Input{Statements: []safety.Statement{{ChangeID: "create-widgets", SQL: p.Statements[0]}}}, Policy: policy.Document{Version: policy.LanguageVersion}, PolicyIdentity: "policy/main@v1", Precheck: p, Approval: req}
+	in.StatementBindings, err = BuildStatementBindings(changes, in.Safety.Statements)
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := approval.Request{Plan: approval.Plan{Digest: approvalDigest, Environment: environment, Author: "author", Risk: approval.RiskCritical}, RequestedBy: "deployer"}
-	return Input{Changes: changes, Safety: safety.Input{Statements: []safety.Statement{{ChangeID: "create-widgets", SQL: p.Statements[0]}}}, Policy: policy.Document{Version: policy.LanguageVersion}, Precheck: p, Approval: req}, approvalDigest
+	in.Approval.Plan.Digest, err = g.BundleDigest(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return in, in.Approval.Plan.Digest
 }
 
 func harness(t *testing.T, log *eventLog) (Guardrail, *database, *audit) {
@@ -146,7 +151,7 @@ func harness(t *testing.T, log *eventLog) (Guardrail, *database, *audit) {
 func TestSuccessfulProductionOrderAndDerivedRisk(t *testing.T) {
 	log := &eventLog{}
 	g, db, _ := harness(t, log)
-	in, _ := boundInput(t, "prod")
+	in, _ := boundInput(t, g, "prod")
 	in.Database = db
 	result, err := g.Apply(context.Background(), in)
 	if err != nil {
@@ -172,27 +177,51 @@ func TestEveryStaticFailurePreventsDatabaseWork(t *testing.T) {
 		"changes mutated": {func(_ *Guardrail, in *Input, _ *audit) {
 			in.Changes.Changes[0].Annotations = map[string]string{"changed": "true"}
 		}, ErrBinding},
-		"change digest":    {func(_ *Guardrail, in *Input, _ *audit) { in.Precheck.ChangeDigest = "sha256:other" }, ErrBinding},
-		"plan digest":      {func(_ *Guardrail, in *Input, _ *audit) { in.Precheck.Statements[0] = "DROP TABLE secret" }, ErrBinding},
-		"assertion digest": {func(_ *Guardrail, in *Input, _ *audit) { in.Precheck.Assertions[0].PlanDigest = "sha256:other" }, ErrBinding},
-		"safety SQL":       {func(_ *Guardrail, in *Input, _ *audit) { in.Safety.Statements[0].SQL = "SELECT 1" }, ErrBinding},
-		"approval digest":  {func(_ *Guardrail, in *Input, _ *audit) { in.Approval.Plan.Digest = "sha256:other" }, ErrBinding},
-		"environment":      {func(_ *Guardrail, in *Input, _ *audit) { in.Approval.Plan.Environment = "stage" }, ErrBinding},
-		"safety": {func(g *Guardrail, _ *Input, _ *audit) {
-			g.Safety = safety.Runner{Analyzers: []safety.Analyzer{safety.AnalyzerFunc{ID: "unsafe", Fn: func(context.Context, safety.Input) ([]safety.Diagnostic, error) {
-				return []safety.Diagnostic{diagnostic(safety.SeverityError)}, nil
-			}}}}
-		}, ErrSafety},
-		"policy": {func(_ *Guardrail, in *Input, _ *audit) {
-			in.Policy = denyingPolicy()
-			in.SchemaResources = []policy.Resource{{Kind: "table", Name: "widgets", Owner: "wrong"}}
-		}, ErrPolicy},
+		"change digest":          {func(_ *Guardrail, in *Input, _ *audit) { in.Precheck.ChangeDigest = "sha256:other" }, ErrBinding},
+		"plan digest":            {func(_ *Guardrail, in *Input, _ *audit) { in.Precheck.Statements[0] = "DROP TABLE secret" }, ErrBinding},
+		"assertion digest":       {func(_ *Guardrail, in *Input, _ *audit) { in.Precheck.Assertions[0].PlanDigest = "sha256:other" }, ErrBinding},
+		"safety SQL":             {func(_ *Guardrail, in *Input, _ *audit) { in.Safety.Statements[0].SQL = "SELECT 1" }, ErrBinding},
+		"statement change":       {func(_ *Guardrail, in *Input, _ *audit) { in.StatementBindings[0].ChangeID = "other" }, ErrBinding},
+		"statement hash":         {func(_ *Guardrail, in *Input, _ *audit) { in.StatementBindings[0].ChangeHash = "sha256:other" }, ErrBinding},
+		"statement bound SQL":    {func(_ *Guardrail, in *Input, _ *audit) { in.StatementBindings[0].SQL = "SELECT 1" }, ErrBinding},
+		"approval digest":        {func(_ *Guardrail, in *Input, _ *audit) { in.Approval.Plan.Digest = "sha256:other" }, ErrBinding},
+		"environment":            {func(_ *Guardrail, in *Input, _ *audit) { in.Approval.Plan.Environment = "stage" }, ErrBinding},
+		"configured environment": {func(g *Guardrail, _ *Input, _ *audit) { g.Config.Environment = "stage" }, ErrBinding},
+		"author":                 {func(_ *Guardrail, in *Input, _ *audit) { in.Approval.Plan.Author = "other" }, ErrBinding},
+		"requester":              {func(_ *Guardrail, in *Input, _ *audit) { in.Approval.RequestedBy = "other" }, ErrBinding},
+		"policy identity":        {func(_ *Guardrail, in *Input, _ *audit) { in.PolicyIdentity = "policy/other" }, ErrBinding},
+		"policy document":        {func(_ *Guardrail, in *Input, _ *audit) { in.Policy.Variables = map[string]any{"mode": "other"} }, ErrBinding},
+		"schema resources": {func(_ *Guardrail, in *Input, _ *audit) {
+			in.SchemaResources = []policy.Resource{{Kind: "table", Name: "other"}}
+		}, ErrBinding},
+		"migration resources": {func(_ *Guardrail, in *Input, _ *audit) {
+			in.MigrationResources = []policy.Resource{{Kind: "drop", Name: "other"}}
+		}, ErrBinding},
+		"severity threshold": {func(g *Guardrail, _ *Input, _ *audit) { g.Config.FailOn = safety.SeverityWarning }, ErrBinding},
+		"risk baseline":      {func(g *Guardrail, _ *Input, _ *audit) { g.Config.Risk.Baseline = approval.RiskMedium }, ErrBinding},
+		"risk mapping": {func(g *Guardrail, _ *Input, _ *audit) {
+			g.Config.Risk.BySeverity = map[safety.Severity]approval.Risk{safety.SeverityWarning: approval.RiskHigh}
+		}, ErrBinding},
+		"target engine":  {func(_ *Guardrail, in *Input, _ *audit) { in.Safety.Target.Engine = "postgresql" }, ErrBinding},
+		"target version": {func(_ *Guardrail, in *Input, _ *audit) { in.Safety.Target.Version = 15 }, ErrBinding},
+		"target statistics": {func(_ *Guardrail, in *Input, _ *audit) {
+			in.Safety.Target.Statistics = map[string]safety.TableStatistics{"table": {EstimatedRows: 10}}
+		}, ErrBinding},
+		"threshold lock":    {func(_ *Guardrail, in *Input, _ *audit) { in.Safety.Thresholds.MaxLockLevel = safety.LockShare }, ErrBinding},
+		"threshold rows":    {func(_ *Guardrail, in *Input, _ *audit) { in.Safety.Thresholds.MaxRowsScanned = 10 }, ErrBinding},
+		"threshold rewrite": {func(_ *Guardrail, in *Input, _ *audit) { in.Safety.Thresholds.MaxRewriteBytes = 10 }, ErrBinding},
+		"analyzers": {func(g *Guardrail, _ *Input, _ *audit) {
+			g.Safety.Analyzers[0] = safety.AnalyzerFunc{ID: "other", Fn: func(context.Context, safety.Input) ([]safety.Diagnostic, error) { return nil, nil }}
+		}, ErrBinding},
+		"suppressions": {func(g *Guardrail, _ *Input, _ *audit) {
+			g.Safety.Suppressions = []safety.Suppression{{Rule: "TEST", ObjectID: "object", Reason: "changed"}}
+		}, ErrBinding},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			log := &eventLog{}
 			g, db, a := harness(t, log)
-			in, _ := boundInput(t, "prod")
+			in, _ := boundInput(t, g, "prod")
 			in.Database = db
 			tc.mutate(&g, &in, a)
 			_, err := g.Apply(context.Background(), in)
@@ -208,12 +237,84 @@ func TestEveryStaticFailurePreventsDatabaseWork(t *testing.T) {
 	}
 }
 
+func TestSuppressionFieldsAreBundleBound(t *testing.T) {
+	for _, field := range []string{"rule", "object", "reason", "expiry"} {
+		t.Run(field, func(t *testing.T) {
+			log := &eventLog{}
+			g, db, _ := harness(t, log)
+			expiry := time.Unix(200, 0)
+			g.Safety.Suppressions = []safety.Suppression{{Rule: "TEST", ObjectID: "object", Reason: "approved", ExpiresAt: &expiry}}
+			in, _ := boundInput(t, g, "prod")
+			in.Database = db
+			if field == "rule" {
+				g.Safety.Suppressions[0].Rule = "OTHER"
+			} else if field == "object" {
+				g.Safety.Suppressions[0].ObjectID = "other"
+			} else if field == "reason" {
+				g.Safety.Suppressions[0].Reason = "changed"
+			} else {
+				changed := expiry.Add(time.Second)
+				g.Safety.Suppressions[0].ExpiresAt = &changed
+			}
+			_, err := g.Apply(context.Background(), in)
+			if !errors.Is(err, ErrBinding) || db.tx != nil {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+}
+
+func TestStatementBindingsRejectReorderingAndStaleChangeHash(t *testing.T) {
+	for _, mode := range []string{"reordered", "stale hash"} {
+		t.Run(mode, func(t *testing.T) {
+			log := &eventLog{}
+			g, db, _ := harness(t, log)
+			in, _ := boundInput(t, g, "prod")
+			in.Database = db
+			if mode == "reordered" {
+				in.Precheck.Statements = append(in.Precheck.Statements, "ALTER TABLE widgets ADD COLUMN note text")
+				in.Safety.Statements = append(in.Safety.Statements, safety.Statement{ChangeID: "create-widgets", SQL: in.Precheck.Statements[1]})
+				rebind(t, g, &in)
+				in.StatementBindings[0], in.StatementBindings[1] = in.StatementBindings[1], in.StatementBindings[0]
+			} else {
+				in.Changes.Changes[0].Annotations = map[string]string{"revision": "new"}
+				digest, err := ChangeDigest(in.Changes)
+				if err != nil {
+					t.Fatal(err)
+				}
+				in.Precheck.ChangeDigest = digest
+				for i := range in.Precheck.Assertions {
+					in.Precheck.Assertions[i].ChangeDigest = digest
+					in.Precheck.Assertions[i].PlanDigest = ""
+				}
+				in.Precheck.Digest, err = precheck.Digest(in.Precheck)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for i := range in.Precheck.Assertions {
+					in.Precheck.Assertions[i].PlanDigest = in.Precheck.Digest
+				}
+				// Deliberately approve the bundle containing the stale binding. Apply
+				// must independently recompute the referenced change hash.
+				in.Approval.Plan.Digest, err = g.BundleDigest(in)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, err := g.Apply(context.Background(), in)
+			if !errors.Is(err, ErrBinding) || db.tx != nil {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+}
+
 func TestApprovalAndAuditFailuresPrecedeDatabase(t *testing.T) {
 	for _, name := range []string{"approval", "audit"} {
 		t.Run(name, func(t *testing.T) {
 			log := &eventLog{}
 			g, db, a := harness(t, log)
-			in, _ := boundInput(t, "prod")
+			in, _ := boundInput(t, g, "prod")
 			in.Database = db
 			if name == "approval" {
 				g.Approval.Policy.Environments["prod"] = approval.EnvironmentPolicy{Allowed: true, Requirements: []approval.Requirement{{MinimumRisk: approval.RiskLow, ApproverCount: 1, Roles: []string{"dba"}}}}
@@ -224,7 +325,7 @@ func TestApprovalAndAuditFailuresPrecedeDatabase(t *testing.T) {
 			if !errors.Is(err, ErrApproval) {
 				t.Fatalf("error=%T %v", err, err)
 			}
-			if name == "audit" && strings.Contains(err.Error(), "password") {
+			if name == "audit" && strings.Contains(formatErrorChain(err), "password") {
 				t.Fatalf("audit detail leaked: %v", err)
 			}
 			if db.tx != nil {
@@ -234,16 +335,66 @@ func TestApprovalAndAuditFailuresPrecedeDatabase(t *testing.T) {
 	}
 }
 
+func TestPolicyViolationPreventsApprovalAndDatabase(t *testing.T) {
+	log := &eventLog{}
+	g, db, _ := harness(t, log)
+	in, _ := boundInput(t, g, "prod")
+	in.Policy = denyingPolicy()
+	in.SchemaResources = []policy.Resource{{Kind: "table", Name: "widgets", Owner: "wrong"}}
+	rebind(t, g, &in)
+	in.Database = db
+	result, err := g.Apply(context.Background(), in)
+	if !errors.Is(err, ErrPolicy) || len(result.Violations) != 1 || db.tx != nil {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
+type unstableAnalyzer struct{ calls int }
+
+func (a *unstableAnalyzer) Name() string { a.calls++; return fmt.Sprintf("unstable-%d", a.calls) }
+func (a *unstableAnalyzer) Analyze(context.Context, safety.Input) ([]safety.Diagnostic, error) {
+	return nil, nil
+}
+
+func TestBundleRejectsMissingOrUnstableIdentities(t *testing.T) {
+	for _, name := range []string{"no analyzers", "empty policy", "empty author", "empty requester", "duplicate analyzers", "unstable analyzer"} {
+		t.Run(name, func(t *testing.T) {
+			log := &eventLog{}
+			g, db, _ := harness(t, log)
+			in, _ := boundInput(t, g, "prod")
+			in.Database = db
+			switch name {
+			case "no analyzers":
+				g.Safety.Analyzers = nil
+			case "empty policy":
+				in.PolicyIdentity = ""
+			case "empty author":
+				in.Approval.Plan.Author = ""
+			case "empty requester":
+				in.Approval.RequestedBy = ""
+			case "duplicate analyzers":
+				g.Safety.Analyzers = append(g.Safety.Analyzers, g.Safety.Analyzers[0])
+			case "unstable analyzer":
+				g.Safety.Analyzers = []safety.Analyzer{&unstableAnalyzer{}}
+			}
+			_, err := g.Apply(context.Background(), in)
+			if !errors.Is(err, ErrConfig) || db.tx != nil {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+}
+
 func TestRealBuiltinSafetyBlocksDestructiveChange(t *testing.T) {
 	log := &eventLog{}
 	g, db, _ := harness(t, log)
-	in, _ := boundInput(t, "prod")
+	in, _ := boundInput(t, g, "prod")
 	r := *in.Changes.Changes[0].After
 	in.Changes.Changes[0] = schema.Change{ID: "drop-widgets", Operation: schema.OperationDrop, ResourceID: r.ID, Before: &r}
-	rebind(t, &in, "prod")
 	in.Safety.Statements[0].ChangeID = "drop-widgets"
-	in.Database = db
 	g.Safety = safety.Runner{Analyzers: safety.Builtins()}
+	rebind(t, g, &in)
+	in.Database = db
 	result, err := g.Apply(context.Background(), in)
 	if !errors.Is(err, ErrSafety) || len(result.Diagnostics) == 0 || db.tx != nil {
 		t.Fatalf("result=%+v err=%v", result, err)
@@ -254,7 +405,7 @@ func TestFailedLiveCheckAuditedButNeverMutates(t *testing.T) {
 	log := &eventLog{}
 	g, db, _ := harness(t, log)
 	db.count = 1
-	in, _ := boundInput(t, "prod")
+	in, _ := boundInput(t, g, "prod")
 	in.Database = db
 	result, err := g.Apply(context.Background(), in)
 	if !errors.Is(err, ErrPrecheck) || db.tx == nil || db.tx.execs != 0 {
@@ -274,7 +425,7 @@ func TestCancellationAfterAuditPreventsDatabase(t *testing.T) {
 	g, db, a := harness(t, log)
 	ctx, cancel := context.WithCancel(context.Background())
 	a.cancel = cancel
-	in, _ := boundInput(t, "prod")
+	in, _ := boundInput(t, g, "prod")
 	in.Database = db
 	_, err := g.Apply(ctx, in)
 	if !errors.Is(err, context.Canceled) || db.tx != nil {
@@ -282,7 +433,7 @@ func TestCancellationAfterAuditPreventsDatabase(t *testing.T) {
 	}
 }
 
-func TestSuppressedDiagnosticDoesNotBlockOrRaiseRisk(t *testing.T) {
+func TestSuppressedDiagnosticDoesNotBlockButStillRaisesRisk(t *testing.T) {
 	log := &eventLog{}
 	g, db, _ := harness(t, log)
 	d := diagnostic(safety.SeverityError)
@@ -290,13 +441,13 @@ func TestSuppressedDiagnosticDoesNotBlockOrRaiseRisk(t *testing.T) {
 		log.add("analyze")
 		return []safety.Diagnostic{d}, nil
 	}}}, Suppressions: []safety.Suppression{{Rule: d.Rule, ObjectID: d.Object.ID, Reason: "approved test"}}}
-	in, _ := boundInput(t, "prod")
+	in, _ := boundInput(t, g, "prod")
 	in.Database = db
 	result, err := g.Apply(context.Background(), in)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Risk != approval.RiskLow || result.Diagnostics[0].Suppressed == nil {
+	if result.Risk != approval.RiskHigh || result.Diagnostics[0].Suppressed == nil {
 		t.Fatalf("result=%+v", result)
 	}
 }
@@ -310,7 +461,7 @@ func TestDerivedWarningRiskDrivesApprovalRequirement(t *testing.T) {
 		return []safety.Diagnostic{d}, nil
 	}}}}
 	g.Approval.Policy.Environments["prod"] = approval.EnvironmentPolicy{Allowed: true, Requirements: []approval.Requirement{{MinimumRisk: approval.RiskMedium, ApproverCount: 1, Roles: []string{"dba"}}}}
-	in, digest := boundInput(t, "prod")
+	in, digest := boundInput(t, g, "prod")
 	in.Database = db
 	now := time.Unix(100, 0)
 	in.Approval.Plan.Risk = approval.RiskLow
@@ -327,7 +478,7 @@ func TestDerivedWarningRiskDrivesApprovalRequirement(t *testing.T) {
 func TestErrorsAndResultsDoNotExposeSQLOrArguments(t *testing.T) {
 	log := &eventLog{}
 	g, db, _ := harness(t, log)
-	in, _ := boundInput(t, "prod")
+	in, _ := boundInput(t, g, "prod")
 	secret := "ultra-secret-value"
 	d := diagnostic(safety.SeverityWarning)
 	d.Message = "password=" + secret
@@ -338,16 +489,22 @@ func TestErrorsAndResultsDoNotExposeSQLOrArguments(t *testing.T) {
 	in.Precheck.Statements[0] = "SELECT '" + secret + "'"
 	in.Safety.Statements[0].SQL = in.Precheck.Statements[0]
 	in.Precheck.Assertions[0].Args = []any{secret}
-	in.Precheck.Digest, _ = precheck.Digest(in.Precheck)
-	in.Precheck.Assertions[0].PlanDigest = in.Precheck.Digest
-	in.Approval.Plan.Digest, _ = ApprovalDigest(in.Precheck.ChangeDigest, in.Precheck.Digest, "prod")
-	db.count = 1
+	rebind(t, g, &in)
+	db.queryErr = errors.New("backend password=" + secret)
 	in.Database = db
 	result, err := g.Apply(context.Background(), in)
-	combined := fmt.Sprintf("%v %+v", err, result)
+	combined := formatErrorChain(err) + fmt.Sprintf(" %+v", result)
 	if strings.Contains(combined, secret) || strings.Contains(combined, "SELECT") {
 		t.Fatalf("sensitive evidence leaked: %s", combined)
 	}
+}
+
+func formatErrorChain(err error) string {
+	var out strings.Builder
+	for current := err; current != nil; current = errors.Unwrap(current) {
+		fmt.Fprintf(&out, "%v|%+v|%#v\n", current, current, current)
+	}
+	return out.String()
 }
 
 func diagnostic(severity safety.Severity) safety.Diagnostic {
@@ -355,7 +512,7 @@ func diagnostic(severity safety.Severity) safety.Diagnostic {
 	r := changes.Changes[0].After
 	return safety.Diagnostic{Rule: "TEST001", Severity: severity, Message: "risk", Object: safety.Object{ID: r.ID, Kind: r.Kind, Name: r.Name.String()}, Impact: "impact", Remediation: "fix", Confidence: safety.ConfidenceHigh}
 }
-func rebind(t *testing.T, in *Input, environment string) {
+func rebind(t *testing.T, g Guardrail, in *Input) {
 	t.Helper()
 	digest, err := ChangeDigest(in.Changes)
 	if err != nil {
@@ -373,7 +530,11 @@ func rebind(t *testing.T, in *Input, environment string) {
 	for i := range in.Precheck.Assertions {
 		in.Precheck.Assertions[i].PlanDigest = in.Precheck.Digest
 	}
-	in.Approval.Plan.Digest, err = ApprovalDigest(digest, in.Precheck.Digest, environment)
+	in.StatementBindings, err = BuildStatementBindings(in.Changes, in.Safety.Statements)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in.Approval.Plan.Digest, err = g.BundleDigest(*in)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -402,11 +563,5 @@ func TestDigestIsCanonicalAndEnvironmentBound(t *testing.T) {
 	dc, err := ChangeDigest(c)
 	if err != nil || dc != db {
 		t.Fatalf("canonical map ordering changed digest: %s %s %v", db, dc, err)
-	}
-	x, _ := ApprovalDigest(da, "plan", "prod")
-	y, _ := ApprovalDigest(da, "plan", "stage")
-	z, _ := ApprovalDigest(da+"x", "plan", "prod")
-	if x == y || x == z {
-		t.Fatal("approval digest is not domain bound")
 	}
 }

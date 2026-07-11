@@ -10,15 +10,22 @@ The caller first binds the artifacts:
 2. Set that value on `precheck.Plan.ChangeDigest` and every assertion's
    `ChangeDigest`.
 3. Compute `precheck.Digest(plan)` and set every assertion's `PlanDigest`.
-4. Compute `guardrail.ApprovalDigest(changeDigest, plan.Digest, environment)`
-   and use it as `approval.Request.Plan.Digest`.
-5. Supply one safety statement per precheck statement, in the same order, with
+4. Supply a stable, non-empty policy identity and one safety statement per
+   precheck statement, in the same order, with
    identical SQL and a change ID present in the bound change set. This prevents
    analysis of a harmless statement list followed by execution of another.
+5. Build canonical statement bindings with `guardrail.BuildStatementBindings`.
+   Each entry binds SQL and change ID to a canonical hash of the exact referenced
+   `schema.Change`.
+6. Compute `Guardrail.BundleDigest(input)` and use it as
+   `approval.Request.Plan.Digest`.
 
-The approval digest uses domain-separated, length-prefixed fields, so values
-cannot be moved across boundaries or environments. `Guardrail.Apply` recomputes
-all digests and rejects any mismatch before analysis, audit, or database work.
+The bundle digest is domain-separated and binds the exact changes, precheck
+plan, environment, author, requester, policy identity/document/resources,
+safety threshold and risk mapping, target metadata and thresholds, sorted
+analyzer identities, exact suppressions, and canonical statement bindings.
+`Guardrail.Apply` recomputes it and rejects any mismatch before analysis, audit,
+or database work. Analyzer identities must be non-empty, unique, and stable.
 
 On a valid request, apply proceeds in this order:
 
@@ -26,8 +33,9 @@ On a valid request, apply proceeds in this order:
    severity threshold.
 2. Evaluate the policy document over the supplied schema and migration
    resources and reject every violation.
-3. Derive approval risk from trusted risk configuration and unsuppressed
-   diagnostics. Caller-supplied risk is ignored.
+3. Derive approval risk from trusted risk configuration and all diagnostics.
+   Suppression can prevent blocking/reporting but never lowers approval risk;
+   caller-supplied risk is ignored.
 4. Ask `approval.Gate` to authorize and durably audit the exact bound plan.
 5. Only within the gate's authorized callback, call `precheck.GuardedApply`.
    It begins the transaction, acquires the migration lock, runs live scalar
@@ -35,5 +43,6 @@ On a valid request, apply proceeds in this order:
 
 The returned result contains only digests, diagnostics, violations, derived
 risk, and bounded precheck counts. Guardrail error strings never include SQL,
-query arguments, backend audit messages, or sampled database rows. Typed errors
-retain causes for programmatic inspection with `errors.Is` and `errors.As`.
+query arguments, backend audit messages, or sampled database rows. Typed stage
+errors intentionally discard raw backend causes; `errors.Is` exposes only safe
+guardrail stage sentinels and cancellation/deadline classifications.
