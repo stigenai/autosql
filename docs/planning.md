@@ -5,6 +5,9 @@ execution plan. A plan binds the planner and driver versions, source and target
 semantic fingerprints, canonical changes, SQL steps, transaction requirements,
 lock and impact metadata, dependency edges, phases, and a digest. Planning is
 all-or-nothing: an invalid graph or unsupported transition returns a zero plan.
+Executable steps contain SQL. Topology steps bind database-derived descendants
+to a parent transition, contain zero SQL, and are excluded from plugin, safety,
+precheck, and apply statement lists.
 
 Plans do not provide an apply function. `Plan.SafetyStatements` exposes exact
 SQL/change bindings for the existing safety, policy, approval, precheck, and
@@ -19,6 +22,10 @@ until their entire canonical transition matrix and guarded phase execution are
 available. View definitions are replaceable, while materialized-view changes
 require the explicit `allow_rebuild=true` strategy. Concurrent/nontransactional
 rendering is rejected until a phase-aware guarded executor is available.
+View and materialized-view output columns remain canonical resources. The SQL
+source normalizer derives them only for a conservative round-trip subset:
+simple projections, expanded wildcards over known tables, and aliased integer
+or text literals. Other definitions fail closed instead of planning drift.
 
 `postgres.RenderDocument` renders a full desired document from an empty schema
 projection when every resource is in the managed matrix. Read-only kinds make

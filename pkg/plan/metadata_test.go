@@ -34,4 +34,11 @@ func TestConservativeStructuralMetadata(t *testing.T) {
 	if got := lockFor(schema.Change{}, "CREATE INDEX CONCURRENTLY x ON t(x)"); got != LockShare {
 		t.Fatalf("concurrent lock=%s", got)
 	}
+	mv := metadataResource(schema.KindMaterializedView, `{"definition":"SELECT 1 AS value"}`)
+	if got := impactFor(schema.Change{Operation: schema.OperationCreate, After: &mv}, "CREATE MATERIALIZED VIEW mv AS SELECT 1 AS value"); !got.Scans {
+		t.Fatal("materialized view create not marked scan")
+	}
+	if got := impactFor(schema.Change{Operation: schema.OperationAlter, Before: &mv, After: &mv}, "DROP MATERIALIZED VIEW mv"); !got.Scans || !got.Destructive {
+		t.Fatalf("materialized rebuild impact=%+v", got)
+	}
 }

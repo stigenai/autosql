@@ -112,10 +112,18 @@ type RenderRequest struct {
 
 // Statement is one rendered database statement with its originating change.
 type Statement struct {
-	SQL           string `json:"sql"`
-	ChangeID      string `json:"change_id"`
-	Transactional bool   `json:"transactional"`
+	SQL           string        `json:"sql"`
+	ChangeID      string        `json:"change_id"`
+	Transactional bool          `json:"transactional"`
+	Kind          StatementKind `json:"kind,omitempty"`
 }
+
+type StatementKind string
+
+const (
+	StatementExecutable StatementKind = "executable"
+	StatementTopology   StatementKind = "topology"
+)
 
 // Driver inspects live state, normalizes dialect values, and renders changes.
 type Driver interface {

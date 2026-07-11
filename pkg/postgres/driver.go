@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"autosql/pkg/plugin"
@@ -82,18 +84,6 @@ func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Documen
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
-	parents := map[string]schema.Kind{}
-	for _, r := range doc.Graph.Resources {
-		parents[r.ID] = r.Kind
-	}
-	filtered := doc.Graph.Resources[:0]
-	for _, r := range doc.Graph.Resources {
-		if r.Kind == schema.KindColumn && (parents[r.Name.Parent] == schema.KindView || parents[r.Name.Parent] == schema.KindMaterializedView) {
-			continue
-		}
-		filtered = append(filtered, r)
-	}
-	doc.Graph.Resources = filtered
 	for idx := range doc.Graph.Resources {
 		r := &doc.Graph.Resources[idx]
 		// Serialized/public annotations are not trusted provenance.
@@ -109,11 +99,99 @@ func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Documen
 			r.Spec = normalized
 		}
 	}
+	augmentProjectionColumns(&doc)
 	doc.Normalize()
 	if err := doc.Validate(); err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
 	return doc, nil
+}
+
+var simpleViewFrom = regexp.MustCompile(`(?i)^SELECT\s+(.+)\s+FROM\s+([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)$`)
+var simpleLiteralView = regexp.MustCompile(`(?i)^SELECT\s+(.+)\s+AS\s+([a-z_][a-z0-9_]*)$`)
+
+func augmentProjectionColumns(doc *schema.Document) {
+	children := map[string]bool{}
+	tables := map[string]schema.Resource{}
+	columns := map[string][]schema.Resource{}
+	for _, r := range doc.Graph.Resources {
+		if r.Kind == schema.KindColumn {
+			children[r.Name.Parent] = true
+			columns[r.Name.Parent] = append(columns[r.Name.Parent], r)
+		}
+		if r.Kind == schema.KindTable {
+			tables[r.Name.Schema+"."+r.Name.Name] = r
+		}
+	}
+	var added []schema.Resource
+	for idx := range doc.Graph.Resources {
+		r := &doc.Graph.Resources[idx]
+		if (r.Kind != schema.KindView && r.Kind != schema.KindMaterializedView) || children[r.ID] {
+			continue
+		}
+		s := specMap(r.Spec)
+		definition, _ := s["definition"].(string)
+		var projections []schema.Resource
+		if match := simpleViewFrom.FindStringSubmatch(definition); match != nil {
+			table, ok := tables[match[2]+"."+match[3]]
+			if !ok {
+				continue
+			}
+			items := strings.Split(match[1], ",")
+			if strings.TrimSpace(match[1]) == "*" {
+				items = nil
+				for _, column := range columns[table.ID] {
+					items = append(items, column.Name.Name)
+				}
+				names := make([]string, len(items))
+				for i, name := range items {
+					names[i] = strings.TrimSpace(name)
+				}
+				s["definition"] = "SELECT " + strings.Join(names, ", ") + " FROM " + match[2] + "." + match[3]
+				r.Spec, _ = json.Marshal(s)
+			}
+			for _, item := range items {
+				name := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(item), table.Name.Name+"."))
+				for _, column := range columns[table.ID] {
+					if column.Name.Name == name {
+						column.Name.Parent = r.ID
+						column.ID = schema.StableID(column.Kind, column.Name)
+						column.Dependencies = []schema.Dependency{{Target: r.ID, Type: schema.DependencyContains}}
+						cs := specMap(column.Spec)
+						cs["not_null"] = false
+						delete(cs, "default")
+						delete(cs, "identity")
+						delete(cs, "generated")
+						column.Spec, _ = json.Marshal(cs)
+						projections = append(projections, column)
+					}
+				}
+			}
+		}
+		if match := simpleLiteralView.FindStringSubmatch(definition); match != nil {
+			expr, name := strings.TrimSpace(match[1]), match[2]
+			typ := ""
+			if _, err := strconv.Atoi(expr); err == nil {
+				typ = "integer"
+			} else if len(expr) >= 2 && expr[0] == '\'' && expr[len(expr)-1] == '\'' {
+				typ = "text"
+				s["definition"] = "SELECT " + expr + "::text AS " + name
+				r.Spec, _ = json.Marshal(s)
+			}
+			if typ != "" {
+				column := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: r.Name.Schema, Name: name, Parent: r.ID}, Dependencies: []schema.Dependency{{Target: r.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{"not_null":false,"type":"` + typ + `"}`)}
+				column.ID = schema.StableID(column.Kind, column.Name)
+				projections = append(projections, column)
+			}
+		}
+		added = append(added, projections...)
+	}
+	doc.Graph.Resources = append(doc.Graph.Resources, added...)
+}
+func specMap(raw json.RawMessage) map[string]any {
+	out := map[string]any{}
+	_ = json.Unmarshal(raw, &out)
+	return out
 }
 
 func normalizePostgresSpecForKind(kind schema.Kind, spec map[string]any) {

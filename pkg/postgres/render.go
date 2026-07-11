@@ -57,11 +57,23 @@ func renderChange(change schema.Change, resources map[string]schema.Resource, op
 	if r == nil {
 		return nil, fmt.Errorf("%w: change %s has no resource", plugin.ErrUnsupported, change.ID)
 	}
+	if err := validateManagedMetadata(*r); err != nil {
+		return nil, err
+	}
+	if change.Before != nil {
+		if err := validateManagedMetadata(*change.Before); err != nil {
+			return nil, err
+		}
+	}
 	parentOnlyRename := change.Operation == schema.OperationRename && change.Before != nil && change.After != nil && change.Before.Name.Name == change.After.Name.Name && change.Before.Name.Parent != change.After.Name.Parent
-	if !parentOnlyRename {
+	projectionChild := r.Kind == schema.KindColumn && isManagedProjectionParent(r.Name.Parent, resources)
+	if !parentOnlyRename && !projectionChild {
 		if err := plugin.RequireManaged(New().Info(), r.Kind); err != nil {
 			return nil, err
 		}
+	}
+	if parentOnlyRename || projectionChild {
+		return []plugin.Statement{{ChangeID: change.ID, Transactional: true, Kind: plugin.StatementTopology}}, nil
 	}
 	var sqls []string
 	var err error
@@ -82,7 +94,7 @@ func renderChange(change schema.Change, resources map[string]schema.Resource, op
 	}
 	out := make([]plugin.Statement, len(sqls))
 	for i, sql := range sqls {
-		out[i] = plugin.Statement{SQL: terminate(sql), ChangeID: change.ID, Transactional: !strings.Contains(strings.ToUpper(sql), "CONCURRENTLY")}
+		out[i] = plugin.Statement{SQL: terminate(sql), ChangeID: change.ID, Transactional: !strings.Contains(strings.ToUpper(sql), "CONCURRENTLY"), Kind: plugin.StatementExecutable}
 	}
 	return out, nil
 }
@@ -167,13 +179,9 @@ func renderCreate(r schema.Resource, resources map[string]schema.Resource, optio
 		}
 		prefix := "CREATE "
 		switch stringValue(s, "persistence") {
-		case "u":
-			prefix += "UNLOGGED "
-		case "t":
-			prefix += "TEMPORARY "
 		case "", "p":
 		default:
-			return nil, unsupported(r, "table persistence")
+			return nil, unsupported(r, "temporary/unlogged table persistence is outside the managed matrix")
 		}
 		out := []string{prefix + "TABLE " + name + " ()"}
 		if boolValue(s, "row_security") {
@@ -216,6 +224,9 @@ func renderCreate(r schema.Resource, resources map[string]schema.Resource, optio
 		}
 		if e := validateSQLFragment(d); e != nil {
 			return nil, unsupported(r, "unsafe view definition: "+e.Error())
+		}
+		if e := validateProjectionShape(r, resources); e != nil {
+			return nil, unsupported(r, "output shape is not provable: "+e.Error())
 		}
 		kind := "VIEW"
 		if r.Kind == schema.KindMaterializedView {
@@ -267,9 +278,6 @@ func renderDrop(r schema.Resource, resources map[string]schema.Resource, options
 }
 
 func renderRename(before, after schema.Resource, resources map[string]schema.Resource) ([]string, error) {
-	if before.Name.Name == after.Name.Name && before.Name.Parent != after.Name.Parent {
-		return []string{"-- AutoSQL topology: " + string(after.Kind) + " " + quote(after.Name.Name) + " follows its renamed parent"}, nil
-	}
 	old, newName := qualified(before.Name), quote(after.Name.Name)
 	parent, err := parentName(after, resources)
 	switch after.Kind {
@@ -375,6 +383,9 @@ func renderAlter(before, after schema.Resource, resources map[string]schema.Reso
 		}
 		if e := validateSQLFragment(d); e != nil {
 			return nil, unsupported(after, "unsafe view definition: "+e.Error())
+		}
+		if e := validateProjectionShape(after, resources); e != nil {
+			return nil, unsupported(after, "output shape is not provable: "+e.Error())
 		}
 		return []string{"CREATE OR REPLACE VIEW " + name + " AS " + d}, nil
 	case schema.KindIndex:
@@ -569,6 +580,82 @@ func terminate(sql string) string {
 }
 func unsupported(r schema.Resource, what string) error {
 	return fmt.Errorf("%w: %s %s %s", plugin.ErrUnsupported, r.Kind, r.Name.String(), what)
+}
+func isManagedProjectionParent(id string, resources map[string]schema.Resource) bool {
+	r, ok := resources[id]
+	return ok && (r.Kind == schema.KindView || r.Kind == schema.KindMaterializedView)
+}
+func validateProjectionShape(view schema.Resource, resources map[string]schema.Resource) error {
+	var children []schema.Resource
+	for _, r := range resources {
+		if r.Kind == schema.KindColumn && r.Name.Parent == view.ID {
+			children = append(children, r)
+		}
+	}
+	if len(children) == 0 {
+		return fmt.Errorf("no canonical output columns")
+	}
+	definition := stringValue(spec(view), "definition")
+	expected := map[string]string{}
+	if match := simpleViewFrom.FindStringSubmatch(definition); match != nil {
+		if strings.TrimSpace(match[1]) == "*" {
+			return fmt.Errorf("wildcard was not canonically expanded")
+		}
+		var table schema.Resource
+		for _, r := range resources {
+			if r.Kind == schema.KindTable && r.Name.Schema+"."+r.Name.Name == match[2]+"."+match[3] {
+				table = r
+			}
+		}
+		if table.ID == "" {
+			return fmt.Errorf("source table is absent")
+		}
+		for _, item := range strings.Split(match[1], ",") {
+			name := strings.TrimSpace(item)
+			if dot := strings.LastIndex(name, "."); dot >= 0 {
+				name = name[dot+1:]
+			}
+			for _, r := range resources {
+				if r.Kind == schema.KindColumn && r.Name.Parent == table.ID && r.Name.Name == name {
+					expected[name] = stringValue(spec(r), "type")
+				}
+			}
+		}
+	} else if match := simpleLiteralView.FindStringSubmatch(definition); match != nil {
+		expr, name := strings.TrimSpace(match[1]), match[2]
+		if _, e := strconv.Atoi(expr); e == nil {
+			expected[name] = "integer"
+		} else if strings.HasSuffix(expr, "::text") && len(strings.TrimSuffix(expr, "::text")) >= 2 && strings.TrimSuffix(expr, "::text")[0] == '\'' {
+			expected[name] = "text"
+		}
+	}
+	if len(expected) != len(children) {
+		return fmt.Errorf("projection count mismatch")
+	}
+	for _, child := range children {
+		if expected[child.Name.Name] == "" || expected[child.Name.Name] != stringValue(spec(child), "type") || boolValue(spec(child), "not_null") {
+			return fmt.Errorf("projection %s mismatch", child.Name.Name)
+		}
+	}
+	return nil
+}
+func validateManagedMetadata(r schema.Resource) error {
+	if len(r.Annotations) > 0 || len(r.Extra) > 0 || len(r.Name.Extra) > 0 {
+		return unsupported(r, "annotations, comments, and extension metadata are not renderable")
+	}
+	for _, dep := range r.Dependencies {
+		if len(dep.Extra) > 0 {
+			return unsupported(r, "dependency extension metadata is not renderable")
+		}
+	}
+	for _, part := range []string{r.Name.Catalog, r.Name.Schema, r.Name.Name} {
+		for _, ch := range part {
+			if ch < ' ' || ch == 127 {
+				return unsupported(r, "identifier contains control characters")
+			}
+		}
+	}
+	return nil
 }
 func allowedKeys(values map[string]any, keys ...string) bool {
 	allowed := map[string]bool{}

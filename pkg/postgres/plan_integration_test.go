@@ -39,7 +39,7 @@ func TestSQLSourcePlanApplyReinspectConverges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fromSQL, err := source.ParseSQL("desired.sql", `CREATE TABLE autosql_plan.widgets(id bigint NOT NULL); CREATE OR REPLACE VIEW autosql_plan.widget_view AS SELECT id FROM autosql_plan.widgets;`)
+	fromSQL, err := source.ParseSQL("desired.sql", `CREATE TABLE autosql_plan.widgets(id bigint NOT NULL); CREATE OR REPLACE VIEW autosql_plan.widget_view AS SELECT * FROM autosql_plan.widgets; CREATE VIEW autosql_plan.literal_view AS SELECT 'x' AS label; CREATE MATERIALIZED VIEW autosql_plan.widget_mv AS SELECT * FROM autosql_plan.widgets; CREATE MATERIALIZED VIEW autosql_plan.literal_mv AS SELECT 1 AS answer;`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,6 +84,9 @@ func TestSQLSourcePlanApplyReinspectConverges(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, step := range p.Steps {
+		if step.Kind == plan.StepTopology {
+			continue
+		}
 		if step.Transaction != plan.TransactionRequired {
 			_ = tx.Rollback(ctx)
 			t.Fatalf("unexpected phase: %+v", step)
@@ -152,6 +155,9 @@ func TestSchemaAndTableRenameTopologyConverges(t *testing.T) {
 	}
 	applyTestPlan(t, ctx, conn, p)
 	for _, step := range p.Steps {
+		if step.Kind == plan.StepTopology && step.SQL != "" {
+			t.Fatal("topology step has SQL")
+		}
 		if strings.Contains(step.SQL, "RENAME TO \"widgets\"") {
 			t.Fatalf("invalid same-name descendant SQL: %s", step.SQL)
 		}
@@ -169,6 +175,9 @@ func TestSchemaAndTableRenameTopologyConverges(t *testing.T) {
 	}
 	applyTestPlan(t, ctx, conn, p)
 	for _, step := range p.Steps {
+		if step.Kind == plan.StepTopology && step.SQL != "" {
+			t.Fatal("topology step has SQL")
+		}
 		if strings.Contains(step.SQL, "RENAME COLUMN \"id\" TO \"id\"") {
 			t.Fatalf("invalid same-name child SQL: %s", step.SQL)
 		}
@@ -247,6 +256,9 @@ func applyTestPlan(t *testing.T, ctx context.Context, conn *pgx.Conn, p plan.Pla
 		t.Fatal(err)
 	}
 	for _, step := range p.Steps {
+		if step.Kind == plan.StepTopology {
+			continue
+		}
 		if _, err = tx.Exec(ctx, step.SQL); err != nil {
 			_ = tx.Rollback(ctx)
 			t.Fatalf("%s: %v", step.SQL, err)

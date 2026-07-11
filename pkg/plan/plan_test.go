@@ -24,8 +24,9 @@ func resource(kind schema.Kind, name schema.Name, spec string, deps ...schema.De
 func documents() (schema.Document, schema.Document) {
 	empty := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{}}}
 	s := resource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
-	view := resource(schema.KindView, schema.Name{Schema: "app", Name: "users", Parent: s.ID}, `{"definition":"SELECT 1"}`, schema.Dependency{Target: s.ID, Type: schema.DependencyContains})
-	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{view, s}}}
+	view := resource(schema.KindView, schema.Name{Schema: "app", Name: "users", Parent: s.ID}, `{"definition":"SELECT 1 AS value"}`, schema.Dependency{Target: s.ID, Type: schema.DependencyContains})
+	column := resource(schema.KindColumn, schema.Name{Schema: "app", Name: "value", Parent: view.ID}, `{"not_null":false,"type":"integer"}`, schema.Dependency{Target: view.ID, Type: schema.DependencyContains})
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{column, view, s}}}
 	return empty, desired
 }
 
@@ -102,8 +103,30 @@ func TestPlanIsInputIndependentAndGuardrailCompatible(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(bindings) != len(p.Steps) {
-		t.Fatalf("bindings=%d steps=%d", len(bindings), len(p.Steps))
+	if len(bindings) != len(p.Statements()) {
+		t.Fatalf("bindings=%d executable=%d", len(bindings), len(p.Statements()))
+	}
+	foundTopology := false
+	for _, step := range p.Steps {
+		if step.Kind == plan.StepTopology {
+			foundTopology = true
+			if step.SQL != "" {
+				t.Fatal("topology SQL is not empty")
+			}
+		}
+	}
+	if !foundTopology {
+		t.Fatal("expected projection topology step")
+	}
+	for _, statement := range p.Statements() {
+		if statement.Kind == plugin.StatementTopology || statement.SQL == "" {
+			t.Fatal("topology leaked into executable statements")
+		}
+	}
+	for _, statement := range p.SafetyStatements() {
+		if statement.SQL == "" {
+			t.Fatal("topology leaked into safety statements")
+		}
 	}
 }
 
@@ -136,14 +159,15 @@ func TestRendererDiscardsEarlierStatementsOnLaterFailure(t *testing.T) {
 
 func TestValidateRecomputesAllDerivedTopology(t *testing.T) {
 	mutations := map[string]func(*plan.Plan){
-		"planner version":   func(p *plan.Plan) { p.PlannerVersion = "9" },
-		"step id":           func(p *plan.Plan) { p.Steps[0].ID = "step:wrong" },
-		"step lock":         func(p *plan.Plan) { p.Steps[0].Lock = "mystery" },
-		"phase id":          func(p *plan.Plan) { p.Phases[0].ID = "phase:wrong" },
-		"phase coverage":    func(p *plan.Plan) { p.Phases[0].StepIDs = nil },
-		"phase transaction": func(p *plan.Plan) { p.Phases[0].Transaction = "mystery" },
-		"change coverage":   func(p *plan.Plan) { p.Steps = p.Steps[:len(p.Steps)-1] },
-		"step order":        func(p *plan.Plan) { p.Steps[0], p.Steps[1] = p.Steps[1], p.Steps[0] },
+		"planner version":        func(p *plan.Plan) { p.PlannerVersion = "9" },
+		"step id":                func(p *plan.Plan) { p.Steps[0].ID = "step:wrong" },
+		"step lock":              func(p *plan.Plan) { p.Steps[0].Lock = "mystery" },
+		"prohibited transaction": func(p *plan.Plan) { p.Steps[0].Transaction = plan.TransactionProhibited },
+		"phase id":               func(p *plan.Plan) { p.Phases[0].ID = "phase:wrong" },
+		"phase coverage":         func(p *plan.Plan) { p.Phases[0].StepIDs = nil },
+		"phase transaction":      func(p *plan.Plan) { p.Phases[0].Transaction = "mystery" },
+		"change coverage":        func(p *plan.Plan) { p.Steps = p.Steps[:len(p.Steps)-1] },
+		"step order":             func(p *plan.Plan) { p.Steps[0], p.Steps[1] = p.Steps[1], p.Steps[0] },
 	}
 	for name, mutate := range mutations {
 		t.Run(name, func(t *testing.T) {

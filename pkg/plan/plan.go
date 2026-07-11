@@ -24,10 +24,15 @@ var ErrInvalidPlan = errors.New("invalid migration plan")
 var ErrUnsupportedTransition = errors.New("unsupported schema transition")
 
 type TransactionMode string
+type StepKind string
 
 const (
 	TransactionRequired   TransactionMode = "required"
 	TransactionProhibited TransactionMode = "prohibited"
+)
+const (
+	StepExecutable StepKind = "executable"
+	StepTopology   StepKind = "topology"
 )
 
 type LockLevel string
@@ -53,6 +58,7 @@ type Step struct {
 	ID          string          `json:"id"`
 	ChangeID    string          `json:"change_id"`
 	SQL         string          `json:"sql"`
+	Kind        StepKind        `json:"kind"`
 	Transaction TransactionMode `json:"transaction"`
 	Lock        LockLevel       `json:"lock"`
 	Impact      Impact          `json:"impact"`
@@ -108,7 +114,7 @@ func Build(ctx context.Context, driver plugin.Driver, current, desired schema.Do
 		return Plan{}, fmt.Errorf("%w: %w", ErrUnsupportedTransition, err)
 	}
 	for _, statement := range statements {
-		if !statement.Transactional {
+		if statement.Kind != plugin.StatementTopology && !statement.Transactional {
 			return Plan{}, fmt.Errorf("%w: transaction-prohibited execution requires a phase-aware guarded executor", ErrUnsupportedTransition)
 		}
 	}
@@ -141,18 +147,24 @@ func (p Plan) Validate() error {
 	}
 	stepIDs := map[string]bool{}
 	for _, s := range p.Steps {
-		if s.ID == "" || strings.TrimSpace(s.SQL) == "" || !changeIDs[s.ChangeID] || stepIDs[s.ID] {
+		if s.ID == "" || !changeIDs[s.ChangeID] || stepIDs[s.ID] || s.Kind == StepExecutable && strings.TrimSpace(s.SQL) == "" || s.Kind == StepTopology && s.SQL != "" {
 			return fmt.Errorf("%w: invalid step", ErrInvalidPlan)
 		}
 		if s.Transaction != TransactionRequired && s.Transaction != TransactionProhibited {
 			return fmt.Errorf("%w: transaction mode", ErrInvalidPlan)
+		}
+		if s.Kind != StepExecutable && s.Kind != StepTopology {
+			return fmt.Errorf("%w: step kind", ErrInvalidPlan)
+		}
+		if s.Transaction == TransactionProhibited {
+			return fmt.Errorf("%w: transaction-prohibited execution is unavailable", ErrInvalidPlan)
 		}
 		if s.Lock != LockNone && s.Lock != LockShare && s.Lock != LockExclusive {
 			return fmt.Errorf("%w: lock level", ErrInvalidPlan)
 		}
 		stepIDs[s.ID] = true
 	}
-	rebuilt, err := bindSteps(p.Changes, p.Statements())
+	rebuilt, err := bindSteps(p.Changes, p.renderedStatements())
 	if err != nil || !reflect.DeepEqual(rebuilt, p.Steps) {
 		return fmt.Errorf("%w: step identity, coverage, order, or topology", ErrInvalidPlan)
 	}
@@ -195,9 +207,23 @@ func (p Plan) MarshalCanonical() ([]byte, error) {
 // Statements returns a defensive copy in the existing plugin/guardrail
 // binding shape. It does not execute the plan.
 func (p Plan) Statements() []plugin.Statement {
+	var out []plugin.Statement
+	for _, step := range p.Steps {
+		if step.Kind == StepTopology {
+			continue
+		}
+		out = append(out, plugin.Statement{SQL: step.SQL, ChangeID: step.ChangeID, Transactional: step.Transaction == TransactionRequired, Kind: plugin.StatementExecutable})
+	}
+	return out
+}
+func (p Plan) renderedStatements() []plugin.Statement {
 	out := make([]plugin.Statement, len(p.Steps))
 	for i, step := range p.Steps {
-		out[i] = plugin.Statement{SQL: step.SQL, ChangeID: step.ChangeID, Transactional: step.Transaction == TransactionRequired}
+		kind := plugin.StatementExecutable
+		if step.Kind == StepTopology {
+			kind = plugin.StatementTopology
+		}
+		out[i] = plugin.Statement{SQL: step.SQL, ChangeID: step.ChangeID, Transactional: step.Transaction == TransactionRequired, Kind: kind}
 	}
 	return out
 }
@@ -205,9 +231,12 @@ func (p Plan) Statements() []plugin.Statement {
 // SafetyStatements returns exact SQL/change bindings accepted by the existing
 // guardrail safety and statement-binding pipeline.
 func (p Plan) SafetyStatements() []safety.Statement {
-	out := make([]safety.Statement, len(p.Steps))
-	for i, step := range p.Steps {
-		out[i] = safety.Statement{SQL: step.SQL, ChangeID: step.ChangeID}
+	var out []safety.Statement
+	for _, step := range p.Steps {
+		if step.Kind == StepTopology {
+			continue
+		}
+		out = append(out, safety.Statement{SQL: step.SQL, ChangeID: step.ChangeID})
 	}
 	return out
 }
@@ -225,14 +254,18 @@ func bindSteps(changes schema.ChangeSet, statements []plugin.Statement) ([]Step,
 	steps := make([]Step, 0, len(statements))
 	for idx, statement := range statements {
 		change, ok := byChange[statement.ChangeID]
-		if !ok || strings.TrimSpace(statement.SQL) == "" {
+		kind := StepExecutable
+		if statement.Kind == plugin.StatementTopology {
+			kind = StepTopology
+		}
+		if !ok || kind == StepExecutable && strings.TrimSpace(statement.SQL) == "" || kind == StepTopology && statement.SQL != "" {
 			return nil, fmt.Errorf("%w: unbound renderer statement", ErrInvalidPlan)
 		}
 		mode := TransactionRequired
 		if !statement.Transactional {
 			mode = TransactionProhibited
 		}
-		id := stableID("step", statement.ChangeID, fmt.Sprint(idx), statement.SQL, string(mode))
+		id := stableID("step", statement.ChangeID, fmt.Sprint(idx), string(kind), statement.SQL, string(mode))
 		deps := []string{}
 		for _, dep := range change.DependsOn {
 			step := lastByChange[dep]
@@ -245,7 +278,12 @@ func bindSteps(changes schema.ChangeSet, statements []plugin.Statement) ([]Step,
 			deps = append(deps, previous)
 		}
 		sort.Strings(deps)
-		steps = append(steps, Step{ID: id, ChangeID: change.ID, SQL: statement.SQL, Transaction: mode, Lock: lockFor(change, statement.SQL), Impact: impactFor(change, statement.SQL), DependsOn: deps})
+		lock, impact := lockFor(change, statement.SQL), impactFor(change, statement.SQL)
+		if kind == StepTopology {
+			lock = LockNone
+			impact = Impact{}
+		}
+		steps = append(steps, Step{ID: id, ChangeID: change.ID, SQL: statement.SQL, Kind: kind, Transaction: mode, Lock: lock, Impact: impact, DependsOn: deps})
 		lastByChange[change.ID] = id
 		seenChange[change.ID] = true
 	}
@@ -308,6 +346,9 @@ func impactFor(c schema.Change, sql string) Impact {
 					impact.Scans = true
 				}
 			}
+		}
+		if r.Kind == schema.KindMaterializedView && (c.Operation == schema.OperationCreate || c.Operation == schema.OperationAlter) {
+			impact.Scans = true
 		}
 		switch r.Kind {
 		case schema.KindPrimaryKey, schema.KindUniqueConstraint, schema.KindCheckConstraint, schema.KindForeignKey:
