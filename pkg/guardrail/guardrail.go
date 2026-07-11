@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -135,20 +136,23 @@ type enforcementBundle struct {
 	Requester          string               `json:"requester"`
 	PolicyIdentity     string               `json:"policy_identity"`
 	Policy             policy.Document      `json:"policy"`
+	PolicyLimits       policy.Limits        `json:"policy_limits"`
 	SchemaResources    []policy.Resource    `json:"schema_resources"`
 	MigrationResources []policy.Resource    `json:"migration_resources"`
 	FailOn             safety.Severity      `json:"fail_on"`
 	Risk               RiskConfig           `json:"risk"`
 	Target             safety.Target        `json:"target"`
 	Thresholds         safety.Thresholds    `json:"thresholds"`
-	Analyzers          []string             `json:"analyzers"`
+	Analyzers          []analyzerIdentity   `json:"analyzers"`
 	Suppressions       []safety.Suppression `json:"suppressions"`
+	ApprovalPolicy     approval.Policy      `json:"approval_policy"`
 	Statements         []StatementBinding   `json:"statements"`
 }
+type analyzerIdentity struct{ Name, Concrete, Version, ConfigDigest string }
 
 // BundleDigest returns the one digest that approval.Plan.Digest must equal.
 func (g Guardrail) BundleDigest(in Input) (string, error) {
-	if err := validateConfig(g.Config); err != nil {
+	if err := validateProduction(g, in); err != nil {
 		return "", err
 	}
 	if strings.TrimSpace(in.PolicyIdentity) == "" {
@@ -165,7 +169,7 @@ func (g Guardrail) BundleDigest(in Input) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	bundle := enforcementBundle{Version: "autosql.guardrail.bundle/v1", ChangeDigest: changeDigest, PrecheckDigest: in.Precheck.Digest, Environment: g.Config.Environment, Author: in.Approval.Plan.Author, Requester: in.Approval.RequestedBy, PolicyIdentity: in.PolicyIdentity, Policy: in.Policy, SchemaResources: in.SchemaResources, MigrationResources: in.MigrationResources, FailOn: g.Config.FailOn, Risk: g.Config.Risk, Target: in.Safety.Target, Thresholds: in.Safety.Thresholds, Analyzers: names, Suppressions: g.Safety.Suppressions, Statements: in.StatementBindings}
+	bundle := enforcementBundle{Version: "autosql.guardrail.bundle/v1", ChangeDigest: changeDigest, PrecheckDigest: in.Precheck.Digest, Environment: g.Config.Environment, Author: in.Approval.Plan.Author, Requester: in.Approval.RequestedBy, PolicyIdentity: in.PolicyIdentity, Policy: in.Policy, PolicyLimits: g.Policy.Limits, SchemaResources: in.SchemaResources, MigrationResources: in.MigrationResources, FailOn: g.Config.FailOn, Risk: g.Config.Risk, Target: in.Safety.Target, Thresholds: in.Safety.Thresholds, Analyzers: names, Suppressions: g.Safety.Suppressions, ApprovalPolicy: g.Approval.Policy, Statements: in.StatementBindings}
 	raw, err := json.Marshal(bundle)
 	if err != nil {
 		return "", fmt.Errorf("%w: bundle is not canonical JSON", ErrBinding)
@@ -176,11 +180,11 @@ func (g Guardrail) BundleDigest(in Input) (string, error) {
 	return "sha256:" + hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func analyzerIdentities(analyzers []safety.Analyzer) ([]string, error) {
+func analyzerIdentities(analyzers []safety.Analyzer) ([]analyzerIdentity, error) {
 	if len(analyzers) == 0 {
 		return nil, fmt.Errorf("%w: at least one analyzer is required", ErrConfig)
 	}
-	names := make([]string, 0, len(analyzers))
+	identities := make([]analyzerIdentity, 0, len(analyzers))
 	seen := map[string]bool{}
 	for _, analyzer := range analyzers {
 		if analyzer == nil {
@@ -195,10 +199,48 @@ func analyzerIdentities(analyzers []safety.Analyzer) ([]string, error) {
 			return nil, fmt.Errorf("%w: duplicate analyzer identity", ErrConfig)
 		}
 		seen[first] = true
-		names = append(names, first)
+		attested, ok := analyzer.(safety.AttestedAnalyzer)
+		if !ok {
+			return nil, fmt.Errorf("%w: analyzer lacks production attestation", ErrConfig)
+		}
+		t := reflect.TypeOf(analyzer)
+		for t.Kind() == reflect.Pointer {
+			t = t.Elem()
+		}
+		if t.PkgPath() == "" || t.Name() == "" {
+			return nil, fmt.Errorf("%w: analyzer concrete identity is unavailable", ErrConfig)
+		}
+		concrete := t.PkgPath() + "." + t.Name()
+		att := attested.Attestation()
+		computedConfig, configErr := safety.ConfigDigest(analyzer)
+		if configErr != nil || att.Implementation != concrete || strings.TrimSpace(att.Version) == "" || !validSHA256(att.ConfigDigest) || att.ConfigDigest != computedConfig {
+			return nil, fmt.Errorf("%w: analyzer attestation is invalid", ErrConfig)
+		}
+		identities = append(identities, analyzerIdentity{Name: first, Concrete: concrete, Version: att.Version, ConfigDigest: att.ConfigDigest})
 	}
-	sort.Strings(names)
-	return names, nil
+	sort.Slice(identities, func(i, j int) bool { return identities[i].Name < identities[j].Name })
+	return identities, nil
+}
+
+func validSHA256(value string) bool {
+	if !strings.HasPrefix(value, "sha256:") || len(value) != 71 {
+		return false
+	}
+	_, err := hex.DecodeString(strings.TrimPrefix(value, "sha256:"))
+	return err == nil
+}
+
+func validateProduction(g Guardrail, in Input) error {
+	if err := validateConfig(g.Config); err != nil {
+		return err
+	}
+	if len(in.Policy.Rules) == 0 {
+		return fmt.Errorf("%w: policy must contain at least one rule", ErrConfig)
+	}
+	if g.Safety.Now != nil || g.Policy.Now != nil || g.Approval.Now != nil {
+		return fmt.Errorf("%w: injectable clocks are not allowed in production", ErrConfig)
+	}
+	return nil
 }
 
 // BuildStatementBindings canonically attributes every safety statement.

@@ -20,6 +20,39 @@ type eventLog struct{ values []string }
 
 func (l *eventLog) add(v string) { l.values = append(l.values, v) }
 
+var currentAnalyzerLog *eventLog
+
+type testAnalyzer struct {
+	Mode    string
+	Finding *safety.Diagnostic
+}
+
+func (a *testAnalyzer) Name() string { return "order" }
+func (a *testAnalyzer) Analyze(context.Context, safety.Input) ([]safety.Diagnostic, error) {
+	if currentAnalyzerLog != nil {
+		currentAnalyzerLog.add("analyze")
+	}
+	if a.Finding != nil {
+		return []safety.Diagnostic{*a.Finding}, nil
+	}
+	return nil, nil
+}
+func (a *testAnalyzer) Attestation() safety.AnalyzerAttestation {
+	digest, _ := safety.ConfigDigest(a)
+	return safety.AnalyzerAttestation{Implementation: "autosql/pkg/guardrail.testAnalyzer", Version: "1", ConfigDigest: digest}
+}
+
+type noopAnalyzer struct{}
+
+func (*noopAnalyzer) Name() string { return "order" }
+func (*noopAnalyzer) Analyze(context.Context, safety.Input) ([]safety.Diagnostic, error) {
+	return nil, nil
+}
+func (a *noopAnalyzer) Attestation() safety.AnalyzerAttestation {
+	digest, _ := safety.ConfigDigest(a)
+	return safety.AnalyzerAttestation{Implementation: "autosql/pkg/guardrail.noopAnalyzer", Version: "1", ConfigDigest: digest}
+}
+
 type authority struct {
 	log  *eventLog
 	seen bool
@@ -118,7 +151,7 @@ func boundInput(t *testing.T, g Guardrail, environment string) (Input, string) {
 	}
 	p.Assertions[0].PlanDigest = p.Digest
 	req := approval.Request{Plan: approval.Plan{Environment: environment, Author: "author", Risk: approval.RiskCritical}, RequestedBy: "deployer"}
-	in := Input{Changes: changes, Safety: safety.Input{Statements: []safety.Statement{{ChangeID: "create-widgets", SQL: p.Statements[0]}}}, Policy: policy.Document{Version: policy.LanguageVersion}, PolicyIdentity: "policy/main@v1", Precheck: p, Approval: req}
+	in := Input{Changes: changes, Safety: safety.Input{Statements: []safety.Statement{{ChangeID: "create-widgets", SQL: p.Statements[0]}}}, Policy: allowPolicy(), PolicyIdentity: "policy/main@v1", Precheck: p, Approval: req}
 	in.StatementBindings, err = BuildStatementBindings(changes, in.Safety.Statements)
 	if err != nil {
 		t.Fatal(err)
@@ -132,18 +165,12 @@ func boundInput(t *testing.T, g Guardrail, environment string) (Input, string) {
 
 func harness(t *testing.T, log *eventLog) (Guardrail, *database, *audit) {
 	t.Helper()
-	analyzer := safety.AnalyzerFunc{ID: "order", Fn: func(context.Context, safety.Input) ([]safety.Diagnostic, error) { log.add("analyze"); return nil, nil }}
-	policySeen := false
-	ev := policy.Evaluator{Now: func() time.Time {
-		if !policySeen {
-			log.add("policy")
-			policySeen = true
-		}
-		return time.Unix(100, 0)
-	}}
+	currentAnalyzerLog = log
+	analyzer := &testAnalyzer{Mode: "safe"}
+	ev := policy.Evaluator{}
 	a := &audit{log: log}
 	authority := &authority{log: log}
-	gate := approval.Gate{Now: func() time.Time { return time.Unix(100, 0) }, Audit: a, Authority: authority, Policy: approval.Policy{Environments: map[string]approval.EnvironmentPolicy{"prod": {Allowed: true}}}}
+	gate := approval.Gate{Audit: a, Authority: authority, Policy: approval.Policy{Environments: map[string]approval.EnvironmentPolicy{"prod": {Allowed: true, Requirements: []approval.Requirement{{MinimumRisk: approval.RiskCritical, ApproverCount: 0, Roles: []string{"dba"}}}}}}}
 	db := &database{log: log}
 	return Guardrail{Config: Config{Environment: "prod", FailOn: safety.SeverityError, Risk: RiskConfig{Baseline: approval.RiskLow}}, Safety: safety.Runner{Analyzers: []safety.Analyzer{analyzer}}, Policy: ev, Approval: gate}, db, a
 }
@@ -157,7 +184,7 @@ func TestSuccessfulProductionOrderAndDerivedRisk(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"analyze", "policy", "approval", "audit", "begin", "lock", "check", "statement", "commit"}
+	want := []string{"analyze", "approval", "audit", "begin", "lock", "check", "statement", "commit"}
 	if fmt.Sprint(log.values) != fmt.Sprint(want) {
 		t.Fatalf("events=%v want=%v", log.values, want)
 	}
@@ -202,6 +229,30 @@ func TestEveryStaticFailurePreventsDatabaseWork(t *testing.T) {
 		"risk mapping": {func(g *Guardrail, _ *Input, _ *audit) {
 			g.Config.Risk.BySeverity = map[safety.Severity]approval.Risk{safety.SeverityWarning: approval.RiskHigh}
 		}, ErrBinding},
+		"policy limits": {func(g *Guardrail, _ *Input, _ *audit) { g.Policy.Limits.MaxSteps = 99 }, ErrBinding},
+		"approval allowed": {func(g *Guardrail, _ *Input, _ *audit) {
+			ep := g.Approval.Policy.Environments["prod"]
+			ep.Allowed = false
+			g.Approval.Policy.Environments["prod"] = ep
+		}, ErrBinding},
+		"approval minimum risk": {func(g *Guardrail, _ *Input, _ *audit) {
+			ep := g.Approval.Policy.Environments["prod"]
+			ep.Requirements[0].MinimumRisk = approval.RiskHigh
+			g.Approval.Policy.Environments["prod"] = ep
+		}, ErrBinding},
+		"approval count": {func(g *Guardrail, _ *Input, _ *audit) {
+			ep := g.Approval.Policy.Environments["prod"]
+			ep.Requirements[0].ApproverCount = 1
+			g.Approval.Policy.Environments["prod"] = ep
+		}, ErrBinding},
+		"approval roles": {func(g *Guardrail, _ *Input, _ *audit) {
+			ep := g.Approval.Policy.Environments["prod"]
+			ep.Requirements[0].Roles = []string{"security"}
+			g.Approval.Policy.Environments["prod"] = ep
+		}, ErrBinding},
+		"approval environments": {func(g *Guardrail, _ *Input, _ *audit) {
+			g.Approval.Policy.Environments["stage"] = approval.EnvironmentPolicy{Allowed: true}
+		}, ErrBinding},
 		"target engine":  {func(_ *Guardrail, in *Input, _ *audit) { in.Safety.Target.Engine = "postgresql" }, ErrBinding},
 		"target version": {func(_ *Guardrail, in *Input, _ *audit) { in.Safety.Target.Version = 15 }, ErrBinding},
 		"target statistics": {func(_ *Guardrail, in *Input, _ *audit) {
@@ -211,11 +262,15 @@ func TestEveryStaticFailurePreventsDatabaseWork(t *testing.T) {
 		"threshold rows":    {func(_ *Guardrail, in *Input, _ *audit) { in.Safety.Thresholds.MaxRowsScanned = 10 }, ErrBinding},
 		"threshold rewrite": {func(_ *Guardrail, in *Input, _ *audit) { in.Safety.Thresholds.MaxRewriteBytes = 10 }, ErrBinding},
 		"analyzers": {func(g *Guardrail, _ *Input, _ *audit) {
-			g.Safety.Analyzers[0] = safety.AnalyzerFunc{ID: "other", Fn: func(context.Context, safety.Input) ([]safety.Diagnostic, error) { return nil, nil }}
+			g.Safety.Analyzers[0] = &noopAnalyzer{}
 		}, ErrBinding},
+		"analyzer config": {func(g *Guardrail, _ *Input, _ *audit) { g.Safety.Analyzers[0].(*testAnalyzer).Mode = "changed" }, ErrBinding},
 		"suppressions": {func(g *Guardrail, _ *Input, _ *audit) {
 			g.Safety.Suppressions = []safety.Suppression{{Rule: "TEST", ObjectID: "object", Reason: "changed"}}
 		}, ErrBinding},
+		"safety clock":   {func(g *Guardrail, _ *Input, _ *audit) { g.Safety.Now = time.Now }, ErrConfig},
+		"policy clock":   {func(g *Guardrail, _ *Input, _ *audit) { g.Policy.Now = time.Now }, ErrConfig},
+		"approval clock": {func(g *Guardrail, _ *Input, _ *audit) { g.Approval.Now = time.Now }, ErrConfig},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -314,11 +369,12 @@ func TestApprovalAndAuditFailuresPrecedeDatabase(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			log := &eventLog{}
 			g, db, a := harness(t, log)
-			in, _ := boundInput(t, g, "prod")
-			in.Database = db
 			if name == "approval" {
 				g.Approval.Policy.Environments["prod"] = approval.EnvironmentPolicy{Allowed: true, Requirements: []approval.Requirement{{MinimumRisk: approval.RiskLow, ApproverCount: 1, Roles: []string{"dba"}}}}
-			} else {
+			}
+			in, _ := boundInput(t, g, "prod")
+			in.Database = db
+			if name == "audit" {
 				a.fail = true
 			}
 			_, err := g.Apply(context.Background(), in)
@@ -357,7 +413,7 @@ func (a *unstableAnalyzer) Analyze(context.Context, safety.Input) ([]safety.Diag
 }
 
 func TestBundleRejectsMissingOrUnstableIdentities(t *testing.T) {
-	for _, name := range []string{"no analyzers", "empty policy", "empty author", "empty requester", "duplicate analyzers", "unstable analyzer"} {
+	for _, name := range []string{"no analyzers", "empty policy identity", "zero policy rules", "empty author", "empty requester", "duplicate analyzers", "unstable analyzer", "closure analyzer"} {
 		t.Run(name, func(t *testing.T) {
 			log := &eventLog{}
 			g, db, _ := harness(t, log)
@@ -366,8 +422,10 @@ func TestBundleRejectsMissingOrUnstableIdentities(t *testing.T) {
 			switch name {
 			case "no analyzers":
 				g.Safety.Analyzers = nil
-			case "empty policy":
+			case "empty policy identity":
 				in.PolicyIdentity = ""
+			case "zero policy rules":
+				in.Policy.Rules = nil
 			case "empty author":
 				in.Approval.Plan.Author = ""
 			case "empty requester":
@@ -376,10 +434,15 @@ func TestBundleRejectsMissingOrUnstableIdentities(t *testing.T) {
 				g.Safety.Analyzers = append(g.Safety.Analyzers, g.Safety.Analyzers[0])
 			case "unstable analyzer":
 				g.Safety.Analyzers = []safety.Analyzer{&unstableAnalyzer{}}
+			case "closure analyzer":
+				g.Safety.Analyzers = []safety.Analyzer{safety.AnalyzerFunc{ID: "closure", Fn: func(context.Context, safety.Input) ([]safety.Diagnostic, error) { return nil, nil }}}
 			}
 			_, err := g.Apply(context.Background(), in)
 			if !errors.Is(err, ErrConfig) || db.tx != nil {
 				t.Fatalf("error=%v", err)
+			}
+			if name == "zero policy rules" && len(log.values) != 0 {
+				t.Fatalf("empty policy reached enforcement: %v", log.values)
 			}
 		})
 	}
@@ -411,7 +474,7 @@ func TestFailedLiveCheckAuditedButNeverMutates(t *testing.T) {
 	if !errors.Is(err, ErrPrecheck) || db.tx == nil || db.tx.execs != 0 {
 		t.Fatalf("result=%+v err=%v execs=%v", result, err, db.tx)
 	}
-	want := []string{"analyze", "policy", "approval", "audit", "begin", "lock", "check", "rollback"}
+	want := []string{"analyze", "approval", "audit", "begin", "lock", "check", "rollback"}
 	if fmt.Sprint(log.values) != fmt.Sprint(want) {
 		t.Fatalf("events=%v", log.values)
 	}
@@ -437,10 +500,7 @@ func TestSuppressedDiagnosticDoesNotBlockButStillRaisesRisk(t *testing.T) {
 	log := &eventLog{}
 	g, db, _ := harness(t, log)
 	d := diagnostic(safety.SeverityError)
-	g.Safety = safety.Runner{Analyzers: []safety.Analyzer{safety.AnalyzerFunc{ID: "suppressed", Fn: func(context.Context, safety.Input) ([]safety.Diagnostic, error) {
-		log.add("analyze")
-		return []safety.Diagnostic{d}, nil
-	}}}, Suppressions: []safety.Suppression{{Rule: d.Rule, ObjectID: d.Object.ID, Reason: "approved test"}}}
+	g.Safety = safety.Runner{Analyzers: []safety.Analyzer{&testAnalyzer{Mode: "suppressed", Finding: &d}}, Suppressions: []safety.Suppression{{Rule: d.Rule, ObjectID: d.Object.ID, Reason: "approved test"}}}
 	in, _ := boundInput(t, g, "prod")
 	in.Database = db
 	result, err := g.Apply(context.Background(), in)
@@ -456,14 +516,11 @@ func TestDerivedWarningRiskDrivesApprovalRequirement(t *testing.T) {
 	log := &eventLog{}
 	g, db, _ := harness(t, log)
 	d := diagnostic(safety.SeverityWarning)
-	g.Safety = safety.Runner{Analyzers: []safety.Analyzer{safety.AnalyzerFunc{ID: "warning", Fn: func(context.Context, safety.Input) ([]safety.Diagnostic, error) {
-		log.add("analyze")
-		return []safety.Diagnostic{d}, nil
-	}}}}
+	g.Safety = safety.Runner{Analyzers: []safety.Analyzer{&testAnalyzer{Mode: "warning", Finding: &d}}}
 	g.Approval.Policy.Environments["prod"] = approval.EnvironmentPolicy{Allowed: true, Requirements: []approval.Requirement{{MinimumRisk: approval.RiskMedium, ApproverCount: 1, Roles: []string{"dba"}}}}
 	in, digest := boundInput(t, g, "prod")
 	in.Database = db
-	now := time.Unix(100, 0)
+	now := time.Now().UTC()
 	in.Approval.Plan.Risk = approval.RiskLow
 	in.Approval.Approvals = []approval.Approval{{PlanDigest: digest, Environment: "prod", Approver: "dba", ApprovedAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour), Proof: "signed"}}
 	result, err := g.Apply(context.Background(), in)
@@ -483,9 +540,7 @@ func TestErrorsAndResultsDoNotExposeSQLOrArguments(t *testing.T) {
 	d := diagnostic(safety.SeverityWarning)
 	d.Message = "password=" + secret
 	d.Properties = map[string]any{"token": secret}
-	g.Safety = safety.Runner{Analyzers: []safety.Analyzer{safety.AnalyzerFunc{ID: "secret-diagnostic", Fn: func(context.Context, safety.Input) ([]safety.Diagnostic, error) {
-		return []safety.Diagnostic{d}, nil
-	}}}}
+	g.Safety = safety.Runner{Analyzers: []safety.Analyzer{&testAnalyzer{Mode: "secret", Finding: &d}}}
 	in.Precheck.Statements[0] = "SELECT '" + secret + "'"
 	in.Safety.Statements[0].SQL = in.Precheck.Statements[0]
 	in.Precheck.Assertions[0].Args = []any{secret}
@@ -541,6 +596,9 @@ func rebind(t *testing.T, g Guardrail, in *Input) {
 }
 func denyingPolicy() policy.Document {
 	return policy.Document{Version: policy.LanguageVersion, Rules: []policy.Rule{{Name: "owner", Target: "schema", Kinds: []string{"table"}, Assert: policy.Expression{Eq: []any{"resource.owner", "required"}}, Message: "wrong owner", Severity: "error"}}}
+}
+func allowPolicy() policy.Document {
+	return policy.Document{Version: policy.LanguageVersion, Rules: []policy.Rule{{Name: "allow", Target: "all", Assert: policy.Expression{Eq: []any{true, true}}, Message: "must pass"}}}
 }
 
 func TestDigestIsCanonicalAndEnvironmentBound(t *testing.T) {

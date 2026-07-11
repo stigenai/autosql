@@ -23,9 +23,17 @@ The caller first binds the artifacts:
 The bundle digest is domain-separated and binds the exact changes, precheck
 plan, environment, author, requester, policy identity/document/resources,
 safety threshold and risk mapping, target metadata and thresholds, sorted
-analyzer identities, exact suppressions, and canonical statement bindings.
+analyzer attestations, exact suppressions, policy evaluator limits, the complete
+approval environment policy, and canonical statement bindings.
 `Guardrail.Apply` recomputes it and rejects any mismatch before analysis, audit,
-or database work. Analyzer identities must be non-empty, unique, and stable.
+or database work. Analyzer identities must be non-empty, unique, stable,
+concrete package/type identities with a versioned configuration attestation.
+Closures and `safety.AnalyzerFunc` are development-only and rejected. The policy
+must have a stable identity and at least one rule.
+
+Production uses the system clock. Non-nil `Safety.Now`, `Policy.Now`, or
+`Approval.Now` hooks are rejected so time behavior cannot be changed after an
+approval was issued.
 
 On a valid request, apply proceeds in this order:
 

@@ -7,6 +7,8 @@ package safety
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -119,6 +121,32 @@ type Input struct {
 type Analyzer interface {
 	Name() string
 	Analyze(context.Context, Input) ([]Diagnostic, error)
+}
+
+// AnalyzerAttestation is a production identity for an analyzer implementation.
+// Implementation is its concrete package/type identity, Version changes with
+// semantics, and ConfigDigest covers its complete semantic configuration.
+type AnalyzerAttestation struct {
+	Implementation string `json:"implementation"`
+	Version        string `json:"version"`
+	ConfigDigest   string `json:"config_digest"`
+}
+
+type AttestedAnalyzer interface {
+	Analyzer
+	Attestation() AnalyzerAttestation
+}
+
+// ConfigDigest returns a domain-separated digest for canonical JSON config.
+func ConfigDigest(config any) (string, error) {
+	raw, err := json.Marshal(config)
+	if err != nil {
+		return "", err
+	}
+	h := sha256.New()
+	_, _ = h.Write([]byte("autosql.safety.analyzer-config/v1\x00"))
+	_, _ = h.Write(raw)
+	return "sha256:" + hex.EncodeToString(h.Sum(nil)), nil
 }
 
 type AnalyzerFunc struct {

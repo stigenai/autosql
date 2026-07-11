@@ -32,6 +32,10 @@ func Builtins() []Analyzer { return []Analyzer{CompatibilityAnalyzer{}, PostgreS
 type CompatibilityAnalyzer struct{}
 
 func (CompatibilityAnalyzer) Name() string { return "compatibility" }
+func (a CompatibilityAnalyzer) Attestation() AnalyzerAttestation {
+	digest, _ := ConfigDigest(a)
+	return AnalyzerAttestation{Implementation: "autosql/pkg/safety.CompatibilityAnalyzer", Version: "1", ConfigDigest: digest}
+}
 func (CompatibilityAnalyzer) Analyze(_ context.Context, in Input) ([]Diagnostic, error) {
 	var out []Diagnostic
 	for _, ch := range in.Changes.Changes {
@@ -93,6 +97,10 @@ func (CompatibilityAnalyzer) Analyze(_ context.Context, in Input) ([]Diagnostic,
 type PostgreSQLAnalyzer struct{}
 
 func (PostgreSQLAnalyzer) Name() string { return "postgresql-operational" }
+func (a PostgreSQLAnalyzer) Attestation() AnalyzerAttestation {
+	digest, _ := ConfigDigest(a)
+	return AnalyzerAttestation{Implementation: "autosql/pkg/safety.PostgreSQLAnalyzer", Version: "1", ConfigDigest: digest}
+}
 func (PostgreSQLAnalyzer) Analyze(_ context.Context, in Input) ([]Diagnostic, error) {
 	if in.Target.Engine != "" && !strings.EqualFold(in.Target.Engine, "postgresql") && !strings.EqualFold(in.Target.Engine, "postgres") {
 		return nil, nil
