@@ -3,9 +3,8 @@
 AutoSQL represents inspected databases as canonical `schema.Document` graphs.
 Before comparison, callers normalize each document with its database driver.
 PostgreSQL normalization canonicalizes established type aliases, stable default
-expressions, conventional generated names, and known SQL definition fields. It
-does not recursively rewrite unknown extension data, so newer semantics survive
-older clients.
+expressions, and known SQL definition fields. It does not recursively rewrite
+unknown extension data, so newer semantics survive older clients.
 
 `schema.Diff(current, desired, options)` returns a deterministic `ChangeSet`.
 Creates follow dependency order and drops reverse it, so children are removed
