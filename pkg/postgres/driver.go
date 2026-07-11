@@ -3,6 +3,7 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -68,11 +69,159 @@ func (d *Driver) Inspect(ctx context.Context, req plugin.InspectRequest) (schema
 }
 
 func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Document, error) {
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
+	}
+	for idx := range doc.Graph.Resources {
+		r := &doc.Graph.Resources[idx]
+		var spec map[string]any
+		if len(r.Spec) > 0 && json.Unmarshal(r.Spec, &spec) == nil {
+			normalizePostgresSpec(spec)
+			normalized, e := json.Marshal(spec)
+			if e != nil {
+				return schema.Document{}, e
+			}
+			r.Spec = normalized
+		}
+		if postgresGeneratedName(*r) {
+			if r.Annotations == nil {
+				r.Annotations = map[string]string{}
+			}
+			r.Annotations["autosql.io/generated-name"] = "true"
+		}
+	}
 	doc.Normalize()
 	if err := doc.Validate(); err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
 	return doc, nil
+}
+
+func normalizePostgresSpec(spec map[string]any) {
+	for _, key := range []string{"type", "base_type"} {
+		if value, ok := spec[key].(string); ok {
+			spec[key] = postgresTypeAlias(value)
+		}
+	}
+	if value, ok := spec["default"].(string); ok {
+		spec["default"] = postgresDefault(value)
+	}
+	if value, ok := spec["definition"].(string); ok {
+		spec["definition"] = normalizeSQLSpace(value)
+	}
+	// Composite attributes are an established PostgreSQL spec shape. Do not
+	// recurse through arbitrary unknown objects: their semantics are opaque.
+	if attributes, ok := spec["attributes"].([]any); ok {
+		for _, attribute := range attributes {
+			if object, ok := attribute.(map[string]any); ok {
+				if value, ok := object["type"].(string); ok {
+					object["type"] = postgresTypeAlias(value)
+				}
+				if value, ok := object["default"].(string); ok {
+					object["default"] = postgresDefault(value)
+				}
+			}
+		}
+	}
+}
+func postgresTypeAlias(value string) string {
+	s := strings.ToLower(strings.TrimSpace(value))
+	s = strings.TrimPrefix(s, "pg_catalog.")
+	aliases := map[string]string{"int2": "smallint", "int4": "integer", "int8": "bigint", "float4": "real", "float8": "double precision", "bool": "boolean", "varchar": "character varying", "timestamp without time zone": "timestamp", "timestamp with time zone": "timestamptz"}
+	if v, ok := aliases[s]; ok {
+		return v
+	}
+	return s
+}
+func postgresDefault(value string) string {
+	s := normalizeSQLSpace(value)
+	for strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")") && balancedOuter(s) {
+		s = strings.TrimSpace(s[1 : len(s)-1])
+	}
+	lower := strings.ToLower(s)
+	if lower == "now()" || lower == "transaction_timestamp()" {
+		return "CURRENT_TIMESTAMP"
+	}
+	for _, cast := range []string{"::character varying", "::varchar", "::text", "::integer", "::bigint", "::boolean"} {
+		if strings.HasSuffix(strings.ToLower(s), cast) {
+			base := strings.TrimSpace(s[:len(s)-len(cast)])
+			if strings.HasPrefix(base, "'") || base == "true" || base == "false" || base == "NULL" || base == "null" {
+				return base
+			}
+		}
+	}
+	return s
+}
+func balancedOuter(s string) bool {
+	depth := 0
+	quoted := false
+	for i, r := range s {
+		if r == '\'' {
+			quoted = !quoted
+		}
+		if quoted {
+			continue
+		}
+		if r == '(' {
+			depth++
+		}
+		if r == ')' {
+			depth--
+			if depth == 0 && i < len(s)-1 {
+				return false
+			}
+		}
+	}
+	return depth == 0
+}
+func normalizeSQLSpace(s string) string {
+	var out strings.Builder
+	space := false
+	quote := rune(0)
+	for _, r := range strings.TrimSpace(s) {
+		if quote != 0 {
+			out.WriteRune(r)
+			if r == quote {
+				quote = 0
+			}
+			continue
+		}
+		if r == '\'' || r == '"' {
+			if space && out.Len() > 0 {
+				out.WriteByte(' ')
+			}
+			space = false
+			quote = r
+			out.WriteRune(r)
+			continue
+		}
+		if r == ' ' || r == '\n' || r == '\t' || r == '\r' {
+			space = true
+			continue
+		}
+		if space && out.Len() > 0 {
+			out.WriteByte(' ')
+		}
+		space = false
+		out.WriteRune(r)
+	}
+	return out.String()
+}
+func postgresGeneratedName(r schema.Resource) bool {
+	if r.Annotations["autosql.io/name-origin"] == "generated" {
+		return true
+	}
+	suffix := map[schema.Kind][]string{schema.KindPrimaryKey: {"_pkey"}, schema.KindUniqueConstraint: {"_key"}, schema.KindForeignKey: {"_fkey"}, schema.KindCheckConstraint: {"_check"}, schema.KindIndex: {"_idx"}}[r.Kind]
+	for _, s := range suffix {
+		if strings.HasSuffix(r.Name.Name, s) {
+			return true
+		}
+	}
+	return false
 }
 
 func (*Driver) Render(context.Context, plugin.RenderRequest) ([]plugin.Statement, error) {
