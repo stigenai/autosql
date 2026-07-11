@@ -11,9 +11,9 @@ import (
 	"fmt"
 	"io"
 	"math/big"
-	"reflect"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -81,16 +81,26 @@ type Violation struct {
 }
 
 type Limits struct {
-	MaxSteps        int
-	MaxResources    int
-	MaxPatternBytes int
-	MaxTextBytes    int
-	Timeout         time.Duration
+	MaxSteps           int
+	MaxResources       int
+	MaxPatternBytes    int
+	MaxTextBytes       int
+	MaxValueDepth      int
+	MaxValueItems      int
+	MaxValueBytes      int
+	MaxNumericDigits   int
+	MaxNumericExponent int
+	Timeout            time.Duration
 }
 
 const (
-	defaultMaxPatternBytes = 4096
-	defaultMaxTextBytes    = 1 << 20
+	defaultMaxPatternBytes    = 4096
+	defaultMaxTextBytes       = 1 << 20
+	defaultMaxValueDepth      = 32
+	defaultMaxValueItems      = 10000
+	defaultMaxValueBytes      = 1 << 20
+	defaultMaxNumericDigits   = 1024
+	defaultMaxNumericExponent = 1024
 )
 
 type Evaluator struct {
@@ -99,6 +109,7 @@ type Evaluator struct {
 }
 
 var ErrLimitExceeded = errors.New("policy evaluation limit exceeded")
+var ErrUnsupportedValue = errors.New("unsupported policy value")
 
 func Parse(data []byte) (*Document, error) {
 	var doc Document
@@ -384,6 +395,21 @@ func (ev Evaluator) Evaluate(ctx context.Context, doc Document, schema, migratio
 	if lim.MaxTextBytes <= 0 {
 		lim.MaxTextBytes = defaultMaxTextBytes
 	}
+	if lim.MaxValueDepth <= 0 {
+		lim.MaxValueDepth = defaultMaxValueDepth
+	}
+	if lim.MaxValueItems <= 0 {
+		lim.MaxValueItems = defaultMaxValueItems
+	}
+	if lim.MaxValueBytes <= 0 {
+		lim.MaxValueBytes = defaultMaxValueBytes
+	}
+	if lim.MaxNumericDigits <= 0 {
+		lim.MaxNumericDigits = defaultMaxNumericDigits
+	}
+	if lim.MaxNumericExponent <= 0 {
+		lim.MaxNumericExponent = defaultMaxNumericExponent
+	}
 	if lim.Timeout <= 0 {
 		lim.Timeout = 5 * time.Second
 	}
@@ -450,11 +476,13 @@ func (ev Evaluator) Evaluate(ctx context.Context, doc Document, schema, migratio
 }
 
 type meter struct {
-	ctx   context.Context
-	limit Limits
-	start time.Time
-	now   func() time.Time
-	steps int
+	ctx        context.Context
+	limit      Limits
+	start      time.Time
+	now        func() time.Time
+	steps      int
+	valueItems int
+	valueBytes int
 }
 
 func (m *meter) charge(n int) error {
@@ -507,24 +535,46 @@ func eval(e Expression, r Resource, vars map[string]any, preds map[string]Expres
 		return !ok, err
 	}
 	if e.Exists != nil {
-		_, ok := resolve(e.Exists, r, vars)
-		return ok, nil
+		_, ok, err := resolve(e.Exists, r, vars, m)
+		return ok, err
 	}
-	cmp := func(vs []any) (any, any, bool) {
-		a, aok := resolve(vs[0], r, vars)
-		b, bok := resolve(vs[1], r, vars)
-		return a, b, aok && bok
+	cmp := func(vs []any) (any, any, bool, error) {
+		a, aok, err := resolve(vs[0], r, vars, m)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		b, bok, err := resolve(vs[1], r, vars, m)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		return a, b, aok && bok, nil
 	}
 	if e.Eq != nil {
-		a, b, ok := cmp(e.Eq)
-		return ok && equalValue(a, b), nil
+		a, b, ok, err := cmp(e.Eq)
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return false, nil
+		}
+		return equalValue(m, a, b, 0)
 	}
 	if e.Ne != nil {
-		a, b, ok := cmp(e.Ne)
-		return ok && !equalValue(a, b), nil
+		a, b, ok, err := cmp(e.Ne)
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return false, nil
+		}
+		equal, err := equalValue(m, a, b, 0)
+		return !equal, err
 	}
 	if e.In != nil {
-		a, b, ok := cmp(e.In)
+		a, b, ok, err := cmp(e.In)
+		if err != nil {
+			return false, err
+		}
 		if !ok {
 			return false, nil
 		}
@@ -534,7 +584,11 @@ func eval(e Expression, r Resource, vars map[string]any, preds map[string]Expres
 				if err := m.charge(1); err != nil {
 					return false, err
 				}
-				if equalValue(a, v) {
+				equal, err := equalValue(m, a, v, 0)
+				if err != nil {
+					return false, err
+				}
+				if equal {
 					return true, nil
 				}
 			}
@@ -548,7 +602,10 @@ func eval(e Expression, r Resource, vars map[string]any, preds map[string]Expres
 		return false, nil
 	}
 	if e.Matches != nil {
-		a, b, ok := cmp(e.Matches)
+		a, b, ok, err := cmp(e.Matches)
+		if err != nil {
+			return false, err
+		}
 		text, textOK := a.(string)
 		pattern, patternOK := b.(string)
 		if !ok || !textOK || !patternOK {
@@ -579,87 +636,313 @@ func eval(e Expression, r Resource, vars map[string]any, preds map[string]Expres
 	return false, nil
 }
 
-func resolve(v any, r Resource, vars map[string]any) (any, bool) {
+func resolve(v any, r Resource, vars map[string]any, m *meter) (any, bool, error) {
 	s, ok := v.(string)
 	if !ok {
-		return v, true
+		return v, true, validateValue(m, v, 0)
 	}
 	if strings.HasPrefix(s, "variables.") {
 		name := strings.TrimPrefix(s, "variables.")
 		if name == "" {
-			return nil, false
+			return nil, false, nil
 		}
 		x, ok := vars[name]
-		return x, ok
+		if !ok {
+			return nil, false, nil
+		}
+		return x, true, validateValue(m, x, 0)
 	}
 	if s == "resource.kind" {
-		return r.Kind, true
+		return r.Kind, true, validateValue(m, r.Kind, 0)
 	}
 	if s == "resource.name" {
-		return r.Name, true
+		return r.Name, true, validateValue(m, r.Name, 0)
 	}
 	if s == "resource.owner" {
-		return r.Owner, r.Owner != ""
+		if r.Owner == "" {
+			return nil, false, nil
+		}
+		return r.Owner, true, validateValue(m, r.Owner, 0)
 	}
 	if strings.HasPrefix(s, "resource.attributes.") {
 		name := strings.TrimPrefix(s, "resource.attributes.")
 		if name == "" {
-			return nil, false
+			return nil, false, nil
 		}
 		x, ok := r.Attributes[name]
-		return x, ok
+		if !ok {
+			return nil, false, nil
+		}
+		return x, true, validateValue(m, x, 0)
 	}
 	if strings.HasPrefix(s, "resource.") {
-		return nil, false
+		return nil, false, nil
 	}
-	return v, true
+	return v, true, validateValue(m, v, 0)
 }
 
-func equalValue(a, b any) bool {
-	if af, ok := number(a); ok {
-		bf, bok := number(b)
-		return bok && af.Cmp(bf) == 0
+func number(m *meter, v any) (*big.Rat, bool, error) {
+	if err := m.charge(1); err != nil {
+		return nil, false, err
 	}
-	if _, ok := number(b); ok {
-		return false
-	}
-	return reflect.TypeOf(a) == reflect.TypeOf(b) && reflect.DeepEqual(a, b)
-}
-
-func number(v any) (*big.Rat, bool) {
 	switch n := v.(type) {
 	case int:
-		return new(big.Rat).SetInt64(int64(n)), true
+		return new(big.Rat).SetInt64(int64(n)), true, nil
 	case int8:
-		return new(big.Rat).SetInt64(int64(n)), true
+		return new(big.Rat).SetInt64(int64(n)), true, nil
 	case int16:
-		return new(big.Rat).SetInt64(int64(n)), true
+		return new(big.Rat).SetInt64(int64(n)), true, nil
 	case int32:
-		return new(big.Rat).SetInt64(int64(n)), true
+		return new(big.Rat).SetInt64(int64(n)), true, nil
 	case int64:
-		return new(big.Rat).SetInt64(n), true
+		return new(big.Rat).SetInt64(n), true, nil
 	case uint:
-		return new(big.Rat).SetUint64(uint64(n)), true
+		return new(big.Rat).SetUint64(uint64(n)), true, nil
 	case uint8:
-		return new(big.Rat).SetUint64(uint64(n)), true
+		return new(big.Rat).SetUint64(uint64(n)), true, nil
 	case uint16:
-		return new(big.Rat).SetUint64(uint64(n)), true
+		return new(big.Rat).SetUint64(uint64(n)), true, nil
 	case uint32:
-		return new(big.Rat).SetUint64(uint64(n)), true
+		return new(big.Rat).SetUint64(uint64(n)), true, nil
 	case uint64:
-		return new(big.Rat).SetUint64(n), true
+		return new(big.Rat).SetUint64(n), true, nil
 	case float32:
 		r := new(big.Rat).SetFloat64(float64(n))
-		return r, r != nil
+		return r, r != nil, nil
 	case float64:
 		r := new(big.Rat).SetFloat64(n)
-		return r, r != nil
+		return r, r != nil, nil
 	case json.Number:
-		r, ok := new(big.Rat).SetString(string(n))
-		return r, ok
+		s := string(n)
+		digits, exp, ok := numericShape(s)
+		if !ok {
+			return nil, false, fmt.Errorf("%w: invalid number", ErrUnsupportedValue)
+		}
+		if digits > m.limit.MaxNumericDigits || exp > m.limit.MaxNumericExponent || digits+exp > m.limit.MaxNumericDigits {
+			return nil, false, fmt.Errorf("%w: numeric literal exceeds bounds", ErrLimitExceeded)
+		}
+		if err := m.consumeValue(len(s)); err != nil {
+			return nil, false, err
+		}
+		r, ok := new(big.Rat).SetString(s)
+		if !ok {
+			return nil, false, fmt.Errorf("%w: invalid number", ErrUnsupportedValue)
+		}
+		return r, true, nil
 	default:
-		return nil, false
+		return nil, false, nil
 	}
+}
+
+func (m *meter) consumeValue(bytes int) error {
+	if err := m.charge(1); err != nil {
+		return err
+	}
+	m.valueItems++
+	m.valueBytes += bytes
+	if m.valueItems > m.limit.MaxValueItems || m.valueBytes > m.limit.MaxValueBytes {
+		return fmt.Errorf("%w: policy value resources", ErrLimitExceeded)
+	}
+	return nil
+}
+
+func validateValue(m *meter, v any, depth int) error {
+	if depth > m.limit.MaxValueDepth {
+		return fmt.Errorf("%w: policy value depth", ErrLimitExceeded)
+	}
+	if err := m.consumeValue(0); err != nil {
+		return err
+	}
+	switch x := v.(type) {
+	case nil, bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
+		return nil
+	case json.Number:
+		_, _, err := number(m, x)
+		return err
+	case string:
+		return m.consumeValue(len(x))
+	case []any:
+		for _, item := range x {
+			if err := validateValue(m, item, depth+1); err != nil {
+				return err
+			}
+		}
+		return nil
+	case []string:
+		for _, item := range x {
+			if err := validateValue(m, item, depth+1); err != nil {
+				return err
+			}
+		}
+		return nil
+	case map[string]any:
+		keys := make([]string, 0, len(x))
+		for k := range x {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if err := m.consumeValue(len(k)); err != nil {
+				return err
+			}
+			if err := validateValue(m, x[k], depth+1); err != nil {
+				return err
+			}
+		}
+		return nil
+	case map[string]string:
+		keys := make([]string, 0, len(x))
+		for k := range x {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if err := m.consumeValue(len(k) + len(x[k])); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("%w: %T", ErrUnsupportedValue, v)
+	}
+}
+
+func equalValue(m *meter, a, b any, depth int) (bool, error) {
+	if depth > m.limit.MaxValueDepth {
+		return false, fmt.Errorf("%w: equality depth", ErrLimitExceeded)
+	}
+	if err := m.charge(1); err != nil {
+		return false, err
+	}
+	af, aok, err := number(m, a)
+	if err != nil {
+		return false, err
+	}
+	bf, bok, err := number(m, b)
+	if err != nil {
+		return false, err
+	}
+	if aok || bok {
+		return aok && bok && af.Cmp(bf) == 0, nil
+	}
+	switch x := a.(type) {
+	case nil:
+		return b == nil, nil
+	case bool:
+		y, ok := b.(bool)
+		return ok && x == y, nil
+	case string:
+		y, ok := b.(string)
+		return ok && x == y, nil
+	case []any:
+		y, ok := b.([]any)
+		if !ok || len(x) != len(y) {
+			return false, nil
+		}
+		for i := range x {
+			eq, err := equalValue(m, x[i], y[i], depth+1)
+			if err != nil || !eq {
+				return eq, err
+			}
+		}
+		return true, nil
+	case []string:
+		y, ok := b.([]string)
+		if !ok || len(x) != len(y) {
+			return false, nil
+		}
+		for i := range x {
+			if err := m.consumeValue(len(x[i]) + len(y[i])); err != nil {
+				return false, err
+			}
+			if x[i] != y[i] {
+				return false, nil
+			}
+		}
+		return true, nil
+	case map[string]any:
+		y, ok := b.(map[string]any)
+		if !ok || len(x) != len(y) {
+			return false, nil
+		}
+		keys := make([]string, 0, len(x))
+		for k := range x {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if err := m.charge(1); err != nil {
+				return false, err
+			}
+			yv, ok := y[k]
+			if !ok {
+				return false, nil
+			}
+			eq, err := equalValue(m, x[k], yv, depth+1)
+			if err != nil || !eq {
+				return eq, err
+			}
+		}
+		return true, nil
+	case map[string]string:
+		y, ok := b.(map[string]string)
+		if !ok || len(x) != len(y) {
+			return false, nil
+		}
+		keys := make([]string, 0, len(x))
+		for k := range x {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if err := m.charge(1); err != nil {
+				return false, err
+			}
+			if y[k] != x[k] {
+				return false, nil
+			}
+		}
+		return true, nil
+	default:
+		return false, fmt.Errorf("%w: %T", ErrUnsupportedValue, a)
+	}
+}
+
+func numericShape(s string) (digits, absExp int, ok bool) {
+	e := strings.IndexAny(s, "eE")
+	mant, exp := s, ""
+	if e >= 0 {
+		mant, exp = s[:e], s[e+1:]
+	}
+	for _, c := range mant {
+		if c >= '0' && c <= '9' {
+			digits++
+		} else if c != '-' && c != '.' {
+			return 0, 0, false
+		}
+	}
+	if digits == 0 {
+		return 0, 0, false
+	}
+	if exp != "" {
+		if len(exp) > 1 && (exp[0] == '+' || exp[0] == '-') {
+			exp = exp[1:]
+		}
+		if len(exp) == 0 || len(exp) > 6 {
+			return 0, 0, false
+		}
+		for _, c := range exp {
+			if c < '0' || c > '9' {
+				return 0, 0, false
+			}
+		}
+		n, err := strconv.Atoi(exp)
+		if err != nil {
+			return 0, 0, false
+		}
+		absExp = n
+	}
+	return digits, absExp, true
 }
 
 func meteredContains(m *meter, xs []string, s string) (bool, error) {

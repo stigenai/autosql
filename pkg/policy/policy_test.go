@@ -214,6 +214,69 @@ func TestValidationAndRegexAreBounded(t *testing.T) {
 	}
 }
 
+func TestRecursiveEqualityAndValuesFailBoundedly(t *testing.T) {
+	nested := any("leaf")
+	for i := 0; i < 20; i++ {
+		nested = []any{nested}
+	}
+	doc := Document{Version: "v1", Rules: []Rule{{Name: "deep", Target: "all", Message: "x", Assert: Expression{Eq: []any{"resource.attributes.value", nested}}}}}
+	resource := []Resource{{Kind: "table", Name: "t", Attributes: map[string]any{"value": nested}}}
+	if _, err := (Evaluator{Limits: Limits{MaxValueDepth: 5}}).Evaluate(context.Background(), doc, resource, nil); !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("depth: %v", err)
+	}
+	items := make([]any, 100)
+	for i := range items {
+		items[i] = i
+	}
+	doc.Rules[0].Assert = Expression{In: []any{1, items}}
+	if _, err := (Evaluator{Limits: Limits{MaxValueItems: 20}}).Evaluate(context.Background(), doc, resource, nil); !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("items: %v", err)
+	}
+	doc.Rules[0].Assert = Expression{Eq: []any{"resource.attributes.value", "x"}}
+	resource[0].Attributes["value"] = strings.Repeat("x", 100)
+	if _, err := (Evaluator{Limits: Limits{MaxValueBytes: 20}}).Evaluate(context.Background(), doc, resource, nil); !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("bytes: %v", err)
+	}
+	resource[0].Attributes["value"] = struct{ Secret string }{"x"}
+	if _, err := (Evaluator{}).Evaluate(context.Background(), doc, resource, nil); !errors.Is(err, ErrUnsupportedValue) {
+		t.Fatalf("unsupported: %v", err)
+	}
+}
+
+func TestHugeNumbersAndEqualityMeterFailBoundedly(t *testing.T) {
+	for _, literal := range []string{strings.Repeat("9", 200), "1e999999"} {
+		raw := `{"version":"v1","rules":[{"name":"n","target":"all","message":"x","assert":{"eq":[` + literal + `,0]}}]}`
+		doc, err := Parse([]byte(raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = (Evaluator{Limits: Limits{MaxNumericDigits: 32, MaxNumericExponent: 32}}).Evaluate(context.Background(), *doc, []Resource{{Kind: "table", Name: "t"}}, nil)
+		if !errors.Is(err, ErrLimitExceeded) {
+			t.Fatalf("literal %s: %v", literal, err)
+		}
+	}
+	nested := any("x")
+	for i := 0; i < 10; i++ {
+		nested = []any{nested}
+	}
+	doc := Document{Version: "v1", Rules: []Rule{{Name: "n", Target: "all", Message: "x", Assert: Expression{Eq: []any{nested, nested}}}}}
+	if _, err := (Evaluator{Limits: Limits{MaxSteps: 15}}).Evaluate(context.Background(), doc, []Resource{{Kind: "table", Name: "t"}}, nil); !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("steps: %v", err)
+	}
+	clock := time.Unix(0, 0)
+	calls := 0
+	_, err := (Evaluator{Limits: Limits{MaxSteps: 10000, Timeout: time.Second}, Now: func() time.Time {
+		calls++
+		if calls > 20 {
+			return clock.Add(2 * time.Second)
+		}
+		return clock
+	}}).Evaluate(context.Background(), doc, []Resource{{Kind: "table", Name: "t"}}, nil)
+	if !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("timeout: %v", err)
+	}
+}
+
 func TestLimitsCoverSkippedRulesKindsPredicatesAndRegex(t *testing.T) {
 	predicate := Expression{Matches: []any{"resource.name", "^table_[0-9]+$"}}
 	doc := Document{Version: "v1", Predicates: map[string]Expression{"named": predicate}, Rules: []Rule{
