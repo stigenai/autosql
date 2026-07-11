@@ -28,7 +28,7 @@ type Command struct {
 }
 type Assertion struct {
 	Name, SQL, File string
-	Line            int
+	Line, Column    int
 	Args            []any
 	Want            int64
 }
@@ -58,7 +58,7 @@ type Result struct {
 
 type Failure struct {
 	Case, Stage, Name, File string
-	Line                    int
+	Line, Column            int
 	Err                     error
 }
 
@@ -66,6 +66,9 @@ func (e *Failure) Error() string {
 	loc := e.File
 	if e.Line > 0 {
 		loc = fmt.Sprintf("%s:%d", loc, e.Line)
+		if e.Column > 0 {
+			loc = fmt.Sprintf("%s:%d", loc, e.Column)
+		}
 	}
 	if loc != "" {
 		loc = " at " + loc
@@ -93,6 +96,9 @@ func (r Runner) Run(ctx context.Context, c Case) (result Result, err error) {
 	result.Case = c.Name
 	if r.Factory == nil || strings.TrimSpace(c.Name) == "" {
 		return result, errors.New("dbtest: factory and case name are required")
+	}
+	if validationErr := validateAssertions(c); validationErr != nil {
+		return result, validationErr
 	}
 	if c.Timeout > 0 {
 		var cancel context.CancelFunc
@@ -174,13 +180,34 @@ func runAssertions(ctx context.Context, db Database, c Case, stage string, asser
 	for i, a := range assertions {
 		observed, err := db.QueryCount(ctx, expand(a.SQL, c.Variables), a.Args...)
 		if err != nil {
-			return i, &Failure{Case: c.Name, Stage: stage, Name: a.Name, File: a.File, Line: a.Line, Err: err}
+			return i, &Failure{Case: c.Name, Stage: stage, Name: a.Name, File: a.File, Line: a.Line, Column: a.Column, Err: err}
 		}
 		if observed != a.Want {
-			return i + 1, &Failure{Case: c.Name, Stage: stage, Name: a.Name, File: a.File, Line: a.Line, Err: fmt.Errorf("observed %d, want %d", observed, a.Want)}
+			return i + 1, &Failure{Case: c.Name, Stage: stage, Name: a.Name, File: a.File, Line: a.Line, Column: a.Column, Err: fmt.Errorf("observed %d, want %d", observed, a.Want)}
 		}
 	}
 	return len(assertions), nil
+}
+
+func validateAssertions(c Case) error {
+	groups := []struct {
+		stage      string
+		assertions []Assertion
+	}{{"assertion", c.Assertions}}
+	for _, v := range c.Versions {
+		groups = append(groups, struct {
+			stage      string
+			assertions []Assertion
+		}{"assertion " + v.Name, v.Assertions})
+	}
+	for _, group := range groups {
+		for _, a := range group.assertions {
+			if strings.TrimSpace(a.Name) == "" || strings.TrimSpace(a.SQL) == "" || strings.TrimSpace(a.File) == "" || a.Line <= 0 || a.Column < 0 {
+				return &Failure{Case: c.Name, Stage: "validation", Name: a.Name, File: a.File, Line: a.Line, Column: a.Column, Err: errors.New("assertion name, SQL, source file, and positive line are required; column cannot be negative")}
+			}
+		}
+	}
+	return nil
 }
 
 // expand is deterministic and only substitutes explicitly supplied variables.

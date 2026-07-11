@@ -67,6 +67,7 @@ type Result struct {
 	Name                 string
 	Observed, MaxAllowed int64
 	Passed               bool
+	Source               Source
 }
 type DB interface {
 	Begin(context.Context) (Tx, error)
@@ -82,7 +83,17 @@ type Tx interface {
 type Failure struct{ Result Result }
 
 func (e *Failure) Error() string {
-	return fmt.Sprintf("%v: %s observed %d, maximum %d", ErrAssertion, e.Result.Name, e.Result.Observed, e.Result.MaxAllowed)
+	location := e.Result.Source.File
+	if e.Result.Source.Line > 0 {
+		location = fmt.Sprintf("%s:%d", location, e.Result.Source.Line)
+		if e.Result.Source.Column > 0 {
+			location = fmt.Sprintf("%s:%d", location, e.Result.Source.Column)
+		}
+	}
+	if location != "" {
+		location = " at " + location
+	}
+	return fmt.Sprintf("%v: %s%s observed %d, maximum %d", ErrAssertion, e.Result.Name, location, e.Result.Observed, e.Result.MaxAllowed)
 }
 func (e *Failure) Unwrap() error { return ErrAssertion }
 
@@ -92,6 +103,7 @@ type digestAssertion struct {
 	MaxAllowed   int64
 	Timeout      int64
 	ChangeDigest string
+	Source       Source
 }
 type digestArg struct {
 	Type  string
@@ -115,7 +127,7 @@ func Digest(p Plan) (string, error) {
 		if err != nil {
 			return "", validation(a, "arguments are not canonically encodable: "+err.Error())
 		}
-		dp.Assertions = append(dp.Assertions, digestAssertion{Name: a.Name, Query: query, Args: args, MaxAllowed: a.MaxAllowed, Timeout: int64(a.Timeout), ChangeDigest: a.ChangeDigest})
+		dp.Assertions = append(dp.Assertions, digestAssertion{Name: a.Name, Query: query, Args: args, MaxAllowed: a.MaxAllowed, Timeout: int64(a.Timeout), ChangeDigest: a.ChangeDigest, Source: a.Source})
 	}
 	b, err := json.Marshal(dp)
 	if err != nil {
@@ -179,7 +191,7 @@ func GuardedApply(ctx context.Context, db DB, plan Plan) (results []Result, err 
 		if queryErr != nil {
 			return results, fmt.Errorf("precheck %q: %w", check.Name, queryErr)
 		}
-		result := Result{Name: check.Name, Observed: observed, MaxAllowed: check.MaxAllowed, Passed: observed <= check.MaxAllowed}
+		result := Result{Name: check.Name, Observed: observed, MaxAllowed: check.MaxAllowed, Passed: observed <= check.MaxAllowed, Source: check.Source}
 		results = append(results, result)
 		if !result.Passed {
 			return results, &Failure{Result: result}
@@ -203,6 +215,9 @@ func validate(p Plan) ([]string, error) {
 	}
 	canonical := make([]string, len(p.Assertions))
 	for i, a := range p.Assertions {
+		if strings.TrimSpace(a.Source.File) == "" || a.Source.Line <= 0 || a.Source.Column < 0 {
+			return nil, validation(a, "source file and positive line are required; column cannot be negative")
+		}
 		if strings.TrimSpace(a.Name) == "" {
 			return nil, validation(a, "name is required")
 		}

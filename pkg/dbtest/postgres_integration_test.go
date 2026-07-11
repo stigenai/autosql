@@ -15,7 +15,7 @@ func TestPostgresFactoryIntegration(t *testing.T) {
 	if dsn == "" {
 		t.Skip("set AUTOSQL_POSTGRES_TEST_DSN to run PostgreSQL integration")
 	}
-	c := Case{Name: "blank-to-v2", Timeout: 30 * time.Second, Versions: []Version{{Name: "v1", Migrations: []Command{{SQL: "CREATE TABLE widgets (id bigint PRIMARY KEY)"}}, Assertions: []Assertion{{Name: "blank creation", SQL: "SELECT count(*) FROM widgets", Want: 0}}}, {Name: "v2", Migrations: []Command{{SQL: "ALTER TABLE widgets ADD COLUMN label text"}}, Plan: []Command{{SQL: "INSERT INTO widgets (id, label) VALUES (1, 'ready')"}}, Assertions: []Assertion{{Name: "upgrade", SQL: "SELECT count(*) FROM widgets WHERE label = 'ready'", Want: 1}}}}}
+	c := Case{Name: "blank-to-v2", Timeout: 30 * time.Second, Versions: []Version{{Name: "v1", Migrations: []Command{{SQL: "CREATE TABLE widgets (id bigint PRIMARY KEY)"}}, Assertions: []Assertion{{Name: "blank creation", SQL: "SELECT count(*) FROM widgets", Want: 0, File: "integration.sql", Line: 1}}}, {Name: "v2", Migrations: []Command{{SQL: "ALTER TABLE widgets ADD COLUMN label text"}}, Plan: []Command{{SQL: "INSERT INTO widgets (id, label) VALUES (1, 'ready')"}}, Assertions: []Assertion{{Name: "upgrade", SQL: "SELECT count(*) FROM widgets WHERE label = 'ready'", Want: 1, File: "integration.sql", Line: 2}}}}}
 	var schema string
 	result, err := (Runner{Factory: PostgresFactory{DSN: dsn, OnSchema: func(name string) { schema = name }}}).Run(context.Background(), c)
 	if err != nil {

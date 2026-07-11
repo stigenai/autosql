@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -69,6 +70,9 @@ func TestFailurePreventsEveryMutation(t *testing.T) {
 	if !errors.Is(err, ErrAssertion) {
 		t.Fatalf("error %v", err)
 	}
+	if !strings.Contains(err.Error(), "checks.sql:12:3") {
+		t.Fatalf("missing source in %v", err)
+	}
 	if tx.execs != 0 {
 		t.Fatal("mutation executed")
 	}
@@ -129,6 +133,7 @@ func TestEverySemanticFieldIsDigestBound(t *testing.T) {
 		"maximum":       func(p *Plan) { p.Assertions[0].MaxAllowed++ },
 		"timeout":       func(p *Plan) { p.Assertions[0].Timeout++ },
 		"change digest": func(p *Plan) { p.Assertions[0].ChangeDigest = "other" },
+		"source":        func(p *Plan) { p.Assertions[0].Source.Line++ },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -158,6 +163,19 @@ func TestValidationErrorIncludesAssertionSource(t *testing.T) {
 	var validationErr *ValidationError
 	if !errors.As(err, &validationErr) || validationErr.Source.File != "checks.sql" || validationErr.Source.Line != 12 || validationErr.Source.Column != 3 {
 		t.Fatalf("error %#v", err)
+	}
+}
+
+func TestMissingAssertionSourceIsRejectedBeforeBegin(t *testing.T) {
+	for _, source := range []Source{{}, {File: "checks.sql"}, {File: "checks.sql", Line: 1, Column: -1}} {
+		p := plan(0)
+		p.Assertions[0].Source = source
+		p.Digest, _ = Digest(p)
+		p.Assertions[0].PlanDigest = p.Digest
+		tx := &fakeTx{}
+		if _, err := GuardedApply(context.Background(), fakeDB{tx}, p); !errors.Is(err, ErrInvalidPlan) || len(tx.events) != 0 {
+			t.Fatalf("source=%+v error=%v events=%v", source, err, tx.events)
+		}
 	}
 }
 
