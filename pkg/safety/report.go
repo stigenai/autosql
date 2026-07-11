@@ -5,24 +5,26 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
 )
 
-var sensitive = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)(password|passwd|pwd|token|secret|api[_-]?key)\s*[:=]\s*[^\s,;]+`),
-	regexp.MustCompile(`(?i)postgres(?:ql)?://[^\s/@:]+:[^\s/@]+@`),
-}
+var (
+	secretKey             = regexp.MustCompile(`(?i)^(?:.*[_-])?(?:password|passwd|pwd|token|secret|api[_-]?key|credential)(?:[_-].*)?$`)
+	quotedSecret          = regexp.MustCompile(`(?i)(password|passwd|pwd|token|secret|api[_-]?key|credential)\s*[:=]\s*(?:"(?:\\.|[^"\\])*"|'(?:''|[^'])*')`)
+	plainSecret           = regexp.MustCompile(`(?i)(password|passwd|pwd|token|secret|api[_-]?key|credential)\s*[:=]\s*[^\s,;]+`)
+	connectionCredentials = regexp.MustCompile(`(?i)(?:postgres|postgresql)://[^@\r\n]*@`)
+)
 
 func redact(s string) string {
-	for _, re := range sensitive {
+	s = connectionCredentials.ReplaceAllStringFunc(s, func(v string) string {
+		i := strings.Index(v, "://")
+		return v[:i+3] + "[REDACTED]@"
+	})
+	for _, re := range []*regexp.Regexp{quotedSecret, plainSecret} {
 		s = re.ReplaceAllStringFunc(s, func(v string) string {
-			if strings.HasPrefix(strings.ToLower(v), "postgres") {
-				i := strings.Index(v, "://")
-				at := strings.LastIndex(v, "@")
-				return v[:i+3] + "[REDACTED]" + v[at:]
-			}
 			i := strings.IndexAny(v, "=:")
 			if i < 0 {
 				return "[REDACTED]"
@@ -44,9 +46,22 @@ func sanitized(in []Diagnostic) []Diagnostic {
 		if d.Source != nil {
 			source := *d.Source
 			source.URI = redact(source.URI)
+			if source.Extra != nil {
+				extra := make(map[string]json.RawMessage, len(source.Extra))
+				for key, value := range source.Extra {
+					clean, err := json.Marshal(redactValue(key, value))
+					if err == nil {
+						extra[key] = clean
+					} else {
+						extra[key] = json.RawMessage(`"[REDACTED]"`)
+					}
+				}
+				source.Extra = extra
+			}
 			d.Source = &source
 		}
 		d.Properties = redactMap(d.Properties)
+		d.Assumptions = append([]string(nil), d.Assumptions...)
 		for j := range d.Assumptions {
 			d.Assumptions[j] = redact(d.Assumptions[j])
 		}
@@ -65,22 +80,71 @@ func redactMap(in map[string]any) map[string]any {
 	}
 	out := make(map[string]any, len(in))
 	for k, v := range in {
-		switch x := v.(type) {
-		case string:
-			out[k] = redact(x)
-		case map[string]any:
-			out[k] = redactMap(x)
-		case []string:
-			copy := append([]string(nil), x...)
-			for i := range copy {
-				copy[i] = redact(copy[i])
-			}
-			out[k] = copy
-		default:
-			out[k] = v
-		}
+		out[k] = redactValue(k, v)
 	}
 	return out
+}
+
+func redactValue(key string, value any) any {
+	if secretKey.MatchString(strings.TrimSpace(key)) {
+		return "[REDACTED]"
+	}
+	switch x := value.(type) {
+	case nil:
+		return nil
+	case string:
+		return redact(x)
+	case json.RawMessage:
+		var decoded any
+		if json.Unmarshal(x, &decoded) == nil {
+			clean, err := json.Marshal(redactValue(key, decoded))
+			if err == nil {
+				return json.RawMessage(clean)
+			}
+		}
+		return json.RawMessage(strconvQuote(redact(string(x))))
+	case map[string]any:
+		return redactMap(x)
+	case map[string]string:
+		out := make(map[string]string, len(x))
+		for k, v := range x {
+			if secretKey.MatchString(strings.TrimSpace(k)) {
+				out[k] = "[REDACTED]"
+			} else {
+				out[k] = redact(v)
+			}
+		}
+		return out
+	case []any:
+		out := make([]any, len(x))
+		for i := range x {
+			out[i] = redactValue("", x[i])
+		}
+		return out
+	case []string:
+		out := append([]string(nil), x...)
+		for i := range out {
+			out[i] = redact(out[i])
+		}
+		return out
+	}
+	// Properties are extension points and may contain named map or slice types.
+	rv := reflect.ValueOf(value)
+	if rv.IsValid() && (rv.Kind() == reflect.Map || rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array) {
+		raw, err := json.Marshal(value)
+		if err == nil {
+			var decoded any
+			if json.Unmarshal(raw, &decoded) == nil {
+				return redactValue(key, decoded)
+			}
+		}
+	}
+	return value
+}
+
+func strconvQuote(s string) []byte {
+	raw, _ := json.Marshal(s)
+	return raw
 }
 
 // WriteJSON writes deterministic, indented JSON after secret redaction.

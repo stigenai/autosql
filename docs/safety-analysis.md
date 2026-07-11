@@ -27,8 +27,11 @@ credential, token, and connection-URL forms.
 
 Target statistics are optional and keyed by stable resource ID. When absent,
 the PostgreSQL analyzer retains static findings, lowers confidence, and records
-its conservative assumption. Thresholds promote excessive lock, row-scan, or
-rewrite estimates to errors for a policy gate to enforce.
+its conservative assumption. If a row-scan or rewrite threshold is configured
+but statistics are missing, that threshold is marked unproven and the finding
+is promoted to an error. Rewrite-size caps apply only to actual rewrite risks.
+An unknown PostgreSQL version is never replaced with an arbitrary default;
+version-sensitive rules use the oldest supported behavior and low confidence.
 
 Suppressions are narrow audit records: each must identify exactly one rule and
 one object and include a non-empty reason. An optional expiry stops the
@@ -52,7 +55,10 @@ Rule IDs are stable public API:
 | `AUTOSQL104` | table validation scan |
 | `AUTOSQL105` | transaction-restricted statement |
 
-PostgreSQL's fast constant-default behavior is modeled from version 11 onward.
-Other version-sensitive decisions include enum and concurrent-index transaction
-restrictions. New rules should prefer conservative findings with explicit
-assumptions when target facts are unavailable.
+PostgreSQL's fast non-volatile-default behavior is modeled from version 11
+onward, distinguishing literals and stable expressions from volatile or unknown
+expressions. PostgreSQL 12's transactional enum support is modeled separately
+from the rule that a newly added enum value remains unusable until commit.
+Statement rules ignore SQL comments, literals, quoted identifiers, and
+dollar-quoted bodies. New rules should prefer conservative findings with
+explicit assumptions when target facts are unavailable.

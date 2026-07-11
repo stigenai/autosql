@@ -7,6 +7,7 @@ package safety
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -171,7 +172,11 @@ func (r Runner) Run(ctx context.Context, in Input) ([]Diagnostic, error) {
 			return nil, fmt.Errorf("duplicate analyzer %q", a.Name())
 		}
 		seen[a.Name()] = true
-		ds, err := a.Analyze(ctx, in)
+		isolated, err := cloneInput(in)
+		if err != nil {
+			return nil, fmt.Errorf("clone analyzer input: %w", err)
+		}
+		ds, err := a.Analyze(ctx, isolated)
 		if err != nil {
 			return nil, fmt.Errorf("analyzer %s: %w", a.Name(), err)
 		}
@@ -196,6 +201,45 @@ func (r Runner) Run(ctx context.Context, in Input) ([]Diagnostic, error) {
 		}
 		return a.Severity < b.Severity
 	})
+	return out, nil
+}
+
+// cloneInput creates a complete ownership boundary for an analyzer. This is
+// intentionally done once per invocation: third-party analyzers may mutate any
+// map, slice, raw JSON buffer, or source pointer they receive without affecting
+// another analyzer or the caller's plan.
+func cloneInput(in Input) (Input, error) {
+	var out Input
+	raw, err := json.Marshal(in.Changes)
+	if err != nil {
+		return out, err
+	}
+	if err := json.Unmarshal(raw, &out.Changes); err != nil {
+		return out, err
+	}
+	out.Statements = make([]Statement, len(in.Statements))
+	for i, st := range in.Statements {
+		out.Statements[i] = st
+		if st.Source != nil {
+			source := *st.Source
+			if st.Source.Extra != nil {
+				source.Extra = make(map[string]json.RawMessage, len(st.Source.Extra))
+				for key, value := range st.Source.Extra {
+					source.Extra[key] = append(json.RawMessage(nil), value...)
+				}
+			}
+			out.Statements[i].Source = &source
+		}
+	}
+	out.Target.Engine = in.Target.Engine
+	out.Target.Version = in.Target.Version
+	if in.Target.Statistics != nil {
+		out.Target.Statistics = make(map[string]TableStatistics, len(in.Target.Statistics))
+		for key, value := range in.Target.Statistics {
+			out.Target.Statistics[key] = value
+		}
+	}
+	out.Thresholds = in.Thresholds
 	return out, nil
 }
 

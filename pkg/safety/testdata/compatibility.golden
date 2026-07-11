@@ -1,0 +1,24 @@
+error [AUTOSQL002] public.events
+  table is truncated
+  impact: Definite deletion of all table rows.
+  remediation: Use a reviewed, bounded data migration with a recoverable backup.
+error [AUTOSQL003] public.value
+  column type narrows from text to varchar(8)
+  impact: Existing values may be rejected, truncated, or lose precision.
+  remediation: Prove values fit, backfill a new column, and switch consumers before removing the old column.
+warning [AUTOSQL004] public.value
+  NOT NULL constraint is added
+  impact: The change fails when existing rows contain NULL and can block concurrent writes during validation.
+  remediation: Backfill NULLs, validate with a NOT VALID check, then set NOT NULL.
+warning [AUTOSQL005] public.value
+  column default changes
+  impact: Old and new application versions may observe different write semantics.
+  remediation: Deploy application compatibility first and verify existing rows do not require a backfill.
+warning [AUTOSQL006] public.value
+  constraint definition changes
+  impact: Existing rows or writes may violate the new condition.
+  remediation: Add the replacement as NOT VALID, remediate data, then validate and remove the old constraint.
+warning [AUTOSQL007] public.current
+  object is renamed
+  impact: Existing queries using the old name will fail; a rename may also represent an ambiguous drop-and-create intent.
+  remediation: Confirm rename intent, then use an expand/contract transition with a compatibility view or dual-read period.
