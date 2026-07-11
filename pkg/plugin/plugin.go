@@ -105,6 +105,8 @@ type InspectRequest struct {
 // RenderRequest asks a driver to render canonical changes for its dialect.
 type RenderRequest struct {
 	Changes schema.ChangeSet
+	Current schema.Document
+	Desired schema.Document
 	Options map[string]string
 }
 

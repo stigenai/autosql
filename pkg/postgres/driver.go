@@ -58,8 +58,20 @@ func (*Driver) Info() plugin.Info {
 		schema.KindTrigger, schema.KindPolicy, schema.KindRole, schema.KindGrant,
 	}
 	caps := make([]plugin.Capability, 0, len(kinds))
+	managed := map[schema.Kind]bool{
+		schema.KindSchema: true, schema.KindExtension: true, schema.KindEnum: true,
+		schema.KindDomain: true, schema.KindComposite: true, schema.KindSequence: true,
+		schema.KindTable: true, schema.KindColumn: true, schema.KindPrimaryKey: true,
+		schema.KindUniqueConstraint: true, schema.KindCheckConstraint: true,
+		schema.KindForeignKey: true, schema.KindIndex: true, schema.KindView: true,
+		schema.KindMaterializedView: true,
+	}
 	for _, kind := range kinds {
-		caps = append(caps, plugin.Capability{Kind: kind, Mode: plugin.ReadOnly})
+		mode := plugin.ReadOnly
+		if managed[kind] {
+			mode = plugin.Managed
+		}
+		caps = append(caps, plugin.Capability{Kind: kind, Mode: mode})
 	}
 	return plugin.Info{Name: "postgres", Version: version, APIVersion: plugin.HostAPIVersion, Capabilities: caps}
 }
@@ -244,10 +256,6 @@ func normalizeSQLSpace(s string) string {
 	}
 	return out.String()
 }
-func (*Driver) Render(context.Context, plugin.RenderRequest) ([]plugin.Statement, error) {
-	return nil, fmt.Errorf("render PostgreSQL changes: %w", plugin.ErrUnsupported)
-}
-
 func enabled(options map[string]string, key string, defaultValue bool) bool {
 	v, ok := options[key]
 	if !ok {

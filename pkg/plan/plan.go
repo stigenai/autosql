@@ -1,0 +1,288 @@
+// Package plan builds immutable, deterministic database execution plans.
+package plan
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+
+	"autosql/pkg/plugin"
+	"autosql/pkg/safety"
+	"autosql/pkg/schema"
+)
+
+const Version = "autosql.plan/v1"
+const PlannerVersion = "0.1.0"
+
+var ErrInvalidPlan = errors.New("invalid migration plan")
+var ErrUnsupportedTransition = errors.New("unsupported schema transition")
+
+type TransactionMode string
+
+const (
+	TransactionRequired   TransactionMode = "required"
+	TransactionProhibited TransactionMode = "prohibited"
+)
+
+type LockLevel string
+
+const (
+	LockNone      LockLevel = "none"
+	LockShare     LockLevel = "share"
+	LockExclusive LockLevel = "exclusive"
+)
+
+type Impact struct {
+	Destructive bool `json:"destructive,omitempty"`
+	Rewrites    bool `json:"rewrites,omitempty"`
+	Scans       bool `json:"scans,omitempty"`
+}
+
+type DriverIdentity struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+}
+
+type Step struct {
+	ID          string          `json:"id"`
+	ChangeID    string          `json:"change_id"`
+	SQL         string          `json:"sql"`
+	Transaction TransactionMode `json:"transaction"`
+	Lock        LockLevel       `json:"lock"`
+	Impact      Impact          `json:"impact"`
+	DependsOn   []string        `json:"depends_on,omitempty"`
+}
+
+type Phase struct {
+	ID          string          `json:"id"`
+	Transaction TransactionMode `json:"transaction"`
+	StepIDs     []string        `json:"step_ids"`
+}
+
+type Plan struct {
+	Version         string           `json:"version"`
+	PlannerVersion  string           `json:"planner_version"`
+	Driver          DriverIdentity   `json:"driver"`
+	FromFingerprint string           `json:"from_fingerprint"`
+	ToFingerprint   string           `json:"to_fingerprint"`
+	Changes         schema.ChangeSet `json:"changes"`
+	Steps           []Step           `json:"steps"`
+	Phases          []Phase          `json:"phases"`
+	Digest          string           `json:"digest"`
+}
+
+type Options struct {
+	Diff   schema.DiffOptions
+	Render map[string]string
+}
+
+// Build validates both graphs, computes the exact change set, renders all SQL,
+// and publishes a plan only after every transition has succeeded.
+func Build(ctx context.Context, driver plugin.Driver, current, desired schema.Document, options Options) (Plan, error) {
+	if err := current.Validate(); err != nil {
+		return Plan{}, fmt.Errorf("%w: current graph: %v", ErrInvalidPlan, err)
+	}
+	if err := desired.Validate(); err != nil {
+		return Plan{}, fmt.Errorf("%w: desired graph: %v", ErrInvalidPlan, err)
+	}
+	from, err := schema.SemanticFingerprint(current)
+	if err != nil {
+		return Plan{}, fmt.Errorf("%w: current fingerprint: %v", ErrInvalidPlan, err)
+	}
+	to, err := schema.SemanticFingerprint(desired)
+	if err != nil {
+		return Plan{}, fmt.Errorf("%w: desired fingerprint: %v", ErrInvalidPlan, err)
+	}
+	changes, err := schema.Diff(current, desired, options.Diff)
+	if err != nil {
+		return Plan{}, fmt.Errorf("%w: diff: %v", ErrInvalidPlan, err)
+	}
+	statements, err := driver.Render(ctx, plugin.RenderRequest{Changes: changes, Current: current, Desired: desired, Options: cloneMap(options.Render)})
+	if err != nil {
+		return Plan{}, fmt.Errorf("%w: %w", ErrUnsupportedTransition, err)
+	}
+	steps, err := bindSteps(changes, statements)
+	if err != nil {
+		return Plan{}, err
+	}
+	p := Plan{Version: Version, PlannerVersion: PlannerVersion, Driver: DriverIdentity{Name: driver.Info().Name, Version: driver.Info().Version}, FromFingerprint: from, ToFingerprint: to, Changes: changes, Steps: steps}
+	p.Phases = phases(steps)
+	p.Digest, err = digestPlan(p)
+	if err != nil {
+		return Plan{}, err
+	}
+	if err := p.Validate(); err != nil {
+		return Plan{}, err
+	}
+	return p, nil
+}
+
+func (p Plan) Validate() error {
+	if p.Version != Version || p.PlannerVersion == "" || p.Driver.Name == "" || p.Driver.Version == "" || p.FromFingerprint == "" || p.ToFingerprint == "" || p.Digest == "" {
+		return fmt.Errorf("%w: incomplete identity", ErrInvalidPlan)
+	}
+	if err := p.Changes.Validate(); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidPlan, err)
+	}
+	changeIDs := map[string]bool{}
+	for _, c := range p.Changes.Changes {
+		changeIDs[c.ID] = true
+	}
+	stepIDs := map[string]bool{}
+	for _, s := range p.Steps {
+		if s.ID == "" || strings.TrimSpace(s.SQL) == "" || !changeIDs[s.ChangeID] || stepIDs[s.ID] {
+			return fmt.Errorf("%w: invalid step", ErrInvalidPlan)
+		}
+		if s.Transaction != TransactionRequired && s.Transaction != TransactionProhibited {
+			return fmt.Errorf("%w: transaction mode", ErrInvalidPlan)
+		}
+		stepIDs[s.ID] = true
+	}
+	for _, s := range p.Steps {
+		for _, dep := range s.DependsOn {
+			if !stepIDs[dep] {
+				return fmt.Errorf("%w: missing step dependency", ErrInvalidPlan)
+			}
+		}
+	}
+	want, err := digestPlan(Plan{Version: p.Version, PlannerVersion: p.PlannerVersion, Driver: p.Driver, FromFingerprint: p.FromFingerprint, ToFingerprint: p.ToFingerprint, Changes: p.Changes, Steps: p.Steps, Phases: p.Phases})
+	if err != nil || want != p.Digest {
+		return fmt.Errorf("%w: digest mismatch", ErrInvalidPlan)
+	}
+	return nil
+}
+
+func (p Plan) MarshalCanonical() ([]byte, error) {
+	if err := p.Validate(); err != nil {
+		return nil, err
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	return append(b, '\n'), nil
+}
+
+// Statements returns a defensive copy in the existing plugin/guardrail
+// binding shape. It does not execute the plan.
+func (p Plan) Statements() []plugin.Statement {
+	out := make([]plugin.Statement, len(p.Steps))
+	for i, step := range p.Steps {
+		out[i] = plugin.Statement{SQL: step.SQL, ChangeID: step.ChangeID, Transactional: step.Transaction == TransactionRequired}
+	}
+	return out
+}
+
+// SafetyStatements returns exact SQL/change bindings accepted by the existing
+// guardrail safety and statement-binding pipeline.
+func (p Plan) SafetyStatements() []safety.Statement {
+	out := make([]safety.Statement, len(p.Steps))
+	for i, step := range p.Steps {
+		out[i] = safety.Statement{SQL: step.SQL, ChangeID: step.ChangeID}
+	}
+	return out
+}
+
+func bindSteps(changes schema.ChangeSet, statements []plugin.Statement) ([]Step, error) {
+	byChange := map[string]schema.Change{}
+	for _, c := range changes.Changes {
+		byChange[c.ID] = c
+	}
+	if len(changes.Changes) > 0 && len(statements) == 0 {
+		return nil, fmt.Errorf("%w: renderer returned zero statements", ErrUnsupportedTransition)
+	}
+	lastByChange := map[string]string{}
+	seenChange := map[string]bool{}
+	steps := make([]Step, 0, len(statements))
+	for idx, statement := range statements {
+		change, ok := byChange[statement.ChangeID]
+		if !ok || strings.TrimSpace(statement.SQL) == "" {
+			return nil, fmt.Errorf("%w: unbound renderer statement", ErrInvalidPlan)
+		}
+		mode := TransactionRequired
+		if !statement.Transactional {
+			mode = TransactionProhibited
+		}
+		id := stableID("step", statement.ChangeID, fmt.Sprint(idx), statement.SQL, string(mode))
+		deps := []string{}
+		for _, dep := range change.DependsOn {
+			if step := lastByChange[dep]; step != "" {
+				deps = append(deps, step)
+			}
+		}
+		if previous := lastByChange[change.ID]; previous != "" {
+			deps = append(deps, previous)
+		}
+		sort.Strings(deps)
+		steps = append(steps, Step{ID: id, ChangeID: change.ID, SQL: statement.SQL, Transaction: mode, Lock: lockFor(change, statement.SQL), Impact: impactFor(change, statement.SQL), DependsOn: deps})
+		lastByChange[change.ID] = id
+		seenChange[change.ID] = true
+	}
+	for id := range byChange {
+		if !seenChange[id] {
+			return nil, fmt.Errorf("%w: change %s has no statement", ErrUnsupportedTransition, id)
+		}
+	}
+	return steps, nil
+}
+
+func phases(steps []Step) []Phase {
+	var out []Phase
+	for _, s := range steps {
+		if len(out) == 0 || out[len(out)-1].Transaction != s.Transaction {
+			out = append(out, Phase{Transaction: s.Transaction})
+		}
+		out[len(out)-1].StepIDs = append(out[len(out)-1].StepIDs, s.ID)
+	}
+	for i := range out {
+		out[i].ID = stableID("phase", fmt.Sprint(i), string(out[i].Transaction), strings.Join(out[i].StepIDs, "\x00"))
+	}
+	return out
+}
+
+func lockFor(c schema.Change, sql string) LockLevel {
+	if strings.Contains(strings.ToUpper(sql), "CONCURRENTLY") {
+		return LockShare
+	}
+	if c.Operation == schema.OperationCreate && c.After != nil && c.After.Kind == schema.KindSchema {
+		return LockNone
+	}
+	return LockExclusive
+}
+func impactFor(c schema.Change, sql string) Impact {
+	u := strings.ToUpper(sql)
+	return Impact{Destructive: c.Operation == schema.OperationDrop || strings.HasPrefix(strings.TrimSpace(u), "DROP "), Rewrites: strings.Contains(u, " TYPE ") || strings.Contains(u, "SET DATA TYPE"), Scans: strings.Contains(u, "VALIDATE") || strings.Contains(u, "CREATE INDEX")}
+}
+func stableID(domain string, values ...string) string {
+	h := sha256.New()
+	h.Write([]byte("autosql.plan." + domain + "/v1\x00"))
+	for _, v := range values {
+		h.Write([]byte(v))
+		h.Write([]byte{0})
+	}
+	return domain + ":" + hex.EncodeToString(h.Sum(nil))[:24]
+}
+func digestPlan(p Plan) (string, error) {
+	p.Digest = ""
+	b, e := json.Marshal(p)
+	if e != nil {
+		return "", e
+	}
+	sum := sha256.Sum256(append([]byte("autosql.plan.digest/v1\x00"), b...))
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+func cloneMap(in map[string]string) map[string]string {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
