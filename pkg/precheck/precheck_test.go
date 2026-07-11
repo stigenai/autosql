@@ -46,8 +46,9 @@ func (t *fakeTx) Rollback(context.Context) error { t.events = append(t.events, "
 
 func plan(max int64) Plan {
 	p := Plan{ID: "p1", ChangeDigest: "change1", Statements: []string{"ALTER TABLE t ADD UNIQUE (n)"}}
-	p.Digest = Digest(p)
-	p.Assertions = []Assertion{{Name: "duplicates", Query: "SELECT count(*) FROM duplicates WHERE n = $1", Args: []any{7}, MaxAllowed: max, PlanDigest: p.Digest, ChangeDigest: p.ChangeDigest}}
+	p.Assertions = []Assertion{{Name: "duplicates", Query: "SELECT count(*) FROM duplicates WHERE n = $1", Args: []any{7}, MaxAllowed: max, ChangeDigest: p.ChangeDigest, Timeout: time.Second, Source: Source{File: "checks.sql", Line: 12, Column: 3}}}
+	p.Digest, _ = Digest(p)
+	p.Assertions[0].PlanDigest = p.Digest
 	return p
 }
 
@@ -89,6 +90,8 @@ func TestAssertionTimeoutRollsBack(t *testing.T) {
 	tx := &fakeTx{}
 	p := plan(0)
 	p.Assertions[0].Timeout = time.Millisecond
+	p.Digest, _ = Digest(p)
+	p.Assertions[0].PlanDigest = p.Digest
 	_, err := GuardedApply(context.Background(), fakeDB{tx}, p)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error %v", err)
@@ -98,10 +101,93 @@ func TestAssertionTimeoutRollsBack(t *testing.T) {
 	}
 }
 func TestRejectsUnsafeEvidenceQuery(t *testing.T) {
+	queries := []string{
+		"DELETE FROM users",
+		"SELECT email FROM users",
+		"SELECT count(*) FROM users; DELETE FROM users",
+		"SELECT count(side_effect()) FROM users",
+		"SELECT count(*) FROM users WHERE side_effect() = $1",
+		"SELECT count(*) FROM users WHERE id = $1 OR admin = $2",
+	}
+	for _, query := range queries {
+		p := plan(0)
+		p.Assertions[0].Query = query
+		if _, err := GuardedApply(context.Background(), fakeDB{&fakeTx{}}, p); !errors.Is(err, ErrInvalidPlan) {
+			t.Errorf("query %q: error %v", query, err)
+		}
+	}
+}
+
+func TestEverySemanticFieldIsDigestBound(t *testing.T) {
+	tests := map[string]func(*Plan){
+		"plan id":       func(p *Plan) { p.ID = "other" },
+		"statement":     func(p *Plan) { p.Statements[0] = "DROP TABLE t" },
+		"name":          func(p *Plan) { p.Assertions[0].Name = "changed" },
+		"query":         func(p *Plan) { p.Assertions[0].Query = "SELECT count(*) FROM other WHERE n = $1" },
+		"args":          func(p *Plan) { p.Assertions[0].Args[0] = 8 },
+		"args type":     func(p *Plan) { p.Assertions[0].Args[0] = int64(7) },
+		"maximum":       func(p *Plan) { p.Assertions[0].MaxAllowed++ },
+		"timeout":       func(p *Plan) { p.Assertions[0].Timeout++ },
+		"change digest": func(p *Plan) { p.Assertions[0].ChangeDigest = "other" },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			p := plan(0)
+			p.Assertions[0].Args = append([]any(nil), p.Assertions[0].Args...)
+			mutate(&p)
+			tx := &fakeTx{}
+			if _, err := GuardedApply(context.Background(), fakeDB{tx}, p); !errors.Is(err, ErrInvalidPlan) || len(tx.events) != 0 {
+				t.Fatalf("error=%v events=%v", err, tx.events)
+			}
+		})
+	}
+}
+
+func TestDigestRejectsNonCanonicalArgumentType(t *testing.T) {
 	p := plan(0)
-	p.Assertions[0].Query = "DELETE FROM users"
-	_, err := GuardedApply(context.Background(), fakeDB{&fakeTx{}}, p)
-	if !errors.Is(err, ErrInvalidPlan) {
+	p.Assertions[0].Args = []any{map[string]any{"secret": "value"}}
+	if _, err := Digest(p); !errors.Is(err, ErrInvalidPlan) {
 		t.Fatalf("error %v", err)
 	}
+}
+
+func TestValidationErrorIncludesAssertionSource(t *testing.T) {
+	p := plan(0)
+	p.Assertions[0].Name = ""
+	_, err := GuardedApply(context.Background(), fakeDB{&fakeTx{}}, p)
+	var validationErr *ValidationError
+	if !errors.As(err, &validationErr) || validationErr.Source.File != "checks.sql" || validationErr.Source.Line != 12 || validationErr.Source.Column != 3 {
+		t.Fatalf("error %#v", err)
+	}
+}
+
+func TestCanonicalQueryIsExecuted(t *testing.T) {
+	p := plan(0)
+	p.Assertions[0].Query = " select COUNT ( * ) from DUPLICATES where N=$1 "
+	p.Digest, _ = Digest(p)
+	p.Assertions[0].PlanDigest = p.Digest
+	tx := &queryCapturingTx{fakeTx: fakeTx{counts: []int64{0}}}
+	if _, err := GuardedApply(context.Background(), capturingDB{tx}, p); err != nil {
+		t.Fatal(err)
+	}
+	if tx.query != "SELECT count(*) FROM duplicates WHERE n = $1" {
+		t.Fatalf("query %q", tx.query)
+	}
+}
+
+type queryCapturingTx struct {
+	fakeTx
+	query string
+}
+
+func (t *queryCapturingTx) QueryCount(ctx context.Context, q string, args ...any) (int64, error) {
+	t.query = q
+	return t.fakeTx.QueryCount(ctx, q, args...)
+}
+
+type capturingDB struct{ tx *queryCapturingTx }
+
+func (d capturingDB) Begin(context.Context) (Tx, error) {
+	d.tx.events = append(d.tx.events, "begin")
+	return d.tx, nil
 }

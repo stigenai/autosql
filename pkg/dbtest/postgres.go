@@ -4,16 +4,23 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 )
 
 // PostgresFactory creates a random PostgreSQL schema per case. DSN should
 // reference a disposable test database; the connected role needs CREATE on it.
-type PostgresFactory struct{ DSN string }
+type PostgresFactory struct {
+	DSN                 string
+	SetupCleanupTimeout time.Duration
+	// OnSchema is an optional observability hook useful for CI cleanup checks.
+	OnSchema func(string)
+}
 
 func (f PostgresFactory) OpenIsolated(ctx context.Context, caseName string) (Database, error) {
 	conn, err := pgx.Connect(ctx, f.DSN)
@@ -23,20 +30,30 @@ func (f PostgresFactory) OpenIsolated(ctx context.Context, caseName string) (Dat
 	name := postgresSchemaName(caseName)
 	quoted := pgx.Identifier{name}.Sanitize()
 	if _, err := conn.Exec(ctx, "CREATE SCHEMA "+quoted); err != nil {
-		_ = conn.Close(ctx)
-		return nil, err
+		closeCtx, cancel := freshSetupContext(ctx, f.SetupCleanupTimeout)
+		closeErr := conn.Close(closeCtx)
+		cancel()
+		return nil, errors.Join(err, closeErr)
+	}
+	if f.OnSchema != nil {
+		f.OnSchema(name)
 	}
 	if _, err := conn.Exec(ctx, "SET search_path TO "+quoted+", pg_catalog"); err != nil {
-		_, _ = conn.Exec(ctx, "DROP SCHEMA "+quoted+" CASCADE")
-		_ = conn.Close(ctx)
-		return nil, err
+		dropCtx, cancel := freshSetupContext(ctx, f.SetupCleanupTimeout)
+		_, dropErr := conn.Exec(dropCtx, "DROP SCHEMA "+quoted+" CASCADE")
+		cancel()
+		closeCtx, cancel := freshSetupContext(ctx, f.SetupCleanupTimeout)
+		closeErr := conn.Close(closeCtx)
+		cancel()
+		return nil, errors.Join(err, dropErr, closeErr)
 	}
-	return &postgresDB{conn: conn, schema: quoted}, nil
+	return &postgresDB{conn: conn, schema: quoted, cleanupTimeout: f.SetupCleanupTimeout}, nil
 }
 
 type postgresDB struct {
-	conn   *pgx.Conn
-	schema string
+	conn           *pgx.Conn
+	schema         string
+	cleanupTimeout time.Duration
 }
 
 func (d *postgresDB) Exec(ctx context.Context, query string) error {
@@ -49,12 +66,23 @@ func (d *postgresDB) QueryCount(ctx context.Context, query string, args ...any) 
 	return n, err
 }
 func (d *postgresDB) Close(ctx context.Context) error {
-	_, dropErr := d.conn.Exec(ctx, "DROP SCHEMA "+d.schema+" CASCADE")
-	closeErr := d.conn.Close(ctx)
+	dropCtx, cancel := freshSetupContext(ctx, d.cleanupTimeout)
+	_, dropErr := d.conn.Exec(dropCtx, "DROP SCHEMA "+d.schema+" CASCADE")
+	cancel()
+	closeCtx, cancel := freshSetupContext(ctx, d.cleanupTimeout)
+	closeErr := d.conn.Close(closeCtx)
+	cancel()
 	if dropErr != nil {
-		return fmt.Errorf("drop isolated schema: %w", dropErr)
+		dropErr = fmt.Errorf("drop isolated schema: %w", dropErr)
 	}
-	return closeErr
+	return errors.Join(dropErr, closeErr)
+}
+
+func freshSetupContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	return context.WithTimeout(context.WithoutCancel(parent), timeout)
 }
 
 var nonIdentifier = regexp.MustCompile(`[^a-z0-9_]+`)

@@ -79,6 +79,13 @@ type Runner struct {
 	CleanupTimeout time.Duration
 }
 
+type cleanupAction struct {
+	name string
+	file string
+	line int
+	run  func(context.Context) error
+}
+
 // Run executes one isolated case. Teardown and Close always run in reverse
 // registration order, using a fresh bounded cleanup context after cancellation.
 func (r Runner) Run(ctx context.Context, c Case) (result Result, err error) {
@@ -96,22 +103,25 @@ func (r Runner) Run(ctx context.Context, c Case) (result Result, err error) {
 	if openErr != nil {
 		return result, &Failure{Case: c.Name, Stage: "isolate", Name: c.Name, Err: openErr}
 	}
-	cleanup := make([]func(context.Context) error, 0, len(c.Teardown)+1)
-	cleanup = append(cleanup, db.Close)
+	cleanup := make([]cleanupAction, 0, len(c.Teardown)+1)
+	cleanup = append(cleanup, cleanupAction{name: "close isolated database", run: db.Close})
 	for _, cmd := range c.Teardown {
 		cmd := cmd
-		cleanup = append(cleanup, func(cleanupCtx context.Context) error { return db.Exec(cleanupCtx, expand(cmd.SQL, c.Variables)) })
+		cleanup = append(cleanup, cleanupAction{name: "teardown", file: cmd.File, line: cmd.Line, run: func(cleanupCtx context.Context) error { return db.Exec(cleanupCtx, expand(cmd.SQL, c.Variables)) }})
 	}
 	defer func() {
 		d := r.CleanupTimeout
 		if d <= 0 {
 			d = 10 * time.Second
 		}
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), d)
-		defer cancel()
 		for i := len(cleanup) - 1; i >= 0; i-- {
-			if cleanupErr := cleanup[i](cleanupCtx); cleanupErr != nil && err == nil {
-				err = &Failure{Case: c.Name, Stage: "cleanup", Name: "cleanup", Err: cleanupErr}
+			// Every action receives its own full budget. A hung teardown cannot
+			// consume the deadline needed by later teardown or Close actions.
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), d)
+			cleanupErr := cleanup[i].run(cleanupCtx)
+			cancel()
+			if cleanupErr != nil {
+				err = errors.Join(err, &Failure{Case: c.Name, Stage: "cleanup", Name: cleanup[i].name, File: cleanup[i].file, Line: cleanup[i].line, Err: cleanupErr})
 			}
 		}
 		result.Duration = time.Since(started)

@@ -98,3 +98,42 @@ func TestAssertionFailureIdentifiesAssertion(t *testing.T) {
 		t.Fatalf("error %v", err)
 	}
 }
+
+type cleanupDB struct{ events []string }
+
+func (d *cleanupDB) Exec(ctx context.Context, q string) error {
+	d.events = append(d.events, q)
+	switch q {
+	case "PRIMARY":
+		return errors.New("primary failure")
+	case "HANG":
+		<-ctx.Done()
+		return ctx.Err()
+	case "CLEANUP FAIL":
+		return errors.New("cleanup failure")
+	}
+	return nil
+}
+func (d *cleanupDB) QueryCount(context.Context, string, ...any) (int64, error) { return 0, nil }
+func (d *cleanupDB) Close(context.Context) error                               { d.events = append(d.events, "close"); return nil }
+
+type cleanupFactory struct{ db *cleanupDB }
+
+func (f cleanupFactory) OpenIsolated(context.Context, string) (Database, error) { return f.db, nil }
+
+func TestEveryCleanupGetsFreshBudgetAndErrorsAreJoined(t *testing.T) {
+	db := &cleanupDB{}
+	_, err := (Runner{Factory: cleanupFactory{db}, CleanupTimeout: time.Millisecond}).Run(context.Background(), Case{Name: "cleanup-errors", Setup: []Command{{SQL: "PRIMARY"}}, Teardown: []Command{{SQL: "OK"}, {SQL: "CLEANUP FAIL"}, {SQL: "HANG"}}})
+	if err == nil || !strings.Contains(err.Error(), "primary failure") || !strings.Contains(err.Error(), "cleanup failure") || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error %v", err)
+	}
+	want := []string{"PRIMARY", "HANG", "CLEANUP FAIL", "OK", "close"}
+	if len(db.events) != len(want) {
+		t.Fatalf("events %v", db.events)
+	}
+	for i := range want {
+		if db.events[i] != want[i] {
+			t.Fatalf("events %v", db.events)
+		}
+	}
+}
