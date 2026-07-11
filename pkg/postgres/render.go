@@ -838,12 +838,12 @@ func validateProjectionTopology(request plugin.RenderRequest) (map[string]bool, 
 		if !isProjectionID(beforeParent, current) && !isProjectionID(afterParent, desired) {
 			continue
 		}
-		if change.Before != nil {
+		if change.Before != nil && change.Operation != schema.OperationRename {
 			if e := validateProjectionResource(*change.Before, beforeParent); e != nil {
 				return nil, e
 			}
 		}
-		if change.After != nil {
+		if change.After != nil && change.Operation != schema.OperationRename {
 			if e := validateProjectionResource(*change.After, afterParent); e != nil {
 				return nil, e
 			}
@@ -1130,7 +1130,7 @@ func validateParentRenameDependents(request plugin.RenderRequest) error {
 		}
 	}
 	for _, change := range request.Changes.Changes {
-		if change.Operation != schema.OperationRename || change.Before == nil || (change.Before.Kind != schema.KindTable && change.Before.Kind != schema.KindSchema) {
+		if change.Operation != schema.OperationRename || change.Before == nil || (change.Before.Kind != schema.KindTable && change.Before.Kind != schema.KindSchema && change.Before.Kind != schema.KindView && change.Before.Kind != schema.KindMaterializedView) {
 			continue
 		}
 		root := change.Before.ID

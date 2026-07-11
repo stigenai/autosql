@@ -46,10 +46,11 @@ Column drop and rename also fail when a retained read-only table child or
 table-referencing object might depend on the affected column. This deliberately
 conservative guard remains until inspection can prove exact column-level edges
 and complete dependent transitions.
-The same principle applies to schema and table rename: a retained index,
-constraint, trigger, view, or other opaque descendant/dependent blocks the parent
-rename because PostgreSQL may rewrite its identity or stored definition. Bare
-managed parents and columns continue to use proven rename topology.
+The same principle applies to every managed renameable container—schema, table,
+view, and materialized view: a retained index, constraint, trigger, view, or
+other opaque descendant/dependent blocks the parent rename because PostgreSQL
+may rewrite its identity or stored definition. Bare managed parents and their
+canonical column topology continue to use proven rename transitions.
 
 View definitions are replaceable, while materialized-view changes require the
 explicit `allow_rebuild=true` strategy. A shape-changing view replacement also

@@ -737,6 +737,96 @@ func TestParentRenameRejectsRetainedOpaqueDescendants(t *testing.T) {
 	}
 }
 
+func TestMaterializedViewRenameDependentGuardAndBareConvergence(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	_, err = conn.Exec(ctx, `drop schema if exists autosql_mvrename cascade; create schema autosql_mvrename; create table autosql_mvrename.widgets(id bigint); create materialized view autosql_mvrename.widget_mv as select id from autosql_mvrename.widgets; create index widget_mv_id_idx on autosql_mvrename.widget_mv(id);`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Exec(context.Background(), `drop schema if exists autosql_mvrename cascade`)
+	inspect := func() schema.Document {
+		doc, e := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_mvrename"}})
+		if e != nil {
+			t.Fatal(e)
+		}
+		doc, e = postgres.New().Normalize(ctx, doc)
+		if e != nil {
+			t.Fatal(e)
+		}
+		return doc
+	}
+	rename := func(current schema.Document) (schema.Document, []schema.RenameHint) {
+		var before schema.Resource
+		for _, r := range current.Graph.Resources {
+			if r.Kind == schema.KindMaterializedView {
+				before = r
+			}
+		}
+		after := before
+		after.Name.Name = "widget_mv_new"
+		after.ID = schema.StableID(after.Kind, after.Name)
+		desired := current
+		hints := []schema.RenameHint{{From: before.ID, To: after.ID}}
+		desired.Graph.Resources = nil
+		for _, original := range current.Graph.Resources {
+			r := original
+			r.Dependencies = append([]schema.Dependency(nil), r.Dependencies...)
+			if r.ID == before.ID {
+				r = after
+			} else {
+				if r.Name.Parent == before.ID {
+					r.Name.Parent = after.ID
+				}
+				for i := range r.Dependencies {
+					if r.Dependencies[i].Target == before.ID {
+						r.Dependencies[i].Target = after.ID
+					}
+				}
+				old := r.ID
+				r.ID = schema.StableID(r.Kind, r.Name)
+				if old != r.ID && r.Kind == schema.KindColumn {
+					hints = append(hints, schema.RenameHint{From: old, To: r.ID})
+				}
+			}
+			desired.Graph.Resources = append(desired.Graph.Resources, r)
+		}
+		desired.Normalize()
+		return desired, hints
+	}
+	current := inspect()
+	desired, hints := rename(current)
+	failed, buildErr := plan.Build(ctx, postgres.New(), current, desired, plan.Options{Diff: schema.DiffOptions{RenameHints: hints}})
+	if buildErr == nil || len(failed.Steps) != 0 {
+		t.Fatalf("indexed MV rename planned=%+v err=%v", failed, buildErr)
+	}
+	if _, err = conn.Exec(ctx, `drop index autosql_mvrename.widget_mv_id_idx`); err != nil {
+		t.Fatal(err)
+	}
+	current = inspect()
+	desired, hints = rename(current)
+	p, err := plan.Build(ctx, postgres.New(), current, desired, plan.Options{Diff: schema.DiffOptions{RenameHints: hints}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, p)
+	actual := inspect()
+	assertFingerprint(t, actual, desired)
+	noop, err := plan.Build(ctx, postgres.New(), actual, desired, plan.Options{})
+	if err != nil || len(noop.Steps) != 0 {
+		t.Fatalf("bare MV second plan=%+v err=%v", noop, err)
+	}
+}
+
 func renameFixture(doc schema.Document, newSchemaName, newTableName string) (schema.Document, string, string, string, string) {
 	var oldSchema, oldTable schema.Resource
 	for _, r := range doc.Graph.Resources {
