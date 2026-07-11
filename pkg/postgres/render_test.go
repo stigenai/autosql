@@ -334,6 +334,17 @@ func TestNestedViewDependenciesFailClosed(t *testing.T) {
 	}
 }
 
+func TestTableQueryExpressionFailsClosed(t *testing.T) {
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "app", Name: "b", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	view := renderResource(schema.KindView, schema.Name{Schema: "app", Name: "v", Parent: ns.ID}, `{"definition":"TABLE app.b"}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains}, schema.Dependency{Target: table.ID, Type: schema.DependencyReferences})
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, view}}}
+	changes := schema.ChangeSet{Version: schema.ChangeVersion, Changes: []schema.Change{{ID: "c", Operation: schema.OperationCreate, ResourceID: view.ID, After: &view}}}
+	if out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Desired: desired}); err == nil || len(out) != 0 {
+		t.Fatalf("out=%+v err=%v", out, err)
+	}
+}
+
 func TestCanonicalUDTUsesAcceptsQuotedUnqualifiedAndArrays(t *testing.T) {
 	ns := renderResource(schema.KindSchema, schema.Name{Name: "public"}, `{}`)
 	table := renderResource(schema.KindTable, schema.Name{Schema: "public", Name: "widgets", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})

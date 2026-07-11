@@ -156,6 +156,16 @@ func TestSQLSourcePlanApplyReinspectConverges(t *testing.T) {
 			}
 		})
 	}
+	badQuery := actual
+	badQuery.Graph.Resources = append([]schema.Resource(nil), actual.Graph.Resources...)
+	for i := range badQuery.Graph.Resources {
+		if badQuery.Graph.Resources[i].Kind == schema.KindView && badQuery.Graph.Resources[i].Name.Name == "widget_view" {
+			badQuery.Graph.Resources[i].Spec = json.RawMessage(`{"definition":"TABLE autosql_plan.widgets"}`)
+		}
+	}
+	if failed, buildErr := plan.Build(ctx, postgres.New(), actual, badQuery, plan.Options{}); buildErr == nil || len(failed.Steps) != 0 {
+		t.Fatalf("TABLE query expression planned: %+v err=%v", failed, buildErr)
+	}
 	raw, _ := json.Marshal(actual)
 	var sameShape schema.Document
 	_ = json.Unmarshal(raw, &sameShape)
@@ -454,12 +464,12 @@ func TestUDTArrayColumnApplyReinspectConverges(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close(context.Background())
-	_, err = conn.Exec(ctx, `drop schema if exists autosql_udt cascade; create schema autosql_udt; create type autosql_udt.status as enum ('new'); create type autosql_udt."Mood" as enum ('good'); create table autosql_udt.widgets(id bigint);`)
+	_, err = conn.Exec(ctx, `drop schema if exists "AutoSQL_UDT" cascade; create schema "AutoSQL_UDT"; create type "AutoSQL_UDT".status as enum ('new'); create type "AutoSQL_UDT"."Mood" as enum ('good'); create table "AutoSQL_UDT".widgets(id bigint);`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Exec(context.Background(), `drop schema if exists autosql_udt cascade`)
-	current, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_udt"}})
+	defer conn.Exec(context.Background(), `drop schema if exists "AutoSQL_UDT" cascade`)
+	current, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"AutoSQL_UDT"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -479,8 +489,12 @@ func TestUDTArrayColumnApplyReinspectConverges(t *testing.T) {
 			types[r.Name.Name] = r
 		}
 	}
-	for index, fixture := range []struct{ name, typ, target string }{{"statuses", "autosql_udt.status[]", "status"}, {"moods", `autosql_udt."Mood"[]`, "Mood"}} {
-		column := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: "autosql_udt", Name: fixture.name, Parent: table.ID}, Dependencies: []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}, {Target: types[fixture.target].ID, Type: schema.DependencyUses}}, Spec: json.RawMessage(fmt.Sprintf(`{"type":%q,"not_null":false,"ordinal":%d}`, fixture.typ, index+2))}
+	for index, fixture := range []struct{ name, typ, target string }{{"statuses", `"AutoSQL_UDT".status[][]`, "status"}, {"moods", `"AutoSQL_UDT"."Mood"[][]`, "Mood"}, {"matrix", "integer[][]", ""}} {
+		deps := []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}}
+		if fixture.target != "" {
+			deps = append(deps, schema.Dependency{Target: types[fixture.target].ID, Type: schema.DependencyUses})
+		}
+		column := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: "AutoSQL_UDT", Name: fixture.name, Parent: table.ID}, Dependencies: deps, Spec: json.RawMessage(fmt.Sprintf(`{"type":%q,"not_null":false,"ordinal":%d}`, fixture.typ, index+2))}
 		column.ID = schema.StableID(column.Kind, column.Name)
 		desired.Graph.Resources = append(desired.Graph.Resources, column)
 	}
@@ -493,7 +507,7 @@ func TestUDTArrayColumnApplyReinspectConverges(t *testing.T) {
 		t.Fatal(err)
 	}
 	applyTestPlan(t, ctx, conn, p)
-	actual, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_udt"}})
+	actual, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"AutoSQL_UDT"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -506,6 +520,60 @@ func TestUDTArrayColumnApplyReinspectConverges(t *testing.T) {
 	if err != nil || len(noop.Steps) != 0 {
 		t.Fatalf("UDT array second plan=%+v err=%v", noop, err)
 	}
+}
+
+func TestNonfinalColumnRenamePreservesOrdinal(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	_, err = conn.Exec(ctx, `drop schema if exists autosql_colrename cascade; create schema autosql_colrename; create table autosql_colrename.widgets(a text,b text);`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Exec(context.Background(), `drop schema if exists autosql_colrename cascade`)
+	current, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_colrename"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err = postgres.New().Normalize(ctx, current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired := current
+	desired.Graph.Resources = append([]schema.Resource(nil), current.Graph.Resources...)
+	var oldID, newID string
+	for i := range desired.Graph.Resources {
+		r := &desired.Graph.Resources[i]
+		if r.Kind == schema.KindColumn && r.Name.Name == "a" {
+			oldID = r.ID
+			r.Name.Name = "x"
+			r.ID = schema.StableID(r.Kind, r.Name)
+			newID = r.ID
+		}
+	}
+	desired.Normalize()
+	p, err := plan.Build(ctx, postgres.New(), current, desired, plan.Options{Diff: schema.DiffOptions{RenameHints: []schema.RenameHint{{From: oldID, To: newID}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, p)
+	actual, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_colrename"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err = postgres.New().Normalize(ctx, actual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFingerprint(t, actual, desired)
 }
 
 func renameFixture(doc schema.Document, newSchemaName, newTableName string) (schema.Document, string, string, string, string) {

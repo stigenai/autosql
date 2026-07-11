@@ -31,6 +31,8 @@ append and drop columns but cannot insert or reorder them, so the planner proves
 the complete sibling sequence: append and drop consequences are topology-only,
 while middle insertion, reorder, or a simultaneous ordinal-and-attribute change
 fails until a table rebuild strategy exists.
+Column rename hints preserve the same physical slot (including nonfinal columns)
+and cannot be combined with hidden attribute changes.
 
 View definitions are replaceable, while materialized-view changes require the
 explicit `allow_rebuild=true` strategy. A shape-changing view replacement also
@@ -53,10 +55,15 @@ and type subset. Missing, extra, or unprovable dependencies fail planning so a
 post-apply inspection cannot silently change the target graph.
 The conservative view grammar accepts only one top-level relation; joins,
 subqueries, nested `SELECT`/`EXISTS`, and other multi-relation forms fail closed.
+`TABLE` query expressions, CTEs, and set operations are also rejected by lexical
+token checks performed outside quoted strings.
 For user-defined column types, inspection follows array element OIDs and emits a
 `uses` edge to the true enum/domain/composite resource. Validation resolves
 canonical qualified, same-schema/public unqualified, quoted, and array spellings
 against that exact dependency target.
+Rendered UDT SQL always uses the dependency target's quoted schema and type name,
+never the table schema or session search path. PostgreSQL's one-or-more array
+brackets are canonicalized to a single `[]` before fingerprinting and rendering.
 
 `postgres.RenderDocument` renders a full desired document from an empty schema
 projection when every resource is in the managed matrix. Read-only kinds make

@@ -218,7 +218,7 @@ func renderCreate(r schema.Resource, resources map[string]schema.Resource, optio
 		if err != nil {
 			return nil, err
 		}
-		def, e := columnDefinition(r)
+		def, e := columnDefinition(r, resources)
 		if e != nil {
 			return nil, e
 		}
@@ -564,13 +564,30 @@ func renderCreateIndex(r schema.Resource, parent string, options map[string]stri
 	q += qualified(r.Name) + " ON " + parent + " " + d
 	return []string{q}, nil
 }
-func columnDefinition(r schema.Resource) (string, error) {
+func columnDefinition(r schema.Resource, resources map[string]schema.Resource) (string, error) {
 	s := spec(r)
 	t := stringValue(s, "type")
 	if t == "" {
 		return "", unsupported(r, "column type")
 	}
 	q := t
+	var uses []schema.Resource
+	for _, dep := range r.Dependencies {
+		if dep.Type == schema.DependencyUses {
+			if target, ok := resources[dep.Target]; ok {
+				uses = append(uses, target)
+			}
+		}
+	}
+	if len(uses) > 1 {
+		return "", unsupported(r, "column type has ambiguous uses dependencies")
+	}
+	if len(uses) == 1 {
+		q = quote(uses[0].Name.Schema) + "." + quote(uses[0].Name.Name)
+		if strings.HasSuffix(t, "[]") {
+			q += "[]"
+		}
+	}
 	d := stringValue(s, "default")
 	generated := stringValue(s, "generated")
 	if generated != "" {
@@ -695,7 +712,7 @@ func validateProjectionShape(view schema.Resource, resources map[string]schema.R
 				}
 			}
 		}
-	} else if match := simpleLiteralView.FindStringSubmatch(definition); match != nil {
+	} else if match := simpleLiteralMatch(definition); match != nil {
 		expr, name := strings.TrimSpace(match[1]), match[2]
 		if _, e := strconv.Atoi(expr); e == nil {
 			expected[name] = "integer"
@@ -887,6 +904,20 @@ func validateRebuildDependents(current, desired map[string]schema.Resource, pare
 }
 func validateColumnOrdinalTransitions(request plugin.RenderRequest) error {
 	current, desired := resourceMapForRender(request.Current), resourceMapForRender(request.Desired)
+	renames := map[string]string{}
+	renamedAfter := map[string]bool{}
+	parentRenames := map[string]string{}
+	renamedParents := map[string]bool{}
+	for _, change := range request.Changes.Changes {
+		if change.Operation == schema.OperationRename && change.Before != nil && change.After != nil && change.Before.Kind == schema.KindColumn {
+			renames[change.Before.ID] = change.After.ID
+			renamedAfter[change.After.ID] = true
+		}
+		if change.Operation == schema.OperationRename && change.Before != nil && change.After != nil && change.Before.Kind == schema.KindTable {
+			parentRenames[change.Before.ID] = change.After.ID
+			renamedParents[change.After.ID] = true
+		}
+	}
 	parents := map[string]bool{}
 	for _, resources := range []map[string]schema.Resource{current, desired} {
 		for _, r := range resources {
@@ -908,18 +939,33 @@ func validateColumnOrdinalTransitions(request plugin.RenderRequest) error {
 		return columns
 	}
 	for parent := range parents {
-		before, after := ordered(current, parent), ordered(desired, parent)
+		if renamedParents[parent] {
+			continue
+		}
+		afterParent := parent
+		if renamed := parentRenames[parent]; renamed != "" {
+			afterParent = renamed
+		}
+		before, after := ordered(current, parent), ordered(desired, afterParent)
 		var achievable []string
 		for _, column := range before {
-			if target, retained := desired[column.ID]; retained {
-				achievable = append(achievable, column.ID)
+			target, retained := desired[column.ID]
+			physicalID := column.ID
+			if renamed := renames[column.ID]; renamed != "" {
+				target, retained, physicalID = desired[renamed], true, renamed
+			}
+			if retained {
+				achievable = append(achievable, physicalID)
+				if physicalID != column.ID && !slices.Equal(canonicalMapEntries(spec(column)), canonicalMapEntries(spec(target))) {
+					return unsupported(target, "column rename cannot include attribute changes")
+				}
 				if numberAsInt(spec(column), "ordinal") != numberAsInt(spec(target), "ordinal") && !columnOrdinalOnly(column, target) {
 					return unsupported(target, "ordinal shift cannot be mixed with attribute changes")
 				}
 			}
 		}
 		for _, column := range after {
-			if _, existed := current[column.ID]; !existed {
+			if _, existed := current[column.ID]; !existed && !renamedAfter[column.ID] {
 				achievable = append(achievable, column.ID)
 			}
 		}
@@ -1051,7 +1097,7 @@ func validateSemanticDependencies(r schema.Resource, resources map[string]schema
 			if len(expected) != 1 {
 				return unsupported(r, "view source dependency is not provable")
 			}
-		} else if !simpleLiteralView.MatchString(definition) {
+		} else if simpleLiteralMatch(definition) == nil {
 			return unsupported(r, "view dependencies are not provable from definition")
 		}
 	case schema.KindColumn:
@@ -1091,8 +1137,8 @@ func typeReferenceMatches(typ, columnSchema string, name schema.Name) bool {
 	quotedName := quote(name.Name)
 	quotedSchema := quote(name.Schema)
 	qualified := []string{quotedSchema + "." + quotedName, name.Schema + "." + quotedName}
-	if name.Name == strings.ToLower(name.Name) && name.Schema == strings.ToLower(name.Schema) {
-		qualified = append(qualified, name.Schema+"."+name.Name)
+	if name.Name == strings.ToLower(name.Name) {
+		qualified = append(qualified, quotedSchema+"."+name.Name, name.Schema+"."+name.Name)
 	}
 	for _, spelling := range qualified {
 		if base == spelling {

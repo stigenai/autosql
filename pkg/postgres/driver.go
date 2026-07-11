@@ -170,15 +170,72 @@ func canonicalizeColumnOrdinals(doc *schema.Document) error {
 
 var simpleViewFrom = regexp.MustCompile(`(?i)^SELECT\s+(.+?)\s+FROM\s+([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)(?:\s+WHERE\s+.+)?$`)
 var simpleLiteralView = regexp.MustCompile(`(?i)^SELECT\s+(.+)\s+AS\s+([a-z_][a-z0-9_]*)$`)
-var relationKeyword = regexp.MustCompile(`(?i)\b(SELECT|FROM|JOIN)\b`)
+
+func sqlTokens(definition string) []string {
+	var tokens []string
+	for i := 0; i < len(definition); {
+		if definition[i] == '\'' || definition[i] == '"' {
+			quote := definition[i]
+			i++
+			for i < len(definition) {
+				if definition[i] == quote {
+					if i+1 < len(definition) && definition[i+1] == quote {
+						i += 2
+						continue
+					}
+					i++
+					break
+				}
+				i++
+			}
+			continue
+		}
+		if (definition[i] >= 'A' && definition[i] <= 'Z') || (definition[i] >= 'a' && definition[i] <= 'z') || definition[i] == '_' {
+			start := i
+			for i < len(definition) && ((definition[i] >= 'A' && definition[i] <= 'Z') || (definition[i] >= 'a' && definition[i] <= 'z') || (definition[i] >= '0' && definition[i] <= '9') || definition[i] == '_') {
+				i++
+			}
+			tokens = append(tokens, strings.ToUpper(definition[start:i]))
+			continue
+		}
+		i++
+	}
+	return tokens
+}
+
+func conservativeQueryTokens(definition string, withFrom bool) bool {
+	tokens := sqlTokens(definition)
+	selects, froms := 0, 0
+	for _, token := range tokens {
+		switch token {
+		case "SELECT":
+			selects++
+		case "FROM":
+			froms++
+		case "TABLE", "WITH", "JOIN", "UNION", "INTERSECT", "EXCEPT":
+			return false
+		}
+	}
+	if withFrom {
+		return selects == 1 && froms == 1
+	}
+	return selects == 1 && froms == 0
+}
 
 func simpleViewMatch(definition string) []string {
 	match := simpleViewFrom.FindStringSubmatch(definition)
 	if match == nil {
 		return nil
 	}
-	keywords := relationKeyword.FindAllString(definition, -1)
-	if len(keywords) != 2 || !strings.EqualFold(keywords[0], "SELECT") || !strings.EqualFold(keywords[1], "FROM") {
+	if !conservativeQueryTokens(definition, true) {
+		return nil
+	}
+	return match
+}
+
+func simpleLiteralMatch(definition string) []string {
+	match := simpleLiteralView.FindStringSubmatch(definition)
+	if match == nil || !conservativeQueryTokens(definition, false) {
 		return nil
 	}
 	return match
@@ -254,7 +311,7 @@ func augmentProjectionColumns(doc *schema.Document) {
 				}
 			}
 		}
-		if match := simpleLiteralView.FindStringSubmatch(definition); match != nil {
+		if match := simpleLiteralMatch(definition); match != nil {
 			expr, name := strings.TrimSpace(match[1]), match[2]
 			typ := ""
 			if _, err := strconv.Atoi(expr); err == nil {
@@ -373,18 +430,18 @@ func normalizePostgresSpec(spec map[string]any) {
 }
 func postgresTypeAlias(value string) string {
 	original := strings.TrimSpace(value)
+	array := ""
+	for strings.HasSuffix(original, "[]") {
+		array = "[]"
+		original = strings.TrimSpace(strings.TrimSuffix(original, "[]"))
+	}
 	// Quoted identifiers and user-defined names are case-sensitive. Only fold
 	// names from PostgreSQL's documented built-in alias set.
 	if strings.Contains(original, `"`) {
-		return original
+		return original + array
 	}
 	s := strings.ToLower(original)
 	s = strings.TrimPrefix(s, "pg_catalog.")
-	array := ""
-	for strings.HasSuffix(s, "[]") {
-		array += "[]"
-		s = strings.TrimSpace(strings.TrimSuffix(s, "[]"))
-	}
 	suffix := ""
 	if i := strings.IndexByte(s, '('); i >= 0 && strings.HasSuffix(s, ")") {
 		suffix = s[i:]
@@ -400,7 +457,7 @@ func postgresTypeAlias(value string) string {
 	if normalized, ok := aliases[s]; ok {
 		return normalized + suffix + array
 	}
-	return original
+	return original + array
 }
 func postgresDefault(value string) string {
 	s := normalizeSQLSpace(value)
