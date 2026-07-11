@@ -67,7 +67,7 @@ func (a *authority) ResolveActor(_ context.Context, id string) (approval.Identit
 	case "author":
 		return approval.Identity{ID: id}, nil
 	case "deployer":
-		return approval.Identity{ID: id}, nil
+		return approval.Identity{ID: id, EmergencyAuthority: true}, nil
 	case "dba":
 		return approval.Identity{ID: id, Roles: []string{"dba"}}, nil
 	}
@@ -356,6 +356,83 @@ func TestStatementBindingsRejectReorderingAndStaleChangeHash(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			_, err := g.Apply(context.Background(), in)
+			if !errors.Is(err, ErrBinding) || db.tx != nil {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+}
+
+func TestPlanExpiryIsUTCBundleBoundOnNormalAndEmergencyPaths(t *testing.T) {
+	mutations := map[string]func(time.Time) time.Time{"changed": func(v time.Time) time.Time { return v.Add(30 * time.Second) }, "removed": func(time.Time) time.Time { return time.Time{} }, "shortened": func(v time.Time) time.Time { return v.Add(-time.Hour) }, "extended": func(v time.Time) time.Time { return v.Add(time.Hour) }}
+	for _, path := range []string{"normal", "emergency"} {
+		for name, mutate := range mutations {
+			t.Run(path+"/"+name, func(t *testing.T) {
+				log := &eventLog{}
+				g, db, _ := harness(t, log)
+				if path == "normal" {
+					g.Approval.Policy.Environments["prod"] = approval.EnvironmentPolicy{Allowed: true, Requirements: []approval.Requirement{{MinimumRisk: approval.RiskLow, ApproverCount: 1, Roles: []string{"dba"}}}}
+				}
+				in, _ := boundInput(t, g, "prod")
+				base := time.Now().UTC().Add(2 * time.Hour)
+				in.Approval.Plan.ExpiresAt = base
+				if path == "emergency" {
+					in.Approval.Override = &approval.EmergencyOverride{Identity: "deployer", Reason: "incident"}
+				}
+				rebind(t, g, &in)
+				oldDigest := in.Approval.Plan.Digest
+				if path == "normal" {
+					now := time.Now().UTC()
+					in.Approval.Approvals = []approval.Approval{{PlanDigest: oldDigest, Environment: "prod", Approver: "dba", ApprovedAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour), Proof: "signed"}}
+				}
+				in.Approval.Plan.ExpiresAt = mutate(base)
+				in.Database = db
+				_, err := g.Apply(context.Background(), in)
+				if !errors.Is(err, ErrBinding) || db.tx != nil || len(log.values) != 0 {
+					t.Fatalf("digest=%s error=%v events=%v", oldDigest, err, log.values)
+				}
+			})
+		}
+	}
+}
+
+func TestExpiryCanonicalizesEquivalentUTCInstant(t *testing.T) {
+	log := &eventLog{}
+	g, _, _ := harness(t, log)
+	in, _ := boundInput(t, g, "prod")
+	instant := time.Date(2030, 1, 2, 3, 4, 5, 6, time.FixedZone("offset", -5*60*60))
+	in.Approval.Plan.ExpiresAt = instant
+	rebind(t, g, &in)
+	first := in.Approval.Plan.Digest
+	in.Approval.Plan.ExpiresAt = instant.UTC()
+	second, err := g.BundleDigest(in)
+	if err != nil || first != second {
+		t.Fatalf("first=%s second=%s err=%v", first, second, err)
+	}
+}
+
+func TestEmergencyOverrideFieldsAreBundleBound(t *testing.T) {
+	for _, field := range []string{"attached", "removed", "identity", "reason"} {
+		t.Run(field, func(t *testing.T) {
+			log := &eventLog{}
+			g, db, _ := harness(t, log)
+			in, _ := boundInput(t, g, "prod")
+			if field != "attached" {
+				in.Approval.Override = &approval.EmergencyOverride{Identity: "deployer", Reason: "incident"}
+				rebind(t, g, &in)
+			}
+			switch field {
+			case "attached":
+				in.Approval.Override = &approval.EmergencyOverride{Identity: "deployer", Reason: "incident"}
+			case "removed":
+				in.Approval.Override = nil
+			case "identity":
+				in.Approval.Override.Identity = "other"
+			case "reason":
+				in.Approval.Override.Reason = "changed"
+			}
+			in.Database = db
 			_, err := g.Apply(context.Background(), in)
 			if !errors.Is(err, ErrBinding) || db.tx != nil {
 				t.Fatalf("error=%v", err)

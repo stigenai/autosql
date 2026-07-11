@@ -25,6 +25,11 @@ plan, environment, author, requester, policy identity/document/resources,
 safety threshold and risk mapping, target metadata and thresholds, sorted
 analyzer attestations, exact suppressions, policy evaluator limits, the complete
 approval environment policy, and canonical statement bindings.
+The approval request's plan expiry is represented explicitly as either unset or
+an RFC3339Nano UTC instant. Emergency override presence, identity, and reason
+are also bound, so neither normal nor emergency authorization can replay after
+expiry or override changes. Individual approval proofs remain dynamic evidence;
+their verified claims already bind this bundle digest and environment.
 `Guardrail.Apply` recomputes it and rejects any mismatch before analysis, audit,
 or database work. Analyzer identities must be non-empty, unique, stable,
 concrete package/type identities with a versioned configuration attestation.

@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"time"
 
 	"autosql/pkg/approval"
 	"autosql/pkg/policy"
@@ -134,6 +135,8 @@ type enforcementBundle struct {
 	Environment        string               `json:"environment"`
 	Author             string               `json:"author"`
 	Requester          string               `json:"requester"`
+	PlanExpiry         canonicalExpiry      `json:"plan_expiry"`
+	Override           canonicalOverride    `json:"emergency_override"`
 	PolicyIdentity     string               `json:"policy_identity"`
 	Policy             policy.Document      `json:"policy"`
 	PolicyLimits       policy.Limits        `json:"policy_limits"`
@@ -147,6 +150,15 @@ type enforcementBundle struct {
 	Suppressions       []safety.Suppression `json:"suppressions"`
 	ApprovalPolicy     approval.Policy      `json:"approval_policy"`
 	Statements         []StatementBinding   `json:"statements"`
+}
+type canonicalExpiry struct {
+	Set bool   `json:"set"`
+	UTC string `json:"utc"`
+}
+type canonicalOverride struct {
+	Set      bool   `json:"set"`
+	Identity string `json:"identity"`
+	Reason   string `json:"reason"`
 }
 type analyzerIdentity struct{ Name, Concrete, Version, ConfigDigest string }
 
@@ -169,7 +181,7 @@ func (g Guardrail) BundleDigest(in Input) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	bundle := enforcementBundle{Version: "autosql.guardrail.bundle/v1", ChangeDigest: changeDigest, PrecheckDigest: in.Precheck.Digest, Environment: g.Config.Environment, Author: in.Approval.Plan.Author, Requester: in.Approval.RequestedBy, PolicyIdentity: in.PolicyIdentity, Policy: in.Policy, PolicyLimits: g.Policy.Limits, SchemaResources: in.SchemaResources, MigrationResources: in.MigrationResources, FailOn: g.Config.FailOn, Risk: g.Config.Risk, Target: in.Safety.Target, Thresholds: in.Safety.Thresholds, Analyzers: names, Suppressions: g.Safety.Suppressions, ApprovalPolicy: g.Approval.Policy, Statements: in.StatementBindings}
+	bundle := enforcementBundle{Version: "autosql.guardrail.bundle/v1", ChangeDigest: changeDigest, PrecheckDigest: in.Precheck.Digest, Environment: g.Config.Environment, Author: in.Approval.Plan.Author, Requester: in.Approval.RequestedBy, PlanExpiry: canonicalPlanExpiry(in.Approval.Plan.ExpiresAt), Override: canonicalEmergencyOverride(in.Approval.Override), PolicyIdentity: in.PolicyIdentity, Policy: in.Policy, PolicyLimits: g.Policy.Limits, SchemaResources: in.SchemaResources, MigrationResources: in.MigrationResources, FailOn: g.Config.FailOn, Risk: g.Config.Risk, Target: in.Safety.Target, Thresholds: in.Safety.Thresholds, Analyzers: names, Suppressions: g.Safety.Suppressions, ApprovalPolicy: g.Approval.Policy, Statements: in.StatementBindings}
 	raw, err := json.Marshal(bundle)
 	if err != nil {
 		return "", fmt.Errorf("%w: bundle is not canonical JSON", ErrBinding)
@@ -178,6 +190,18 @@ func (g Guardrail) BundleDigest(in Input) (string, error) {
 	writeField(h, "autosql.guardrail.bundle-digest/v1")
 	writeField(h, string(raw))
 	return "sha256:" + hex.EncodeToString(h.Sum(nil)), nil
+}
+func canonicalPlanExpiry(value time.Time) canonicalExpiry {
+	if value.IsZero() {
+		return canonicalExpiry{}
+	}
+	return canonicalExpiry{Set: true, UTC: value.UTC().Format(time.RFC3339Nano)}
+}
+func canonicalEmergencyOverride(value *approval.EmergencyOverride) canonicalOverride {
+	if value == nil {
+		return canonicalOverride{}
+	}
+	return canonicalOverride{Set: true, Identity: value.Identity, Reason: value.Reason}
 }
 
 func analyzerIdentities(analyzers []safety.Analyzer) ([]analyzerIdentity, error) {
