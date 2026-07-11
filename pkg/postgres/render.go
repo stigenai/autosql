@@ -26,6 +26,9 @@ func (*Driver) Render(ctx context.Context, request plugin.RenderRequest) ([]plug
 	if err := validateManagedDocuments(request); err != nil {
 		return nil, fmt.Errorf("render PostgreSQL changes: %w", err)
 	}
+	if err := validateColumnOrdinalTransitions(request); err != nil {
+		return nil, fmt.Errorf("render PostgreSQL changes: %w", err)
+	}
 	rebuilds, err := validateProjectionTopology(request)
 	if err != nil {
 		return nil, fmt.Errorf("render PostgreSQL changes: %w", err)
@@ -667,7 +670,7 @@ func validateProjectionShape(view schema.Resource, resources map[string]schema.R
 	definition := stringValue(spec(view), "definition")
 	expected := map[string]string{}
 	expectedOrdinal := map[string]int{}
-	if match := simpleViewFrom.FindStringSubmatch(definition); match != nil {
+	if match := simpleViewMatch(definition); match != nil {
 		if strings.TrimSpace(match[1]) == "*" {
 			return fmt.Errorf("wildcard was not canonically expanded")
 		}
@@ -882,6 +885,59 @@ func validateRebuildDependents(current, desired map[string]schema.Resource, pare
 	}
 	return nil
 }
+func validateColumnOrdinalTransitions(request plugin.RenderRequest) error {
+	current, desired := resourceMapForRender(request.Current), resourceMapForRender(request.Desired)
+	parents := map[string]bool{}
+	for _, resources := range []map[string]schema.Resource{current, desired} {
+		for _, r := range resources {
+			if r.Kind == schema.KindColumn && resources[r.Name.Parent].Kind == schema.KindTable {
+				parents[r.Name.Parent] = true
+			}
+		}
+	}
+	ordered := func(resources map[string]schema.Resource, parent string) []schema.Resource {
+		var columns []schema.Resource
+		for _, r := range resources {
+			if r.Kind == schema.KindColumn && r.Name.Parent == parent {
+				columns = append(columns, r)
+			}
+		}
+		sort.Slice(columns, func(i, j int) bool {
+			return numberAsInt(spec(columns[i]), "ordinal") < numberAsInt(spec(columns[j]), "ordinal")
+		})
+		return columns
+	}
+	for parent := range parents {
+		before, after := ordered(current, parent), ordered(desired, parent)
+		var achievable []string
+		for _, column := range before {
+			if target, retained := desired[column.ID]; retained {
+				achievable = append(achievable, column.ID)
+				if numberAsInt(spec(column), "ordinal") != numberAsInt(spec(target), "ordinal") && !columnOrdinalOnly(column, target) {
+					return unsupported(target, "ordinal shift cannot be mixed with attribute changes")
+				}
+			}
+		}
+		for _, column := range after {
+			if _, existed := current[column.ID]; !existed {
+				achievable = append(achievable, column.ID)
+			}
+		}
+		actual := make([]string, len(after))
+		for i := range after {
+			actual[i] = after[i].ID
+		}
+		if !slices.Equal(achievable, actual) {
+			r := schema.Resource{Kind: schema.KindTable, ID: parent}
+			if candidate, ok := desired[parent]; ok {
+				r = candidate
+			}
+			return unsupported(r, "column order requires middle insertion or reorder")
+		}
+	}
+	return nil
+}
+
 func validateManagedDocuments(request plugin.RenderRequest) error {
 	for _, doc := range []schema.Document{request.Current, request.Desired} {
 		resources := resourceMapForRender(doc)
@@ -986,7 +1042,7 @@ func validateSemanticDependencies(r schema.Resource, resources map[string]schema
 	case schema.KindView, schema.KindMaterializedView:
 		expectedType = schema.DependencyReferences
 		definition := stringValue(spec(r), "definition")
-		if match := simpleViewFrom.FindStringSubmatch(definition); match != nil {
+		if match := simpleViewMatch(definition); match != nil {
 			for id, candidate := range resources {
 				if (candidate.Kind == schema.KindTable || candidate.Kind == schema.KindView || candidate.Kind == schema.KindMaterializedView) && candidate.Name.Schema == match[2] && candidate.Name.Name == match[3] {
 					expected = append(expected, id)
@@ -1006,7 +1062,7 @@ func validateSemanticDependencies(r schema.Resource, resources map[string]schema
 		for id, candidate := range resources {
 			switch candidate.Kind {
 			case schema.KindEnum, schema.KindDomain, schema.KindComposite:
-				if typ == candidate.Name.Schema+"."+candidate.Name.Name {
+				if typeReferenceMatches(typ, r.Name.Schema, candidate.Name) {
 					expected = append(expected, id)
 				}
 			}
@@ -1026,6 +1082,29 @@ func validateSemanticDependencies(r schema.Resource, resources map[string]schema
 		return unsupported(r, "declared dependencies do not exactly match rendered semantics")
 	}
 	return nil
+}
+func typeReferenceMatches(typ, columnSchema string, name schema.Name) bool {
+	base := strings.TrimSpace(typ)
+	for strings.HasSuffix(base, "[]") {
+		base = strings.TrimSpace(strings.TrimSuffix(base, "[]"))
+	}
+	quotedName := quote(name.Name)
+	quotedSchema := quote(name.Schema)
+	qualified := []string{quotedSchema + "." + quotedName, name.Schema + "." + quotedName}
+	if name.Name == strings.ToLower(name.Name) && name.Schema == strings.ToLower(name.Schema) {
+		qualified = append(qualified, name.Schema+"."+name.Name)
+	}
+	for _, spelling := range qualified {
+		if base == spelling {
+			return true
+		}
+	}
+	if name.Schema == columnSchema || name.Schema == "public" {
+		if base == quotedName || name.Name == strings.ToLower(name.Name) && base == name.Name {
+			return true
+		}
+	}
+	return false
 }
 func validateCanonicalIdentity(r schema.Resource, resources map[string]schema.Resource) error {
 	if r.Name.Catalog != "" {

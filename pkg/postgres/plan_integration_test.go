@@ -3,6 +3,7 @@ package postgres_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -438,6 +439,72 @@ func TestNativeDocumentCreateReinspectConverges(t *testing.T) {
 	secondDrop, err := plan.Build(ctx, postgres.New(), actual, dropped, plan.Options{})
 	if err != nil || len(secondDrop.Steps) != 0 {
 		t.Fatalf("nonfinal drop second plan=%+v err=%v", secondDrop, err)
+	}
+}
+
+func TestUDTArrayColumnApplyReinspectConverges(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	_, err = conn.Exec(ctx, `drop schema if exists autosql_udt cascade; create schema autosql_udt; create type autosql_udt.status as enum ('new'); create type autosql_udt."Mood" as enum ('good'); create table autosql_udt.widgets(id bigint);`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Exec(context.Background(), `drop schema if exists autosql_udt cascade`)
+	current, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_udt"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err = postgres.New().Normalize(ctx, current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired := current
+	desired.Graph.Resources = append([]schema.Resource(nil), current.Graph.Resources...)
+	var table schema.Resource
+	types := map[string]schema.Resource{}
+	for _, r := range current.Graph.Resources {
+		if r.Kind == schema.KindTable {
+			table = r
+		}
+		if r.Kind == schema.KindEnum {
+			types[r.Name.Name] = r
+		}
+	}
+	for index, fixture := range []struct{ name, typ, target string }{{"statuses", "autosql_udt.status[]", "status"}, {"moods", `autosql_udt."Mood"[]`, "Mood"}} {
+		column := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: "autosql_udt", Name: fixture.name, Parent: table.ID}, Dependencies: []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}, {Target: types[fixture.target].ID, Type: schema.DependencyUses}}, Spec: json.RawMessage(fmt.Sprintf(`{"type":%q,"not_null":false,"ordinal":%d}`, fixture.typ, index+2))}
+		column.ID = schema.StableID(column.Kind, column.Name)
+		desired.Graph.Resources = append(desired.Graph.Resources, column)
+	}
+	desired, err = postgres.New().Normalize(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := plan.Build(ctx, postgres.New(), current, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, p)
+	actual, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_udt"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err = postgres.New().Normalize(ctx, actual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFingerprint(t, actual, desired)
+	noop, err := plan.Build(ctx, postgres.New(), actual, desired, plan.Options{})
+	if err != nil || len(noop.Steps) != 0 {
+		t.Fatalf("UDT array second plan=%+v err=%v", noop, err)
 	}
 }
 

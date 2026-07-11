@@ -170,6 +170,19 @@ func canonicalizeColumnOrdinals(doc *schema.Document) error {
 
 var simpleViewFrom = regexp.MustCompile(`(?i)^SELECT\s+(.+?)\s+FROM\s+([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)(?:\s+WHERE\s+.+)?$`)
 var simpleLiteralView = regexp.MustCompile(`(?i)^SELECT\s+(.+)\s+AS\s+([a-z_][a-z0-9_]*)$`)
+var relationKeyword = regexp.MustCompile(`(?i)\b(SELECT|FROM|JOIN)\b`)
+
+func simpleViewMatch(definition string) []string {
+	match := simpleViewFrom.FindStringSubmatch(definition)
+	if match == nil {
+		return nil
+	}
+	keywords := relationKeyword.FindAllString(definition, -1)
+	if len(keywords) != 2 || !strings.EqualFold(keywords[0], "SELECT") || !strings.EqualFold(keywords[1], "FROM") {
+		return nil
+	}
+	return match
+}
 
 func augmentProjectionColumns(doc *schema.Document) {
 	children := map[string]bool{}
@@ -193,7 +206,7 @@ func augmentProjectionColumns(doc *schema.Document) {
 		s := specMap(r.Spec)
 		definition, _ := s["definition"].(string)
 		var projections []schema.Resource
-		if match := simpleViewFrom.FindStringSubmatch(definition); match != nil {
+		if match := simpleViewMatch(definition); match != nil {
 			table, ok := tables[match[2]+"."+match[3]]
 			if !ok {
 				continue
@@ -312,7 +325,7 @@ func normalizePostgresSpecForKind(kind schema.Kind, spec map[string]any) {
 				definition = strings.TrimSpace(definition[2:])
 			}
 			spec["definition"] = normalizeSQLSpace(definition)
-			if match := simpleViewFrom.FindStringSubmatch(spec["definition"].(string)); match != nil {
+			if match := simpleViewMatch(spec["definition"].(string)); match != nil {
 				items := strings.Split(match[1], ",")
 				for i, item := range items {
 					items[i] = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(item), match[3]+"."))

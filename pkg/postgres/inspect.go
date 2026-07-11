@@ -401,7 +401,7 @@ func (i *inspector) inspectRelations(ctx context.Context) error {
 }
 
 func (i *inspector) inspectColumns(ctx context.Context) error {
-	rows, err := i.conn.Query(ctx, `select a.attrelid,a.attnum,n.nspname,c.relname,a.attname,format_type(a.atttypid,a.atttypmod),a.attnotnull,pg_get_expr(ad.adbin,ad.adrelid),a.attidentity::text,a.attgenerated::text,col_description(a.attrelid,a.attnum),a.atttypid from pg_attribute a join pg_class c on c.oid=a.attrelid join pg_namespace n on n.oid=c.relnamespace left join pg_attrdef ad on ad.adrelid=a.attrelid and ad.adnum=a.attnum where a.attnum>0 and not a.attisdropped and c.relkind in ('r','p','v','m') and n.nspname <> 'information_schema' and n.nspname !~ '^pg_' order by n.nspname,c.relname,a.attnum`)
+	rows, err := i.conn.Query(ctx, `select a.attrelid,a.attnum,n.nspname,c.relname,a.attname,format_type(a.atttypid,a.atttypmod),a.attnotnull,pg_get_expr(ad.adbin,ad.adrelid),a.attidentity::text,a.attgenerated::text,col_description(a.attrelid,a.attnum),case when t.typelem<>0 then t.typelem else a.atttypid end from pg_attribute a join pg_class c on c.oid=a.attrelid join pg_namespace n on n.oid=c.relnamespace join pg_type t on t.oid=a.atttypid left join pg_attrdef ad on ad.adrelid=a.attrelid and ad.adnum=a.attnum where a.attnum>0 and not a.attisdropped and c.relkind in ('r','p','v','m') and n.nspname <> 'information_schema' and n.nspname !~ '^pg_' order by n.nspname,c.relname,a.attnum`)
 	if err != nil {
 		return err
 	}

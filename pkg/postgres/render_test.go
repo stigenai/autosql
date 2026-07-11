@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -278,6 +279,76 @@ func TestColumnTypeAlterAllowsOnlyKnownSafeCasts(t *testing.T) {
 			out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Current: current, Desired: desired})
 			if err == nil || len(out) != 0 {
 				t.Fatalf("out=%+v err=%v", out, err)
+			}
+		})
+	}
+}
+
+func TestColumnOrdinalTransitionsRequirePhysicalProof(t *testing.T) {
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "app", Name: "widgets", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	column := func(name string, ordinal int) schema.Resource {
+		return renderResource(schema.KindColumn, schema.Name{Schema: "app", Name: name, Parent: table.ID}, fmt.Sprintf(`{"type":"text","not_null":false,"ordinal":%d}`, ordinal), schema.Dependency{Target: table.ID, Type: schema.DependencyContains})
+	}
+	a, b := column("a", 1), column("b", 2)
+	current := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, a, b}}}
+	for name, resources := range map[string][]schema.Resource{
+		"middle insertion": {ns, table, a, column("c", 2), column("b", 3)},
+		"pure reorder":     {ns, table, column("b", 1), column("a", 2)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: resources}}
+			changes, _ := schema.Diff(current, desired, schema.DiffOptions{})
+			out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Current: current, Desired: desired})
+			if err == nil || len(out) != 0 {
+				t.Fatalf("out=%+v err=%v", out, err)
+			}
+		})
+	}
+	mixedB := column("b", 1)
+	mixedB.Spec = json.RawMessage(`{"type":"text","not_null":true,"ordinal":1}`)
+	mixed := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, mixedB}}}
+	changes, _ := schema.Diff(current, mixed, schema.DiffOptions{})
+	if out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Current: current, Desired: mixed}); err == nil || len(out) != 0 {
+		t.Fatalf("mixed shift out=%+v err=%v", out, err)
+	}
+}
+
+func TestNestedViewDependenciesFailClosed(t *testing.T) {
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
+	a := renderResource(schema.KindTable, schema.Name{Schema: "app", Name: "a", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	b := renderResource(schema.KindTable, schema.Name{Schema: "app", Name: "b", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	for name, deps := range map[string][]schema.Dependency{
+		"missing nested relation":  {{Target: ns.ID, Type: schema.DependencyContains}, {Target: a.ID, Type: schema.DependencyReferences}},
+		"declared nested relation": {{Target: ns.ID, Type: schema.DependencyContains}, {Target: a.ID, Type: schema.DependencyReferences}, {Target: b.ID, Type: schema.DependencyReferences}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			view := renderResource(schema.KindView, schema.Name{Schema: "app", Name: "v", Parent: ns.ID}, `{"definition":"SELECT id FROM app.a WHERE EXISTS (SELECT 1 FROM app.b)"}`, deps...)
+			projection := projection(view, "id", "integer")
+			desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, a, b, view, projection}}}
+			changes := schema.ChangeSet{Version: schema.ChangeVersion, Changes: []schema.Change{{ID: "c", Operation: schema.OperationCreate, ResourceID: view.ID, After: &view}}}
+			if out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Desired: desired}); err == nil || len(out) != 0 {
+				t.Fatalf("out=%+v err=%v", out, err)
+			}
+		})
+	}
+}
+
+func TestCanonicalUDTUsesAcceptsQuotedUnqualifiedAndArrays(t *testing.T) {
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "public"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "public", Name: "widgets", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	status := renderResource(schema.KindEnum, schema.Name{Schema: "public", Name: "status", Parent: ns.ID}, `{"values":["new"]}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	mood := renderResource(schema.KindEnum, schema.Name{Schema: "public", Name: "Mood", Parent: ns.ID}, `{"values":["good"]}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	resources := map[string]schema.Resource{ns.ID: ns, table.ID: table, status.ID: status, mood.ID: mood}
+	for name, fixture := range map[string]struct{ typ, target string }{
+		"public unqualified array": {"status[]", status.ID},
+		"quoted unqualified array": {`"Mood"[]`, mood.ID},
+		"quoted qualified scalar":  {`public."Mood"`, mood.ID},
+	} {
+		t.Run(name, func(t *testing.T) {
+			column := renderResource(schema.KindColumn, schema.Name{Schema: "public", Name: "value", Parent: table.ID}, `{"type":"`+strings.ReplaceAll(fixture.typ, `"`, `\"`)+`","not_null":false,"ordinal":1}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: fixture.target, Type: schema.DependencyUses})
+			if err := validateSemanticDependencies(column, resources); err != nil {
+				t.Fatal(err)
 			}
 		})
 	}

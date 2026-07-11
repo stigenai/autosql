@@ -30,6 +30,7 @@ create schema autosql_inspect;
 comment on schema autosql_inspect is 'integration schema';
 create extension hstore with schema autosql_inspect;
 create type autosql_inspect.status as enum ('new','done');
+create type autosql_inspect."Mood" as enum ('good','bad');
 create domain autosql_inspect.positive_int as integer check (value > 0);
 create type autosql_inspect.address as (street text, zip integer);
 create sequence autosql_inspect.ticket_seq start 10 increment 2;
@@ -41,6 +42,9 @@ create table autosql_inspect.users (
   id integer generated always as identity,
   team_id integer references autosql_inspect.teams(id),
   state autosql_inspect.status not null default 'new',
+  state_history autosql_inspect.status[],
+  mood autosql_inspect."Mood",
+  moods autosql_inspect."Mood"[],
   score autosql_inspect.positive_int,
   email text,
   constraint users_pkey primary key(id),
@@ -94,8 +98,20 @@ create policy user_read on autosql_inspect.users for select to public using (tru
 		schema.KindProcedure: true, schema.KindTrigger: true, schema.KindPolicy: true,
 	}
 	explicitDefaultLookingPK := false
+	typeIDs := map[string]string{}
+	columnUses := map[string]string{}
 	for _, r := range first.Graph.Resources {
 		delete(want, r.Kind)
+		if r.Kind == schema.KindEnum {
+			typeIDs[r.Name.Name] = r.ID
+		}
+		if r.Kind == schema.KindColumn {
+			for _, dep := range r.Dependencies {
+				if dep.Type == schema.DependencyUses {
+					columnUses[r.Name.Name] = dep.Target
+				}
+			}
+		}
 		if r.Kind == schema.KindPrimaryKey && r.Name.Name == "users_pkey" {
 			explicitDefaultLookingPK = true
 			if r.Annotations["autosql.io/generated-name"] != "" || r.Annotations["autosql.io/name-origin"] != "" {
@@ -108,6 +124,11 @@ create policy user_read on autosql_inspect.users for select to public using (tru
 	}
 	if !explicitDefaultLookingPK {
 		t.Fatal("live inspection did not return explicit users_pkey fixture")
+	}
+	for column, typ := range map[string]string{"state": "status", "state_history": "status", "mood": "Mood", "moods": "Mood"} {
+		if columnUses[column] == "" || columnUses[column] != typeIDs[typ] {
+			t.Errorf("column %s uses=%q, want canonical %s dependency %q", column, columnUses[column], typ, typeIDs[typ])
+		}
 	}
 	advanced, err := InspectURL(ctx, url, Options{Schemas: []string{"autosql_inspect"}, Advanced: true})
 	if err != nil {

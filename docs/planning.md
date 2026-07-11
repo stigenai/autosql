@@ -26,6 +26,11 @@ ordinal metadata, and only a narrow set of known implicit or assignment-safe
 type casts; other conversions fail planning because no validated `USING`
 expression is available. Create, alter, drop, and rename are available for tables,
 columns, views, and materialized views within those feature subsets.
+Column ordinals describe canonical relative order. PostgreSQL can physically
+append and drop columns but cannot insert or reorder them, so the planner proves
+the complete sibling sequence: append and drop consequences are topology-only,
+while middle insertion, reorder, or a simultaneous ordinal-and-attribute change
+fails until a table rebuild strategy exists.
 
 View definitions are replaceable, while materialized-view changes require the
 explicit `allow_rebuild=true` strategy. A shape-changing view replacement also
@@ -46,6 +51,12 @@ metadata. For managed views and columns, the declared `references`/`uses` sets
 must exactly match the dependencies derivable from the conservative definition
 and type subset. Missing, extra, or unprovable dependencies fail planning so a
 post-apply inspection cannot silently change the target graph.
+The conservative view grammar accepts only one top-level relation; joins,
+subqueries, nested `SELECT`/`EXISTS`, and other multi-relation forms fail closed.
+For user-defined column types, inspection follows array element OIDs and emits a
+`uses` edge to the true enum/domain/composite resource. Validation resolves
+canonical qualified, same-schema/public unqualified, quoted, and array spellings
+against that exact dependency target.
 
 `postgres.RenderDocument` renders a full desired document from an empty schema
 projection when every resource is in the managed matrix. Read-only kinds make
