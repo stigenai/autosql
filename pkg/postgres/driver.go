@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 
+	"autosql/internal/provenance"
 	"autosql/pkg/plugin"
 	"autosql/pkg/schema"
 )
@@ -69,6 +70,10 @@ func (d *Driver) Inspect(ctx context.Context, req plugin.InspectRequest) (schema
 }
 
 func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Document, error) {
+	trusted := map[string]bool{}
+	for _, r := range doc.Graph.Resources {
+		trusted[r.ID] = schema.IsInspectedGeneratedName(r)
+	}
 	raw, err := json.Marshal(doc)
 	if err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
@@ -78,6 +83,12 @@ func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Documen
 	}
 	for idx := range doc.Graph.Resources {
 		r := &doc.Graph.Resources[idx]
+		// Serialized/public annotations are not trusted provenance.
+		delete(r.Annotations, "autosql.io/generated-name")
+		delete(r.Annotations, "autosql.io/name-origin")
+		if trusted[r.ID] {
+			schema.MarkInspectedGeneratedName(r, provenance.CatalogGeneratedName())
+		}
 		var spec map[string]any
 		if len(r.Spec) > 0 && json.Unmarshal(r.Spec, &spec) == nil {
 			normalizePostgresSpec(spec)
@@ -86,12 +97,6 @@ func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Documen
 				return schema.Document{}, e
 			}
 			r.Spec = normalized
-		}
-		if postgresGeneratedName(*r) {
-			if r.Annotations == nil {
-				r.Annotations = map[string]string{}
-			}
-			r.Annotations["autosql.io/generated-name"] = "true"
 		}
 	}
 	doc.Normalize()
@@ -108,7 +113,11 @@ func normalizePostgresSpec(spec map[string]any) {
 		}
 	}
 	if value, ok := spec["default"].(string); ok {
-		spec["default"] = postgresDefault(value)
+		if normalized := postgresDefault(value); strings.EqualFold(normalized, "NULL") {
+			delete(spec, "default")
+		} else {
+			spec["default"] = normalized
+		}
 	}
 	if value, ok := spec["definition"].(string); ok {
 		spec["definition"] = normalizeSQLSpace(value)
@@ -122,7 +131,11 @@ func normalizePostgresSpec(spec map[string]any) {
 					object["type"] = postgresTypeAlias(value)
 				}
 				if value, ok := object["default"].(string); ok {
-					object["default"] = postgresDefault(value)
+					if normalized := postgresDefault(value); strings.EqualFold(normalized, "NULL") {
+						delete(object, "default")
+					} else {
+						object["default"] = normalized
+					}
 				}
 			}
 		}
@@ -165,8 +178,14 @@ func postgresDefault(value string) string {
 		s = strings.TrimSpace(s[1 : len(s)-1])
 	}
 	lower := strings.ToLower(s)
-	if lower == "now()" || lower == "transaction_timestamp()" {
+	if lower == "now()" || lower == "transaction_timestamp()" || lower == "current_timestamp" || lower == "current_timestamp()" {
 		return "CURRENT_TIMESTAMP"
+	}
+	if strings.HasPrefix(lower, "current_timestamp(") && strings.HasSuffix(lower, ")") {
+		return "CURRENT_TIMESTAMP" + lower[len("current_timestamp"):]
+	}
+	if lower == "null" || strings.HasPrefix(lower, "null::") {
+		return "NULL"
 	}
 	for _, cast := range []string{"::character varying", "::varchar", "::text", "::integer", "::bigint", "::boolean"} {
 		if strings.HasSuffix(strings.ToLower(s), cast) {
@@ -233,10 +252,6 @@ func normalizeSQLSpace(s string) string {
 	}
 	return out.String()
 }
-func postgresGeneratedName(r schema.Resource) bool {
-	return r.Annotations["autosql.io/name-origin"] == "generated"
-}
-
 func (*Driver) Render(context.Context, plugin.RenderRequest) ([]plugin.Statement, error) {
 	return nil, fmt.Errorf("render PostgreSQL changes: %w", plugin.ErrUnsupported)
 }

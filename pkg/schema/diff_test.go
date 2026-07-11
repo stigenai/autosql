@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"testing"
 
+	"autosql/internal/provenance"
 	"autosql/pkg/schema"
 )
 
@@ -210,8 +211,8 @@ func TestRenameWithAlterAndCrossParentRejection(t *testing.T) {
 func TestGeneratedNameEquivalenceIsNarrow(t *testing.T) {
 	a := res(schema.KindPrimaryKey, "users_pkey", "", `{"definition":"PRIMARY KEY (id)"}`)
 	b := res(schema.KindPrimaryKey, "custom_pkey", "", `{"definition":"PRIMARY KEY (id)"}`)
-	a.Annotations = map[string]string{"autosql.io/generated-name": "true", "autosql.io/name-origin": "generated"}
-	b.Annotations = map[string]string{"autosql.io/generated-name": "true", "autosql.io/name-origin": "generated"}
+	schema.MarkInspectedGeneratedName(&a, provenance.CatalogGeneratedName())
+	schema.MarkInspectedGeneratedName(&b, provenance.CatalogGeneratedName())
 	cs, err := schema.Diff(doc(a), doc(b), schema.DiffOptions{})
 	if err != nil || len(cs.Changes) != 0 {
 		t.Fatalf("changes=%+v err=%v", cs, err)
@@ -220,6 +221,41 @@ func TestGeneratedNameEquivalenceIsNarrow(t *testing.T) {
 	cs, err = schema.Diff(doc(a), doc(b), schema.DiffOptions{})
 	if err != nil || len(cs.Changes) != 2 {
 		t.Fatalf("changed generated object=%+v err=%v", cs, err)
+	}
+}
+
+func TestParentRenamePropagatesFullChildTopology(t *testing.T) {
+	s := res(schema.KindSchema, "public", "", `{}`)
+	oldTable := res(schema.KindTable, "users_old", s.ID, `{}`, schema.Dependency{Target: s.ID, Type: schema.DependencyContains})
+	newTable := res(schema.KindTable, "users", s.ID, `{}`, schema.Dependency{Target: s.ID, Type: schema.DependencyContains})
+	makeChild := func(kind schema.Kind, name string, parent schema.Resource) schema.Resource {
+		return res(kind, name, parent.ID, `{}`, schema.Dependency{Target: parent.ID, Type: schema.DependencyContains})
+	}
+	oldChildren := []schema.Resource{
+		makeChild(schema.KindColumn, "id", oldTable),
+		makeChild(schema.KindPrimaryKey, "users_old_pkey", oldTable),
+		makeChild(schema.KindIndex, "users_email_idx", oldTable),
+	}
+	newChildren := []schema.Resource{
+		makeChild(schema.KindColumn, "id", newTable),
+		makeChild(schema.KindPrimaryKey, "users_pkey", newTable),
+		makeChild(schema.KindIndex, "users_email_idx", newTable),
+	}
+	schema.MarkInspectedGeneratedName(&oldChildren[1], provenance.CatalogGeneratedName())
+	schema.MarkInspectedGeneratedName(&newChildren[1], provenance.CatalogGeneratedName())
+	current := doc(append([]schema.Resource{s, oldTable}, oldChildren...)...)
+	desired := doc(append([]schema.Resource{s, newTable}, newChildren...)...)
+	cs, err := schema.Diff(current, desired, schema.DiffOptions{RenameHints: []schema.RenameHint{{From: oldTable.ID, To: newTable.ID}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cs.Changes) != 4 {
+		t.Fatalf("child topology produced destructive changes: %+v", cs.Changes)
+	}
+	for _, change := range cs.Changes {
+		if change.Operation != schema.OperationRename {
+			t.Fatalf("operation=%s changes=%+v", change.Operation, cs.Changes)
+		}
 	}
 }
 

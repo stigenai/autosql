@@ -92,11 +92,18 @@ create policy user_read on autosql_inspect.users for select to public using (tru
 		schema.KindView: true, schema.KindMaterializedView: true, schema.KindFunction: true,
 		schema.KindProcedure: true, schema.KindTrigger: true, schema.KindPolicy: true,
 	}
+	trustedGeneratedPK := false
 	for _, r := range first.Graph.Resources {
 		delete(want, r.Kind)
+		if r.Kind == schema.KindPrimaryKey && schema.IsInspectedGeneratedName(r) {
+			trustedGeneratedPK = true
+		}
 	}
 	if len(want) != 0 {
 		t.Fatalf("inspection missing kinds: %#v", want)
+	}
+	if !trustedGeneratedPK {
+		t.Fatal("live inspection did not retain exact generated-name provenance")
 	}
 	advanced, err := InspectURL(ctx, url, Options{Schemas: []string{"autosql_inspect"}, Advanced: true})
 	if err != nil {

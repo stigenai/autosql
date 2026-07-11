@@ -29,10 +29,17 @@ cross-parent, or conflicting hint returns `schema.ErrAmbiguousRename` instead
 of choosing silently. When a renamed object also changes semantically, the
 change set emits an ordered rename followed by an alter.
 
-A driver may annotate an object with both `autosql.io/name-origin=generated`
-and `autosql.io/generated-name=true` when catalog provenance proves that the
-database generated the name. A conventional-looking suffix alone is not
-evidence. Two proven generated objects are treated as equivalent only when
+An explicitly renamed container carries uniquely identifiable descendants to
+the new parent. Columns and same-named constraints or indexes are therefore
+renamed with the table rather than dropped and recreated. A child hint may
+cross parent IDs only when those parents are themselves an explicit rename
+pair; unrelated moves remain ambiguous.
+
+A database inspector may attach process-only generated-name provenance after
+proving an exact catalog derivation. This trust is neither serialized nor
+accepted from public annotations, so an authored document cannot forge it. A
+conventional-looking suffix alone is not evidence. Two proven generated
+objects are treated as equivalent only when
 their kind, parent, and all name-independent semantics match and the pairing is
 unique. This narrow rule
 avoids churn from database-generated constraint and index names without hiding

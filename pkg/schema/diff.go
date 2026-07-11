@@ -220,7 +220,14 @@ func Diff(current, desired Document, options DiffOptions) (ChangeSet, error) {
 			matchedWant[id] = true
 		}
 	}
-	// Explicit hints are the only general rename inference.
+	// Resolve every hint before validation so child hints may refer to an
+	// explicitly renamed parent regardless of hint order.
+	type resolvedHint struct {
+		hint     RenameHint
+		from, to Resource
+	}
+	resolved := make([]resolvedHint, 0, len(options.RenameHints))
+	hintedParents := map[string]string{}
 	for _, hint := range options.RenameHints {
 		from, e := resolveResource(cur, hint.From)
 		if e != nil {
@@ -230,15 +237,61 @@ func Diff(current, desired Document, options DiffOptions) (ChangeSet, error) {
 		if e != nil {
 			return ChangeSet{}, e
 		}
-		if matchedCur[from.ID] || matchedWant[to.ID] || from.Kind != to.Kind {
+		if from.Kind != to.Kind {
 			return ChangeSet{}, fmt.Errorf("%w: %s -> %s", ErrAmbiguousRename, hint.From, hint.To)
 		}
-		if from.Name.Parent != to.Name.Parent || from.Name.Catalog != to.Name.Catalog || from.Name.Schema != to.Name.Schema {
+		if previous, exists := hintedParents[from.ID]; exists && previous != to.ID {
+			return ChangeSet{}, fmt.Errorf("%w: conflicting source %s", ErrAmbiguousRename, hint.From)
+		}
+		hintedParents[from.ID] = to.ID
+		resolved = append(resolved, resolvedHint{hint: hint, from: from, to: to})
+	}
+	seenTargets := map[string]bool{}
+	for _, item := range resolved {
+		from, to, hint := item.from, item.to, item.hint
+		if matchedCur[from.ID] || matchedWant[to.ID] || seenTargets[to.ID] {
+			return ChangeSet{}, fmt.Errorf("%w: %s -> %s", ErrAmbiguousRename, hint.From, hint.To)
+		}
+		parentMapped := from.Name.Parent != "" && hintedParents[from.Name.Parent] == to.Name.Parent
+		sameContainer := from.Name.Parent == to.Name.Parent && from.Name.Catalog == to.Name.Catalog && from.Name.Schema == to.Name.Schema
+		if !sameContainer && !parentMapped {
 			return ChangeSet{}, fmt.Errorf("%w: cross-parent rename %s -> %s", ErrAmbiguousRename, hint.From, hint.To)
 		}
 		pairs[from.ID] = to.ID
 		matchedCur[from.ID] = true
 		matchedWant[to.ID] = true
+		seenTargets[to.ID] = true
+	}
+	// A renamed container safely carries same-identity descendants with it.
+	// This is repeated for nested resources. Trusted catalog-generated children
+	// may also follow when the candidate is unique.
+	for changed := true; changed; {
+		changed = false
+		for oldID, from := range cur {
+			if matchedCur[oldID] || from.Name.Parent == "" {
+				continue
+			}
+			newParent, parentRenamed := pairs[from.Name.Parent]
+			if !parentRenamed || newParent == from.Name.Parent {
+				continue
+			}
+			var candidates []Resource
+			for newID, to := range want {
+				if matchedWant[newID] || from.Kind != to.Kind || to.Name.Parent != newParent {
+					continue
+				}
+				if from.Name.Name == to.Name.Name || (generatedName(from) && generatedName(to)) {
+					candidates = append(candidates, to)
+				}
+			}
+			if len(candidates) == 1 {
+				to := candidates[0]
+				pairs[from.ID] = to.ID
+				matchedCur[from.ID] = true
+				matchedWant[to.ID] = true
+				changed = true
+			}
+		}
 	}
 	// Driver-marked generated names may be ignored only for a unique pair with
 	// identical name-independent semantics.
@@ -287,7 +340,7 @@ func Diff(current, desired Document, options DiffOptions) (ChangeSet, error) {
 		newID := pairs[oldID]
 		before, after := cur[oldID], want[newID]
 		if oldID != newID {
-			intermediate := before
+			intermediate := remapResourceReferences(before, pairs)
 			intermediate.ID = after.ID
 			intermediate.Name = after.Name
 			rename, e := newChange(OperationRename, &before, &intermediate)
@@ -348,6 +401,18 @@ func Diff(current, desired Document, options DiffOptions) (ChangeSet, error) {
 	return result, nil
 }
 
+func remapResourceReferences(resource Resource, pairs map[string]string) Resource {
+	if mapped, ok := pairs[resource.Name.Parent]; ok {
+		resource.Name.Parent = mapped
+	}
+	for idx := range resource.Dependencies {
+		if mapped, ok := pairs[resource.Dependencies[idx].Target]; ok {
+			resource.Dependencies[idx].Target = mapped
+		}
+	}
+	return resource
+}
+
 func newChange(op Operation, before, after *Resource) (Change, error) {
 	r := after
 	if r == nil {
@@ -400,7 +465,7 @@ func resolveResource(resources map[string]Resource, value string) (Resource, err
 	return found[0], nil
 }
 func generatedName(r Resource) bool {
-	return r.Annotations["autosql.io/generated-name"] == "true" && r.Annotations["autosql.io/name-origin"] == "generated"
+	return r.trustedGeneratedName
 }
 func generatedKey(r Resource) string { return string(r.Kind) + "\x00" + r.Name.Parent }
 func generatedEquivalent(a, b Resource) (bool, error) {
@@ -418,10 +483,6 @@ func generatedEquivalent(a, b Resource) (bool, error) {
 	y.Name.Name = ""
 	x.Source = nil
 	y.Source = nil
-	delete(x.Annotations, "autosql.io/generated-name")
-	delete(y.Annotations, "autosql.io/generated-name")
-	delete(x.Annotations, "autosql.io/name-origin")
-	delete(y.Annotations, "autosql.io/name-origin")
 	sortDependencies(&x)
 	sortDependencies(&y)
 	xr, _ := json.Marshal(x)
@@ -548,7 +609,17 @@ func cloneDocument(doc Document) (Document, error) {
 	}
 	var out Document
 	e = json.Unmarshal(raw, &out)
-	return out, e
+	if e != nil {
+		return Document{}, e
+	}
+	trusted := map[string]bool{}
+	for _, r := range doc.Graph.Resources {
+		trusted[r.ID] = r.trustedGeneratedName
+	}
+	for i := range out.Graph.Resources {
+		out.Graph.Resources[i].trustedGeneratedName = trusted[out.Graph.Resources[i].ID]
+	}
+	return out, nil
 }
 func cloneResource(resource Resource) (Resource, error) {
 	raw, e := json.Marshal(resource)
@@ -557,6 +628,7 @@ func cloneResource(resource Resource) (Resource, error) {
 	}
 	var out Resource
 	e = json.Unmarshal(raw, &out)
+	out.trustedGeneratedName = resource.trustedGeneratedName
 	return out, e
 }
 func sortDependencies(r *Resource) {

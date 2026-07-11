@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"testing"
 
+	"autosql/internal/provenance"
 	"autosql/pkg/schema"
 )
 
@@ -95,8 +96,9 @@ func TestNormalizePostgresSemanticsAndPreservesUnknown(t *testing.T) {
 	parent.ID = schema.StableID(parent.Kind, parent.Name)
 	column := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: "public", Name: "age", Parent: parent.ID}, Dependencies: []schema.Dependency{{Target: parent.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{"type":"pg_catalog.int4","default":"(('1'::integer))","future":{"opaque":"kept","type":"int4"}}`)}
 	column.ID = schema.StableID(column.Kind, column.Name)
-	pk := schema.Resource{Kind: schema.KindPrimaryKey, Name: schema.Name{Schema: "public", Name: "users_pkey", Parent: parent.ID}, Dependencies: []schema.Dependency{{Target: parent.ID, Type: schema.DependencyContains}}, Annotations: map[string]string{"autosql.io/name-origin": "generated"}, Spec: json.RawMessage(`{"definition":"PRIMARY   KEY (id)"}`)}
+	pk := schema.Resource{Kind: schema.KindPrimaryKey, Name: schema.Name{Schema: "public", Name: "users_pkey", Parent: parent.ID}, Dependencies: []schema.Dependency{{Target: parent.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{"definition":"PRIMARY   KEY (id)"}`)}
 	pk.ID = schema.StableID(pk.Kind, pk.Name)
+	schema.MarkInspectedGeneratedName(&pk, provenance.CatalogGeneratedName())
 	input := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{pk, column, parent}}}
 	got, err := New().Normalize(context.Background(), input)
 	if err != nil {
@@ -117,9 +119,91 @@ func TestNormalizePostgresSemanticsAndPreservesUnknown(t *testing.T) {
 				t.Fatalf("spec=%#v", spec)
 			}
 		}
-		if r.Kind == schema.KindPrimaryKey && r.Annotations["autosql.io/generated-name"] != "true" {
-			t.Fatalf("generated name not marked: %#v", r)
+		if r.Kind == schema.KindPrimaryKey && !schema.IsInspectedGeneratedName(r) {
+			t.Fatalf("generated name provenance not preserved: %#v", r)
 		}
+	}
+}
+
+func TestAuthoredAnnotationsCannotForgeGeneratedProvenance(t *testing.T) {
+	parent := schema.Resource{Kind: schema.KindTable, Name: schema.Name{Schema: "public", Name: "users"}, Spec: json.RawMessage(`{}`)}
+	parent.ID = schema.StableID(parent.Kind, parent.Name)
+	pk := schema.Resource{Kind: schema.KindPrimaryKey, Name: schema.Name{Schema: "public", Name: "users_pkey", Parent: parent.ID}, Annotations: map[string]string{"autosql.io/generated-name": "true", "autosql.io/name-origin": "generated"}, Dependencies: []schema.Dependency{{Target: parent.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{}`)}
+	pk.ID = schema.StableID(pk.Kind, pk.Name)
+	doc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{parent, pk}}}
+	normalized, err := New().Normalize(context.Background(), doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range normalized.Graph.Resources {
+		if r.Kind == schema.KindPrimaryKey && (schema.IsInspectedGeneratedName(r) || r.Annotations["autosql.io/generated-name"] != "") {
+			t.Fatalf("authored provenance was trusted: %#v", r)
+		}
+	}
+	markCatalogGeneratedNames(&normalized)
+	found := false
+	for _, r := range normalized.Graph.Resources {
+		if r.Kind == schema.KindPrimaryKey {
+			found = schema.IsInspectedGeneratedName(r)
+		}
+	}
+	if !found {
+		t.Fatal("catalog fixture did not mark exact generated primary key")
+	}
+	wire, err := json.Marshal(normalized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var roundTrip schema.Document
+	if err := json.Unmarshal(wire, &roundTrip); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range roundTrip.Graph.Resources {
+		if schema.IsInspectedGeneratedName(r) {
+			t.Fatal("runtime provenance leaked into the authored wire format")
+		}
+	}
+}
+
+func TestNormalizeDefaultEquivalence(t *testing.T) {
+	makeDoc := func(defaultValue *string) schema.Document {
+		spec := map[string]any{"type": "timestamp"}
+		if defaultValue != nil {
+			spec["default"] = *defaultValue
+		}
+		raw, _ := json.Marshal(spec)
+		r := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: "public", Name: "created_at"}, Spec: raw}
+		r.ID = schema.StableID(r.Kind, r.Name)
+		return schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{r}}}
+	}
+	forms := []string{"current_timestamp", "CURRENT_TIMESTAMP()", "now()", "transaction_timestamp()"}
+	base, _ := New().Normalize(context.Background(), makeDoc(&forms[0]))
+	for _, form := range forms[1:] {
+		other, _ := New().Normalize(context.Background(), makeDoc(&form))
+		changes, err := schema.Diff(base, other, schema.DiffOptions{})
+		if err != nil || len(changes.Changes) != 0 {
+			t.Fatalf("default form %q differs: %+v %v", form, changes, err)
+		}
+	}
+	null := "NULL"
+	withNull, _ := New().Normalize(context.Background(), makeDoc(&null))
+	absent, _ := New().Normalize(context.Background(), makeDoc(nil))
+	changes, err := schema.Diff(withNull, absent, schema.DiffOptions{})
+	if err != nil || len(changes.Changes) != 0 {
+		t.Fatalf("DEFAULT NULL differs from absent: %+v %v", changes, err)
+	}
+	castNull := "NULL::timestamp without time zone"
+	withCastNull, _ := New().Normalize(context.Background(), makeDoc(&castNull))
+	changes, err = schema.Diff(withCastNull, absent, schema.DiffOptions{})
+	if err != nil || len(changes.Changes) != 0 {
+		t.Fatalf("cast DEFAULT NULL differs from absent: %+v %v", changes, err)
+	}
+	precisionA, precisionB := "current_timestamp(3)", "CURRENT_TIMESTAMP(3)"
+	a, _ := New().Normalize(context.Background(), makeDoc(&precisionA))
+	b, _ := New().Normalize(context.Background(), makeDoc(&precisionB))
+	changes, err = schema.Diff(a, b, schema.DiffOptions{})
+	if err != nil || len(changes.Changes) != 0 {
+		t.Fatalf("precision/casing defaults differ: %+v %v", changes, err)
 	}
 }
 

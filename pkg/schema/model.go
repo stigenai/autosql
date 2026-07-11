@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"autosql/internal/provenance"
 )
 
 const (
@@ -128,7 +130,21 @@ type Resource struct {
 	Source       *SourceLocation            `json:"source,omitempty"`
 	Spec         json.RawMessage            `json:"spec,omitempty"`
 	Extra        map[string]json.RawMessage `json:"-"`
+	// trustedGeneratedName is runtime-only provenance supplied by a database
+	// inspector. It is deliberately absent from the wire format so authored
+	// documents cannot claim database-generated identity.
+	trustedGeneratedName bool
 }
+
+// MarkInspectedGeneratedName records runtime-only catalog provenance. Database
+// inspectors call this only after independently proving the generated name.
+func MarkInspectedGeneratedName(resource *Resource, proof provenance.GeneratedName) {
+	resource.trustedGeneratedName = proof.Valid()
+}
+
+// IsInspectedGeneratedName reports runtime catalog provenance. The value is
+// never decoded from JSON or other authored schema input.
+func IsInspectedGeneratedName(resource Resource) bool { return resource.trustedGeneratedName }
 
 // Graph contains resources. Edges are stored on resources to make ownership
 // and references portable without relying on array position.
