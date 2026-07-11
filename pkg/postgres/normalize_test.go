@@ -172,7 +172,7 @@ func TestNormalizePostgresSemanticsAndPreservesUnknown(t *testing.T) {
 	for _, r := range got.Graph.Resources {
 		if r.Kind == schema.KindColumn {
 			_ = json.Unmarshal(r.Spec, &spec)
-			if spec["type"] != "integer" || spec["default"] != "'1'" || spec["future"].(map[string]any)["opaque"] != "kept" || spec["future"].(map[string]any)["type"] != "int4" {
+			if spec["type"] != "integer" || spec["default"] != "1" || spec["future"].(map[string]any)["opaque"] != "kept" || spec["future"].(map[string]any)["type"] != "int4" {
 				t.Fatalf("spec=%#v", spec)
 			}
 		}

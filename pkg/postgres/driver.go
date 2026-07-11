@@ -542,6 +542,12 @@ func postgresDefault(value string) string {
 	for _, cast := range []string{"::character varying", "::varchar", "::text", "::integer", "::bigint", "::boolean"} {
 		if strings.HasSuffix(strings.ToLower(s), cast) {
 			base := strings.TrimSpace(s[:len(s)-len(cast)])
+			if (cast == "::integer" || cast == "::bigint") && len(base) >= 2 && base[0] == '\'' && base[len(base)-1] == '\'' {
+				inner := base[1 : len(base)-1]
+				if regexp.MustCompile(`^-?[0-9]+$`).MatchString(inner) {
+					return inner
+				}
+			}
 			if strings.HasPrefix(base, "'") || base == "true" || base == "false" || base == "NULL" || base == "null" {
 				return base
 			}

@@ -31,6 +31,10 @@ fragments. Length/precision variants, `ARRAY` keyword spelling, collation,
 constraints, and embedded clauses are rejected. Defaults are modeled per type:
 simple numeric, boolean, quoted text, and canonical current-timestamp values;
 casts, functions, array defaults, and other expressions fail closed.
+Fixed-width integer defaults are canonical base-10 values with exact PostgreSQL
+range checks; catalog-quoted negative integer casts normalize back to that form.
+Leading zeros and out-of-range values fail, and real/double/numeric defaults stay
+unsupported until their catalog round trip is modeled precisely.
 Column ordinals describe canonical relative order. PostgreSQL can physically
 append and drop columns but cannot insert or reorder them, so the planner proves
 the complete sibling sequence: append and drop consequences are topology-only,
@@ -42,6 +46,10 @@ Column drop and rename also fail when a retained read-only table child or
 table-referencing object might depend on the affected column. This deliberately
 conservative guard remains until inspection can prove exact column-level edges
 and complete dependent transitions.
+The same principle applies to schema and table rename: a retained index,
+constraint, trigger, view, or other opaque descendant/dependent blocks the parent
+rename because PostgreSQL may rewrite its identity or stored definition. Bare
+managed parents and columns continue to use proven rename topology.
 
 View definitions are replaceable, while materialized-view changes require the
 explicit `allow_rebuild=true` strategy. A shape-changing view replacement also

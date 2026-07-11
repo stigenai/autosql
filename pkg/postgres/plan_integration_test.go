@@ -377,7 +377,7 @@ func TestNativeDocumentCreateReinspectConverges(t *testing.T) {
 	a := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: "autosql_native", Name: "a", Parent: table.ID}, Dependencies: []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{"type":"text","not_null":false,"ordinal":2}`)}
 	a.ID = schema.StableID(a.Kind, a.Name)
 	defaults := []schema.Resource{}
-	for index, fixture := range []struct{ name, typ, value string }{{"count", "integer", "7"}, {"label", "text", "'x'"}, {"enabled", "boolean", "true"}, {"created_at", "timestamptz", "CURRENT_TIMESTAMP"}} {
+	for index, fixture := range []struct{ name, typ, value string }{{"count", "integer", "-2147483648"}, {"small", "smallint", "-32768"}, {"large", "bigint", "9223372036854775807"}, {"label", "text", "'x'"}, {"enabled", "boolean", "true"}, {"created_at", "timestamptz", "CURRENT_TIMESTAMP"}} {
 		column := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: "autosql_native", Name: fixture.name, Parent: table.ID}, Dependencies: []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(fmt.Sprintf(`{"type":%q,"default":%q,"not_null":false,"ordinal":%d}`, fixture.typ, fixture.value, index+3))}
 		column.ID = schema.StableID(column.Kind, column.Name)
 		defaults = append(defaults, column)
@@ -416,6 +416,23 @@ func TestNativeDocumentCreateReinspectConverges(t *testing.T) {
 	}
 	if len(noop.Changes.Changes) != 0 || len(noop.Steps) != 0 {
 		t.Fatalf("native document second plan not empty: %+v", noop)
+	}
+	for name, value := range map[string]string{"leading zero": "01", "out of range": "2147483648"} {
+		t.Run(name, func(t *testing.T) {
+			bad := actual
+			bad.Graph.Resources = append([]schema.Resource(nil), actual.Graph.Resources...)
+			column := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: "autosql_native", Name: "bad_default", Parent: table.ID}, Dependencies: []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(fmt.Sprintf(`{"type":"integer","default":%q,"not_null":false,"ordinal":%d}`, value, len(defaults)+3))}
+			column.ID = schema.StableID(column.Kind, column.Name)
+			bad.Graph.Resources = append(bad.Graph.Resources, column)
+			bad, err = postgres.New().Normalize(ctx, bad)
+			if err != nil {
+				t.Fatal(err)
+			}
+			failed, buildErr := plan.Build(ctx, postgres.New(), actual, bad, plan.Options{})
+			if buildErr == nil || len(failed.Steps) != 0 {
+				t.Fatalf("planned=%+v err=%v", failed, buildErr)
+			}
+		})
 	}
 	safe := desired
 	safe.Graph.Resources = append([]schema.Resource(nil), desired.Graph.Resources...)
@@ -670,6 +687,49 @@ func TestColumnTransitionsRejectRetainedReadOnlyDependents(t *testing.T) {
 				options.Diff.RenameHints = []schema.RenameHint{{From: oldID, To: newID}}
 			}
 			failed, buildErr := plan.Build(ctx, postgres.New(), current, desired, options)
+			if buildErr == nil || len(failed.Steps) != 0 {
+				t.Fatalf("planned=%+v err=%v", failed, buildErr)
+			}
+		})
+	}
+}
+
+func TestParentRenameRejectsRetainedOpaqueDescendants(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	_, err = conn.Exec(ctx, `drop schema if exists autosql_parent_old cascade; drop schema if exists autosql_parent_new cascade; create schema autosql_parent_old; create table autosql_parent_old.widgets(id bigint); create index widgets_id_idx on autosql_parent_old.widgets(id);`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Exec(context.Background(), `drop schema if exists autosql_parent_old cascade; drop schema if exists autosql_parent_new cascade`)
+	current, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_parent_old"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err = postgres.New().Normalize(ctx, current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, fixture := range map[string]struct {
+		schemaName, tableName string
+		schemaHint            bool
+	}{"table rename": {"autosql_parent_old", "widgets_new", false}, "schema rename": {"autosql_parent_new", "widgets", true}} {
+		t.Run(name, func(t *testing.T) {
+			desired, oldSchema, newSchema, oldTable, newTable := renameFixture(current, fixture.schemaName, fixture.tableName)
+			hint := schema.RenameHint{From: oldTable, To: newTable}
+			if fixture.schemaHint {
+				hint = schema.RenameHint{From: oldSchema, To: newSchema}
+			}
+			failed, buildErr := plan.Build(ctx, postgres.New(), current, desired, plan.Options{Diff: schema.DiffOptions{RenameHints: []schema.RenameHint{hint}}})
 			if buildErr == nil || len(failed.Steps) != 0 {
 				t.Fatalf("planned=%+v err=%v", failed, buildErr)
 			}

@@ -33,6 +33,9 @@ func (*Driver) Render(ctx context.Context, request plugin.RenderRequest) ([]plug
 	if err := validateColumnDependentTransitions(request); err != nil {
 		return nil, fmt.Errorf("render PostgreSQL changes: %w", err)
 	}
+	if err := validateParentRenameDependents(request); err != nil {
+		return nil, fmt.Errorf("render PostgreSQL changes: %w", err)
+	}
 	rebuilds, err := validateProjectionTopology(request)
 	if err != nil {
 		return nil, fmt.Errorf("render PostgreSQL changes: %w", err)
@@ -1089,14 +1092,23 @@ func validateCoreDefault(r schema.Resource, value string) error {
 		return unsupported(r, "array defaults are not modeled")
 	}
 	integer := regexp.MustCompile(`^-?[0-9]+$`)
-	numeric := regexp.MustCompile(`^-?[0-9]+(?:\.[0-9]+)?$`)
 	quoted := regexp.MustCompile(`^'(?:''|[^'])*'$`)
 	ok := false
 	switch typ {
 	case "smallint", "integer", "bigint":
-		ok = integer.MatchString(value)
+		if integer.MatchString(value) && (value == "0" || !strings.HasPrefix(value, "0")) && !strings.HasPrefix(value, "-0") {
+			bits := 64
+			if typ == "smallint" {
+				bits = 16
+			}
+			if typ == "integer" {
+				bits = 32
+			}
+			_, err := strconv.ParseInt(value, 10, bits)
+			ok = err == nil
+		}
 	case "real", "double precision", "numeric":
-		ok = numeric.MatchString(value)
+		ok = false
 	case "boolean":
 		ok = value == "true" || value == "false"
 	case "text", "character varying":
@@ -1106,6 +1118,51 @@ func validateCoreDefault(r schema.Resource, value string) error {
 	}
 	if !ok {
 		return unsupported(r, "column default is outside canonical core grammar")
+	}
+	return nil
+}
+func validateParentRenameDependents(request plugin.RenderRequest) error {
+	current := resourceMapForRender(request.Current)
+	dropped := map[string]bool{}
+	for _, change := range request.Changes.Changes {
+		if change.Operation == schema.OperationDrop && change.Before != nil {
+			dropped[change.Before.ID] = true
+		}
+	}
+	for _, change := range request.Changes.Changes {
+		if change.Operation != schema.OperationRename || change.Before == nil || (change.Before.Kind != schema.KindTable && change.Before.Kind != schema.KindSchema) {
+			continue
+		}
+		root := change.Before.ID
+		isDescendant := func(r schema.Resource) bool {
+			p := r.Name.Parent
+			for p != "" {
+				if p == root {
+					return true
+				}
+				parent, ok := current[p]
+				if !ok {
+					break
+				}
+				p = parent.Name.Parent
+			}
+			return false
+		}
+		for _, r := range current {
+			if dropped[r.ID] {
+				continue
+			}
+			opaqueDescendant := isDescendant(r) && r.Kind != schema.KindTable && r.Kind != schema.KindColumn
+			dependent := false
+			for _, dep := range r.Dependencies {
+				if dep.Type == schema.DependencyReferences && (dep.Target == root || isDescendant(current[dep.Target])) {
+					dependent = true
+				}
+			}
+			if opaqueDescendant || dependent {
+				return unsupported(r, "retained opaque object may be rewritten by parent rename")
+			}
+		}
 	}
 	return nil
 }

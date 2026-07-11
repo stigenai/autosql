@@ -545,7 +545,11 @@ func TestManagedLifecycleMatrix(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			cs := schema.ChangeSet{Version: schema.ChangeVersion, Changes: []schema.Change{tc.change}}
-			out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: cs, Current: schema.Document{Graph: schema.Graph{Resources: mapValues(resources)}}, Desired: schema.Document{Graph: schema.Graph{Resources: mapValues(resources)}}, Options: tc.options})
+			docResources := mapValues(resources)
+			if tc.name == "schema rename" {
+				docResources = []schema.Resource{s, s2}
+			}
+			out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: cs, Current: schema.Document{Graph: schema.Graph{Resources: docResources}}, Desired: schema.Document{Graph: schema.Graph{Resources: docResources}}, Options: tc.options})
 			if err != nil || len(out) == 0 {
 				t.Fatalf("out=%+v err=%v", out, err)
 			}
