@@ -288,6 +288,7 @@ func parseCreateTable(rest string, loc *schema.SourceLocation) ([]schema.Resourc
 	out := []schema.Resource{table}
 	columns := map[string]string{}
 	items := splitTopLevel(body[1:len(body)-1], ',')
+	ordinal := 0
 	for _, item := range items {
 		item = strings.TrimSpace(item)
 		if item == "" {
@@ -297,6 +298,7 @@ func parseCreateTable(rest string, loc *schema.SourceLocation) ([]schema.Resourc
 		if strings.HasPrefix(upper, "CONSTRAINT ") || strings.HasPrefix(upper, "PRIMARY KEY") || strings.HasPrefix(upper, "UNIQUE") || strings.HasPrefix(upper, "CHECK") || strings.HasPrefix(upper, "FOREIGN KEY") {
 			continue
 		}
+		ordinal++
 		cn, tail, e := takeQName(item)
 		if e != nil || cn.Schema != "" {
 			return nil, fmt.Errorf("invalid column definition %q", item)
@@ -306,7 +308,7 @@ func parseCreateTable(rest string, loc *schema.SourceLocation) ([]schema.Resourc
 			return nil, fmt.Errorf("column %s has no type", cn.Name)
 		}
 		nullable := !containsWords(attrs, "NOT NULL")
-		spec := map[string]any{"type": normalizeSpace(typeName), "nullable": nullable}
+		spec := map[string]any{"type": normalizeSpace(typeName), "nullable": nullable, "ordinal": ordinal}
 		if def := clauseValue(attrs, "DEFAULT", []string{"NOT NULL", "NULL", "PRIMARY KEY", "UNIQUE", "REFERENCES", "CHECK", "GENERATED"}); def != "" {
 			spec["default"] = def
 		}

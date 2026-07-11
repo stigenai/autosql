@@ -97,6 +97,9 @@ func Build(ctx context.Context, driver plugin.Driver, current, desired schema.Do
 	if err := desired.Validate(); err != nil {
 		return Plan{}, fmt.Errorf("%w: desired graph: %v", ErrInvalidPlan, err)
 	}
+	if !documentMetadataEqual(current, desired) {
+		return Plan{}, fmt.Errorf("%w: document or graph metadata differs and has no renderable transition", ErrUnsupportedTransition)
+	}
 	from, err := schema.SemanticFingerprint(current)
 	if err != nil {
 		return Plan{}, fmt.Errorf("%w: current fingerprint: %v", ErrInvalidPlan, err)
@@ -191,6 +194,16 @@ func validFingerprint(value string) bool {
 	}
 	_, err := hex.DecodeString(strings.TrimPrefix(value, "sha256:"))
 	return err == nil
+}
+func documentMetadataEqual(a, b schema.Document) bool {
+	type metadata struct {
+		Annotations   map[string]string          `json:"annotations,omitempty"`
+		DocumentExtra map[string]json.RawMessage `json:"document_extra,omitempty"`
+		GraphExtra    map[string]json.RawMessage `json:"graph_extra,omitempty"`
+	}
+	am, _ := json.Marshal(metadata{a.Annotations, a.Extra, a.Graph.Extra})
+	bm, _ := json.Marshal(metadata{b.Annotations, b.Extra, b.Graph.Extra})
+	return string(am) == string(bm)
 }
 
 func (p Plan) MarshalCanonical() ([]byte, error) {

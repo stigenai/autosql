@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -77,6 +78,13 @@ func (d *Driver) Inspect(ctx context.Context, req plugin.InspectRequest) (schema
 }
 
 func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Document, error) {
+	if dialect := doc.Annotations["dialect"]; dialect != "" && dialect != "postgresql" {
+		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: dialect %q is not PostgreSQL", dialect)
+	}
+	if doc.Annotations == nil {
+		doc.Annotations = map[string]string{}
+	}
+	doc.Annotations["dialect"] = "postgresql"
 	raw, err := json.Marshal(doc)
 	if err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
@@ -140,7 +148,11 @@ func augmentProjectionColumns(doc *schema.Document) {
 			items := strings.Split(match[1], ",")
 			if strings.TrimSpace(match[1]) == "*" {
 				items = nil
-				for _, column := range columns[table.ID] {
+				tableColumns := append([]schema.Resource(nil), columns[table.ID]...)
+				sort.Slice(tableColumns, func(i, j int) bool {
+					return numberAsInt(specMap(tableColumns[i].Spec), "ordinal") < numberAsInt(specMap(tableColumns[j].Spec), "ordinal")
+				})
+				for _, column := range tableColumns {
 					items = append(items, column.Name.Name)
 				}
 				names := make([]string, len(items))
@@ -159,6 +171,7 @@ func augmentProjectionColumns(doc *schema.Document) {
 						column.Dependencies = []schema.Dependency{{Target: r.ID, Type: schema.DependencyContains}}
 						cs := specMap(column.Spec)
 						cs["not_null"] = false
+						cs["ordinal"] = len(projections) + 1
 						delete(cs, "default")
 						delete(cs, "identity")
 						delete(cs, "generated")
@@ -179,7 +192,7 @@ func augmentProjectionColumns(doc *schema.Document) {
 				r.Spec, _ = json.Marshal(s)
 			}
 			if typ != "" {
-				column := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: r.Name.Schema, Name: name, Parent: r.ID}, Dependencies: []schema.Dependency{{Target: r.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{"not_null":false,"type":"` + typ + `"}`)}
+				column := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: r.Name.Schema, Name: name, Parent: r.ID}, Dependencies: []schema.Dependency{{Target: r.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{"not_null":false,"ordinal":1,"type":"` + typ + `"}`)}
 				column.ID = schema.StableID(column.Kind, column.Name)
 				projections = append(projections, column)
 			}
@@ -193,6 +206,12 @@ func specMap(raw json.RawMessage) map[string]any {
 	_ = json.Unmarshal(raw, &out)
 	return out
 }
+func numberAsInt(values map[string]any, key string) int {
+	if value, ok := values[key].(float64); ok {
+		return int(value)
+	}
+	return 0
+}
 
 func normalizePostgresSpecForKind(kind schema.Kind, spec map[string]any) {
 	normalizePostgresSpec(spec)
@@ -201,7 +220,10 @@ func normalizePostgresSpecForKind(kind schema.Kind, spec map[string]any) {
 			spec["not_null"] = !nullable
 			delete(spec, "nullable")
 		}
-		delete(spec, "position")
+		if position, ok := spec["position"]; ok {
+			spec["ordinal"] = position
+			delete(spec, "position")
+		}
 	}
 	if kind == schema.KindTable {
 		if options, ok := spec["options"].(string); ok {
@@ -222,6 +244,13 @@ func normalizePostgresSpecForKind(kind schema.Kind, spec map[string]any) {
 				definition = strings.TrimSpace(definition[2:])
 			}
 			spec["definition"] = normalizeSQLSpace(definition)
+			if match := simpleViewFrom.FindStringSubmatch(spec["definition"].(string)); match != nil {
+				items := strings.Split(match[1], ",")
+				for i, item := range items {
+					items[i] = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(item), match[3]+"."))
+				}
+				spec["definition"] = "SELECT " + strings.Join(items, ", ") + " FROM " + match[2] + "." + match[3]
+			}
 		}
 	}
 }

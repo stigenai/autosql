@@ -17,7 +17,7 @@ func renderResource(kind schema.Kind, name schema.Name, spec string, deps ...sch
 	return r
 }
 func projection(parent schema.Resource, name, typ string) schema.Resource {
-	return renderResource(schema.KindColumn, schema.Name{Schema: parent.Name.Schema, Name: name, Parent: parent.ID}, `{"not_null":false,"type":"`+typ+`"}`, schema.Dependency{Target: parent.ID, Type: schema.DependencyContains})
+	return renderResource(schema.KindColumn, schema.Name{Schema: parent.Name.Schema, Name: name, Parent: parent.ID}, `{"not_null":false,"ordinal":1,"type":"`+typ+`"}`, schema.Dependency{Target: parent.ID, Type: schema.DependencyContains})
 }
 
 func TestRenderDocumentQuotesAndOrders(t *testing.T) {
@@ -155,6 +155,8 @@ func TestManagedMetadataAndIdentifierControlsFailClosed(t *testing.T) {
 	cases := []schema.Resource{}
 	s := renderResource(schema.KindSchema, schema.Name{Name: "app\nDROP"}, `{}`)
 	cases = append(cases, s)
+	catalog := renderResource(schema.KindSchema, schema.Name{Catalog: "other", Name: "app"}, `{}`)
+	cases = append(cases, catalog)
 	commented := renderResource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
 	commented.Annotations = map[string]string{"comment": "not rendered"}
 	cases = append(cases, commented)
@@ -167,6 +169,8 @@ func TestManagedMetadataAndIdentifierControlsFailClosed(t *testing.T) {
 	for _, persistence := range []string{"t", "u"} {
 		cases = append(cases, renderResource(schema.KindTable, schema.Name{Schema: "public", Name: "t_" + persistence}, `{"partitioned":false,"persistence":"`+persistence+`","row_security":false,"force_row_security":false}`))
 	}
+	wrongType := renderResource(schema.KindTable, schema.Name{Schema: "public", Name: "wrong_type"}, `{"partitioned":"false","persistence":1,"row_security":false,"force_row_security":false}`)
+	cases = append(cases, wrongType)
 	cases = append(cases, renderResource(schema.KindTable, schema.Name{Schema: "public", Name: "partitioned"}, `{"partitioned":true,"persistence":"p","row_security":false,"force_row_security":false}`))
 	for _, r := range cases {
 		change := schema.ChangeSet{Version: schema.ChangeVersion, Changes: []schema.Change{{ID: "c", Operation: schema.OperationCreate, ResourceID: r.ID, After: &r}}}
@@ -174,6 +178,67 @@ func TestManagedMetadataAndIdentifierControlsFailClosed(t *testing.T) {
 		if err == nil || len(out) != 0 {
 			t.Fatalf("resource=%+v out=%+v err=%v", r, out, err)
 		}
+	}
+}
+
+func TestViewAlterOutputShapePolicy(t *testing.T) {
+	view := renderResource(schema.KindView, schema.Name{Schema: "public", Name: "v"}, `{"definition":"SELECT 1 AS value"}`)
+	column := projection(view, "value", "integer")
+	current := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{view, column}}}
+	same := view
+	same.Spec = json.RawMessage(`{"definition":"SELECT 2 AS value"}`)
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{same, column}}}
+	changes, _ := schema.Diff(current, desired, schema.DiffOptions{})
+	out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Current: current, Desired: desired})
+	if err != nil || len(out) != 1 {
+		t.Fatalf("same shape out=%+v err=%v", out, err)
+	}
+	for name, mutate := range map[string]func(*schema.Resource, *schema.Resource){"name": func(v, c *schema.Resource) {
+		v.Spec = json.RawMessage(`{"definition":"SELECT 2 AS other"}`)
+		c.Name.Name = "other"
+		c.ID = schema.StableID(c.Kind, c.Name)
+	}, "type": func(v, c *schema.Resource) {
+		v.Spec = json.RawMessage(`{"definition":"SELECT 'x'::text AS value"}`)
+		c.Spec = json.RawMessage(`{"not_null":false,"ordinal":1,"type":"text"}`)
+	}} {
+		t.Run(name, func(t *testing.T) {
+			v, c := view, column
+			mutate(&v, &c)
+			target := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{v, c}}}
+			cs, _ := schema.Diff(current, target, schema.DiffOptions{})
+			result, e := New().Render(context.Background(), plugin.RenderRequest{Changes: cs, Current: current, Desired: target})
+			if e == nil || len(result) != 0 {
+				t.Fatalf("out=%+v err=%v", result, e)
+			}
+		})
+	}
+}
+
+func TestIndependentOrMalformedProjectionChangesFailClosed(t *testing.T) {
+	view := renderResource(schema.KindView, schema.Name{Schema: "public", Name: "v"}, `{"definition":"SELECT 1 AS value"}`)
+	column := projection(view, "value", "integer")
+	current := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{view}}}
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{view, column}}}
+	changes, _ := schema.Diff(current, desired, schema.DiffOptions{})
+	out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Current: current, Desired: desired})
+	if err == nil || len(out) != 0 {
+		t.Fatalf("independent out=%+v err=%v", out, err)
+	}
+	bad := column
+	bad.Spec = json.RawMessage(`{"future":true,"not_null":false,"ordinal":1,"type":"integer"}`)
+	desired.Graph.Resources = []schema.Resource{view, bad}
+	changes, _ = schema.Diff(current, desired, schema.DiffOptions{})
+	out, err = New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Current: current, Desired: desired})
+	if err == nil || len(out) != 0 {
+		t.Fatalf("malformed out=%+v err=%v", out, err)
+	}
+	bad = column
+	bad.Dependencies = []schema.Dependency{{Target: view.ID, Type: schema.DependencyReferences}}
+	desired.Graph.Resources = []schema.Resource{view, bad}
+	changes, _ = schema.Diff(current, desired, schema.DiffOptions{})
+	out, err = New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Current: current, Desired: desired})
+	if err == nil || len(out) != 0 {
+		t.Fatalf("bad dependency out=%+v err=%v", out, err)
 	}
 }
 
@@ -200,7 +265,9 @@ func TestManagedLifecycleMatrix(t *testing.T) {
 	mvRenamed.ID = schema.StableID(mvRenamed.Kind, mvRenamed.Name)
 	vcol := projection(view, "value", "integer")
 	mvcol := projection(mv, "value", "integer")
-	resources := map[string]schema.Resource{s.ID: s, s2.ID: s2, table.ID: table, tableRenamed.ID: tableRenamed, view.ID: view, viewRenamed.ID: viewRenamed, mv.ID: mv, mvRenamed.ID: mvRenamed, vcol.ID: vcol, mvcol.ID: mvcol}
+	vcolRenamed := projection(viewRenamed, "value", "integer")
+	mvcolRenamed := projection(mvRenamed, "value", "integer")
+	resources := map[string]schema.Resource{s.ID: s, s2.ID: s2, table.ID: table, tableRenamed.ID: tableRenamed, view.ID: view, viewRenamed.ID: viewRenamed, mv.ID: mv, mvRenamed.ID: mvRenamed, vcol.ID: vcol, mvcol.ID: mvcol, vcolRenamed.ID: vcolRenamed, mvcolRenamed.ID: mvcolRenamed}
 	tests := []struct {
 		name    string
 		change  schema.Change

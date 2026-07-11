@@ -25,7 +25,7 @@ func documents() (schema.Document, schema.Document) {
 	empty := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{}}}
 	s := resource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
 	view := resource(schema.KindView, schema.Name{Schema: "app", Name: "users", Parent: s.ID}, `{"definition":"SELECT 1 AS value"}`, schema.Dependency{Target: s.ID, Type: schema.DependencyContains})
-	column := resource(schema.KindColumn, schema.Name{Schema: "app", Name: "value", Parent: view.ID}, `{"not_null":false,"type":"integer"}`, schema.Dependency{Target: view.ID, Type: schema.DependencyContains})
+	column := resource(schema.KindColumn, schema.Name{Schema: "app", Name: "value", Parent: view.ID}, `{"not_null":false,"ordinal":1,"type":"integer"}`, schema.Dependency{Target: view.ID, Type: schema.DependencyContains})
 	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{column, view, s}}}
 	return empty, desired
 }
@@ -179,6 +179,22 @@ func TestValidateRecomputesAllDerivedTopology(t *testing.T) {
 			mutate(&p)
 			if !errors.Is(p.Validate(), plan.ErrInvalidPlan) {
 				t.Fatal("mutated plan validated")
+			}
+		})
+	}
+}
+
+func TestDocumentAndGraphMetadataMismatchCannotProduceZeroStepPlan(t *testing.T) {
+	for name, mutate := range map[string]func(*schema.Document){"annotation": func(d *schema.Document) { d.Annotations = map[string]string{"environment": "prod"} }, "document extra": func(d *schema.Document) { d.Extra = map[string]json.RawMessage{"future": json.RawMessage(`true`)} }, "graph extra": func(d *schema.Document) {
+		d.Graph.Extra = map[string]json.RawMessage{"future": json.RawMessage(`true`)}
+	}} {
+		t.Run(name, func(t *testing.T) {
+			current, _ := documents()
+			desired := current
+			mutate(&desired)
+			p, err := plan.Build(context.Background(), postgres.New(), current, desired, plan.Options{})
+			if err == nil || !reflect.DeepEqual(p, plan.Plan{}) {
+				t.Fatalf("plan=%+v err=%v", p, err)
 			}
 		})
 	}

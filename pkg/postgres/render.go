@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -21,6 +22,13 @@ func (*Driver) Render(ctx context.Context, request plugin.RenderRequest) ([]plug
 	if enabled(request.Options, "concurrent_indexes", false) {
 		return nil, fmt.Errorf("render PostgreSQL changes: %w: nontransactional execution is unavailable until phase-aware guarded apply", plugin.ErrUnsupported)
 	}
+	if err := validateManagedDocuments(request); err != nil {
+		return nil, fmt.Errorf("render PostgreSQL changes: %w", err)
+	}
+	rebuilds, err := validateProjectionTopology(request)
+	if err != nil {
+		return nil, fmt.Errorf("render PostgreSQL changes: %w", err)
+	}
 	resources := map[string]schema.Resource{}
 	for _, doc := range []schema.Document{request.Current, request.Desired} {
 		for _, r := range doc.Graph.Resources {
@@ -29,7 +37,12 @@ func (*Driver) Render(ctx context.Context, request plugin.RenderRequest) ([]plug
 	}
 	var output []plugin.Statement
 	for _, change := range request.Changes.Changes {
-		statements, err := renderChange(change, resources, request.Options)
+		options := request.Options
+		if rebuilds[change.ID] {
+			options = cloneOptions(options)
+			options["__view_rebuild"] = "true"
+		}
+		statements, err := renderChange(change, resources, options)
 		if err != nil {
 			return nil, fmt.Errorf("render PostgreSQL changes: %w", err)
 		}
@@ -173,6 +186,9 @@ func renderCreate(r schema.Resource, resources map[string]schema.Resource, optio
 	case schema.KindTable:
 		if !allowedKeys(s, "partitioned", "persistence", "row_security", "force_row_security") {
 			return nil, unsupported(r, "unknown table semantics")
+		}
+		if e := validateTableSpec(s); e != nil {
+			return nil, unsupported(r, e.Error())
 		}
 		if boolValue(s, "partitioned") {
 			return nil, unsupported(r, "partitioned table requires an explicit partition strategy")
@@ -387,6 +403,14 @@ func renderAlter(before, after schema.Resource, resources map[string]schema.Reso
 		if e := validateProjectionShape(after, resources); e != nil {
 			return nil, unsupported(after, "output shape is not provable: "+e.Error())
 		}
+		if enabled(options, "__view_rebuild", false) {
+			drop, e := renderDrop(before, resources, options)
+			if e != nil {
+				return nil, e
+			}
+			create, e := renderCreate(after, resources, options)
+			return append(drop, create...), e
+		}
 		return []string{"CREATE OR REPLACE VIEW " + name + " AS " + d}, nil
 	case schema.KindIndex:
 		if !enabled(options, "allow_rebuild", false) {
@@ -440,6 +464,12 @@ func renderAlter(before, after schema.Resource, resources map[string]schema.Reso
 	case schema.KindTable:
 		if !allowedKeys(bs, "partitioned", "persistence", "row_security", "force_row_security") || !allowedKeys(as, "partitioned", "persistence", "row_security", "force_row_security") {
 			return nil, unsupported(after, "unknown table semantics")
+		}
+		if e := validateTableSpec(bs); e != nil {
+			return nil, unsupported(before, e.Error())
+		}
+		if e := validateTableSpec(as); e != nil {
+			return nil, unsupported(after, e.Error())
 		}
 		if stringValue(bs, "persistence") != stringValue(as, "persistence") || boolValue(bs, "partitioned") != boolValue(as, "partitioned") {
 			return nil, unsupported(after, "table storage alteration")
@@ -597,6 +627,7 @@ func validateProjectionShape(view schema.Resource, resources map[string]schema.R
 	}
 	definition := stringValue(spec(view), "definition")
 	expected := map[string]string{}
+	expectedOrdinal := map[string]int{}
 	if match := simpleViewFrom.FindStringSubmatch(definition); match != nil {
 		if strings.TrimSpace(match[1]) == "*" {
 			return fmt.Errorf("wildcard was not canonically expanded")
@@ -610,7 +641,7 @@ func validateProjectionShape(view schema.Resource, resources map[string]schema.R
 		if table.ID == "" {
 			return fmt.Errorf("source table is absent")
 		}
-		for _, item := range strings.Split(match[1], ",") {
+		for index, item := range strings.Split(match[1], ",") {
 			name := strings.TrimSpace(item)
 			if dot := strings.LastIndex(name, "."); dot >= 0 {
 				name = name[dot+1:]
@@ -618,6 +649,7 @@ func validateProjectionShape(view schema.Resource, resources map[string]schema.R
 			for _, r := range resources {
 				if r.Kind == schema.KindColumn && r.Name.Parent == table.ID && r.Name.Name == name {
 					expected[name] = stringValue(spec(r), "type")
+					expectedOrdinal[name] = index + 1
 				}
 			}
 		}
@@ -625,21 +657,26 @@ func validateProjectionShape(view schema.Resource, resources map[string]schema.R
 		expr, name := strings.TrimSpace(match[1]), match[2]
 		if _, e := strconv.Atoi(expr); e == nil {
 			expected[name] = "integer"
+			expectedOrdinal[name] = 1
 		} else if strings.HasSuffix(expr, "::text") && len(strings.TrimSuffix(expr, "::text")) >= 2 && strings.TrimSuffix(expr, "::text")[0] == '\'' {
 			expected[name] = "text"
+			expectedOrdinal[name] = 1
 		}
 	}
 	if len(expected) != len(children) {
 		return fmt.Errorf("projection count mismatch")
 	}
 	for _, child := range children {
-		if expected[child.Name.Name] == "" || expected[child.Name.Name] != stringValue(spec(child), "type") || boolValue(spec(child), "not_null") {
+		if expected[child.Name.Name] == "" || expected[child.Name.Name] != stringValue(spec(child), "type") || boolValue(spec(child), "not_null") || numberAsInt(spec(child), "ordinal") != expectedOrdinal[child.Name.Name] {
 			return fmt.Errorf("projection %s mismatch", child.Name.Name)
 		}
 	}
 	return nil
 }
 func validateManagedMetadata(r schema.Resource) error {
+	if r.Name.Catalog != "" {
+		return unsupported(r, "PostgreSQL catalog qualification is not renderable")
+	}
 	if len(r.Annotations) > 0 || len(r.Extra) > 0 || len(r.Name.Extra) > 0 {
 		return unsupported(r, "annotations, comments, and extension metadata are not renderable")
 	}
@@ -656,6 +693,223 @@ func validateManagedMetadata(r schema.Resource) error {
 		}
 	}
 	return nil
+}
+func validateTableSpec(values map[string]any) error {
+	for _, key := range []string{"partitioned", "row_security", "force_row_security"} {
+		if value, ok := values[key]; ok {
+			if _, valid := value.(bool); !valid {
+				return fmt.Errorf("table %s must be boolean", key)
+			}
+		}
+	}
+	if value, ok := values["persistence"]; ok {
+		if _, valid := value.(string); !valid {
+			return fmt.Errorf("table persistence must be a string")
+		}
+	}
+	return nil
+}
+func cloneOptions(in map[string]string) map[string]string {
+	out := map[string]string{}
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+func validateProjectionTopology(request plugin.RenderRequest) (map[string]bool, error) {
+	current, desired := resourceMapForRender(request.Current), resourceMapForRender(request.Desired)
+	parents := map[string]schema.Change{}
+	for _, change := range request.Changes.Changes {
+		if change.Before != nil {
+			parents[change.Before.ID] = change
+		}
+		if change.After != nil {
+			parents[change.After.ID] = change
+		}
+	}
+	rebuilds := map[string]bool{}
+	for _, change := range request.Changes.Changes {
+		r := change.After
+		if r == nil {
+			r = change.Before
+		}
+		if r == nil {
+			continue
+		}
+		if r.Kind == schema.KindView || r.Kind == schema.KindMaterializedView {
+			if change.Operation == schema.OperationAlter {
+				beforeSig, e := projectionSignature(current, change.Before.ID)
+				if e != nil {
+					return nil, e
+				}
+				afterSig, e := projectionSignature(desired, change.After.ID)
+				if e != nil {
+					return nil, e
+				}
+				if beforeSig != afterSig {
+					if !enabled(request.Options, "allow_rebuild", false) {
+						return nil, unsupported(*r, "view output shape change requires allow_rebuild=true")
+					}
+					rebuilds[change.ID] = true
+				}
+			}
+			continue
+		}
+		if r.Kind != schema.KindColumn {
+			continue
+		}
+		beforeParent, afterParent := "", ""
+		if change.Before != nil {
+			beforeParent = change.Before.Name.Parent
+		}
+		if change.After != nil {
+			afterParent = change.After.Name.Parent
+		}
+		if !isProjectionID(beforeParent, current) && !isProjectionID(afterParent, desired) {
+			continue
+		}
+		if change.Before != nil {
+			if e := validateProjectionResource(*change.Before, beforeParent); e != nil {
+				return nil, e
+			}
+		}
+		if change.After != nil {
+			if e := validateProjectionResource(*change.After, afterParent); e != nil {
+				return nil, e
+			}
+		}
+		parent, ok := parents[beforeParent]
+		if !ok {
+			parent, ok = parents[afterParent]
+		}
+		if !ok {
+			return nil, unsupported(*r, "independent projection child transition")
+		}
+		allowed := false
+		switch change.Operation {
+		case schema.OperationCreate:
+			allowed = parent.Operation == schema.OperationCreate || parent.Operation == schema.OperationAlter && enabled(request.Options, "allow_rebuild", false)
+		case schema.OperationDrop:
+			allowed = parent.Operation == schema.OperationDrop || parent.Operation == schema.OperationAlter && enabled(request.Options, "allow_rebuild", false)
+		case schema.OperationRename:
+			allowed = parent.Operation == schema.OperationRename && change.Before.Name.Name == change.After.Name.Name && sameProjectionSpec(*change.Before, *change.After)
+		case schema.OperationAlter:
+			allowed = parent.Operation == schema.OperationAlter && enabled(request.Options, "allow_rebuild", false)
+		}
+		if !allowed {
+			return nil, unsupported(*r, "projection child transition is not a proven parent consequence")
+		}
+	}
+	return rebuilds, nil
+}
+func validateManagedDocuments(request plugin.RenderRequest) error {
+	for _, doc := range []schema.Document{request.Current, request.Desired} {
+		resources := resourceMapForRender(doc)
+		for _, r := range doc.Graph.Resources {
+			mode := New().Info().Capability(r.Kind).Mode
+			if mode == plugin.Managed {
+				if e := validateManagedMetadata(r); e != nil {
+					return e
+				}
+				s := spec(r)
+				switch r.Kind {
+				case schema.KindSchema:
+					if !allowedKeys(s) {
+						return unsupported(r, "unknown schema semantics")
+					}
+				case schema.KindTable:
+					if !allowedKeys(s, "partitioned", "persistence", "row_security", "force_row_security") {
+						return unsupported(r, "unknown table semantics")
+					}
+					if e := validateTableSpec(s); e != nil {
+						return unsupported(r, e.Error())
+					}
+					if boolValue(s, "partitioned") || stringValue(s, "persistence") != "p" && stringValue(s, "persistence") != "" {
+						return unsupported(r, "table storage is outside managed matrix")
+					}
+				case schema.KindView, schema.KindMaterializedView:
+					if !allowedKeys(s, "definition") {
+						return unsupported(r, "unknown view semantics")
+					}
+					if e := validateSQLFragment(stringValue(s, "definition")); e != nil {
+						return unsupported(r, e.Error())
+					}
+					if e := validateProjectionShape(r, resources); e != nil {
+						return unsupported(r, e.Error())
+					}
+				}
+			} else if r.Kind == schema.KindColumn && isManagedProjectionParent(r.Name.Parent, resources) {
+				if e := validateManagedMetadata(r); e != nil {
+					return e
+				}
+				if e := validateProjectionResource(r, r.Name.Parent); e != nil {
+					return e
+				}
+			}
+		}
+	}
+	return nil
+}
+func resourceMapForRender(doc schema.Document) map[string]schema.Resource {
+	out := map[string]schema.Resource{}
+	for _, r := range doc.Graph.Resources {
+		out[r.ID] = r
+	}
+	return out
+}
+func isProjectionID(id string, resources map[string]schema.Resource) bool {
+	r, ok := resources[id]
+	return ok && (r.Kind == schema.KindView || r.Kind == schema.KindMaterializedView)
+}
+func validateProjectionResource(r schema.Resource, parent string) error {
+	s := spec(r)
+	if !allowedKeys(s, "type", "not_null", "ordinal") {
+		return unsupported(r, "unknown projection spec")
+	}
+	if _, ok := s["type"].(string); !ok {
+		return unsupported(r, "projection type must be a string")
+	}
+	if _, ok := s["not_null"].(bool); !ok {
+		return unsupported(r, "projection not_null must be boolean")
+	}
+	ordinal, ok := s["ordinal"].(float64)
+	if !ok || ordinal < 1 || ordinal != float64(int(ordinal)) {
+		return unsupported(r, "projection ordinal must be a positive integer")
+	}
+	if len(r.Dependencies) != 1 || r.Dependencies[0].Target != parent || r.Dependencies[0].Type != schema.DependencyContains || len(r.Dependencies[0].Extra) > 0 {
+		return unsupported(r, "projection dependency must be exactly its parent")
+	}
+	return nil
+}
+func sameProjectionSpec(a, b schema.Resource) bool {
+	as, bs := spec(a), spec(b)
+	return stringValue(as, "type") == stringValue(bs, "type") && boolValue(as, "not_null") == boolValue(bs, "not_null") && numberAsInt(as, "ordinal") == numberAsInt(bs, "ordinal")
+}
+func projectionSignature(resources map[string]schema.Resource, parent string) (string, error) {
+	var children []schema.Resource
+	for _, r := range resources {
+		if r.Kind == schema.KindColumn && r.Name.Parent == parent {
+			if e := validateProjectionResource(r, parent); e != nil {
+				return "", e
+			}
+			children = append(children, r)
+		}
+	}
+	if len(children) == 0 {
+		return "", fmt.Errorf("projection %s has no canonical output", parent)
+	}
+	sort.Slice(children, func(i, j int) bool {
+		return numberAsInt(spec(children[i]), "ordinal") < numberAsInt(spec(children[j]), "ordinal")
+	})
+	parts := make([]string, len(children))
+	for i, r := range children {
+		if numberAsInt(spec(r), "ordinal") != i+1 {
+			return "", unsupported(r, "projection ordinals must be contiguous and unique")
+		}
+		s := spec(r)
+		parts[i] = fmt.Sprintf("%d:%s:%s:%t", numberAsInt(s, "ordinal"), r.Name.Name, stringValue(s, "type"), boolValue(s, "not_null"))
+	}
+	return strings.Join(parts, "\x00"), nil
 }
 func allowedKeys(values map[string]any, keys ...string) bool {
 	allowed := map[string]bool{}

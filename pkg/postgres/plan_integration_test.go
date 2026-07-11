@@ -2,6 +2,7 @@ package postgres_test
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
@@ -27,7 +28,7 @@ func TestSQLSourcePlanApplyReinspectConverges(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close(context.Background())
-	if _, err = conn.Exec(ctx, `drop schema if exists autosql_plan cascade; create schema autosql_plan; create table autosql_plan.widgets(id bigint not null);`); err != nil {
+	if _, err = conn.Exec(ctx, `drop schema if exists autosql_plan cascade; create schema autosql_plan; create table autosql_plan.widgets(z bigint not null, a text);`); err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Exec(context.Background(), `drop schema if exists autosql_plan cascade`)
@@ -39,7 +40,7 @@ func TestSQLSourcePlanApplyReinspectConverges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fromSQL, err := source.ParseSQL("desired.sql", `CREATE TABLE autosql_plan.widgets(id bigint NOT NULL); CREATE OR REPLACE VIEW autosql_plan.widget_view AS SELECT * FROM autosql_plan.widgets; CREATE VIEW autosql_plan.literal_view AS SELECT 'x' AS label; CREATE MATERIALIZED VIEW autosql_plan.widget_mv AS SELECT * FROM autosql_plan.widgets; CREATE MATERIALIZED VIEW autosql_plan.literal_mv AS SELECT 1 AS answer;`)
+	fromSQL, err := source.ParseSQL("desired.sql", `CREATE TABLE autosql_plan.widgets(z bigint NOT NULL, a text); CREATE OR REPLACE VIEW autosql_plan.widget_view AS SELECT * FROM autosql_plan.widgets; CREATE VIEW autosql_plan.literal_view AS SELECT 'x' AS label; CREATE MATERIALIZED VIEW autosql_plan.widget_mv AS SELECT * FROM autosql_plan.widgets; CREATE MATERIALIZED VIEW autosql_plan.literal_mv AS SELECT 1 AS answer;`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,6 +121,34 @@ func TestSQLSourcePlanApplyReinspectConverges(t *testing.T) {
 	}
 	if len(empty.Changes.Changes) != 0 || len(empty.Steps) != 0 {
 		t.Fatalf("second plan not empty: %+v", empty)
+	}
+	raw, _ := json.Marshal(actual)
+	var sameShape schema.Document
+	_ = json.Unmarshal(raw, &sameShape)
+	for idx := range sameShape.Graph.Resources {
+		r := &sameShape.Graph.Resources[idx]
+		if r.Kind == schema.KindView && r.Name.Name == "literal_view" {
+			r.Spec = json.RawMessage(`{"definition":"SELECT 'y'::text AS label"}`)
+		}
+	}
+	sameShape.Normalize()
+	alter, err := plan.Build(ctx, postgres.New(), actual, sameShape, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, alter)
+	reinspected, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_plan"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reinspected, err = postgres.New().Normalize(ctx, reinspected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFingerprint(t, reinspected, sameShape)
+	noop, err := plan.Build(ctx, postgres.New(), reinspected, sameShape, plan.Options{})
+	if err != nil || len(noop.Steps) != 0 {
+		t.Fatalf("same-shape second plan=%+v err=%v", noop, err)
 	}
 }
 

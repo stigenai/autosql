@@ -25,7 +25,10 @@ rendering is rejected until a phase-aware guarded executor is available.
 View and materialized-view output columns remain canonical resources. The SQL
 source normalizer derives them only for a conservative round-trip subset:
 simple projections, expanded wildcards over known tables, and aliased integer
-or text literals. Other definitions fail closed instead of planning drift.
+or text literals. Output name, type, nullability, dependency, and ordinal are
+validated. Shape-changing view alters require an explicit proven rebuild;
+independent projection-child changes fail closed. Other definitions fail closed
+instead of planning drift.
 
 `postgres.RenderDocument` renders a full desired document from an empty schema
 projection when every resource is in the managed matrix. Read-only kinds make
