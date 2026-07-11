@@ -57,6 +57,9 @@ The conservative view grammar accepts only one top-level relation; joins,
 subqueries, nested `SELECT`/`EXISTS`, and other multi-relation forms fail closed.
 `TABLE` query expressions, CTEs, and set operations are also rejected by lexical
 token checks performed outside quoted strings.
+Managed relation-backed views are limited to direct column projections with no
+`WHERE`, functions, casts, or trailing clauses; proven integer/text literal views
+remain dependency-free, while object-bearing casts such as `regclass` fail closed.
 For user-defined column types, inspection follows array element OIDs and emits a
 `uses` edge to the true enum/domain/composite resource. Validation resolves
 canonical qualified, same-schema/public unqualified, quoted, and array spellings
@@ -64,6 +67,9 @@ against that exact dependency target.
 Rendered UDT SQL always uses the dependency target's quoted schema and type name,
 never the table schema or session search path. PostgreSQL's one-or-more array
 brackets are canonicalized to a single `[]` before fingerprinting and rendering.
+Normalization also rewrites accepted UDT aliases from the exact `uses` target to
+the inspector spelling: public types are unqualified, nonpublic types qualified,
+and mixed-case identifiers correctly quoted.
 
 `postgres.RenderDocument` renders a full desired document from an empty schema
 projection when every resource is in the managed matrix. Read-only kinds make

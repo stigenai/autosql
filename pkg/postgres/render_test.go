@@ -365,6 +365,29 @@ func TestCanonicalUDTUsesAcceptsQuotedUnqualifiedAndArrays(t *testing.T) {
 	}
 }
 
+func TestNormalizeCanonicalizesTypeFromUsesTarget(t *testing.T) {
+	public := renderResource(schema.KindSchema, schema.Name{Name: "public"}, `{}`)
+	mixed := renderResource(schema.KindSchema, schema.Name{Name: "Mixed"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "Mixed", Name: "widgets", Parent: mixed.ID}, `{}`, schema.Dependency{Target: mixed.ID, Type: schema.DependencyContains})
+	publicType := renderResource(schema.KindEnum, schema.Name{Schema: "public", Name: "status", Parent: public.ID}, `{"values":["new"]}`, schema.Dependency{Target: public.ID, Type: schema.DependencyContains})
+	mixedType := renderResource(schema.KindEnum, schema.Name{Schema: "Mixed", Name: "Mood", Parent: mixed.ID}, `{"values":["good"]}`, schema.Dependency{Target: mixed.ID, Type: schema.DependencyContains})
+	columns := []schema.Resource{
+		renderResource(schema.KindColumn, schema.Name{Schema: "Mixed", Name: "a", Parent: table.ID}, `{"type":"public.status[][]","not_null":false,"ordinal":1}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: publicType.ID, Type: schema.DependencyUses}),
+		renderResource(schema.KindColumn, schema.Name{Schema: "Mixed", Name: "b", Parent: table.ID}, `{"type":"Mood[][]","not_null":false,"ordinal":2}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: mixedType.ID, Type: schema.DependencyUses}),
+	}
+	doc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: append([]schema.Resource{public, mixed, table, publicType, mixedType}, columns...)}}
+	normalized, err := New().Normalize(context.Background(), doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"a": "status[]", "b": `"Mixed"."Mood"[]`}
+	for _, r := range normalized.Graph.Resources {
+		if expected := want[r.Name.Name]; expected != "" && stringValue(spec(r), "type") != expected {
+			t.Errorf("%s type=%q want=%q", r.Name.Name, stringValue(spec(r), "type"), expected)
+		}
+	}
+}
+
 func TestViewAlterOutputShapePolicy(t *testing.T) {
 	s := renderResource(schema.KindSchema, schema.Name{Name: "public"}, `{}`)
 	view := renderResource(schema.KindView, schema.Name{Schema: "public", Name: "v", Parent: s.ID}, `{"definition":"SELECT 1 AS value"}`, schema.Dependency{Target: s.ID, Type: schema.DependencyContains})

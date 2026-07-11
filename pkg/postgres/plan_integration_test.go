@@ -64,7 +64,10 @@ func TestSQLSourcePlanApplyReinspectConverges(t *testing.T) {
 			desired.Graph.Resources = append(desired.Graph.Resources, r)
 		}
 	}
-	desired.Normalize()
+	desired, err = postgres.New().Normalize(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := desired.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -165,6 +168,16 @@ func TestSQLSourcePlanApplyReinspectConverges(t *testing.T) {
 	}
 	if failed, buildErr := plan.Build(ctx, postgres.New(), actual, badQuery, plan.Options{}); buildErr == nil || len(failed.Steps) != 0 {
 		t.Fatalf("TABLE query expression planned: %+v err=%v", failed, buildErr)
+	}
+	regclassQuery := actual
+	regclassQuery.Graph.Resources = append([]schema.Resource(nil), actual.Graph.Resources...)
+	for i := range regclassQuery.Graph.Resources {
+		if regclassQuery.Graph.Resources[i].Kind == schema.KindView && regclassQuery.Graph.Resources[i].Name.Name == "widget_view" {
+			regclassQuery.Graph.Resources[i].Spec = json.RawMessage(`{"definition":"SELECT 'autosql_plan.widgets'::regclass AS label"}`)
+		}
+	}
+	if failed, buildErr := plan.Build(ctx, postgres.New(), actual, regclassQuery, plan.Options{}); buildErr == nil || len(failed.Steps) != 0 {
+		t.Fatalf("regclass dependency planned: %+v err=%v", failed, buildErr)
 	}
 	raw, _ := json.Marshal(actual)
 	var sameShape schema.Document
@@ -489,7 +502,7 @@ func TestUDTArrayColumnApplyReinspectConverges(t *testing.T) {
 			types[r.Name.Name] = r
 		}
 	}
-	for index, fixture := range []struct{ name, typ, target string }{{"statuses", `"AutoSQL_UDT".status[][]`, "status"}, {"moods", `"AutoSQL_UDT"."Mood"[][]`, "Mood"}, {"matrix", "integer[][]", ""}} {
+	for index, fixture := range []struct{ name, typ, target string }{{"statuses", `status[][]`, "status"}, {"moods", `AutoSQL_UDT."Mood"[][]`, "Mood"}, {"matrix", "integer[][]", ""}} {
 		deps := []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}}
 		if fixture.target != "" {
 			deps = append(deps, schema.Dependency{Target: types[fixture.target].ID, Type: schema.DependencyUses})
@@ -548,18 +561,25 @@ func TestNonfinalColumnRenamePreservesOrdinal(t *testing.T) {
 		t.Fatal(err)
 	}
 	desired := current
-	desired.Graph.Resources = append([]schema.Resource(nil), current.Graph.Resources...)
+	desired.Graph.Resources = nil
 	var oldID, newID string
-	for i := range desired.Graph.Resources {
-		r := &desired.Graph.Resources[i]
+	for _, original := range current.Graph.Resources {
+		r := original
 		if r.Kind == schema.KindColumn && r.Name.Name == "a" {
+			continue
+		}
+		if r.Kind == schema.KindColumn && r.Name.Name == "b" {
 			oldID = r.ID
 			r.Name.Name = "x"
 			r.ID = schema.StableID(r.Kind, r.Name)
 			newID = r.ID
 		}
+		desired.Graph.Resources = append(desired.Graph.Resources, r)
 	}
-	desired.Normalize()
+	desired, err = postgres.New().Normalize(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
 	p, err := plan.Build(ctx, postgres.New(), current, desired, plan.Options{Diff: schema.DiffOptions{RenameHints: []schema.RenameHint{{From: oldID, To: newID}}}})
 	if err != nil {
 		t.Fatal(err)

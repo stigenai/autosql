@@ -113,6 +113,7 @@ func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Documen
 			r.Spec = normalized
 		}
 	}
+	canonicalizeUsedTypes(&doc)
 	if err := canonicalizeColumnOrdinals(&doc); err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
@@ -122,6 +123,47 @@ func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Documen
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
 	return doc, nil
+}
+
+func canonicalizeUsedTypes(doc *schema.Document) {
+	resources := map[string]schema.Resource{}
+	for _, r := range doc.Graph.Resources {
+		resources[r.ID] = r
+	}
+	safeIdentifier := regexp.MustCompile(`^[a-z_][a-z0-9_]*$`)
+	identifier := func(value string) string {
+		if safeIdentifier.MatchString(value) {
+			return value
+		}
+		return `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
+	}
+	for i := range doc.Graph.Resources {
+		r := &doc.Graph.Resources[i]
+		if r.Kind != schema.KindColumn {
+			continue
+		}
+		for _, dep := range r.Dependencies {
+			if dep.Type != schema.DependencyUses {
+				continue
+			}
+			target, ok := resources[dep.Target]
+			if !ok {
+				continue
+			}
+			s := specMap(r.Spec)
+			old, _ := s["type"].(string)
+			array := ""
+			if strings.HasSuffix(old, "[]") {
+				array = "[]"
+			}
+			name := identifier(target.Name.Name)
+			if target.Name.Schema != "public" {
+				name = identifier(target.Name.Schema) + "." + name
+			}
+			s["type"] = name + array
+			r.Spec, _ = json.Marshal(s)
+		}
+	}
 }
 
 func canonicalizeColumnOrdinals(doc *schema.Document) error {
@@ -168,8 +210,10 @@ func canonicalizeColumnOrdinals(doc *schema.Document) error {
 	return nil
 }
 
-var simpleViewFrom = regexp.MustCompile(`(?i)^SELECT\s+(.+?)\s+FROM\s+([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)(?:\s+WHERE\s+.+)?$`)
+var simpleViewFrom = regexp.MustCompile(`(?i)^SELECT\s+(.+?)\s+FROM\s+([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)$`)
 var simpleLiteralView = regexp.MustCompile(`(?i)^SELECT\s+(.+)\s+AS\s+([a-z_][a-z0-9_]*)$`)
+var directProjection = regexp.MustCompile(`(?i)^(?:\*|(?:[a-z_][a-z0-9_]*\.)?[a-z_][a-z0-9_]*)$`)
+var provenLiteral = regexp.MustCompile(`(?i)^(?:[0-9]+|'(?:''|[^'])*'(?:::text)?)$`)
 
 func sqlTokens(definition string) []string {
 	var tokens []string
@@ -230,12 +274,17 @@ func simpleViewMatch(definition string) []string {
 	if !conservativeQueryTokens(definition, true) {
 		return nil
 	}
+	for _, item := range strings.Split(match[1], ",") {
+		if !directProjection.MatchString(strings.TrimSpace(item)) {
+			return nil
+		}
+	}
 	return match
 }
 
 func simpleLiteralMatch(definition string) []string {
 	match := simpleLiteralView.FindStringSubmatch(definition)
-	if match == nil || !conservativeQueryTokens(definition, false) {
+	if match == nil || !conservativeQueryTokens(definition, false) || !provenLiteral.MatchString(strings.TrimSpace(match[1])) {
 		return nil
 	}
 	return match

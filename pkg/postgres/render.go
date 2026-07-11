@@ -956,7 +956,10 @@ func validateColumnOrdinalTransitions(request plugin.RenderRequest) error {
 			}
 			if retained {
 				achievable = append(achievable, physicalID)
-				if physicalID != column.ID && !slices.Equal(canonicalMapEntries(spec(column)), canonicalMapEntries(spec(target))) {
+				beforeSpec, afterSpec := spec(column), spec(target)
+				delete(beforeSpec, "ordinal")
+				delete(afterSpec, "ordinal")
+				if physicalID != column.ID && !slices.Equal(canonicalMapEntries(beforeSpec), canonicalMapEntries(afterSpec)) {
 					return unsupported(target, "column rename cannot include attribute changes")
 				}
 				if numberAsInt(spec(column), "ordinal") != numberAsInt(spec(target), "ordinal") && !columnOrdinalOnly(column, target) {
