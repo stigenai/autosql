@@ -38,11 +38,12 @@ create table autosql_inspect.teams (
   name text not null unique
 );
 create table autosql_inspect.users (
-  id integer generated always as identity primary key,
+  id integer generated always as identity,
   team_id integer references autosql_inspect.teams(id),
   state autosql_inspect.status not null default 'new',
   score autosql_inspect.positive_int,
   email text,
+  constraint users_pkey primary key(id),
   constraint users_email_check check (position('@' in email) > 1),
   constraint users_email_unique unique(email)
 );
@@ -92,18 +93,21 @@ create policy user_read on autosql_inspect.users for select to public using (tru
 		schema.KindView: true, schema.KindMaterializedView: true, schema.KindFunction: true,
 		schema.KindProcedure: true, schema.KindTrigger: true, schema.KindPolicy: true,
 	}
-	trustedGeneratedPK := false
+	explicitDefaultLookingPK := false
 	for _, r := range first.Graph.Resources {
 		delete(want, r.Kind)
-		if r.Kind == schema.KindPrimaryKey && schema.IsInspectedGeneratedName(r) {
-			trustedGeneratedPK = true
+		if r.Kind == schema.KindPrimaryKey && r.Name.Name == "users_pkey" {
+			explicitDefaultLookingPK = true
+			if r.Annotations["autosql.io/generated-name"] != "" || r.Annotations["autosql.io/name-origin"] != "" {
+				t.Fatal("explicit users_pkey was incorrectly trusted as generated")
+			}
 		}
 	}
 	if len(want) != 0 {
 		t.Fatalf("inspection missing kinds: %#v", want)
 	}
-	if !trustedGeneratedPK {
-		t.Fatal("live inspection did not retain exact generated-name provenance")
+	if !explicitDefaultLookingPK {
+		t.Fatal("live inspection did not return explicit users_pkey fixture")
 	}
 	advanced, err := InspectURL(ctx, url, Options{Schemas: []string{"autosql_inspect"}, Advanced: true})
 	if err != nil {

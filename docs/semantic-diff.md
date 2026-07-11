@@ -35,15 +35,12 @@ renamed with the table rather than dropped and recreated. A child hint may
 cross parent IDs only when those parents are themselves an explicit rename
 pair; unrelated moves remain ambiguous.
 
-A database inspector may attach process-only generated-name provenance after
-proving an exact catalog derivation. This trust is neither serialized nor
-accepted from public annotations, so an authored document cannot forge it. A
-conventional-looking suffix alone is not evidence. Two proven generated
-objects are treated as equivalent only when
-their kind, parent, and all name-independent semantics match and the pairing is
-unique. This narrow rule
-avoids churn from database-generated constraint and index names without hiding
-user-defined renames.
+PostgreSQL does not record whether a constraint name was supplied explicitly.
+Consequently, AutoSQL does not infer generated identity from names such as
+`users_pkey`, nor does it accept generated-name annotations from authored
+documents. Ambiguous constraint and index names remain semantic, even when they
+look like PostgreSQL defaults. This conservative rule prevents an explicitly
+named object from being silently paired with another object.
 
 ## Semantic fingerprints
 

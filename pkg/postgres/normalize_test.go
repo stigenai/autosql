@@ -7,7 +7,6 @@ import (
 	"reflect"
 	"testing"
 
-	"autosql/internal/provenance"
 	"autosql/pkg/schema"
 )
 
@@ -98,7 +97,6 @@ func TestNormalizePostgresSemanticsAndPreservesUnknown(t *testing.T) {
 	column.ID = schema.StableID(column.Kind, column.Name)
 	pk := schema.Resource{Kind: schema.KindPrimaryKey, Name: schema.Name{Schema: "public", Name: "users_pkey", Parent: parent.ID}, Dependencies: []schema.Dependency{{Target: parent.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{"definition":"PRIMARY   KEY (id)"}`)}
 	pk.ID = schema.StableID(pk.Kind, pk.Name)
-	schema.MarkInspectedGeneratedName(&pk, provenance.CatalogGeneratedName())
 	input := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{pk, column, parent}}}
 	got, err := New().Normalize(context.Background(), input)
 	if err != nil {
@@ -119,8 +117,8 @@ func TestNormalizePostgresSemanticsAndPreservesUnknown(t *testing.T) {
 				t.Fatalf("spec=%#v", spec)
 			}
 		}
-		if r.Kind == schema.KindPrimaryKey && !schema.IsInspectedGeneratedName(r) {
-			t.Fatalf("generated name provenance not preserved: %#v", r)
+		if r.Kind == schema.KindPrimaryKey && r.Annotations["autosql.io/generated-name"] != "" {
+			t.Fatalf("default-looking name was trusted: %#v", r)
 		}
 	}
 }
@@ -136,19 +134,9 @@ func TestAuthoredAnnotationsCannotForgeGeneratedProvenance(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, r := range normalized.Graph.Resources {
-		if r.Kind == schema.KindPrimaryKey && (schema.IsInspectedGeneratedName(r) || r.Annotations["autosql.io/generated-name"] != "") {
+		if r.Kind == schema.KindPrimaryKey && r.Annotations["autosql.io/generated-name"] != "" {
 			t.Fatalf("authored provenance was trusted: %#v", r)
 		}
-	}
-	markCatalogGeneratedNames(&normalized)
-	found := false
-	for _, r := range normalized.Graph.Resources {
-		if r.Kind == schema.KindPrimaryKey {
-			found = schema.IsInspectedGeneratedName(r)
-		}
-	}
-	if !found {
-		t.Fatal("catalog fixture did not mark exact generated primary key")
 	}
 	wire, err := json.Marshal(normalized)
 	if err != nil {
@@ -159,8 +147,8 @@ func TestAuthoredAnnotationsCannotForgeGeneratedProvenance(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, r := range roundTrip.Graph.Resources {
-		if schema.IsInspectedGeneratedName(r) {
-			t.Fatal("runtime provenance leaked into the authored wire format")
+		if r.Annotations["autosql.io/generated-name"] != "" || r.Annotations["autosql.io/name-origin"] != "" {
+			t.Fatal("untrusted provenance leaked into the normalized wire format")
 		}
 	}
 }

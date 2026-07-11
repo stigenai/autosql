@@ -263,8 +263,7 @@ func Diff(current, desired Document, options DiffOptions) (ChangeSet, error) {
 		seenTargets[to.ID] = true
 	}
 	// A renamed container safely carries same-identity descendants with it.
-	// This is repeated for nested resources. Trusted catalog-generated children
-	// may also follow when the candidate is unique.
+	// This is repeated for nested resources.
 	for changed := true; changed; {
 		changed = false
 		for oldID, from := range cur {
@@ -280,7 +279,7 @@ func Diff(current, desired Document, options DiffOptions) (ChangeSet, error) {
 				if matchedWant[newID] || from.Kind != to.Kind || to.Name.Parent != newParent {
 					continue
 				}
-				if from.Name.Name == to.Name.Name || (generatedName(from) && generatedName(to)) {
+				if from.Name.Name == to.Name.Name {
 					candidates = append(candidates, to)
 				}
 			}
@@ -293,43 +292,6 @@ func Diff(current, desired Document, options DiffOptions) (ChangeSet, error) {
 			}
 		}
 	}
-	// Driver-marked generated names may be ignored only for a unique pair with
-	// identical name-independent semantics.
-	type bucket struct{ old, new []Resource }
-	buckets := map[string]*bucket{}
-	for id, r := range cur {
-		if !matchedCur[id] && generatedName(r) {
-			k := generatedKey(r)
-			b := buckets[k]
-			if b == nil {
-				b = &bucket{}
-				buckets[k] = b
-			}
-			b.old = append(b.old, r)
-		}
-	}
-	for id, r := range want {
-		if !matchedWant[id] && generatedName(r) {
-			k := generatedKey(r)
-			b := buckets[k]
-			if b == nil {
-				b = &bucket{}
-				buckets[k] = b
-			}
-			b.new = append(b.new, r)
-		}
-	}
-	for _, b := range buckets {
-		if len(b.old) == 1 && len(b.new) == 1 {
-			a, z := b.old[0], b.new[0]
-			equal, _ := generatedEquivalent(a, z)
-			if equal {
-				matchedCur[a.ID] = true
-				matchedWant[z.ID] = true
-			}
-		}
-	}
-
 	var changes []Change
 	oldIDs := make([]string, 0, len(pairs))
 	for id := range pairs {
@@ -464,31 +426,6 @@ func resolveResource(resources map[string]Resource, value string) (Resource, err
 	}
 	return found[0], nil
 }
-func generatedName(r Resource) bool {
-	return r.trustedGeneratedName
-}
-func generatedKey(r Resource) string { return string(r.Kind) + "\x00" + r.Name.Parent }
-func generatedEquivalent(a, b Resource) (bool, error) {
-	x, e := cloneResource(a)
-	if e != nil {
-		return false, e
-	}
-	y, e := cloneResource(b)
-	if e != nil {
-		return false, e
-	}
-	x.ID = ""
-	y.ID = ""
-	x.Name.Name = ""
-	y.Name.Name = ""
-	x.Source = nil
-	y.Source = nil
-	sortDependencies(&x)
-	sortDependencies(&y)
-	xr, _ := json.Marshal(x)
-	yr, _ := json.Marshal(y)
-	return string(xr) == string(yr), nil
-}
 func resourcesEqual(a, b Resource) (bool, error) {
 	af, e := ResourceFingerprint(a)
 	if e != nil {
@@ -612,13 +549,6 @@ func cloneDocument(doc Document) (Document, error) {
 	if e != nil {
 		return Document{}, e
 	}
-	trusted := map[string]bool{}
-	for _, r := range doc.Graph.Resources {
-		trusted[r.ID] = r.trustedGeneratedName
-	}
-	for i := range out.Graph.Resources {
-		out.Graph.Resources[i].trustedGeneratedName = trusted[out.Graph.Resources[i].ID]
-	}
 	return out, nil
 }
 func cloneResource(resource Resource) (Resource, error) {
@@ -628,7 +558,6 @@ func cloneResource(resource Resource) (Resource, error) {
 	}
 	var out Resource
 	e = json.Unmarshal(raw, &out)
-	out.trustedGeneratedName = resource.trustedGeneratedName
 	return out, e
 }
 func sortDependencies(r *Resource) {

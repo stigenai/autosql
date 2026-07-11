@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"strings"
 
-	"autosql/internal/provenance"
 	"autosql/pkg/plugin"
 	"autosql/pkg/schema"
 )
@@ -70,10 +69,6 @@ func (d *Driver) Inspect(ctx context.Context, req plugin.InspectRequest) (schema
 }
 
 func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Document, error) {
-	trusted := map[string]bool{}
-	for _, r := range doc.Graph.Resources {
-		trusted[r.ID] = schema.IsInspectedGeneratedName(r)
-	}
 	raw, err := json.Marshal(doc)
 	if err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
@@ -86,9 +81,6 @@ func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Documen
 		// Serialized/public annotations are not trusted provenance.
 		delete(r.Annotations, "autosql.io/generated-name")
 		delete(r.Annotations, "autosql.io/name-origin")
-		if trusted[r.ID] {
-			schema.MarkInspectedGeneratedName(r, provenance.CatalogGeneratedName())
-		}
 		var spec map[string]any
 		if len(r.Spec) > 0 && json.Unmarshal(r.Spec, &spec) == nil {
 			normalizePostgresSpec(spec)

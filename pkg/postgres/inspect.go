@@ -8,7 +8,6 @@ import (
 	"path"
 	"strings"
 
-	"autosql/internal/provenance"
 	"autosql/pkg/plugin"
 	"autosql/pkg/schema"
 
@@ -73,28 +72,11 @@ func inspect(ctx context.Context, req plugin.InspectRequest) (schema.Document, e
 	}
 	doc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: i.resources}, Annotations: map[string]string{"dialect": "postgresql"}}
 	doc = filterDocument(doc, req.Schemas, splitPatterns(req.Options["include"]), splitPatterns(req.Options["exclude"]))
-	markCatalogGeneratedNames(&doc)
 	doc.Normalize()
 	if err := doc.Validate(); err != nil {
 		return schema.Document{}, fmt.Errorf("inspect PostgreSQL database: build canonical document: %w", err)
 	}
 	return doc, nil
-}
-
-// markCatalogGeneratedNames records only exact PostgreSQL derivations we can
-// prove from catalog structure. It never consumes document annotations.
-func markCatalogGeneratedNames(doc *schema.Document) {
-	parents := map[string]schema.Resource{}
-	for _, r := range doc.Graph.Resources {
-		parents[r.ID] = r
-	}
-	for idx := range doc.Graph.Resources {
-		r := &doc.Graph.Resources[idx]
-		parent, ok := parents[r.Name.Parent]
-		if ok && r.Kind == schema.KindPrimaryKey && r.Name.Name == parent.Name.Name+"_pkey" {
-			schema.MarkInspectedGeneratedName(r, provenance.CatalogGeneratedName())
-		}
-	}
 }
 
 func safeError(action, dsn string, err error) error {

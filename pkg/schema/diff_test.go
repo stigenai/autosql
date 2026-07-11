@@ -7,7 +7,6 @@ import (
 	"reflect"
 	"testing"
 
-	"autosql/internal/provenance"
 	"autosql/pkg/schema"
 )
 
@@ -208,19 +207,14 @@ func TestRenameWithAlterAndCrossParentRejection(t *testing.T) {
 	}
 }
 
-func TestGeneratedNameEquivalenceIsNarrow(t *testing.T) {
+func TestGeneratedNameAnnotationsCannotEraseIdentity(t *testing.T) {
 	a := res(schema.KindPrimaryKey, "users_pkey", "", `{"definition":"PRIMARY KEY (id)"}`)
 	b := res(schema.KindPrimaryKey, "custom_pkey", "", `{"definition":"PRIMARY KEY (id)"}`)
-	schema.MarkInspectedGeneratedName(&a, provenance.CatalogGeneratedName())
-	schema.MarkInspectedGeneratedName(&b, provenance.CatalogGeneratedName())
+	a.Annotations = map[string]string{"autosql.io/generated-name": "true", "autosql.io/name-origin": "generated"}
+	b.Annotations = map[string]string{"autosql.io/generated-name": "true", "autosql.io/name-origin": "generated"}
 	cs, err := schema.Diff(doc(a), doc(b), schema.DiffOptions{})
-	if err != nil || len(cs.Changes) != 0 {
-		t.Fatalf("changes=%+v err=%v", cs, err)
-	}
-	b.Spec = json.RawMessage(`{"definition":"PRIMARY KEY (other)"}`)
-	cs, err = schema.Diff(doc(a), doc(b), schema.DiffOptions{})
 	if err != nil || len(cs.Changes) != 2 {
-		t.Fatalf("changed generated object=%+v err=%v", cs, err)
+		t.Fatalf("changes=%+v err=%v", cs, err)
 	}
 }
 
@@ -238,11 +232,9 @@ func TestParentRenamePropagatesFullChildTopology(t *testing.T) {
 	}
 	newChildren := []schema.Resource{
 		makeChild(schema.KindColumn, "id", newTable),
-		makeChild(schema.KindPrimaryKey, "users_pkey", newTable),
+		makeChild(schema.KindPrimaryKey, "users_old_pkey", newTable),
 		makeChild(schema.KindIndex, "users_email_idx", newTable),
 	}
-	schema.MarkInspectedGeneratedName(&oldChildren[1], provenance.CatalogGeneratedName())
-	schema.MarkInspectedGeneratedName(&newChildren[1], provenance.CatalogGeneratedName())
 	current := doc(append([]schema.Resource{s, oldTable}, oldChildren...)...)
 	desired := doc(append([]schema.Resource{s, newTable}, newChildren...)...)
 	cs, err := schema.Diff(current, desired, schema.DiffOptions{RenameHints: []schema.RenameHint{{From: oldTable.ID, To: newTable.ID}}})
