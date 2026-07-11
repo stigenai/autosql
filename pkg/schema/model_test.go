@@ -185,3 +185,19 @@ func TestChangeSetRoundTrip(t *testing.T) {
 		t.Fatalf("change round trip mismatch\n%s\n%s", got, again)
 	}
 }
+
+func TestRenameChangesStableIdentity(t *testing.T) {
+	before := resource(schema.KindTable, schema.Name{Schema: "public", Name: "old_name"}, `{}`)
+	after := resource(schema.KindTable, schema.Name{Schema: "public", Name: "new_name"}, `{}`)
+	cs := schema.ChangeSet{Version: schema.ChangeVersion, Changes: []schema.Change{{
+		ID: "rename-1", Operation: schema.OperationRename, ResourceID: after.ID,
+		Before: &before, After: &after,
+	}}}
+	if err := cs.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	cs.Changes[0].ResourceID = before.ID
+	if err := cs.Validate(); err == nil {
+		t.Fatal("expected resource_id mismatch")
+	}
+}

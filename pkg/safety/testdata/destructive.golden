@@ -1,0 +1,8 @@
+error [AUTOSQL001] public.customers
+  object is dropped
+  impact: Definite data loss or loss of a database API.
+  remediation: Deprecate consumers, retain or archive data, then drop in a later release.
+warning [AUTOSQL101] public.customers
+  DDL requires ACCESS EXCLUSIVE lock
+  impact: Concurrent reads or writes can wait behind the migration.
+  remediation: Set lock_timeout and schedule the contract step after dependencies are removed.
