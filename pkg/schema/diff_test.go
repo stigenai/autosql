@@ -130,6 +130,32 @@ func TestSelectionDependencyClosure(t *testing.T) {
 	}
 }
 
+func TestSelectionContainerDescendantsAndBoundaryClosure(t *testing.T) {
+	s := res(schema.KindSchema, "public", "", `{}`)
+	enum := res(schema.KindEnum, "status", s.ID, `{"values":["active"]}`, schema.Dependency{Target: s.ID, Type: schema.DependencyContains})
+	table := res(schema.KindTable, "users", s.ID, `{}`, schema.Dependency{Target: s.ID, Type: schema.DependencyContains})
+	col := res(schema.KindColumn, "status", table.ID, `{"type":"status"}`,
+		schema.Dependency{Target: table.ID, Type: schema.DependencyContains},
+		schema.Dependency{Target: enum.ID, Type: schema.DependencyUses})
+	all := doc(s, enum, table, col)
+	selected, err := schema.Select(all, []string{"table:public.users"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selected.Graph.Resources) != 4 {
+		t.Fatalf("container descendants/dependency closure=%+v", selected.Graph.Resources)
+	}
+	excluded, err := schema.Select(all, []string{"table:public.users"}, []string{"enum:public.status"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range excluded.Graph.Resources {
+		if r.Kind == schema.KindColumn || r.Kind == schema.KindEnum {
+			t.Fatalf("cross-boundary exclusion retained dependent: %+v", excluded.Graph.Resources)
+		}
+	}
+}
+
 func TestSelectionRejectsInvalidPattern(t *testing.T) {
 	_, err := schema.Select(doc(), []string{"["}, nil)
 	if !errors.Is(err, schema.ErrInvalidSelection) {
@@ -156,11 +182,36 @@ func TestExplicitRenameAndAmbiguity(t *testing.T) {
 	}
 }
 
+func TestRenameWithAlterAndCrossParentRejection(t *testing.T) {
+	old := res(schema.KindTable, "old", "", `{"x":1}`)
+	next := res(schema.KindTable, "new", "", `{"x":2}`)
+	cs, err := schema.Diff(doc(old), doc(next), schema.DiffOptions{RenameHints: []schema.RenameHint{{From: old.ID, To: next.ID}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cs.Changes) != 2 || cs.Changes[0].Operation != schema.OperationRename || cs.Changes[1].Operation != schema.OperationAlter ||
+		!reflect.DeepEqual(cs.Changes[1].DependsOn, []string{cs.Changes[0].ID}) {
+		t.Fatalf("rename+alter order=%+v", cs.Changes)
+	}
+	left := res(schema.KindTable, "left", "", `{}`)
+	right := res(schema.KindTable, "right", "", `{}`)
+	before := res(schema.KindColumn, "value", left.ID, `{}`, schema.Dependency{Target: left.ID, Type: schema.DependencyContains})
+	after := res(schema.KindColumn, "renamed", right.ID, `{}`, schema.Dependency{Target: right.ID, Type: schema.DependencyContains})
+	_, err = schema.Diff(doc(left, before), doc(right, after), schema.DiffOptions{RenameHints: []schema.RenameHint{{From: before.ID, To: after.ID}}})
+	if !errors.Is(err, schema.ErrAmbiguousRename) {
+		t.Fatalf("cross-parent error=%v", err)
+	}
+	_, err = schema.Diff(doc(old), doc(next), schema.DiffOptions{RenameHints: []schema.RenameHint{{From: "table:public.missing", To: next.ID}}})
+	if !errors.Is(err, schema.ErrAmbiguousRename) {
+		t.Fatalf("stale hint error=%v", err)
+	}
+}
+
 func TestGeneratedNameEquivalenceIsNarrow(t *testing.T) {
 	a := res(schema.KindPrimaryKey, "users_pkey", "", `{"definition":"PRIMARY KEY (id)"}`)
 	b := res(schema.KindPrimaryKey, "custom_pkey", "", `{"definition":"PRIMARY KEY (id)"}`)
-	a.Annotations = map[string]string{"autosql.io/generated-name": "true"}
-	b.Annotations = map[string]string{"autosql.io/generated-name": "true"}
+	a.Annotations = map[string]string{"autosql.io/generated-name": "true", "autosql.io/name-origin": "generated"}
+	b.Annotations = map[string]string{"autosql.io/generated-name": "true", "autosql.io/name-origin": "generated"}
 	cs, err := schema.Diff(doc(a), doc(b), schema.DiffOptions{})
 	if err != nil || len(cs.Changes) != 0 {
 		t.Fatalf("changes=%+v err=%v", cs, err)
@@ -169,6 +220,36 @@ func TestGeneratedNameEquivalenceIsNarrow(t *testing.T) {
 	cs, err = schema.Diff(doc(a), doc(b), schema.DiffOptions{})
 	if err != nil || len(cs.Changes) != 2 {
 		t.Fatalf("changed generated object=%+v err=%v", cs, err)
+	}
+}
+
+func TestGeneratedLookingSuffixRequiresProvenance(t *testing.T) {
+	a := res(schema.KindIndex, "users_idx", "", `{"definition":"(id)"}`)
+	b := res(schema.KindIndex, "renamed_idx", "", `{"definition":"(id)"}`)
+	cs, err := schema.Diff(doc(a), doc(b), schema.DiffOptions{})
+	if err != nil || len(cs.Changes) != 2 {
+		t.Fatalf("suffix-only names ignored: changes=%+v err=%v", cs, err)
+	}
+}
+
+func TestChangeIDBindsSemanticSnapshots(t *testing.T) {
+	current := res(schema.KindTable, "users", "", `{"x":1}`)
+	a := res(schema.KindTable, "users", "", `{"x":2}`)
+	b := res(schema.KindTable, "users", "", `{"x":3}`)
+	one, err := schema.Diff(doc(current), doc(a), schema.DiffOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	two, err := schema.Diff(doc(current), doc(b), schema.DiffOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := schema.Diff(doc(current), doc(a), schema.DiffOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if one.Changes[0].ID == two.Changes[0].ID || one.Changes[0].ID != again.Changes[0].ID {
+		t.Fatalf("semantic change IDs: %q %q %q", one.Changes[0].ID, two.Changes[0].ID, again.Changes[0].ID)
 	}
 }
 

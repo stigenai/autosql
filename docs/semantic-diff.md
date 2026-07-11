@@ -25,12 +25,16 @@ the same behavior available without computing a diff.
 
 General renames are never guessed. Supply `DiffOptions.RenameHints` with an old
 and new resource ID or qualified name. A missing, multiply matched, wrong-kind,
-or duplicate hint returns `schema.ErrAmbiguousRename` instead of choosing
-silently.
+cross-parent, or conflicting hint returns `schema.ErrAmbiguousRename` instead
+of choosing silently. When a renamed object also changes semantically, the
+change set emits an ordered rename followed by an alter.
 
-A driver may annotate an object with `autosql.io/generated-name=true`. Two such
-objects are treated as equivalent only when their kind, parent, and all
-name-independent semantics match and the pairing is unique. This narrow rule
+A driver may annotate an object with both `autosql.io/name-origin=generated`
+and `autosql.io/generated-name=true` when catalog provenance proves that the
+database generated the name. A conventional-looking suffix alone is not
+evidence. Two proven generated objects are treated as equivalent only when
+their kind, parent, and all name-independent semantics match and the pairing is
+unique. This narrow rule
 avoids churn from database-generated constraint and index names without hiding
 user-defined renames.
 

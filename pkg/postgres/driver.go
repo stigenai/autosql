@@ -129,13 +129,35 @@ func normalizePostgresSpec(spec map[string]any) {
 	}
 }
 func postgresTypeAlias(value string) string {
-	s := strings.ToLower(strings.TrimSpace(value))
-	s = strings.TrimPrefix(s, "pg_catalog.")
-	aliases := map[string]string{"int2": "smallint", "int4": "integer", "int8": "bigint", "float4": "real", "float8": "double precision", "bool": "boolean", "varchar": "character varying", "timestamp without time zone": "timestamp", "timestamp with time zone": "timestamptz"}
-	if v, ok := aliases[s]; ok {
-		return v
+	original := strings.TrimSpace(value)
+	// Quoted identifiers and user-defined names are case-sensitive. Only fold
+	// names from PostgreSQL's documented built-in alias set.
+	if strings.Contains(original, `"`) {
+		return original
 	}
-	return s
+	s := strings.ToLower(original)
+	s = strings.TrimPrefix(s, "pg_catalog.")
+	array := ""
+	for strings.HasSuffix(s, "[]") {
+		array += "[]"
+		s = strings.TrimSpace(strings.TrimSuffix(s, "[]"))
+	}
+	suffix := ""
+	if i := strings.IndexByte(s, '('); i >= 0 && strings.HasSuffix(s, ")") {
+		suffix = s[i:]
+		s = strings.TrimSpace(s[:i])
+	}
+	aliases := map[string]string{
+		"int2": "smallint", "smallint": "smallint", "int4": "integer", "int": "integer", "integer": "integer",
+		"int8": "bigint", "bigint": "bigint", "float4": "real", "real": "real", "float8": "double precision",
+		"double precision": "double precision", "bool": "boolean", "boolean": "boolean", "varchar": "character varying",
+		"character varying": "character varying", "timestamp without time zone": "timestamp", "timestamp": "timestamp",
+		"timestamp with time zone": "timestamptz", "timestamptz": "timestamptz",
+	}
+	if normalized, ok := aliases[s]; ok {
+		return normalized + suffix + array
+	}
+	return original
 }
 func postgresDefault(value string) string {
 	s := normalizeSQLSpace(value)
@@ -212,16 +234,7 @@ func normalizeSQLSpace(s string) string {
 	return out.String()
 }
 func postgresGeneratedName(r schema.Resource) bool {
-	if r.Annotations["autosql.io/name-origin"] == "generated" {
-		return true
-	}
-	suffix := map[schema.Kind][]string{schema.KindPrimaryKey: {"_pkey"}, schema.KindUniqueConstraint: {"_key"}, schema.KindForeignKey: {"_fkey"}, schema.KindCheckConstraint: {"_check"}, schema.KindIndex: {"_idx"}}[r.Kind]
-	for _, s := range suffix {
-		if strings.HasSuffix(r.Name.Name, s) {
-			return true
-		}
-	}
-	return false
+	return r.Annotations["autosql.io/name-origin"] == "generated"
 }
 
 func (*Driver) Render(context.Context, plugin.RenderRequest) ([]plugin.Statement, error) {

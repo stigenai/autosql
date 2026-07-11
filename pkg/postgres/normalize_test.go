@@ -39,12 +39,63 @@ func TestPostgresSemanticDiffGolden(t *testing.T) {
 	}
 }
 
+func TestPostgresRepresentativeTransitionsGolden(t *testing.T) {
+	makeResource := func(kind schema.Kind, name schema.Name, spec string, deps ...schema.Dependency) schema.Resource {
+		r := schema.Resource{Kind: kind, Name: name, Spec: json.RawMessage(spec), Dependencies: deps}
+		r.ID = schema.StableID(kind, name)
+		return r
+	}
+	s := makeResource(schema.KindSchema, schema.Name{Name: "public"}, `{}`)
+	contained := func(target string) []schema.Dependency {
+		return []schema.Dependency{{Target: target, Type: schema.DependencyContains}}
+	}
+	account := makeResource(schema.KindTable, schema.Name{Schema: "public", Name: "accounts", Parent: s.ID}, `{}`, contained(s.ID)...)
+	identityBefore := makeResource(schema.KindColumn, schema.Name{Schema: "public", Name: "id", Parent: account.ID}, `{"type":"int8","identity":"by_default"}`, contained(account.ID)...)
+	identityAfter := identityBefore
+	identityAfter.Spec = json.RawMessage(`{"type":"bigint","identity":"always"}`)
+	enumBefore := makeResource(schema.KindEnum, schema.Name{Schema: "public", Name: "status", Parent: s.ID}, `{"values":["pending"]}`, contained(s.ID)...)
+	enumAfter := enumBefore
+	enumAfter.Spec = json.RawMessage(`{"values":["pending","active"]}`)
+	viewBefore := makeResource(schema.KindView, schema.Name{Schema: "public", Name: "active_accounts", Parent: s.ID}, `{"definition":"SELECT  1"}`, schema.Dependency{Target: s.ID, Type: schema.DependencyContains}, schema.Dependency{Target: account.ID, Type: schema.DependencyReferences})
+	viewAfter := viewBefore
+	viewAfter.Spec = json.RawMessage(`{"definition":"SELECT 2"}`)
+	oldIndex := makeResource(schema.KindIndex, schema.Name{Schema: "public", Name: "accounts_email_idx", Parent: account.ID}, `{"definition":"(email)"}`, contained(account.ID)...)
+	oldFK := makeResource(schema.KindForeignKey, schema.Name{Schema: "public", Name: "accounts_owner_fkey", Parent: account.ID}, `{"columns":["owner_id"],"references":"users(id)"}`, contained(account.ID)...)
+	obsolete := makeResource(schema.KindTable, schema.Name{Schema: "public", Name: "obsolete", Parent: s.ID}, `{}`, contained(s.ID)...)
+	obsoleteColumn := makeResource(schema.KindColumn, schema.Name{Schema: "public", Name: "value", Parent: obsolete.ID}, `{"type":"text"}`, contained(obsolete.ID)...)
+	invoiceBefore := makeResource(schema.KindTable, schema.Name{Schema: "public", Name: "invoice_old", Parent: s.ID}, `{"persistence":"p"}`, contained(s.ID)...)
+	invoiceAfter := makeResource(schema.KindTable, schema.Name{Schema: "public", Name: "invoices", Parent: s.ID}, `{"persistence":"u"}`, contained(s.ID)...)
+	newIndex := makeResource(schema.KindIndex, schema.Name{Schema: "public", Name: "accounts_status_idx", Parent: account.ID}, `{"definition":"(status)"}`, contained(account.ID)...)
+	current := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{s, account, identityBefore, enumBefore, viewBefore, oldIndex, oldFK, obsolete, obsoleteColumn, invoiceBefore}}}
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{s, account, identityAfter, enumAfter, viewAfter, invoiceAfter, newIndex}}}
+	current, err := New().Normalize(context.Background(), current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err = New().Normalize(context.Background(), desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changes, err := schema.Diff(current, desired, schema.DiffOptions{RenameHints: []schema.RenameHint{{From: invoiceBefore.ID, To: invoiceAfter.ID}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err := changes.MarshalCanonical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, err := os.ReadFile("testdata/representative_transitions.golden.json")
+	if err != nil || string(actual) != string(expected) {
+		t.Fatalf("representative golden mismatch: %v\nactual: %s\nexpected: %s", err, actual, expected)
+	}
+}
+
 func TestNormalizePostgresSemanticsAndPreservesUnknown(t *testing.T) {
 	parent := schema.Resource{Kind: schema.KindTable, Name: schema.Name{Schema: "public", Name: "users"}, Spec: json.RawMessage(`{}`)}
 	parent.ID = schema.StableID(parent.Kind, parent.Name)
 	column := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: "public", Name: "age", Parent: parent.ID}, Dependencies: []schema.Dependency{{Target: parent.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{"type":"pg_catalog.int4","default":"(('1'::integer))","future":{"opaque":"kept","type":"int4"}}`)}
 	column.ID = schema.StableID(column.Kind, column.Name)
-	pk := schema.Resource{Kind: schema.KindPrimaryKey, Name: schema.Name{Schema: "public", Name: "users_pkey", Parent: parent.ID}, Dependencies: []schema.Dependency{{Target: parent.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{"definition":"PRIMARY   KEY (id)"}`)}
+	pk := schema.Resource{Kind: schema.KindPrimaryKey, Name: schema.Name{Schema: "public", Name: "users_pkey", Parent: parent.ID}, Dependencies: []schema.Dependency{{Target: parent.ID, Type: schema.DependencyContains}}, Annotations: map[string]string{"autosql.io/name-origin": "generated"}, Spec: json.RawMessage(`{"definition":"PRIMARY   KEY (id)"}`)}
 	pk.ID = schema.StableID(pk.Kind, pk.Name)
 	input := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{pk, column, parent}}}
 	got, err := New().Normalize(context.Background(), input)
@@ -69,6 +120,29 @@ func TestNormalizePostgresSemanticsAndPreservesUnknown(t *testing.T) {
 		if r.Kind == schema.KindPrimaryKey && r.Annotations["autosql.io/generated-name"] != "true" {
 			t.Fatalf("generated name not marked: %#v", r)
 		}
+	}
+}
+
+func TestNormalizeTypesConservatively(t *testing.T) {
+	cases := map[string]string{
+		"varchar(42)":             "character varying(42)",
+		"pg_catalog.varchar(8)[]": "character varying(8)[]",
+		`"CaseSensitiveType"`:     `"CaseSensitiveType"`,
+		"App.CustomType":          "App.CustomType",
+	}
+	for input, want := range cases {
+		if got := postgresTypeAlias(input); got != want {
+			t.Errorf("postgresTypeAlias(%q)=%q want %q", input, got, want)
+		}
+	}
+	manual := schema.Resource{Kind: schema.KindIndex, Name: schema.Name{Schema: "public", Name: "users_idx"}, Spec: json.RawMessage(`{}`)}
+	manual.ID = schema.StableID(manual.Kind, manual.Name)
+	normalized, err := New().Normalize(context.Background(), schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{manual}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if normalized.Graph.Resources[0].Annotations["autosql.io/generated-name"] != "" {
+		t.Fatal("suffix-only name was guessed as generated")
 	}
 }
 

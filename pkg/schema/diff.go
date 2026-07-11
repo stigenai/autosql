@@ -81,6 +81,7 @@ func Select(doc Document, include, exclude []string) (Document, error) {
 	}
 	byID := map[string]Resource{}
 	reverse := map[string][]string{}
+	children := map[string][]string{}
 	for _, r := range clone.Graph.Resources {
 		byID[r.ID] = r
 		for _, d := range r.Dependencies {
@@ -88,6 +89,7 @@ func Select(doc Document, include, exclude []string) (Document, error) {
 		}
 		if r.Name.Parent != "" {
 			reverse[r.Name.Parent] = append(reverse[r.Name.Parent], r.ID)
+			children[r.Name.Parent] = append(children[r.Name.Parent], r.ID)
 		}
 	}
 	keep := map[string]bool{}
@@ -101,6 +103,24 @@ func Select(doc Document, include, exclude []string) (Document, error) {
 				keep[id] = true
 			}
 		}
+	}
+	// Selecting a container selects its eligible descendants. Explicit
+	// exclusions are applied below and still remove dependent resources.
+	var addChildren func(string)
+	addChildren = func(id string) {
+		for _, child := range children[id] {
+			if !keep[child] {
+				keep[child] = true
+				addChildren(child)
+			}
+		}
+	}
+	childSeeds := make([]string, 0, len(keep))
+	for id := range keep {
+		childSeeds = append(childSeeds, id)
+	}
+	for _, id := range childSeeds {
+		addChildren(id)
 	}
 	expanded := map[string]bool{}
 	var addDeps func(string)
@@ -213,6 +233,9 @@ func Diff(current, desired Document, options DiffOptions) (ChangeSet, error) {
 		if matchedCur[from.ID] || matchedWant[to.ID] || from.Kind != to.Kind {
 			return ChangeSet{}, fmt.Errorf("%w: %s -> %s", ErrAmbiguousRename, hint.From, hint.To)
 		}
+		if from.Name.Parent != to.Name.Parent || from.Name.Catalog != to.Name.Catalog || from.Name.Schema != to.Name.Schema {
+			return ChangeSet{}, fmt.Errorf("%w: cross-parent rename %s -> %s", ErrAmbiguousRename, hint.From, hint.To)
+		}
 		pairs[from.ID] = to.ID
 		matchedCur[from.ID] = true
 		matchedWant[to.ID] = true
@@ -264,7 +287,25 @@ func Diff(current, desired Document, options DiffOptions) (ChangeSet, error) {
 		newID := pairs[oldID]
 		before, after := cur[oldID], want[newID]
 		if oldID != newID {
-			changes = append(changes, newChange(OperationRename, &before, &after))
+			intermediate := before
+			intermediate.ID = after.ID
+			intermediate.Name = after.Name
+			rename, e := newChange(OperationRename, &before, &intermediate)
+			if e != nil {
+				return ChangeSet{}, e
+			}
+			changes = append(changes, rename)
+			equal, e := resourcesEqual(intermediate, after)
+			if e != nil {
+				return ChangeSet{}, e
+			}
+			if !equal {
+				alter, e := newChange(OperationAlter, &intermediate, &after)
+				if e != nil {
+					return ChangeSet{}, e
+				}
+				changes = append(changes, alter)
+			}
 			continue
 		}
 		equal, e := resourcesEqual(before, after)
@@ -272,19 +313,31 @@ func Diff(current, desired Document, options DiffOptions) (ChangeSet, error) {
 			return ChangeSet{}, e
 		}
 		if !equal {
-			changes = append(changes, newChange(OperationAlter, &before, &after))
+			change, e := newChange(OperationAlter, &before, &after)
+			if e != nil {
+				return ChangeSet{}, e
+			}
+			changes = append(changes, change)
 		}
 	}
 	for id, r := range want {
 		if !matchedWant[id] {
 			copy := r
-			changes = append(changes, newChange(OperationCreate, nil, &copy))
+			change, e := newChange(OperationCreate, nil, &copy)
+			if e != nil {
+				return ChangeSet{}, e
+			}
+			changes = append(changes, change)
 		}
 	}
 	for id, r := range cur {
 		if !matchedCur[id] {
 			copy := r
-			changes = append(changes, newChange(OperationDrop, &copy, nil))
+			change, e := newChange(OperationDrop, &copy, nil)
+			if e != nil {
+				return ChangeSet{}, e
+			}
+			changes = append(changes, change)
 		}
 	}
 	changes = orderChanges(changes, current, desired)
@@ -295,7 +348,7 @@ func Diff(current, desired Document, options DiffOptions) (ChangeSet, error) {
 	return result, nil
 }
 
-func newChange(op Operation, before, after *Resource) Change {
+func newChange(op Operation, before, after *Resource) (Change, error) {
 	r := after
 	if r == nil {
 		r = before
@@ -307,8 +360,22 @@ func newChange(op Operation, before, after *Resource) Change {
 	if after != nil {
 		newID = after.ID
 	}
-	id := digest("change", []byte(strings.Join([]string{string(op), oldID, newID}, "\x00")))
-	return Change{ID: "change:" + strings.TrimPrefix(id, "sha256:")[:24], Operation: op, ResourceID: r.ID, Before: before, After: after}
+	beforeFingerprint, afterFingerprint := "", ""
+	var err error
+	if before != nil {
+		beforeFingerprint, err = ResourceFingerprint(*before)
+		if err != nil {
+			return Change{}, err
+		}
+	}
+	if after != nil {
+		afterFingerprint, err = ResourceFingerprint(*after)
+		if err != nil {
+			return Change{}, err
+		}
+	}
+	id := digest("change", []byte(strings.Join([]string{string(op), oldID, newID, beforeFingerprint, afterFingerprint}, "\x00")))
+	return Change{ID: "change:" + strings.TrimPrefix(id, "sha256:")[:24], Operation: op, ResourceID: r.ID, Before: before, After: after}, nil
 }
 func resourceMap(doc Document) map[string]Resource {
 	out := map[string]Resource{}
@@ -332,7 +399,9 @@ func resolveResource(resources map[string]Resource, value string) (Resource, err
 	}
 	return found[0], nil
 }
-func generatedName(r Resource) bool  { return r.Annotations["autosql.io/generated-name"] == "true" }
+func generatedName(r Resource) bool {
+	return r.Annotations["autosql.io/generated-name"] == "true" && r.Annotations["autosql.io/name-origin"] == "generated"
+}
 func generatedKey(r Resource) string { return string(r.Kind) + "\x00" + r.Name.Parent }
 func generatedEquivalent(a, b Resource) (bool, error) {
 	x, e := cloneResource(a)
@@ -351,6 +420,8 @@ func generatedEquivalent(a, b Resource) (bool, error) {
 	y.Source = nil
 	delete(x.Annotations, "autosql.io/generated-name")
 	delete(y.Annotations, "autosql.io/generated-name")
+	delete(x.Annotations, "autosql.io/name-origin")
+	delete(y.Annotations, "autosql.io/name-origin")
 	sortDependencies(&x)
 	sortDependencies(&y)
 	xr, _ := json.Marshal(x)
@@ -388,6 +459,19 @@ func orderChanges(changes []Change, current, desired Document) []Change {
 		}
 		edges[depends][change] = true
 		indegree[change]++
+	}
+	// A rename followed by an alteration of the renamed object is two explicit
+	// operations; execution must never observe the alteration under the old ID.
+	renameByAfter := map[string]string{}
+	for _, c := range changes {
+		if c.Operation == OperationRename && c.After != nil {
+			renameByAfter[c.After.ID] = c.ID
+		}
+	}
+	for _, c := range changes {
+		if c.Operation == OperationAlter && c.Before != nil {
+			add(c.ID, renameByAfter[c.Before.ID])
+		}
 	}
 	for _, c := range changes {
 		r := c.After
