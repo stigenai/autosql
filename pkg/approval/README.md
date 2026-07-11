@@ -1,9 +1,14 @@
 # Apply approval gate
 
 `Gate` enforces environment allow-lists and risk-tiered approval requirements.
-Plans may have an apply deadline. Approvals must match both the immutable plan digest and environment, be current,
-come from distinct eligible identities, and carry required roles. Plan authors
-and the apply requester cannot approve their own work. Emergency authorization
-requires an identity and reason. Every allow or deny decision is appended to an
-`AuditLog`; an allow is durable before the mutation callback can run, and audit
-failure is fail-closed.
+Plans may have an apply deadline. Approvals must match the immutable plan digest
+and environment and be current. Identity, proof, roles, and emergency authority
+come exclusively from an `IdentityAuthority`; approval payloads cannot assert
+their own roles. Plan authors, apply requesters, and approvers are separated.
+
+Every decision is persisted before mutation through a `Chain` backed by a
+`DurableSink`. Records include sequence and previous-record hashes. `FileSink`
+validates the complete chain, appends JSON lines, and synchronizes file and
+directory storage before success. Persistence, context, or final expiry failure
+is fail-closed. `GuardedApply` rechecks plan and approval expiry after audit and
+immediately before calling the mutation adapter.

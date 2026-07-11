@@ -7,4 +7,6 @@ resource kinds. Expressions support `all`, `any`, `not`, `predicate`, `eq`, `ne`
 `resource.name`, `resource.owner`, `resource.attributes.<key>`, and
 `variables.<key>`. Rule packs wrap a policy document with an organization-owned
 name and independent version. Evaluation is bounded by context cancellation,
-resource count, expression steps, and an injectable-clock timeout.
+resource count, metered traversal/expression/regex steps, and an injectable-clock
+timeout. Missing references fail comparisons; equality is type-safe, with exact
+numeric comparison across Go numeric representations.

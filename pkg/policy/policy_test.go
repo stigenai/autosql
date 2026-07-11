@@ -3,6 +3,7 @@ package policy
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -91,5 +92,109 @@ func TestUnknownFieldAndWrongTypeHaveSource(t *testing.T) {
 		if !errors.As(err, &se) || se.Line < 2 {
 			t.Fatalf("got %T %v", err, err)
 		}
+	}
+}
+
+func TestSourceLocationIdentifiesExactIndexedRuleField(t *testing.T) {
+	raw := strings.Join([]string{
+		"{",
+		`  "version":"v1",`,
+		`  "rules":[`,
+		`    {"name":"first","target":"schema","message":"ok","assert":{"eq":[1,1]}},`,
+		`    {"name":"second","target":"invalid","message":"bad","assert":{"eq":[1,1]}}`,
+		`  ]`,
+		`}`,
+	}, "\n")
+	_, err := Parse([]byte(raw))
+	var se *SourceError
+	if !errors.As(err, &se) {
+		t.Fatalf("got %T %v", err, err)
+	}
+	wantLine := 5
+	wantColumn := strings.Index(strings.Split(raw, "\n")[wantLine-1], `"target"`) + 1
+	if se.Path != "$.rules[1].target" || se.Line != wantLine || se.Column != wantColumn {
+		t.Fatalf("location=%s %d:%d want %d:%d", se.Path, se.Line, se.Column, wantLine, wantColumn)
+	}
+}
+
+func TestDecodeErrorIdentifiesExactIndexedRuleField(t *testing.T) {
+	raw := strings.Join([]string{
+		"{",
+		`  "version":"v1",`,
+		`  "rules":[`,
+		`    {"name":"first","target":"schema","message":"ok","assert":{"eq":[1,1]}},`,
+		`    {"name":"second","target":42,"message":"bad","assert":{"eq":[1,1]}}`,
+		`  ]`,
+		`}`,
+	}, "\n")
+	_, err := Parse([]byte(raw))
+	var se *SourceError
+	if !errors.As(err, &se) {
+		t.Fatalf("got %T %v", err, err)
+	}
+	wantColumn := strings.Index(strings.Split(raw, "\n")[4], `"target"`) + 1
+	if se.Path != "$.rules[1].target" || se.Line != 5 || se.Column != wantColumn {
+		t.Fatalf("location=%s %d:%d want $.rules[1].target 5:%d", se.Path, se.Line, se.Column, wantColumn)
+	}
+}
+
+func TestTypeSafeComparisonsAndMissingReferences(t *testing.T) {
+	doc := Document{Version: "v1", Rules: []Rule{
+		{Name: "missing-eq", Target: "all", Message: "missing", Assert: Expression{Eq: []any{"resource.attributes.absent", nil}}},
+		{Name: "missing-ne", Target: "all", Message: "missing", Assert: Expression{Ne: []any{"resource.attributes.absent", "value"}}},
+		{Name: "number-string", Target: "all", Message: "typed", Assert: Expression{Eq: []any{"resource.attributes.count", "1"}}},
+		{Name: "number-number", Target: "all", Message: "numeric", Assert: Expression{Eq: []any{"resource.attributes.count", float64(1)}}},
+	}}
+	violations, err := (Evaluator{}).Evaluate(context.Background(), doc, []Resource{{Kind: "table", Name: "t", Attributes: map[string]any{"count": 1}}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(violations) != 3 {
+		t.Fatalf("violations=%+v", violations)
+	}
+}
+
+func TestNumericComparisonDoesNotLoseIntegerPrecision(t *testing.T) {
+	const a = uint64(1<<63 + 1)
+	const b = uint64(1<<63 + 2)
+	doc := Document{Version: "v1", Rules: []Rule{{Name: "exact", Target: "all", Message: "numbers differ", Assert: Expression{Eq: []any{"resource.attributes.value", b}}}}}
+	v, err := (Evaluator{}).Evaluate(context.Background(), doc, []Resource{{Kind: "table", Name: "t", Attributes: map[string]any{"value": a}}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v) != 1 {
+		t.Fatalf("large integers compared equal: %+v", v)
+	}
+}
+
+func TestLimitsCoverSkippedRulesKindsPredicatesAndRegex(t *testing.T) {
+	predicate := Expression{Matches: []any{"resource.name", "^table_[0-9]+$"}}
+	doc := Document{Version: "v1", Predicates: map[string]Expression{"named": predicate}, Rules: []Rule{
+		{Name: "wrong-target", Target: "migration", Message: "x", Assert: Expression{Eq: []any{1, 1}}},
+		{Name: "wrong-kind", Target: "schema", Kinds: []string{"view", "index", "column"}, Message: "x", Assert: Expression{Eq: []any{1, 1}}},
+		{Name: "regex", Target: "schema", Kinds: []string{"table"}, Message: "x", Assert: Expression{Predicate: "named"}},
+	}}
+	resource := []Resource{{Kind: "table", Name: "table_1"}}
+	if _, err := (Evaluator{Limits: Limits{MaxSteps: 12}}).Evaluate(context.Background(), doc, resource, nil); !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("skipped scans were not charged: %v", err)
+	}
+
+	clock := time.Unix(0, 0)
+	calls := 0
+	_, err := (Evaluator{Limits: Limits{MaxSteps: 1000, Timeout: time.Second}, Now: func() time.Time {
+		calls++
+		if calls > 14 {
+			return clock.Add(2 * time.Second)
+		}
+		return clock
+	}}).Evaluate(context.Background(), doc, resource, nil)
+	if !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("regex/predicate timeout was not observed: %v (clock calls %d)", err, calls)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := (Evaluator{}).Evaluate(ctx, doc, resource, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation not observed: %v", err)
 	}
 }

@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
@@ -110,11 +112,17 @@ func ParsePack(data []byte) (*RulePack, error) {
 	if err := strictUnmarshal(data, &pack); err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(pack.Name) == "" || strings.TrimSpace(pack.Version) == "" {
-		return nil, &SourceError{Path: "$.name", Line: 1, Column: 1, Msg: "rule pack name and version are required"}
+	if strings.TrimSpace(pack.Name) == "" {
+		line, col := locate(data, "$.name")
+		return nil, &SourceError{Path: "$.name", Line: line, Column: col, Msg: "rule pack name is required"}
+	}
+	if strings.TrimSpace(pack.Version) == "" {
+		line, col := locate(data, "$.version")
+		return nil, &SourceError{Path: "$.version", Line: line, Column: col, Msg: "rule pack version is required"}
 	}
 	if err := validate(&pack.Policies); err != nil {
 		if se, ok := err.(*SourceError); ok {
+			se.Path = "$.policies" + strings.TrimPrefix(se.Path, "$")
 			se.Line, se.Column = locate(data, se.Path)
 		}
 		return nil, err
@@ -148,6 +156,14 @@ func strictUnmarshal(data []byte, dst any) error {
 				}
 			}
 		}
+		if root, parseErr := parseJSONNode(data); parseErr == nil {
+			if exact := root.pathAt(offset-1, "$"); exact != "$" {
+				path = exact
+				if keyOffset, ok := root.pathOffset(path); ok {
+					offset = keyOffset + 1
+				}
+			}
+		}
 		line, col := position(data, offset)
 		return &SourceError{Path: path, Line: line, Column: col, Msg: err.Error()}
 	}
@@ -167,7 +183,13 @@ func validate(doc *Document) error {
 		return source("$.version", "unsupported language version %q", doc.Version)
 	}
 	seen := map[string]bool{}
-	for name, expr := range doc.Predicates {
+	predicateNames := make([]string, 0, len(doc.Predicates))
+	for name := range doc.Predicates {
+		predicateNames = append(predicateNames, name)
+	}
+	sort.Strings(predicateNames)
+	for _, name := range predicateNames {
+		expr := doc.Predicates[name]
 		if strings.TrimSpace(name) == "" {
 			return source("$.predicates", "predicate names cannot be empty")
 		}
@@ -269,9 +291,6 @@ func validateExpr(e Expression, predicates map[string]Expression, stack map[stri
 }
 
 func (ev Evaluator) Evaluate(ctx context.Context, doc Document, schema, migrations []Resource) ([]Violation, error) {
-	if err := validate(&doc); err != nil {
-		return nil, err
-	}
 	lim := ev.Limits
 	if lim.MaxSteps <= 0 {
 		lim.MaxSteps = 100000
@@ -290,7 +309,13 @@ func (ev Evaluator) Evaluate(ctx context.Context, doc Document, schema, migratio
 		now = time.Now
 	}
 	start := now()
-	steps := 0
+	m := &meter{ctx: ctx, limit: lim, start: start, now: now}
+	if err := validate(&doc); err != nil {
+		return nil, err
+	}
+	if err := m.charge(1 + len(doc.Rules) + len(doc.Predicates)); err != nil {
+		return nil, err
+	}
 	var out []Violation
 	sets := []struct {
 		target string
@@ -298,14 +323,27 @@ func (ev Evaluator) Evaluate(ctx context.Context, doc Document, schema, migratio
 	}{{"schema", schema}, {"migration", migrations}}
 	for _, set := range sets {
 		for _, r := range set.rs {
+			if err := m.charge(1); err != nil {
+				return nil, err
+			}
 			for _, rule := range doc.Rules {
+				if err := m.charge(1); err != nil { // rule traversal
+					return nil, err
+				}
+				if err := m.charge(1); err != nil { // target comparison
+					return nil, err
+				}
 				if rule.Target != "all" && rule.Target != set.target {
 					continue
 				}
-				if len(rule.Kinds) > 0 && !contains(rule.Kinds, r.Kind) {
+				kindOK, err := meteredContains(m, rule.Kinds, r.Kind)
+				if err != nil {
+					return nil, err
+				}
+				if len(rule.Kinds) > 0 && !kindOK {
 					continue
 				}
-				ok, err := eval(ctx, rule.Assert, r, doc.Variables, doc.Predicates, &steps, lim, start, now)
+				ok, err := eval(rule.Assert, r, doc.Variables, doc.Predicates, m)
 				if err != nil {
 					return nil, err
 				}
@@ -328,23 +366,41 @@ func (ev Evaluator) Evaluate(ctx context.Context, doc Document, schema, migratio
 	return out, nil
 }
 
-func eval(ctx context.Context, e Expression, r Resource, vars map[string]any, preds map[string]Expression, steps *int, lim Limits, start time.Time, now func() time.Time) (bool, error) {
-	*steps++
-	if *steps > lim.MaxSteps {
-		return false, fmt.Errorf("%w: steps (%d > %d)", ErrLimitExceeded, *steps, lim.MaxSteps)
+type meter struct {
+	ctx   context.Context
+	limit Limits
+	start time.Time
+	now   func() time.Time
+	steps int
+}
+
+func (m *meter) charge(n int) error {
+	if err := m.ctx.Err(); err != nil {
+		return err
 	}
-	if err := ctx.Err(); err != nil {
+	if m.now().Sub(m.start) > m.limit.Timeout {
+		return fmt.Errorf("%w: timeout", ErrLimitExceeded)
+	}
+	m.steps += n
+	if m.steps > m.limit.MaxSteps {
+		return fmt.Errorf("%w: steps (%d > %d)", ErrLimitExceeded, m.steps, m.limit.MaxSteps)
+	}
+	return nil
+}
+
+func eval(e Expression, r Resource, vars map[string]any, preds map[string]Expression, m *meter) (bool, error) {
+	if err := m.charge(1); err != nil {
 		return false, err
 	}
-	if now().Sub(start) > lim.Timeout {
-		return false, fmt.Errorf("%w: timeout", ErrLimitExceeded)
-	}
 	if e.Predicate != "" {
-		return eval(ctx, preds[e.Predicate], r, vars, preds, steps, lim, start, now)
+		if err := m.charge(1); err != nil {
+			return false, err
+		}
+		return eval(preds[e.Predicate], r, vars, preds, m)
 	}
 	if len(e.All) > 0 {
 		for _, x := range e.All {
-			ok, err := eval(ctx, x, r, vars, preds, steps, lim, start, now)
+			ok, err := eval(x, r, vars, preds, m)
 			if err != nil || !ok {
 				return ok, err
 			}
@@ -353,7 +409,7 @@ func eval(ctx context.Context, e Expression, r Resource, vars map[string]any, pr
 	}
 	if len(e.Any) > 0 {
 		for _, x := range e.Any {
-			ok, err := eval(ctx, x, r, vars, preds, steps, lim, start, now)
+			ok, err := eval(x, r, vars, preds, m)
 			if err != nil {
 				return false, err
 			}
@@ -364,47 +420,72 @@ func eval(ctx context.Context, e Expression, r Resource, vars map[string]any, pr
 		return false, nil
 	}
 	if e.Not != nil {
-		ok, err := eval(ctx, *e.Not, r, vars, preds, steps, lim, start, now)
+		ok, err := eval(*e.Not, r, vars, preds, m)
 		return !ok, err
 	}
 	if e.Exists != nil {
 		_, ok := resolve(e.Exists, r, vars)
 		return ok, nil
 	}
-	cmp := func(vs []any) (any, any) {
-		a, _ := resolve(vs[0], r, vars)
-		b, _ := resolve(vs[1], r, vars)
-		return a, b
+	cmp := func(vs []any) (any, any, bool) {
+		a, aok := resolve(vs[0], r, vars)
+		b, bok := resolve(vs[1], r, vars)
+		return a, b, aok && bok
 	}
 	if e.Eq != nil {
-		a, b := cmp(e.Eq)
-		return fmt.Sprint(a) == fmt.Sprint(b), nil
+		a, b, ok := cmp(e.Eq)
+		return ok && equalValue(a, b), nil
 	}
 	if e.Ne != nil {
-		a, b := cmp(e.Ne)
-		return fmt.Sprint(a) != fmt.Sprint(b), nil
+		a, b, ok := cmp(e.Ne)
+		return ok && !equalValue(a, b), nil
 	}
 	if e.In != nil {
-		a, b := cmp(e.In)
+		a, b, ok := cmp(e.In)
+		if !ok {
+			return false, nil
+		}
 		switch x := b.(type) {
 		case []any:
 			for _, v := range x {
-				if fmt.Sprint(a) == fmt.Sprint(v) {
+				if err := m.charge(1); err != nil {
+					return false, err
+				}
+				if equalValue(a, v) {
 					return true, nil
 				}
 			}
 		case []string:
-			return contains(x, fmt.Sprint(a)), nil
+			as, ok := a.(string)
+			if !ok {
+				return false, nil
+			}
+			return meteredContains(m, x, as)
 		}
 		return false, nil
 	}
 	if e.Matches != nil {
-		a, b := cmp(e.Matches)
-		rx, err := regexp.Compile(fmt.Sprint(b))
+		a, b, ok := cmp(e.Matches)
+		text, textOK := a.(string)
+		pattern, patternOK := b.(string)
+		if !ok || !textOK || !patternOK {
+			return false, nil
+		}
+		if err := m.charge(1); err != nil {
+			return false, err
+		}
+		rx, err := regexp.Compile(pattern)
 		if err != nil {
 			return false, err
 		}
-		return rx.MatchString(fmt.Sprint(a)), nil
+		if err := m.charge(1); err != nil {
+			return false, err
+		}
+		matched := rx.MatchString(text)
+		if err := m.charge(1); err != nil {
+			return false, err
+		}
+		return matched, nil
 	}
 	return false, nil
 }
@@ -415,7 +496,11 @@ func resolve(v any, r Resource, vars map[string]any) (any, bool) {
 		return v, true
 	}
 	if strings.HasPrefix(s, "variables.") {
-		x, ok := vars[strings.TrimPrefix(s, "variables.")]
+		name := strings.TrimPrefix(s, "variables.")
+		if name == "" {
+			return nil, false
+		}
+		x, ok := vars[name]
 		return x, ok
 	}
 	if s == "resource.kind" {
@@ -428,18 +513,73 @@ func resolve(v any, r Resource, vars map[string]any) (any, bool) {
 		return r.Owner, r.Owner != ""
 	}
 	if strings.HasPrefix(s, "resource.attributes.") {
-		x, ok := r.Attributes[strings.TrimPrefix(s, "resource.attributes.")]
+		name := strings.TrimPrefix(s, "resource.attributes.")
+		if name == "" {
+			return nil, false
+		}
+		x, ok := r.Attributes[name]
 		return x, ok
+	}
+	if strings.HasPrefix(s, "resource.") {
+		return nil, false
 	}
 	return v, true
 }
-func contains(xs []string, s string) bool {
+
+func equalValue(a, b any) bool {
+	if af, ok := number(a); ok {
+		bf, bok := number(b)
+		return bok && af.Cmp(bf) == 0
+	}
+	if _, ok := number(b); ok {
+		return false
+	}
+	return reflect.TypeOf(a) == reflect.TypeOf(b) && reflect.DeepEqual(a, b)
+}
+
+func number(v any) (*big.Rat, bool) {
+	switch n := v.(type) {
+	case int:
+		return new(big.Rat).SetInt64(int64(n)), true
+	case int8:
+		return new(big.Rat).SetInt64(int64(n)), true
+	case int16:
+		return new(big.Rat).SetInt64(int64(n)), true
+	case int32:
+		return new(big.Rat).SetInt64(int64(n)), true
+	case int64:
+		return new(big.Rat).SetInt64(n), true
+	case uint:
+		return new(big.Rat).SetUint64(uint64(n)), true
+	case uint8:
+		return new(big.Rat).SetUint64(uint64(n)), true
+	case uint16:
+		return new(big.Rat).SetUint64(uint64(n)), true
+	case uint32:
+		return new(big.Rat).SetUint64(uint64(n)), true
+	case uint64:
+		return new(big.Rat).SetUint64(n), true
+	case float32:
+		r := new(big.Rat).SetFloat64(float64(n))
+		return r, r != nil
+	case float64:
+		r := new(big.Rat).SetFloat64(n)
+		return r, r != nil
+	default:
+		return nil, false
+	}
+}
+
+func meteredContains(m *meter, xs []string, s string) (bool, error) {
 	for _, x := range xs {
+		if err := m.charge(1); err != nil {
+			return false, err
+		}
 		if x == s {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 func source(path, format string, args ...any) error {
 	return &SourceError{Path: path, Line: 1, Column: 1, Msg: fmt.Sprintf(format, args...)}
@@ -460,15 +600,13 @@ func position(data []byte, offset int) (int, int) {
 	return line, col
 }
 func locate(data []byte, path string) (int, int) {
-	key := path
-	if i := strings.LastIndexAny(key, ".["); i >= 0 {
-		key = key[i+1:]
-	}
-	key = strings.TrimRight(key, "]")
-	needle := []byte(`"` + key + `"`)
-	idx := strings.Index(string(data), string(needle))
-	if idx < 0 {
+	root, err := parseJSONNode(data)
+	if err != nil {
 		return 1, 1
 	}
-	return position(data, idx+1)
+	offset, ok := root.pathOffset(path)
+	if !ok {
+		return 1, 1
+	}
+	return position(data, offset+1)
 }
