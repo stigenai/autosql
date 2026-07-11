@@ -373,7 +373,7 @@ func TestNormalizeCanonicalizesTypeFromUsesTarget(t *testing.T) {
 	mixedType := renderResource(schema.KindEnum, schema.Name{Schema: "Mixed", Name: "Mood", Parent: mixed.ID}, `{"values":["good"]}`, schema.Dependency{Target: mixed.ID, Type: schema.DependencyContains})
 	columns := []schema.Resource{
 		renderResource(schema.KindColumn, schema.Name{Schema: "Mixed", Name: "a", Parent: table.ID}, `{"type":"public.status[][]","not_null":false,"ordinal":1}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: publicType.ID, Type: schema.DependencyUses}),
-		renderResource(schema.KindColumn, schema.Name{Schema: "Mixed", Name: "b", Parent: table.ID}, `{"type":"Mood[][]","not_null":false,"ordinal":2}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: mixedType.ID, Type: schema.DependencyUses}),
+		renderResource(schema.KindColumn, schema.Name{Schema: "Mixed", Name: "b", Parent: table.ID}, `{"type":"\"Mood\"[][]","not_null":false,"ordinal":2}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: mixedType.ID, Type: schema.DependencyUses}),
 	}
 	doc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: append([]schema.Resource{public, mixed, table, publicType, mixedType}, columns...)}}
 	normalized, err := New().Normalize(context.Background(), doc)
@@ -385,6 +385,42 @@ func TestNormalizeCanonicalizesTypeFromUsesTarget(t *testing.T) {
 		if expected := want[r.Name.Name]; expected != "" && stringValue(spec(r), "type") != expected {
 			t.Errorf("%s type=%q want=%q", r.Name.Name, stringValue(spec(r), "type"), expected)
 		}
+	}
+}
+
+func TestNormalizeRejectsTypeUsesMismatch(t *testing.T) {
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "public"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "public", Name: "widgets", Parent: ns.ID}, `{}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	status := renderResource(schema.KindEnum, schema.Name{Schema: "public", Name: "status", Parent: ns.ID}, `{"values":["new"]}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	other := renderResource(schema.KindEnum, schema.Name{Schema: "public", Name: "other", Parent: ns.ID}, `{"values":["new"]}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	for name, fixture := range map[string]struct{ typ, target string }{
+		"builtin with enum use": {"integer", status.ID},
+		"unrelated UDT":         {"status", other.ID},
+		"mismatched array UDT":  {"status[][]", other.ID},
+	} {
+		t.Run(name, func(t *testing.T) {
+			column := renderResource(schema.KindColumn, schema.Name{Schema: "public", Name: "value", Parent: table.ID}, fmt.Sprintf(`{"type":%q,"not_null":false,"ordinal":1}`, fixture.typ), schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: fixture.target, Type: schema.DependencyUses})
+			doc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, status, other, column}}}
+			if normalized, err := New().Normalize(context.Background(), doc); err == nil || len(normalized.Graph.Resources) != 0 {
+				t.Fatalf("normalized=%+v err=%v", normalized, err)
+			}
+		})
+	}
+}
+
+func TestDirectProjectionQualifierAndWildcardRules(t *testing.T) {
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "app", Name: "a", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	column := renderResource(schema.KindColumn, schema.Name{Schema: "app", Name: "id", Parent: table.ID}, `{"type":"integer","not_null":false,"ordinal":1}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains})
+	for name, definition := range map[string]string{"foreign qualifier": "SELECT b.id FROM app.a", "mixed wildcard": "SELECT *, id FROM app.a"} {
+		t.Run(name, func(t *testing.T) {
+			view := renderResource(schema.KindView, schema.Name{Schema: "app", Name: "v", Parent: ns.ID}, `{"definition":"`+definition+`"}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains}, schema.Dependency{Target: table.ID, Type: schema.DependencyReferences})
+			desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, column, view}}}
+			changes := schema.ChangeSet{Version: schema.ChangeVersion, Changes: []schema.Change{{ID: "c", Operation: schema.OperationCreate, ResourceID: view.ID, After: &view}}}
+			if out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Desired: desired}); err == nil || len(out) != 0 {
+				t.Fatalf("out=%+v err=%v", out, err)
+			}
+		})
 	}
 }
 

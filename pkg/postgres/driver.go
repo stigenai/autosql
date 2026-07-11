@@ -113,7 +113,9 @@ func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Documen
 			r.Spec = normalized
 		}
 	}
-	canonicalizeUsedTypes(&doc)
+	if err := canonicalizeUsedTypes(&doc); err != nil {
+		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
+	}
 	if err := canonicalizeColumnOrdinals(&doc); err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
@@ -125,7 +127,7 @@ func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Documen
 	return doc, nil
 }
 
-func canonicalizeUsedTypes(doc *schema.Document) {
+func canonicalizeUsedTypes(doc *schema.Document) error {
 	resources := map[string]schema.Resource{}
 	for _, r := range doc.Graph.Resources {
 		resources[r.ID] = r
@@ -142,16 +144,21 @@ func canonicalizeUsedTypes(doc *schema.Document) {
 		if r.Kind != schema.KindColumn {
 			continue
 		}
+		uses := 0
 		for _, dep := range r.Dependencies {
 			if dep.Type != schema.DependencyUses {
 				continue
 			}
+			uses++
 			target, ok := resources[dep.Target]
 			if !ok {
-				continue
+				return fmt.Errorf("column %s uses missing type %s", r.Name.String(), dep.Target)
 			}
 			s := specMap(r.Spec)
 			old, _ := s["type"].(string)
+			if !typeReferenceMatches(old, r.Name.Schema, target.Name) {
+				return fmt.Errorf("column %s type %q does not name uses target %s", r.Name.String(), old, target.Name.String())
+			}
 			array := ""
 			if strings.HasSuffix(old, "[]") {
 				array = "[]"
@@ -163,7 +170,11 @@ func canonicalizeUsedTypes(doc *schema.Document) {
 			s["type"] = name + array
 			r.Spec, _ = json.Marshal(s)
 		}
+		if uses > 1 {
+			return fmt.Errorf("column %s has ambiguous uses targets", r.Name.String())
+		}
 	}
+	return nil
 }
 
 func canonicalizeColumnOrdinals(doc *schema.Document) error {
@@ -274,8 +285,13 @@ func simpleViewMatch(definition string) []string {
 	if !conservativeQueryTokens(definition, true) {
 		return nil
 	}
-	for _, item := range strings.Split(match[1], ",") {
-		if !directProjection.MatchString(strings.TrimSpace(item)) {
+	items := strings.Split(match[1], ",")
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if !directProjection.MatchString(item) || item == "*" && len(items) != 1 {
+			return nil
+		}
+		if dot := strings.IndexByte(item, '.'); dot >= 0 && !strings.EqualFold(item[:dot], match[3]) {
 			return nil
 		}
 	}

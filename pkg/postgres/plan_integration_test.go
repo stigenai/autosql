@@ -179,6 +179,20 @@ func TestSQLSourcePlanApplyReinspectConverges(t *testing.T) {
 	if failed, buildErr := plan.Build(ctx, postgres.New(), actual, regclassQuery, plan.Options{}); buildErr == nil || len(failed.Steps) != 0 {
 		t.Fatalf("regclass dependency planned: %+v err=%v", failed, buildErr)
 	}
+	for name, definition := range map[string]string{"foreign qualifier": "SELECT other.z FROM autosql_plan.widgets", "mixed wildcard": "SELECT *, z FROM autosql_plan.widgets"} {
+		t.Run(name, func(t *testing.T) {
+			bad := actual
+			bad.Graph.Resources = append([]schema.Resource(nil), actual.Graph.Resources...)
+			for i := range bad.Graph.Resources {
+				if bad.Graph.Resources[i].Kind == schema.KindView && bad.Graph.Resources[i].Name.Name == "widget_view" {
+					bad.Graph.Resources[i].Spec = json.RawMessage(fmt.Sprintf(`{"definition":%q}`, definition))
+				}
+			}
+			if failed, buildErr := plan.Build(ctx, postgres.New(), actual, bad, plan.Options{}); buildErr == nil || len(failed.Steps) != 0 {
+				t.Fatalf("invalid projection planned: %+v err=%v", failed, buildErr)
+			}
+		})
+	}
 	raw, _ := json.Marshal(actual)
 	var sameShape schema.Document
 	_ = json.Unmarshal(raw, &sameShape)
@@ -502,7 +516,7 @@ func TestUDTArrayColumnApplyReinspectConverges(t *testing.T) {
 			types[r.Name.Name] = r
 		}
 	}
-	for index, fixture := range []struct{ name, typ, target string }{{"statuses", `status[][]`, "status"}, {"moods", `AutoSQL_UDT."Mood"[][]`, "Mood"}, {"matrix", "integer[][]", ""}} {
+	for index, fixture := range []struct{ name, typ, target string }{{"statuses", `status[][]`, "status"}, {"moods", `"AutoSQL_UDT"."Mood"[][]`, "Mood"}, {"matrix", "integer[][]", ""}} {
 		deps := []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}}
 		if fixture.target != "" {
 			deps = append(deps, schema.Dependency{Target: types[fixture.target].ID, Type: schema.DependencyUses})

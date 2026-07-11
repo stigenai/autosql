@@ -60,6 +60,9 @@ token checks performed outside quoted strings.
 Managed relation-backed views are limited to direct column projections with no
 `WHERE`, functions, casts, or trailing clauses; proven integer/text literal views
 remain dependency-free, while object-bearing casts such as `regclass` fail closed.
+Qualified projection columns must use the sole relation's name, and `*` is valid
+only as the entire projection list; foreign qualifiers and mixed `*, column`
+lists fail before output-shape inference.
 For user-defined column types, inspection follows array element OIDs and emits a
 `uses` edge to the true enum/domain/composite resource. Validation resolves
 canonical qualified, same-schema/public unqualified, quoted, and array spellings
@@ -70,6 +73,9 @@ brackets are canonicalized to a single `[]` before fingerprinting and rendering.
 Normalization also rewrites accepted UDT aliases from the exact `uses` target to
 the inspector spelling: public types are unqualified, nonpublic types qualified,
 and mixed-case identifiers correctly quoted.
+That rewrite occurs only after the original type spelling is proven to name the
+exact dependency target while preserving scalar/array form; builtin types with
+UDT edges and unrelated or ambiguous type edges are rejected rather than healed.
 
 `postgres.RenderDocument` renders a full desired document from an empty schema
 projection when every resource is in the managed matrix. Read-only kinds make
