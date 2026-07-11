@@ -202,8 +202,8 @@ func validateAssertions(c Case) error {
 	}
 	for _, group := range groups {
 		for _, a := range group.assertions {
-			if strings.TrimSpace(a.Name) == "" || strings.TrimSpace(a.SQL) == "" || strings.TrimSpace(a.File) == "" || a.Line <= 0 || a.Column < 0 {
-				return &Failure{Case: c.Name, Stage: "validation", Name: a.Name, File: a.File, Line: a.Line, Column: a.Column, Err: errors.New("assertion name, SQL, source file, and positive line are required; column cannot be negative")}
+			if strings.TrimSpace(a.Name) == "" || strings.TrimSpace(a.SQL) == "" || strings.TrimSpace(a.File) == "" || a.Line <= 0 || a.Column <= 0 {
+				return &Failure{Case: c.Name, Stage: "validation", Name: a.Name, File: a.File, Line: a.Line, Column: a.Column, Err: errors.New("assertion name, SQL, source file, line, and column must be present and positive")}
 			}
 		}
 	}

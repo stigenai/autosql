@@ -42,7 +42,7 @@ func (d *fakeDB) Close(context.Context) error { d.events = append(d.events, "clo
 
 func TestBlankSchemaAndMultiVersionUpgrade(t *testing.T) {
 	db := &fakeDB{counts: []int64{1, 2, 3}}
-	c := Case{Name: "upgrade", Variables: map[string]string{"schema": "case_a"}, Setup: []Command{{SQL: "CREATE SCHEMA ${schema}"}}, Fixtures: []Command{{SQL: "FIXTURE"}}, Seed: []Command{{SQL: "SEED"}}, Versions: []Version{{Name: "v1", Migrations: []Command{{SQL: "CREATE V1"}}, Assertions: []Assertion{{Name: "v1 exists", SQL: "SELECT", Want: 1, File: "case.sql", Line: 10}}}, {Name: "v2", Migrations: []Command{{SQL: "MIGRATE V2"}}, Plan: []Command{{SQL: "APPLY PLAN V2"}}, Assertions: []Assertion{{Name: "v2 exists", SQL: "SELECT", Want: 2, File: "case.sql", Line: 20}}}}, Assertions: []Assertion{{Name: "final", SQL: "SELECT", Want: 3, File: "case.sql", Line: 30}}, Teardown: []Command{{SQL: "DROP OUTER"}, {SQL: "DROP INNER"}}}
+	c := Case{Name: "upgrade", Variables: map[string]string{"schema": "case_a"}, Setup: []Command{{SQL: "CREATE SCHEMA ${schema}"}}, Fixtures: []Command{{SQL: "FIXTURE"}}, Seed: []Command{{SQL: "SEED"}}, Versions: []Version{{Name: "v1", Migrations: []Command{{SQL: "CREATE V1"}}, Assertions: []Assertion{{Name: "v1 exists", SQL: "SELECT", Want: 1, File: "case.sql", Line: 10, Column: 1}}}, {Name: "v2", Migrations: []Command{{SQL: "MIGRATE V2"}}, Plan: []Command{{SQL: "APPLY PLAN V2"}}, Assertions: []Assertion{{Name: "v2 exists", SQL: "SELECT", Want: 2, File: "case.sql", Line: 20, Column: 1}}}}, Assertions: []Assertion{{Name: "final", SQL: "SELECT", Want: 3, File: "case.sql", Line: 30, Column: 1}}, Teardown: []Command{{SQL: "DROP OUTER"}, {SQL: "DROP INNER"}}}
 	got, err := (Runner{Factory: factory{db}}).Run(context.Background(), c)
 	if err != nil {
 		t.Fatal(err)
@@ -100,7 +100,7 @@ func TestAssertionFailureIdentifiesAssertion(t *testing.T) {
 }
 
 func TestAssertionIdentityValidationHappensBeforeOpen(t *testing.T) {
-	for _, a := range []Assertion{{SQL: "SELECT", File: "a.sql", Line: 1}, {Name: "named", File: "a.sql", Line: 1}, {Name: "named", SQL: "SELECT", Line: 1}, {Name: "named", SQL: "SELECT", File: "a.sql"}, {Name: "named", SQL: "SELECT", File: "a.sql", Line: 1, Column: -1}} {
+	for _, a := range []Assertion{{SQL: "SELECT", File: "a.sql", Line: 1, Column: 1}, {Name: "named", File: "a.sql", Line: 1, Column: 1}, {Name: "named", SQL: "SELECT", Line: 1, Column: 1}, {Name: "named", SQL: "SELECT", File: "a.sql", Column: 1}, {Name: "named", SQL: "SELECT", File: "a.sql", Line: 1}, {Name: "named", SQL: "SELECT", File: "a.sql", Line: 1, Column: -1}} {
 		db := &fakeDB{}
 		_, err := (Runner{Factory: factory{db}}).Run(context.Background(), Case{Name: "invalid", Assertions: []Assertion{a}})
 		if err == nil || len(db.events) != 0 {

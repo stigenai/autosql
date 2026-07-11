@@ -97,6 +97,18 @@ func (e *Failure) Error() string {
 }
 func (e *Failure) Unwrap() error { return ErrAssertion }
 
+// CheckError identifies a declaration whose live count query failed.
+type CheckError struct {
+	Source    Source
+	Assertion string
+	Err       error
+}
+
+func (e *CheckError) Error() string {
+	return fmt.Sprintf("precheck %q at %s:%d:%d: %v", e.Assertion, e.Source.File, e.Source.Line, e.Source.Column, e.Err)
+}
+func (e *CheckError) Unwrap() error { return e.Err }
+
 type digestAssertion struct {
 	Name, Query  string
 	Args         []digestArg
@@ -189,7 +201,7 @@ func GuardedApply(ctx context.Context, db DB, plan Plan) (results []Result, err 
 		observed, queryErr := tx.QueryCount(checkCtx, canonical[i], check.Args...)
 		cancel()
 		if queryErr != nil {
-			return results, fmt.Errorf("precheck %q: %w", check.Name, queryErr)
+			return results, &CheckError{Source: check.Source, Assertion: check.Name, Err: queryErr}
 		}
 		result := Result{Name: check.Name, Observed: observed, MaxAllowed: check.MaxAllowed, Passed: observed <= check.MaxAllowed, Source: check.Source}
 		results = append(results, result)
@@ -215,8 +227,8 @@ func validate(p Plan) ([]string, error) {
 	}
 	canonical := make([]string, len(p.Assertions))
 	for i, a := range p.Assertions {
-		if strings.TrimSpace(a.Source.File) == "" || a.Source.Line <= 0 || a.Source.Column < 0 {
-			return nil, validation(a, "source file and positive line are required; column cannot be negative")
+		if strings.TrimSpace(a.Source.File) == "" || a.Source.Line <= 0 || a.Source.Column <= 0 {
+			return nil, validation(a, "source file, line, and column must be present and positive")
 		}
 		if strings.TrimSpace(a.Name) == "" {
 			return nil, validation(a, "name is required")

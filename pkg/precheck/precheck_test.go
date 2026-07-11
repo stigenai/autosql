@@ -100,6 +100,10 @@ func TestAssertionTimeoutRollsBack(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error %v", err)
 	}
+	var checkErr *CheckError
+	if !errors.As(err, &checkErr) || !strings.Contains(err.Error(), "checks.sql:12:3") {
+		t.Fatalf("typed source error %T %v", err, err)
+	}
 	if tx.execs != 0 {
 		t.Fatal("mutation executed")
 	}
@@ -167,7 +171,7 @@ func TestValidationErrorIncludesAssertionSource(t *testing.T) {
 }
 
 func TestMissingAssertionSourceIsRejectedBeforeBegin(t *testing.T) {
-	for _, source := range []Source{{}, {File: "checks.sql"}, {File: "checks.sql", Line: 1, Column: -1}} {
+	for _, source := range []Source{{}, {File: "checks.sql"}, {File: "checks.sql", Line: 1}, {File: "checks.sql", Line: 1, Column: -1}} {
 		p := plan(0)
 		p.Assertions[0].Source = source
 		p.Digest, _ = Digest(p)
@@ -176,6 +180,19 @@ func TestMissingAssertionSourceIsRejectedBeforeBegin(t *testing.T) {
 		if _, err := GuardedApply(context.Background(), fakeDB{tx}, p); !errors.Is(err, ErrInvalidPlan) || len(tx.events) != 0 {
 			t.Fatalf("source=%+v error=%v events=%v", source, err, tx.events)
 		}
+	}
+}
+
+func TestBackendQueryErrorIncludesTypedSource(t *testing.T) {
+	backendErr := errors.New("database unavailable")
+	tx := &fakeTx{queryErr: backendErr}
+	_, err := GuardedApply(context.Background(), fakeDB{tx}, plan(0))
+	var checkErr *CheckError
+	if !errors.Is(err, backendErr) || !errors.As(err, &checkErr) || !strings.Contains(err.Error(), "checks.sql:12:3") {
+		t.Fatalf("error %T %v", err, err)
+	}
+	if tx.execs != 0 {
+		t.Fatal("mutation executed")
 	}
 }
 
