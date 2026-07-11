@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 
 	"autosql/pkg/plugin"
@@ -58,8 +61,20 @@ func (*Driver) Info() plugin.Info {
 		schema.KindTrigger, schema.KindPolicy, schema.KindRole, schema.KindGrant,
 	}
 	caps := make([]plugin.Capability, 0, len(kinds))
+	all := []schema.Operation{schema.OperationCreate, schema.OperationAlter, schema.OperationDrop, schema.OperationRename}
+	profiles := map[schema.Kind]plugin.Capability{
+		schema.KindSchema:           {Kind: schema.KindSchema, Mode: plugin.Managed, Operations: []schema.Operation{schema.OperationCreate, schema.OperationDrop, schema.OperationRename}, Features: []string{"namespace.lifecycle"}},
+		schema.KindTable:            {Kind: schema.KindTable, Mode: plugin.Managed, Operations: all, Features: []string{"table.permanent_nonpartitioned", "table.rls", "table.child_columns"}},
+		schema.KindColumn:           {Kind: schema.KindColumn, Mode: plugin.Managed, Operations: all, Features: []string{"column.type_safe_casts", "column.default", "column.not_null", "column.ordinal_metadata"}},
+		schema.KindView:             {Kind: schema.KindView, Mode: plugin.Managed, Operations: all, Features: []string{"view.provable_projection"}},
+		schema.KindMaterializedView: {Kind: schema.KindMaterializedView, Mode: plugin.Managed, Operations: all, Features: []string{"materialized_view.provable_projection", "alter.explicit_rebuild"}},
+	}
 	for _, kind := range kinds {
-		caps = append(caps, plugin.Capability{Kind: kind, Mode: plugin.ReadOnly})
+		if capability, ok := profiles[kind]; ok {
+			caps = append(caps, capability)
+		} else {
+			caps = append(caps, plugin.Capability{Kind: kind, Mode: plugin.ReadOnly})
+		}
 	}
 	return plugin.Info{Name: "postgres", Version: version, APIVersion: plugin.HostAPIVersion, Capabilities: caps}
 }
@@ -69,6 +84,13 @@ func (d *Driver) Inspect(ctx context.Context, req plugin.InspectRequest) (schema
 }
 
 func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Document, error) {
+	if dialect := doc.Annotations["dialect"]; dialect != "" && dialect != "postgresql" {
+		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: dialect %q is not PostgreSQL", dialect)
+	}
+	if doc.Annotations == nil {
+		doc.Annotations = map[string]string{}
+	}
+	doc.Annotations["dialect"] = "postgresql"
 	raw, err := json.Marshal(doc)
 	if err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
@@ -83,7 +105,7 @@ func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Documen
 		delete(r.Annotations, "autosql.io/name-origin")
 		var spec map[string]any
 		if len(r.Spec) > 0 && json.Unmarshal(r.Spec, &spec) == nil {
-			normalizePostgresSpec(spec)
+			normalizePostgresSpecForKind(r.Kind, spec)
 			normalized, e := json.Marshal(spec)
 			if e != nil {
 				return schema.Document{}, e
@@ -91,11 +113,349 @@ func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Documen
 			r.Spec = normalized
 		}
 	}
+	if err := canonicalizeUsedTypes(&doc); err != nil {
+		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
+	}
+	if err := canonicalizeColumnOrdinals(&doc); err != nil {
+		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
+	}
+	augmentProjectionColumns(&doc)
 	doc.Normalize()
 	if err := doc.Validate(); err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
 	return doc, nil
+}
+
+func canonicalizeUsedTypes(doc *schema.Document) error {
+	resources := map[string]schema.Resource{}
+	for _, r := range doc.Graph.Resources {
+		resources[r.ID] = r
+	}
+	safeIdentifier := regexp.MustCompile(`^[a-z_][a-z0-9_]*$`)
+	identifier := func(value string) string {
+		if safeIdentifier.MatchString(value) {
+			return value
+		}
+		return `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
+	}
+	for i := range doc.Graph.Resources {
+		r := &doc.Graph.Resources[i]
+		if r.Kind != schema.KindColumn {
+			continue
+		}
+		uses := 0
+		for _, dep := range r.Dependencies {
+			if dep.Type != schema.DependencyUses {
+				continue
+			}
+			uses++
+			target, ok := resources[dep.Target]
+			if !ok {
+				return fmt.Errorf("column %s uses missing type %s", r.Name.String(), dep.Target)
+			}
+			s := specMap(r.Spec)
+			old, _ := s["type"].(string)
+			if !typeReferenceMatches(old, r.Name.Schema, target.Name) {
+				return fmt.Errorf("column %s type %q does not name uses target %s", r.Name.String(), old, target.Name.String())
+			}
+			array := ""
+			if strings.HasSuffix(old, "[]") {
+				array = "[]"
+			}
+			name := identifier(target.Name.Name)
+			if target.Name.Schema != "public" {
+				name = identifier(target.Name.Schema) + "." + name
+			}
+			s["type"] = name + array
+			r.Spec, _ = json.Marshal(s)
+		}
+		if uses > 1 {
+			return fmt.Errorf("column %s has ambiguous uses targets", r.Name.String())
+		}
+	}
+	return nil
+}
+
+func canonicalizeColumnOrdinals(doc *schema.Document) error {
+	groups := map[string][]*schema.Resource{}
+	for i := range doc.Graph.Resources {
+		r := &doc.Graph.Resources[i]
+		if r.Kind == schema.KindColumn {
+			groups[r.Name.Parent] = append(groups[r.Name.Parent], r)
+		}
+	}
+	for _, columns := range groups {
+		seen := map[int]bool{}
+		maxOrdinal := 0
+		for _, column := range columns {
+			ordinal := numberAsInt(specMap(column.Spec), "ordinal")
+			if ordinal < 1 {
+				continue
+			}
+			if seen[ordinal] {
+				return fmt.Errorf("columns under %q require unique positive ordinals", column.Name.Parent)
+			}
+			seen[ordinal] = true
+			if ordinal > maxOrdinal {
+				maxOrdinal = ordinal
+			}
+		}
+		for _, column := range columns {
+			s := specMap(column.Spec)
+			if numberAsInt(s, "ordinal") < 1 {
+				maxOrdinal++
+				s["ordinal"] = maxOrdinal
+				column.Spec, _ = json.Marshal(s)
+			}
+		}
+		sort.SliceStable(columns, func(i, j int) bool {
+			return numberAsInt(specMap(columns[i].Spec), "ordinal") < numberAsInt(specMap(columns[j].Spec), "ordinal")
+		})
+		for i, column := range columns {
+			s := specMap(column.Spec)
+			s["ordinal"] = i + 1
+			column.Spec, _ = json.Marshal(s)
+		}
+	}
+	return nil
+}
+
+var simpleViewFrom = regexp.MustCompile(`(?i)^SELECT\s+(.+?)\s+FROM\s+([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)$`)
+var simpleLiteralView = regexp.MustCompile(`(?i)^SELECT\s+(.+)\s+AS\s+([a-z_][a-z0-9_]*)$`)
+var directProjection = regexp.MustCompile(`(?i)^(?:\*|(?:[a-z_][a-z0-9_]*\.)?[a-z_][a-z0-9_]*)$`)
+var provenLiteral = regexp.MustCompile(`(?i)^(?:[0-9]+|'(?:''|[^'])*'(?:::text)?)$`)
+
+func sqlTokens(definition string) []string {
+	var tokens []string
+	for i := 0; i < len(definition); {
+		if definition[i] == '\'' || definition[i] == '"' {
+			quote := definition[i]
+			i++
+			for i < len(definition) {
+				if definition[i] == quote {
+					if i+1 < len(definition) && definition[i+1] == quote {
+						i += 2
+						continue
+					}
+					i++
+					break
+				}
+				i++
+			}
+			continue
+		}
+		if (definition[i] >= 'A' && definition[i] <= 'Z') || (definition[i] >= 'a' && definition[i] <= 'z') || definition[i] == '_' {
+			start := i
+			for i < len(definition) && ((definition[i] >= 'A' && definition[i] <= 'Z') || (definition[i] >= 'a' && definition[i] <= 'z') || (definition[i] >= '0' && definition[i] <= '9') || definition[i] == '_') {
+				i++
+			}
+			tokens = append(tokens, strings.ToUpper(definition[start:i]))
+			continue
+		}
+		i++
+	}
+	return tokens
+}
+
+func conservativeQueryTokens(definition string, withFrom bool) bool {
+	tokens := sqlTokens(definition)
+	selects, froms := 0, 0
+	for _, token := range tokens {
+		switch token {
+		case "SELECT":
+			selects++
+		case "FROM":
+			froms++
+		case "TABLE", "WITH", "JOIN", "UNION", "INTERSECT", "EXCEPT":
+			return false
+		}
+	}
+	if withFrom {
+		return selects == 1 && froms == 1
+	}
+	return selects == 1 && froms == 0
+}
+
+func simpleViewMatch(definition string) []string {
+	match := simpleViewFrom.FindStringSubmatch(definition)
+	if match == nil {
+		return nil
+	}
+	if !conservativeQueryTokens(definition, true) {
+		return nil
+	}
+	items := strings.Split(match[1], ",")
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if !directProjection.MatchString(item) || item == "*" && len(items) != 1 {
+			return nil
+		}
+		if dot := strings.IndexByte(item, '.'); dot >= 0 && !strings.EqualFold(item[:dot], match[3]) {
+			return nil
+		}
+	}
+	return match
+}
+
+func simpleLiteralMatch(definition string) []string {
+	match := simpleLiteralView.FindStringSubmatch(definition)
+	if match == nil || !conservativeQueryTokens(definition, false) || !provenLiteral.MatchString(strings.TrimSpace(match[1])) {
+		return nil
+	}
+	return match
+}
+
+func augmentProjectionColumns(doc *schema.Document) {
+	children := map[string]bool{}
+	tables := map[string]schema.Resource{}
+	columns := map[string][]schema.Resource{}
+	for _, r := range doc.Graph.Resources {
+		if r.Kind == schema.KindColumn {
+			children[r.Name.Parent] = true
+			columns[r.Name.Parent] = append(columns[r.Name.Parent], r)
+		}
+		if r.Kind == schema.KindTable || r.Kind == schema.KindView || r.Kind == schema.KindMaterializedView {
+			tables[r.Name.Schema+"."+r.Name.Name] = r
+		}
+	}
+	var added []schema.Resource
+	for idx := range doc.Graph.Resources {
+		r := &doc.Graph.Resources[idx]
+		if (r.Kind != schema.KindView && r.Kind != schema.KindMaterializedView) || children[r.ID] {
+			continue
+		}
+		s := specMap(r.Spec)
+		definition, _ := s["definition"].(string)
+		var projections []schema.Resource
+		if match := simpleViewMatch(definition); match != nil {
+			table, ok := tables[match[2]+"."+match[3]]
+			if !ok {
+				continue
+			}
+			hasReference := false
+			for _, dep := range r.Dependencies {
+				hasReference = hasReference || dep.Target == table.ID && dep.Type == schema.DependencyReferences
+			}
+			if !hasReference {
+				r.Dependencies = append(r.Dependencies, schema.Dependency{Target: table.ID, Type: schema.DependencyReferences})
+			}
+			items := strings.Split(match[1], ",")
+			if strings.TrimSpace(match[1]) == "*" {
+				items = nil
+				tableColumns := append([]schema.Resource(nil), columns[table.ID]...)
+				sort.Slice(tableColumns, func(i, j int) bool {
+					return numberAsInt(specMap(tableColumns[i].Spec), "ordinal") < numberAsInt(specMap(tableColumns[j].Spec), "ordinal")
+				})
+				for _, column := range tableColumns {
+					items = append(items, column.Name.Name)
+				}
+				names := make([]string, len(items))
+				for i, name := range items {
+					names[i] = strings.TrimSpace(name)
+				}
+				s["definition"] = "SELECT " + strings.Join(names, ", ") + " FROM " + match[2] + "." + match[3]
+				r.Spec, _ = json.Marshal(s)
+			}
+			for _, item := range items {
+				name := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(item), table.Name.Name+"."))
+				for _, column := range columns[table.ID] {
+					if column.Name.Name == name {
+						column.Name.Parent = r.ID
+						column.ID = schema.StableID(column.Kind, column.Name)
+						column.Dependencies = []schema.Dependency{{Target: r.ID, Type: schema.DependencyContains}}
+						cs := specMap(column.Spec)
+						cs["not_null"] = false
+						cs["ordinal"] = len(projections) + 1
+						delete(cs, "default")
+						delete(cs, "identity")
+						delete(cs, "generated")
+						column.Spec, _ = json.Marshal(cs)
+						projections = append(projections, column)
+					}
+				}
+			}
+		}
+		if match := simpleLiteralMatch(definition); match != nil {
+			expr, name := strings.TrimSpace(match[1]), match[2]
+			typ := ""
+			if _, err := strconv.Atoi(expr); err == nil {
+				typ = "integer"
+			} else if len(expr) >= 2 && expr[0] == '\'' && expr[len(expr)-1] == '\'' {
+				typ = "text"
+				s["definition"] = "SELECT " + expr + "::text AS " + name
+				r.Spec, _ = json.Marshal(s)
+			}
+			if typ != "" {
+				column := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: r.Name.Schema, Name: name, Parent: r.ID}, Dependencies: []schema.Dependency{{Target: r.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{"not_null":false,"ordinal":1,"type":"` + typ + `"}`)}
+				column.ID = schema.StableID(column.Kind, column.Name)
+				projections = append(projections, column)
+			}
+		}
+		added = append(added, projections...)
+	}
+	doc.Graph.Resources = append(doc.Graph.Resources, added...)
+}
+func specMap(raw json.RawMessage) map[string]any {
+	out := map[string]any{}
+	_ = json.Unmarshal(raw, &out)
+	return out
+}
+func numberAsInt(values map[string]any, key string) int {
+	if value, ok := values[key].(float64); ok {
+		return int(value)
+	}
+	return 0
+}
+
+func normalizePostgresSpecForKind(kind schema.Kind, spec map[string]any) {
+	normalizePostgresSpec(spec)
+	if kind == schema.KindColumn {
+		if nullable, ok := spec["nullable"].(bool); ok {
+			spec["not_null"] = !nullable
+			delete(spec, "nullable")
+		}
+		if position, ok := spec["position"]; ok {
+			spec["ordinal"] = position
+			delete(spec, "position")
+		}
+	}
+	if kind == schema.KindTable {
+		if options, ok := spec["options"].(string); ok {
+			if strings.TrimSpace(options) != "" {
+				return
+			}
+			delete(spec, "options")
+		}
+		if _, ok := spec["partitioned"]; !ok {
+			spec["partitioned"] = false
+		}
+		if _, ok := spec["persistence"]; !ok {
+			spec["persistence"] = "p"
+		}
+		if _, ok := spec["row_security"]; !ok {
+			spec["row_security"] = false
+		}
+		if _, ok := spec["force_row_security"]; !ok {
+			spec["force_row_security"] = false
+		}
+	}
+	if kind == schema.KindView || kind == schema.KindMaterializedView {
+		if definition, ok := spec["definition"].(string); ok {
+			definition = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(definition), ";"))
+			if len(definition) >= 2 && strings.EqualFold(definition[:2], "AS") && (len(definition) == 2 || definition[2] == ' ') {
+				definition = strings.TrimSpace(definition[2:])
+			}
+			spec["definition"] = normalizeSQLSpace(definition)
+			if match := simpleViewMatch(spec["definition"].(string)); match != nil {
+				items := strings.Split(match[1], ",")
+				for i, item := range items {
+					items[i] = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(item), match[3]+"."))
+				}
+				spec["definition"] = "SELECT " + strings.Join(items, ", ") + " FROM " + match[2] + "." + match[3]
+			}
+		}
+	}
 }
 
 func normalizePostgresSpec(spec map[string]any) {
@@ -135,18 +495,18 @@ func normalizePostgresSpec(spec map[string]any) {
 }
 func postgresTypeAlias(value string) string {
 	original := strings.TrimSpace(value)
+	array := ""
+	for strings.HasSuffix(original, "[]") {
+		array = "[]"
+		original = strings.TrimSpace(strings.TrimSuffix(original, "[]"))
+	}
 	// Quoted identifiers and user-defined names are case-sensitive. Only fold
 	// names from PostgreSQL's documented built-in alias set.
 	if strings.Contains(original, `"`) {
-		return original
+		return original + array
 	}
 	s := strings.ToLower(original)
 	s = strings.TrimPrefix(s, "pg_catalog.")
-	array := ""
-	for strings.HasSuffix(s, "[]") {
-		array += "[]"
-		s = strings.TrimSpace(strings.TrimSuffix(s, "[]"))
-	}
 	suffix := ""
 	if i := strings.IndexByte(s, '('); i >= 0 && strings.HasSuffix(s, ")") {
 		suffix = s[i:]
@@ -162,7 +522,7 @@ func postgresTypeAlias(value string) string {
 	if normalized, ok := aliases[s]; ok {
 		return normalized + suffix + array
 	}
-	return original
+	return original + array
 }
 func postgresDefault(value string) string {
 	s := normalizeSQLSpace(value)
@@ -182,6 +542,12 @@ func postgresDefault(value string) string {
 	for _, cast := range []string{"::character varying", "::varchar", "::text", "::integer", "::bigint", "::boolean"} {
 		if strings.HasSuffix(strings.ToLower(s), cast) {
 			base := strings.TrimSpace(s[:len(s)-len(cast)])
+			if (cast == "::integer" || cast == "::bigint") && len(base) >= 2 && base[0] == '\'' && base[len(base)-1] == '\'' {
+				inner := base[1 : len(base)-1]
+				if regexp.MustCompile(`^-?[0-9]+$`).MatchString(inner) {
+					return inner
+				}
+			}
 			if strings.HasPrefix(base, "'") || base == "true" || base == "false" || base == "NULL" || base == "null" {
 				return base
 			}
@@ -244,10 +610,6 @@ func normalizeSQLSpace(s string) string {
 	}
 	return out.String()
 }
-func (*Driver) Render(context.Context, plugin.RenderRequest) ([]plugin.Statement, error) {
-	return nil, fmt.Errorf("render PostgreSQL changes: %w", plugin.ErrUnsupported)
-}
-
 func enabled(options map[string]string, key string, defaultValue bool) bool {
 	v, ok := options[key]
 	if !ok {

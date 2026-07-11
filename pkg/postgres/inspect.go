@@ -41,6 +41,7 @@ func inspect(ctx context.Context, req plugin.InspectRequest) (schema.Document, e
 		{"types", "USAGE on the selected schemas and types", i.inspectTypes},
 		{"sequences", "USAGE on the selected schemas", i.inspectSequences},
 		{"relations", "USAGE on schemas and SELECT on catalog metadata", i.inspectRelations},
+		{"relation dependencies", "USAGE on schemas and SELECT on catalog dependency metadata", i.inspectRelationDependencies},
 		{"columns", "USAGE on schemas and SELECT on catalog metadata", i.inspectColumns},
 		{"constraints", "USAGE on schemas and SELECT on catalog metadata", i.inspectConstraints},
 		{"indexes", "USAGE on schemas and SELECT on catalog metadata", i.inspectIndexes},
@@ -77,6 +78,37 @@ func inspect(ctx context.Context, req plugin.InspectRequest) (schema.Document, e
 		return schema.Document{}, fmt.Errorf("inspect PostgreSQL database: build canonical document: %w", err)
 	}
 	return doc, nil
+}
+
+func (i *inspector) inspectRelationDependencies(ctx context.Context) error {
+	rows, err := i.conn.Query(ctx, `select distinct rw.ev_class::oid,d.refobjid::oid from pg_rewrite rw join pg_depend d on d.classid='pg_rewrite'::regclass and d.objid=rw.oid join pg_class v on v.oid=rw.ev_class where v.relkind in ('v','m') and d.refclassid='pg_class'::regclass and d.deptype='n' and d.refobjid<>rw.ev_class order by 1,2`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var from, to uint32
+		if err := rows.Scan(&from, &to); err != nil {
+			return err
+		}
+		fromID, toID := i.byOID[from], i.byOID[to]
+		if fromID == "" || toID == "" {
+			continue
+		}
+		for idx := range i.resources {
+			if i.resources[idx].ID != fromID {
+				continue
+			}
+			exists := false
+			for _, dep := range i.resources[idx].Dependencies {
+				exists = exists || dep.Target == toID && dep.Type == schema.DependencyReferences
+			}
+			if !exists {
+				i.resources[idx].Dependencies = append(i.resources[idx].Dependencies, schema.Dependency{Target: toID, Type: schema.DependencyReferences})
+			}
+		}
+	}
+	return rows.Err()
 }
 
 func safeError(action, dsn string, err error) error {
@@ -369,11 +401,12 @@ func (i *inspector) inspectRelations(ctx context.Context) error {
 }
 
 func (i *inspector) inspectColumns(ctx context.Context) error {
-	rows, err := i.conn.Query(ctx, `select a.attrelid,a.attnum,n.nspname,c.relname,a.attname,format_type(a.atttypid,a.atttypmod),a.attnotnull,pg_get_expr(ad.adbin,ad.adrelid),a.attidentity::text,a.attgenerated::text,col_description(a.attrelid,a.attnum),a.atttypid from pg_attribute a join pg_class c on c.oid=a.attrelid join pg_namespace n on n.oid=c.relnamespace left join pg_attrdef ad on ad.adrelid=a.attrelid and ad.adnum=a.attnum where a.attnum>0 and not a.attisdropped and c.relkind in ('r','p','v','m') and n.nspname <> 'information_schema' and n.nspname !~ '^pg_' order by n.nspname,c.relname,a.attnum`)
+	rows, err := i.conn.Query(ctx, `select a.attrelid,a.attnum,n.nspname,c.relname,a.attname,format_type(a.atttypid,a.atttypmod),a.attnotnull,pg_get_expr(ad.adbin,ad.adrelid),a.attidentity::text,a.attgenerated::text,col_description(a.attrelid,a.attnum),case when t.typelem<>0 then t.typelem else a.atttypid end from pg_attribute a join pg_class c on c.oid=a.attrelid join pg_namespace n on n.oid=c.relnamespace join pg_type t on t.oid=a.atttypid left join pg_attrdef ad on ad.adrelid=a.attrelid and ad.adnum=a.attnum where a.attnum>0 and not a.attisdropped and c.relkind in ('r','p','v','m') and n.nspname <> 'information_schema' and n.nspname !~ '^pg_' order by n.nspname,c.relname,a.attnum`)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
+	ordinals := map[uint32]int{}
 	for rows.Next() {
 		var rel, typeoid uint32
 		var pos int16
@@ -387,7 +420,8 @@ func (i *inspector) inspectColumns(ctx context.Context) error {
 		if p == "" {
 			continue
 		}
-		spec := map[string]any{"position": pos, "type": typ, "not_null": nn}
+		ordinals[rel]++
+		spec := map[string]any{"position": ordinals[rel], "type": typ, "not_null": nn}
 		if def != nil {
 			spec["default"] = *def
 		}

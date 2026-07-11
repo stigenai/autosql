@@ -536,7 +536,16 @@ func changeSortKey(c Change) string {
 	if r == nil {
 		r = c.Before
 	}
-	return rank + "\x00" + string(r.Kind) + "\x00" + r.Name.String() + "\x00" + c.ID
+	ordinal := ""
+	if c.Operation == OperationCreate && r.Kind == KindColumn {
+		var spec map[string]any
+		if json.Unmarshal(r.Spec, &spec) == nil {
+			if n, ok := spec["ordinal"].(float64); ok {
+				ordinal = fmt.Sprintf("%09d\x00", int(n))
+			}
+		}
+	}
+	return rank + "\x00" + string(r.Kind) + "\x00" + r.Name.Parent + "\x00" + ordinal + r.Name.String() + "\x00" + c.ID
 }
 
 func cloneDocument(doc Document) (Document, error) {

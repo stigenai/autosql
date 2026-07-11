@@ -23,8 +23,8 @@ CREATE TABLE app.users (
 	}
 	schemaResource := manualResource(schema.KindSchema, schema.Name{Name: "app"}, `{}`, nil)
 	table := manualResource(schema.KindTable, schema.Name{Schema: "app", Name: "users", Parent: schemaResource.ID}, `{"options":""}`, []schema.Dependency{{Target: schemaResource.ID, Type: schema.DependencyContains}})
-	id := manualResource(schema.KindColumn, schema.Name{Schema: "app", Name: "id", Parent: table.ID}, `{"nullable":false,"type":"bigint"}`, []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}})
-	email := manualResource(schema.KindColumn, schema.Name{Schema: "app", Name: "email", Parent: table.ID}, `{"nullable":true,"type":"text"}`, []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}})
+	id := manualResource(schema.KindColumn, schema.Name{Schema: "app", Name: "id", Parent: table.ID}, `{"nullable":false,"ordinal":1,"type":"bigint"}`, []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}})
+	email := manualResource(schema.KindColumn, schema.Name{Schema: "app", Name: "email", Parent: table.ID}, `{"nullable":true,"ordinal":2,"type":"text"}`, []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}})
 	primary := manualResource(schema.KindPrimaryKey, schema.Name{Schema: "app", Name: "users_pkey", Parent: table.ID}, `{"definition":"PRIMARY KEY (id)"}`, []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}, {Target: id.ID, Type: schema.DependencyReferences}})
 	unique := manualResource(schema.KindUniqueConstraint, schema.Name{Schema: "app", Name: "users_email_key", Parent: table.ID}, `{"definition":"UNIQUE (email)"}`, []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}, {Target: email.ID, Type: schema.DependencyReferences}})
 	nativeDoc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{unique, email, schemaResource, primary, table, id}}}
