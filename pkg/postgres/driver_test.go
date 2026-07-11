@@ -1,0 +1,78 @@
+package postgres
+
+import (
+	"errors"
+	"strings"
+	"testing"
+
+	"autosql/pkg/plugin"
+	"autosql/pkg/schema"
+)
+
+func TestDriverMetadata(t *testing.T) {
+	d := New()
+	if err := plugin.ValidateDriver(d); err != nil {
+		t.Fatalf("ValidateDriver: %v", err)
+	}
+	for _, kind := range []schema.Kind{schema.KindTable, schema.KindPolicy, schema.KindRole, schema.KindGrant} {
+		if got := d.Info().Capability(kind).Mode; got != plugin.ReadOnly {
+			t.Errorf("capability %s = %s, want read_only", kind, got)
+		}
+	}
+}
+
+func TestPermissionError(t *testing.T) {
+	cause := errors.New("catalog rejected access")
+	err := &PermissionError{Resource: "roles", Privilege: "CREATEROLE", Cause: cause}
+	if !errors.Is(err, ErrPermission) || !errors.Is(err, cause) {
+		t.Fatalf("permission error does not preserve classification and cause: %v", err)
+	}
+	if got := err.Error(); !strings.Contains(got, "roles") || !strings.Contains(got, "grant CREATEROLE") {
+		t.Fatalf("permission error is not actionable: %s", got)
+	}
+}
+
+func TestRedactDSN(t *testing.T) {
+	dsn := "postgres://alice:top-secret@db.example:5433/app?sslmode=require"
+	got := redactDSN(dsn)
+	if strings.Contains(got, "top-secret") || strings.Contains(got, "sslmode") {
+		t.Fatalf("redacted DSN leaked secret or query: %s", got)
+	}
+	if !strings.Contains(got, "alice@db.example/app") {
+		t.Fatalf("redacted DSN lost useful endpoint identity: %s", got)
+	}
+	bad := redactDSN("postgres://user:secret@%")
+	if strings.Contains(bad, "secret") {
+		t.Fatalf("malformed DSN leaked secret: %s", bad)
+	}
+}
+
+func TestFilterDocumentDependencyClosure(t *testing.T) {
+	ns := resource(schema.KindSchema, schema.Name{Name: "app"})
+	table := resource(schema.KindTable, schema.Name{Schema: "app", Name: "users", Parent: ns.ID})
+	table.Dependencies = dep(ns.ID, schema.DependencyContains)
+	col := resource(schema.KindColumn, schema.Name{Schema: "app", Name: "id", Parent: table.ID})
+	col.Dependencies = dep(table.ID, schema.DependencyContains)
+	other := resource(schema.KindTable, schema.Name{Schema: "app", Name: "logs", Parent: ns.ID})
+	other.Dependencies = dep(ns.ID, schema.DependencyContains)
+	doc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{other, col, table, ns}}}
+
+	got := filterDocument(doc, []string{"app"}, []string{"table:app.users"}, nil)
+	if err := got.Validate(); err != nil {
+		t.Fatalf("filtered document invalid: %v", err)
+	}
+	kinds := map[schema.Kind]int{}
+	for _, r := range got.Graph.Resources {
+		kinds[r.Kind]++
+		if r.Name.Name == "logs" {
+			t.Fatal("unselected table retained")
+		}
+	}
+	if kinds[schema.KindSchema] != 1 || kinds[schema.KindTable] != 1 || kinds[schema.KindColumn] != 1 {
+		t.Fatalf("unexpected projection: %#v", kinds)
+	}
+}
+
+func resource(kind schema.Kind, name schema.Name) schema.Resource {
+	return schema.Resource{ID: schema.StableID(kind, name), Kind: kind, Name: name, Spec: []byte(`{}`)}
+}
