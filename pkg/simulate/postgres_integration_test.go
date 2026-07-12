@@ -5,16 +5,28 @@ import (
 	"autosql/pkg/postgres"
 	"autosql/pkg/schema"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"github.com/jackc/pgx/v5"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 
-func countSimulationDatabases(t *testing.T, url string) int {
+func uniqueSimulationPrefix(t *testing.T) string {
+	t.Helper()
+	raw := make([]byte, 6)
+	if _, err := rand.Read(raw); err != nil {
+		t.Fatal(err)
+	}
+	return "autosql_sim_" + hex.EncodeToString(raw)
+}
+
+func countSimulationDatabases(t *testing.T, url, prefix string) int {
 	t.Helper()
 	c, e := pgx.Connect(context.Background(), url)
 	if e != nil {
@@ -22,10 +34,24 @@ func countSimulationDatabases(t *testing.T, url string) int {
 	}
 	defer c.Close(context.Background())
 	var n int
-	if e = c.QueryRow(context.Background(), `select count(*) from pg_database where datname like 'autosql_sim_%'`).Scan(&n); e != nil {
+	if e = c.QueryRow(context.Background(), `select count(*) from pg_database where left(datname,length($1))=$1`, prefix+"_").Scan(&n); e != nil {
 		t.Fatal(e)
 	}
 	return n
+}
+
+func TestPostgresFactoryRejectsUnsafeDatabaseNamePrefixes(t *testing.T) {
+	for _, prefix := range []string{
+		"other",
+		"autosql_sim_bad-name",
+		"autosql_sim_UPPER",
+		`autosql_sim_bad"quote`,
+		"autosql_sim_" + strings.Repeat("a", 40),
+	} {
+		if _, err := (PostgresFactory{NamePrefix: prefix}).Create(context.Background(), Config{}); !errors.Is(err, ErrConfig) || !strings.Contains(err.Error(), "database_name_prefix") {
+			t.Fatalf("unsafe prefix %q err=%v", prefix, err)
+		}
+	}
 }
 
 func liveFixture(t *testing.T) (schema.Document, plan.Plan) {
@@ -58,7 +84,10 @@ func TestPostgresSimulationConcurrentIsolationAndCleanup(t *testing.T) {
 	if url == "" {
 		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
 	}
-	baseline := countSimulationDatabases(t, url)
+	prefix := uniqueSimulationPrefix(t)
+	if got := countSimulationDatabases(t, url, prefix); got != 0 {
+		t.Fatalf("prefix %s not isolated: %d", prefix, got)
+	}
 	from, p := liveFixture(t)
 	devIdentity, e := ResolvePostgresIdentity(context.Background(), url)
 	if e != nil {
@@ -75,7 +104,7 @@ func TestPostgresSimulationConcurrentIsolationAndCleanup(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			r, e := Run(ctx, PostgresFactory{}, Request{Config: Config{DevelopmentURL: url, DevelopmentIdentity: devIdentity, ProductionIdentity: "production.example:5432/prod", CleanupTimeout: 15 * time.Second}, From: from, Plan: p})
+			r, e := Run(ctx, PostgresFactory{NamePrefix: prefix}, Request{Config: Config{DevelopmentURL: url, DevelopmentIdentity: devIdentity, ProductionIdentity: "production.example:5432/prod", CleanupTimeout: 15 * time.Second}, From: from, Plan: p})
 			if e == nil {
 				mu.Lock()
 				if ids[r.IsolationIdentity] {
@@ -100,8 +129,8 @@ func TestPostgresSimulationConcurrentIsolationAndCleanup(t *testing.T) {
 	}
 	defer conn.Close(context.Background())
 	var remaining int
-	if e = conn.QueryRow(ctx, `select count(*) from pg_database where datname like 'autosql_sim_%'`).Scan(&remaining); e != nil || remaining != baseline {
-		t.Fatalf("remaining=%d err=%v", remaining, e)
+	if e = conn.QueryRow(ctx, `select count(*) from pg_database where left(datname,length($1))=$1`, prefix+"_").Scan(&remaining); e != nil || remaining != 0 {
+		t.Fatalf("prefix=%s remaining=%d err=%v", prefix, remaining, e)
 	}
 }
 func TestPostgresFactoryRejectsProductionIdentityAndRemoteByDefault(t *testing.T) {
@@ -131,12 +160,12 @@ func TestAmbiguousCreateAlwaysCleansGeneratedDatabase(t *testing.T) {
 	if url == "" {
 		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
 	}
-	baseline := countSimulationDatabases(t, url)
+	prefix := uniqueSimulationPrefix(t)
 	id, e := ResolvePostgresIdentity(context.Background(), url)
 	if e != nil {
 		t.Fatal(e)
 	}
-	factory := PostgresFactory{AfterCreate: func() error { return errors.New("server committed but client saw seeded secret") }}
+	factory := PostgresFactory{NamePrefix: prefix, AfterCreate: func() error { return errors.New("server committed but client saw seeded secret") }}
 	if _, e = factory.Create(context.Background(), Config{DevelopmentURL: url, DevelopmentIdentity: id, ProductionIdentity: "other", CleanupTimeout: 10 * time.Second}); e == nil || contains(e.Error(), "seeded") {
 		t.Fatalf("error=%v", e)
 	}
@@ -146,15 +175,15 @@ func TestAmbiguousCreateAlwaysCleansGeneratedDatabase(t *testing.T) {
 	}
 	defer conn.Close(context.Background())
 	var remaining int
-	if e = conn.QueryRow(context.Background(), `select count(*) from pg_database where datname like 'autosql_sim_%'`).Scan(&remaining); e != nil || remaining != baseline {
-		t.Fatalf("remaining=%d err=%v", remaining, e)
+	if e = conn.QueryRow(context.Background(), `select count(*) from pg_database where left(datname,length($1))=$1`, prefix+"_").Scan(&remaining); e != nil || remaining != 0 {
+		t.Fatalf("prefix=%s remaining=%d err=%v", prefix, remaining, e)
 	}
 }
 
-type liveWrapperFactory struct{ mode string }
+type liveWrapperFactory struct{ mode, prefix string }
 
 func (f liveWrapperFactory) Create(ctx context.Context, c Config) (Isolation, error) {
-	iso, e := (PostgresFactory{}).Create(ctx, c)
+	iso, e := (PostgresFactory{NamePrefix: f.prefix}).Create(ctx, c)
 	if e != nil {
 		return nil, e
 	}
@@ -187,7 +216,6 @@ func TestPostgresCleanupAfterLiveFailureCancelAndMismatch(t *testing.T) {
 	if url == "" {
 		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
 	}
-	baseline := countSimulationDatabases(t, url)
 	from, p := liveFixture(t)
 	devIdentity, e := ResolvePostgresIdentity(context.Background(), url)
 	if e != nil {
@@ -195,12 +223,13 @@ func TestPostgresCleanupAfterLiveFailureCancelAndMismatch(t *testing.T) {
 	}
 	for _, mode := range []string{"fail", "cancel", "mismatch"} {
 		t.Run(mode, func(t *testing.T) {
+			prefix := uniqueSimulationPrefix(t)
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
 			if mode == "cancel" {
 				go func() { time.Sleep(50 * time.Millisecond); cancel() }()
 			}
-			_, e := Run(ctx, liveWrapperFactory{mode: mode}, Request{Config: Config{DevelopmentURL: url, DevelopmentIdentity: devIdentity, ProductionIdentity: "production.example:5432/prod", CleanupTimeout: 10 * time.Second}, From: from, Plan: p})
+			_, e := Run(ctx, liveWrapperFactory{mode: mode, prefix: prefix}, Request{Config: Config{DevelopmentURL: url, DevelopmentIdentity: devIdentity, ProductionIdentity: "production.example:5432/prod", CleanupTimeout: 10 * time.Second}, From: from, Plan: p})
 			if e == nil || contains(e.Error(), "seeded") {
 				t.Fatalf("error=%v", e)
 			}
@@ -212,9 +241,45 @@ func TestPostgresCleanupAfterLiveFailureCancelAndMismatch(t *testing.T) {
 			}
 			defer conn.Close(context.Background())
 			var remaining int
-			if ce = conn.QueryRow(checkCtx, `select count(*) from pg_database where datname like 'autosql_sim_%'`).Scan(&remaining); ce != nil || remaining != baseline {
-				t.Fatalf("remaining=%d err=%v", remaining, ce)
+			if ce = conn.QueryRow(checkCtx, `select count(*) from pg_database where left(datname,length($1))=$1`, prefix+"_").Scan(&remaining); ce != nil || remaining != 0 {
+				t.Fatalf("prefix=%s remaining=%d err=%v", prefix, remaining, ce)
 			}
 		})
+	}
+}
+
+func TestPostgresCancelStressConfirmsOwnedNamespaceAbsent(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	prefix := uniqueSimulationPrefix(t)
+	from, p := liveFixture(t)
+	devIdentity, err := ResolvePostgresIdentity(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const runs = 8
+	errs := make(chan error, runs)
+	var wg sync.WaitGroup
+	for i := 0; i < runs; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+			defer cancel()
+			_, runErr := Run(ctx, liveWrapperFactory{mode: "cancel", prefix: prefix}, Request{Config: Config{DevelopmentURL: url, DevelopmentIdentity: devIdentity, ProductionIdentity: "production.example:5432/prod", CleanupTimeout: 15 * time.Second}, From: from, Plan: p})
+			errs <- runErr
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for runErr := range errs {
+		if runErr == nil {
+			t.Fatal("canceled simulation succeeded")
+		}
+	}
+	if remaining := countSimulationDatabases(t, url, prefix); remaining != 0 {
+		t.Fatalf("prefix=%s remaining=%d", prefix, remaining)
 	}
 }

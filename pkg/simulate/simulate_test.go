@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 type fakeFactory struct {
@@ -133,6 +135,59 @@ func TestFingerprintMismatchAndRedaction(t *testing.T) {
 	_, e := Run(context.Background(), fakeFactory{iso: iso}, Request{Config: Config{DevelopmentURL: "postgres://user:seeded-secret@dev", ProductionIdentity: "prod/db"}, From: from, Plan: p})
 	if !errors.Is(e, ErrFingerprint) || contains(e.Error(), "seeded-secret") {
 		t.Fatalf("error=%v", e)
+	}
+}
+
+func TestCleanupRetriesTransientTerminationDropAndAbsence(t *testing.T) {
+	transient := func(message string) error { return &pgconn.PgError{Code: "55006", Message: message} }
+	attempt, terminateCalls, dropCalls, absentCalls, sleeps := 0, 0, 0, 0, 0
+	cycle := func(ctx context.Context) (bool, error) {
+		attempt++
+		return cleanupDatabaseAttempt(ctx,
+			func(context.Context) error {
+				terminateCalls++
+				if attempt == 1 {
+					return transient("termination raced backend")
+				}
+				return nil
+			},
+			func(context.Context) error {
+				dropCalls++
+				if attempt == 2 {
+					return transient("drop database is being accessed")
+				}
+				return nil
+			},
+			func(context.Context) (bool, error) {
+				absentCalls++
+				return attempt == 4, nil
+			})
+	}
+	if err := cleanupDatabaseCycles(context.Background(), cycle, func(context.Context, time.Duration) error { sleeps++; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if attempt != 4 || terminateCalls != 4 || dropCalls != 3 || absentCalls != 2 || sleeps != 3 {
+		t.Fatalf("attempts=%d terminate=%d drop=%d absent=%d sleeps=%d", attempt, terminateCalls, dropCalls, absentCalls, sleeps)
+	}
+}
+
+func TestCleanupPersistentPresenceIsConfirmedFailure(t *testing.T) {
+	attempts := 0
+	cycle := func(context.Context) (bool, error) { attempts++; return false, nil }
+	err := cleanupDatabaseCycles(context.Background(), cycle, func(context.Context, time.Duration) error { return nil })
+	var present *databaseStillPresentError
+	if !errors.As(err, &present) || attempts != 12 {
+		t.Fatalf("err=%v attempts=%d", err, attempts)
+	}
+}
+
+func TestCleanupCancellationPreservesLastAdministrativeError(t *testing.T) {
+	last := &pgconn.PgError{Code: "55006", Message: "database is being accessed"}
+	ctx, cancel := context.WithCancel(context.Background())
+	cycle := func(context.Context) (bool, error) { return false, last }
+	err := cleanupDatabaseCycles(ctx, cycle, func(context.Context, time.Duration) error { cancel(); return ctx.Err() })
+	if !errors.Is(err, last) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("cleanup cancellation lost causes: %v", err)
 	}
 }
 func contains(s, x string) bool {
