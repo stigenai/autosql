@@ -45,7 +45,7 @@ func TestMigrateStatusJSONLive(t *testing.T) {
 	}
 	entry := manifest.Entries[0]
 	now := time.Now().UTC()
-	if e = store.Insert(context.Background(), revision.Revision{Version: entry.Version, Description: entry.Name, Kind: "migration", FileName: entry.File, FileDigest: entry.SQLDigest, ManifestDigest: manifest.Digest, PlanDigest: entry.Directives.PlanDigest, ChecksDigest: entry.Directives.CheckDigest, BundleDigest: entry.Directives.BundleDigest, State: "applied", StatementOrdinal: 1, Attempt: 1, Operator: "release", StartedAt: now, UpdatedAt: now, CompletedAt: &now}); e != nil {
+	if e = store.Insert(context.Background(), revision.Revision{Version: entry.Version, Description: entry.Name, Kind: "migration", FileName: entry.File, FileDigest: entry.SQLDigest, ManifestDigest: manifest.Digest, ManifestGeneration: manifest.Generation, PlanDigest: entry.Directives.PlanDigest, ChecksDigest: entry.Directives.CheckDigest, BundleDigest: entry.Directives.BundleDigest, State: "applied", StatementOrdinal: 1, Attempt: 1, Operator: "release", StartedAt: now, UpdatedAt: now, CompletedAt: &now}); e != nil {
 		t.Fatal(e)
 	}
 	t.Setenv("AUTOSQL_REVISION_STATUS_URL", url)
@@ -57,5 +57,19 @@ func TestMigrateStatusJSONLive(t *testing.T) {
 	var env Envelope
 	if e = json.Unmarshal(out.Bytes(), &env); e != nil || !env.OK || env.Command != "migrate" {
 		t.Fatalf("envelope=%+v err=%v", env, e)
+	}
+}
+
+func TestMigrateStatusConnectionErrorRedactsSecret(t *testing.T) {
+	dir := t.TempDir()
+	if _, e := migrate.Update(dir, migrate.UpdateRequest{Files: []migrate.File{{Name: "V1.0.0__x.sql", SQL: []byte("select 1;")}}}); e != nil {
+		t.Fatal(e)
+	}
+	secretURL := "postgres://operator:status-secret@127.0.0.1:1/database?sslmode=disable"
+	t.Setenv("AUTOSQL_BAD_STATUS_URL", secretURL)
+	var out bytes.Buffer
+	code := Run(context.Background(), []string{"migrate", "status", "--url", "env://AUTOSQL_BAD_STATUS_URL", "--migration-dir", dir, "--json"}, Streams{Out: &out, Err: &bytes.Buffer{}})
+	if code == 0 || bytes.Contains(out.Bytes(), []byte("status-secret")) || bytes.Contains(out.Bytes(), []byte(secretURL)) {
+		t.Fatalf("code=%d output=%s", code, out.String())
 	}
 }

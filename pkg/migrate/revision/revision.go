@@ -15,7 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-const SchemaVersion = 2
+const SchemaVersion = 3
 
 var (
 	ErrConfig = errors.New("invalid revision store configuration")
@@ -130,22 +130,26 @@ check (kind in ('migration','baseline','checkpoint','reversal')), check (state i
 		}
 		_, err := tx.Exec(ctx, `create table `+ev+` (sequence bigint generated always as identity primary key, version text not null references `+r+`(version), attempt integer not null, event_type text not null, statement_ordinal integer not null default 0, redacted_detail text not null default '', operator_identity text not null, at timestamptz not null)`)
 		return err
+	case 3:
+		_, err := tx.Exec(ctx, `alter table `+r+` add column duration_ns bigint not null default 0 check(duration_ns>=0), add column manifest_generation text not null default ''`)
+		return err
 	default:
 		return ErrConfig
 	}
 }
 
 type Revision struct {
-	Version, Description, Kind, FileName, FileDigest, ManifestDigest, ArtifactDigest, PlanDigest, ChecksDigest, BundleDigest, State string
-	StatementOrdinal, Attempt                                                                                                       int
-	RedactedError, Operator, FromVersion, ToVersion, ReversalOf                                                                     string
-	StartedAt, UpdatedAt                                                                                                            time.Time
-	CompletedAt                                                                                                                     *time.Time
-	Supersedes                                                                                                                      []string
+	Version, Description, Kind, FileName, FileDigest, ManifestDigest, ManifestGeneration, ArtifactDigest, PlanDigest, ChecksDigest, BundleDigest, State string
+	StatementOrdinal, Attempt                                                                                                                           int
+	RedactedError, Operator, FromVersion, ToVersion, ReversalOf                                                                                         string
+	StartedAt, UpdatedAt                                                                                                                                time.Time
+	CompletedAt                                                                                                                                         *time.Time
+	Supersedes                                                                                                                                          []string
+	Duration                                                                                                                                            time.Duration
 }
 
 func validateRevision(r Revision) error {
-	if r.Version == "" || r.FileName == "" || r.FileDigest == "" || r.ManifestDigest == "" || r.Attempt < 1 || r.Operator == "" || r.StartedAt.IsZero() || r.UpdatedAt.IsZero() {
+	if r.Version == "" || r.FileName == "" || r.FileDigest == "" || r.ManifestDigest == "" || r.ManifestGeneration == "" || r.Attempt < 1 || r.Operator == "" || r.StartedAt.IsZero() || r.UpdatedAt.IsZero() || r.Duration < 0 {
 		return ErrConfig
 	}
 	if strings.Contains(strings.ToLower(r.RedactedError), "password=") || strings.Contains(r.RedactedError, "://") {
@@ -166,7 +170,7 @@ func (s *Store) Insert(ctx context.Context, r Revision) error {
 		return err
 	}
 	defer conn.Close(context.WithoutCancel(ctx))
-	_, err = conn.Exec(ctx, `insert into `+q(c.Schema, c.RevisionsTable)+`(version,description,kind,file_name,file_digest,manifest_digest,artifact_digest,plan_digest,checks_digest,bundle_digest,state,statement_ordinal,attempt,redacted_error,operator_identity,started_at,updated_at,completed_at,from_version,to_version,supersedes,reversal_of) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`, r.Version, r.Description, r.Kind, r.FileName, r.FileDigest, r.ManifestDigest, r.ArtifactDigest, r.PlanDigest, r.ChecksDigest, r.BundleDigest, r.State, r.StatementOrdinal, r.Attempt, r.RedactedError, r.Operator, r.StartedAt.UTC(), r.UpdatedAt.UTC(), r.CompletedAt, r.FromVersion, r.ToVersion, r.Supersedes, r.ReversalOf)
+	_, err = conn.Exec(ctx, `insert into `+q(c.Schema, c.RevisionsTable)+`(version,description,kind,file_name,file_digest,manifest_digest,manifest_generation,artifact_digest,plan_digest,checks_digest,bundle_digest,state,statement_ordinal,attempt,redacted_error,operator_identity,started_at,updated_at,completed_at,from_version,to_version,supersedes,reversal_of,duration_ns) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`, r.Version, r.Description, r.Kind, r.FileName, r.FileDigest, r.ManifestDigest, r.ManifestGeneration, r.ArtifactDigest, r.PlanDigest, r.ChecksDigest, r.BundleDigest, r.State, r.StatementOrdinal, r.Attempt, r.RedactedError, r.Operator, r.StartedAt.UTC(), r.UpdatedAt.UTC(), r.CompletedAt, r.FromVersion, r.ToVersion, r.Supersedes, r.ReversalOf, r.Duration.Nanoseconds())
 	if err != nil {
 		return errors.New("insert revision")
 	}
@@ -216,6 +220,7 @@ type StatusEntry struct {
 	RecordedState    string `json:"recorded_state,omitempty"`
 	Attempt          int    `json:"attempt,omitempty"`
 	StatementOrdinal int    `json:"statement_ordinal,omitempty"`
+	DurationNS       int64  `json:"duration_ns,omitempty"`
 	Drift            bool   `json:"drift,omitempty"`
 	Dirty            bool   `json:"dirty,omitempty"`
 	Unknown          bool   `json:"unknown,omitempty"`
@@ -237,17 +242,24 @@ func (s *Store) Status(ctx context.Context, manifest migrate.Manifest) (Status, 
 		return Status{}, errors.New("connect revision status")
 	}
 	defer conn.Close(context.WithoutCancel(ctx))
-	rows, e := conn.Query(ctx, `select version,description,kind,file_name,file_digest,manifest_digest,artifact_digest,plan_digest,checks_digest,bundle_digest,state,statement_ordinal,attempt,redacted_error,operator_identity,started_at,updated_at,completed_at,from_version,to_version,supersedes,reversal_of from `+q(c.Schema, c.RevisionsTable)+` order by version`)
+	tx, e := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if e != nil {
-		return Status{}, errors.New("read revision status")
+		return Status{}, fmt.Errorf("begin read-only revision status: %w", e)
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
+	rows, e := tx.Query(ctx, `select version,description,kind,file_name,file_digest,manifest_digest,manifest_generation,artifact_digest,plan_digest,checks_digest,bundle_digest,state,statement_ordinal,attempt,redacted_error,operator_identity,started_at,updated_at,completed_at,from_version,to_version,supersedes,reversal_of,duration_ns from `+q(c.Schema, c.RevisionsTable)+` order by version`)
+	if e != nil {
+		return Status{}, fmt.Errorf("read revision status: %w", e)
 	}
 	records := map[string]Revision{}
 	for rows.Next() {
 		var r Revision
-		if e = rows.Scan(&r.Version, &r.Description, &r.Kind, &r.FileName, &r.FileDigest, &r.ManifestDigest, &r.ArtifactDigest, &r.PlanDigest, &r.ChecksDigest, &r.BundleDigest, &r.State, &r.StatementOrdinal, &r.Attempt, &r.RedactedError, &r.Operator, &r.StartedAt, &r.UpdatedAt, &r.CompletedAt, &r.FromVersion, &r.ToVersion, &r.Supersedes, &r.ReversalOf); e != nil {
+		var durationNS int64
+		if e = rows.Scan(&r.Version, &r.Description, &r.Kind, &r.FileName, &r.FileDigest, &r.ManifestDigest, &r.ManifestGeneration, &r.ArtifactDigest, &r.PlanDigest, &r.ChecksDigest, &r.BundleDigest, &r.State, &r.StatementOrdinal, &r.Attempt, &r.RedactedError, &r.Operator, &r.StartedAt, &r.UpdatedAt, &r.CompletedAt, &r.FromVersion, &r.ToVersion, &r.Supersedes, &r.ReversalOf, &durationNS); e != nil {
 			rows.Close()
 			return Status{}, e
 		}
+		r.Duration = time.Duration(durationNS)
 		records[r.Version] = r
 	}
 	if e = rows.Err(); e != nil {
@@ -256,7 +268,9 @@ func (s *Store) Status(ctx context.Context, manifest migrate.Manifest) (Status, 
 	rows.Close()
 	history := map[string]map[string]bool{}
 	var reg *string
-	_ = conn.QueryRow(ctx, `select to_regclass($1)::text`, c.ExecutorHistorySchema+"."+c.ExecutorHistoryTable).Scan(&reg)
+	if e = tx.QueryRow(ctx, `select to_regclass($1)::text`, c.ExecutorHistorySchema+"."+c.ExecutorHistoryTable).Scan(&reg); e != nil {
+		return Status{}, fmt.Errorf("locate executor history: %w", e)
+	}
 	artifacts := []string{}
 	for _, r := range records {
 		if r.ArtifactDigest != "" {
@@ -264,19 +278,30 @@ func (s *Store) Status(ctx context.Context, manifest migrate.Manifest) (Status, 
 		}
 	}
 	if reg != nil && len(artifacts) > 0 {
-		hr, he := conn.Query(ctx, `select artifact_digest,state from `+q(c.ExecutorHistorySchema, c.ExecutorHistoryTable)+` where artifact_digest=any($1::text[])`, artifacts)
-		if he == nil {
-			for hr.Next() {
-				var d, st string
-				if hr.Scan(&d, &st) == nil {
-					if history[d] == nil {
-						history[d] = map[string]bool{}
-					}
-					history[d][st] = true
-				}
-			}
-			hr.Close()
+		hr, he := tx.Query(ctx, `select artifact_digest,state from `+q(c.ExecutorHistorySchema, c.ExecutorHistoryTable)+` where artifact_digest=any($1::text[])`, artifacts)
+		if he != nil {
+			return Status{}, fmt.Errorf("read executor history: %w", he)
 		}
+		for hr.Next() {
+			var d, st string
+			if he = hr.Scan(&d, &st); he != nil {
+				hr.Close()
+				return Status{}, fmt.Errorf("scan executor history: %w", he)
+			}
+			if d == "" || st == "" {
+				hr.Close()
+				return Status{}, errors.New("malformed executor history")
+			}
+			if history[d] == nil {
+				history[d] = map[string]bool{}
+			}
+			history[d][st] = true
+		}
+		if he = hr.Err(); he != nil {
+			hr.Close()
+			return Status{}, fmt.Errorf("iterate executor history: %w", he)
+		}
+		hr.Close()
 	}
 	out := Status{ManifestDigest: manifest.Digest, Counts: map[string]int{}}
 	seen := map[string]bool{}
@@ -288,8 +313,9 @@ func (s *Store) Status(ctx context.Context, manifest migrate.Manifest) (Status, 
 			entry.RecordedState = r.State
 			entry.Attempt = r.Attempt
 			entry.StatementOrdinal = r.StatementOrdinal
+			entry.DurationNS = r.Duration.Nanoseconds()
 			entry.Classification = r.State
-			entry.Drift = r.FileName != m.File || r.FileDigest != m.SQLDigest || (index == len(manifest.Entries)-1 && r.ManifestDigest != manifest.Digest) || r.PlanDigest != m.Directives.PlanDigest || r.ChecksDigest != m.Directives.CheckDigest || r.BundleDigest != m.Directives.BundleDigest
+			entry.Drift = r.FileName != m.File || r.FileDigest != m.SQLDigest || (index == len(manifest.Entries)-1 && (r.ManifestDigest != manifest.Digest || r.ManifestGeneration != manifest.Generation)) || r.PlanDigest != m.Directives.PlanDigest || r.ChecksDigest != m.Directives.CheckDigest || r.BundleDigest != m.Directives.BundleDigest
 			if entry.Drift {
 				entry.Classification = "drift"
 				entry.Guidance = "restore the verified manifest or record an explicit repair"
@@ -297,7 +323,7 @@ func (s *Store) Status(ctx context.Context, manifest migrate.Manifest) (Status, 
 			if r.State == "failed" || r.State == "partial" {
 				entry.Dirty = true
 			}
-			if history[r.ArtifactDigest]["intended"] {
+			if history[r.ArtifactDigest]["intended"] || history[r.ArtifactDigest]["uncertain"] {
 				entry.Dirty = true
 				entry.Guidance = "reconcile incomplete executor history without rewriting revision state"
 			}
@@ -323,6 +349,9 @@ func (s *Store) Status(ctx context.Context, manifest migrate.Manifest) (Status, 
 		}
 		return out.Entries[i].Version < out.Entries[j].Version
 	})
+	if e = tx.Commit(ctx); e != nil {
+		return Status{}, fmt.Errorf("finish read-only revision status: %w", e)
+	}
 	return out, nil
 }
 
