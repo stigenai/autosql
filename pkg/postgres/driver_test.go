@@ -8,6 +8,7 @@ import (
 
 	"autosql/pkg/plugin"
 	"autosql/pkg/schema"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func TestDriverMetadata(t *testing.T) {
@@ -45,6 +46,24 @@ func TestPermissionError(t *testing.T) {
 	}
 	if got := err.Error(); !strings.Contains(got, "roles") || !strings.Contains(got, "grant CREATEROLE") {
 		t.Fatalf("permission error is not actionable: %s", got)
+	}
+}
+
+func TestTransientCatalogOIDClassificationIsNarrowAndPreserved(t *testing.T) {
+	for _, message := range []string{"could not open relation with OID 42", "cache lookup failed for relation 42"} {
+		cause := &pgconn.PgError{Code: "XX000", Message: message}
+		classified := classify("indexes", "catalog metadata", "postgres://user:secret@db/app", cause)
+		if !transientCatalogOID(classified) || !errors.Is(classified, cause) {
+			t.Fatalf("catalog invalidation was not retryable/preserved: %v", classified)
+		}
+		if strings.Contains(classified.Error(), "secret") {
+			t.Fatalf("classified catalog error leaked DSN: %v", classified)
+		}
+	}
+	for _, cause := range []*pgconn.PgError{{Code: "XX000", Message: "unrelated internal error"}, {Code: "42P01", Message: "could not open relation with OID 42"}} {
+		if transientCatalogOID(classify("indexes", "catalog metadata", "", cause)) {
+			t.Fatalf("unrelated PostgreSQL error became retryable: %v", cause)
+		}
 	}
 }
 

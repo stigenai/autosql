@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path"
 	"strings"
+	"time"
 
 	"autosql/pkg/plugin"
 	"autosql/pkg/schema"
@@ -16,7 +17,7 @@ import (
 )
 
 type inspector struct {
-	conn      *pgx.Conn
+	conn      catalogQueryer
 	resources []schema.Resource
 	byOID     map[uint32]string
 	schemas   map[string]string
@@ -35,6 +36,133 @@ func inspect(ctx context.Context, req plugin.InspectRequest) (schema.Document, e
 }
 
 func inspectConn(ctx context.Context, conn *pgx.Conn, req plugin.InspectRequest) (schema.Document, error) {
+	if conn.PgConn().TxStatus() != 'I' {
+		return schema.Document{}, errors.New("inspect PostgreSQL database: connection must be idle")
+	}
+	begin := func(ctx context.Context) (catalogQueryer, func(context.Context) error, error) {
+		tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+		if err != nil {
+			return nil, nil, err
+		}
+		return tx, tx.Rollback, nil
+	}
+	return inspectTransactions(ctx, req, begin, inspectSnapshot)
+}
+
+type catalogQueryer interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+}
+type snapshotBegin func(context.Context) (catalogQueryer, func(context.Context) error, error)
+type snapshotInspect func(context.Context, catalogQueryer, plugin.InspectRequest) (schema.Document, error)
+
+type snapshotRollbackError struct{ cause error }
+
+func (e *snapshotRollbackError) Error() string {
+	return "inspect PostgreSQL database: rollback catalog snapshot"
+}
+func (e *snapshotRollbackError) Unwrap() error { return e.cause }
+
+func inspectTransactions(ctx context.Context, req plugin.InspectRequest, begin snapshotBegin, run snapshotInspect) (schema.Document, error) {
+	return inspectTransactionsWithRetry(ctx, req, begin, run, catalogRetryPolicy{
+		maxAttempts: 12,
+		maxBackoff:  2 * time.Second,
+		delay: func(retry int) time.Duration {
+			d := 5 * time.Millisecond * time.Duration(1<<min(retry, 6))
+			return min(d, 250*time.Millisecond)
+		},
+		sleep: sleepCatalogRetry,
+	})
+}
+
+type catalogRetryPolicy struct {
+	maxAttempts int
+	maxBackoff  time.Duration
+	delay       func(int) time.Duration
+	sleep       func(context.Context, time.Duration) error
+}
+
+type catalogRetryExhaustedError struct {
+	attempts int
+	cause    error
+}
+
+func (e *catalogRetryExhaustedError) Error() string {
+	return fmt.Sprintf("PostgreSQL catalog remained unstable after %d inspection attempts: %v", e.attempts, e.cause)
+}
+func (e *catalogRetryExhaustedError) Unwrap() error { return e.cause }
+
+func sleepCatalogRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func inspectTransactionsWithRetry(ctx context.Context, req plugin.InspectRequest, begin snapshotBegin, run snapshotInspect, retry catalogRetryPolicy) (schema.Document, error) {
+	if retry.maxAttempts < 1 || retry.maxBackoff < 0 || retry.delay == nil || retry.sleep == nil {
+		return schema.Document{}, errors.New("inspect PostgreSQL database: invalid catalog retry policy")
+	}
+	var last error
+	var backoff time.Duration
+	for attempt := 0; attempt < retry.maxAttempts; attempt++ {
+		queryer, rollback, err := begin(ctx)
+		if err != nil {
+			return schema.Document{}, err
+		}
+		doc, inspectErr := run(ctx, queryer, req)
+		rollbackErr := rollback(context.WithoutCancel(ctx))
+		if rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
+			typed := &snapshotRollbackError{cause: rollbackErr}
+			if inspectErr != nil {
+				return schema.Document{}, errors.Join(inspectErr, typed)
+			}
+			return schema.Document{}, typed
+		}
+		if inspectErr == nil {
+			return doc, nil
+		}
+		last = inspectErr
+		if !transientCatalogOID(inspectErr) {
+			return schema.Document{}, inspectErr
+		}
+		if attempt+1 == retry.maxAttempts {
+			return schema.Document{}, &catalogRetryExhaustedError{attempts: attempt + 1, cause: inspectErr}
+		}
+		delay := retry.delay(attempt)
+		if delay < 0 || backoff+delay > retry.maxBackoff {
+			return schema.Document{}, &catalogRetryExhaustedError{attempts: attempt + 1, cause: inspectErr}
+		}
+		backoff += delay
+		if err = retry.sleep(ctx, delay); err != nil {
+			return schema.Document{}, err
+		}
+	}
+	return schema.Document{}, &catalogRetryExhaustedError{attempts: retry.maxAttempts, cause: last}
+}
+
+func transientCatalogOID(err error) bool {
+	var disappeared *catalogDisappearanceError
+	if errors.As(err, &disappeared) {
+		return true
+	}
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "XX000" && (strings.Contains(pgErr.Message, "could not open relation with OID") || strings.Contains(pgErr.Message, "cache lookup failed for"))
+}
+
+type catalogDisappearanceError struct {
+	resource string
+	oid      uint32
+}
+
+func (e *catalogDisappearanceError) Error() string {
+	return fmt.Sprintf("PostgreSQL catalog %s disappeared during inspection (OID %d)", e.resource, e.oid)
+}
+
+func inspectSnapshot(ctx context.Context, conn catalogQueryer, req plugin.InspectRequest) (schema.Document, error) {
 	i := &inspector{conn: conn, byOID: map[uint32]string{}, schemas: map[string]string{}}
 	steps := []struct {
 		resource, privilege string
@@ -148,8 +276,19 @@ func classify(resource, privilege, dsn string, err error) error {
 	if errors.As(err, &pe) && pe.Code == "42501" {
 		return &PermissionError{Resource: resource, Privilege: privilege, Cause: pe}
 	}
+	if transientCatalogOID(err) {
+		return &catalogOIDError{message: safeError("inspect "+resource, dsn, err).Error(), cause: err}
+	}
 	return safeError("inspect "+resource, dsn, err)
 }
+
+type catalogOIDError struct {
+	message string
+	cause   error
+}
+
+func (e *catalogOIDError) Error() string { return e.message }
+func (e *catalogOIDError) Unwrap() error { return e.cause }
 
 func (i *inspector) add(kind schema.Kind, name schema.Name, spec any, deps []schema.Dependency, comment *string) string {
 	b, _ := json.Marshal(spec)
@@ -489,17 +628,21 @@ func (i *inspector) inspectIndexes(ctx context.Context) error {
 	defer rows.Close()
 	for rows.Next() {
 		var oid, rel uint32
-		var ns, table, name, method, definition string
+		var ns, table, name, method string
+		var definition *string
 		var unique, valid, ready bool
 		var comment *string
 		if err := rows.Scan(&oid, &rel, &ns, &table, &name, &method, &unique, &valid, &ready, &definition, &comment); err != nil {
 			return err
 		}
+		if definition == nil {
+			return &catalogDisappearanceError{resource: "index definition", oid: oid}
+		}
 		p := i.byOID[rel]
 		if p == "" {
 			continue
 		}
-		id := i.add(schema.KindIndex, i.name(ns, name, p), map[string]any{"method": method, "unique": unique, "valid": valid, "ready": ready, "definition": definition}, dep(p, schema.DependencyContains), comment)
+		id := i.add(schema.KindIndex, i.name(ns, name, p), map[string]any{"method": method, "unique": unique, "valid": valid, "ready": ready, "definition": *definition}, dep(p, schema.DependencyContains), comment)
 		i.byOID[oid] = id
 	}
 	return rows.Err()
