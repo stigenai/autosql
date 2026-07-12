@@ -174,7 +174,7 @@ func TestSuccessfulEditRequiresFreshApproval(t *testing.T) {
 		t.Fatal(err)
 	}
 	approved := time.Now().UTC().Add(time.Minute)
-	fresh, err := eligible.FreshArtifact(approved, approved.Add(time.Hour), a.SourceRevision, a.TargetEnvironment, a.DatabaseIdentity, artifact.Approval{Identity: "bob", ApprovedAt: approved})
+	fresh, err := eligible.FreshArtifact(approved, approved.Add(time.Hour), a.SourceRevision, a.TargetEnvironment, a.DatabaseIdentity, artifact.Approval{Identity: "bob", ApprovedAt: approved, ProofDigest: "sha256:" + strings.Repeat("9", 64)})
 	if err != nil {
 		t.Fatal(err)
 	}

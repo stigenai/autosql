@@ -29,12 +29,13 @@ type applyConfig struct {
 	DatabaseURL, Environment, DatabaseIdentity, SourceRevision, KeyID, PublicKey, Issuer, Signer, Author, Requester, ApprovalAuditPath, LifecycleAuditPath, ArtifactDirectory string
 	PostgresVersion                                                                                                                                                           int
 	Schemas                                                                                                                                                                   []string
-	ExpectedPlanDigest, ExpectedChecksDigest, ExpectedGuardrailDigest, ExpectedApprovalIdentity, KeyStatus, KeyPurpose                                                        string
+	ExpectedPlanDigest, ExpectedChecksDigest, ExpectedGuardrailDigest, ExpectedApprovalIdentity, ExpectedApprovalProofDigest, KeyStatus, KeyPurpose                           string
 	KeyNotBefore, KeyNotAfter                                                                                                                                                 time.Time
 	NoEdits                                                                                                                                                                   bool
 	GeneratorKeyID, GeneratorPublicKey, GeneratorPurpose                                                                                                                      string
 	ExpectedValidationContextDigests                                                                                                                                          map[string]string
-	EditorIdentity, EditSigningKeyID, EditSigningKeyReference, DevelopmentURLReference, FreshApprovalIdentity                                                                 string
+	ExpectedValidationAttestations                                                                                                                                            map[string]artifact.ValidationAttestation
+	EditorIdentity, EditSigningKeyID, EditSigningKeyReference, DevelopmentURLReference, FreshApprovalIdentity, FreshApprovalProofDigest                                       string
 	FreshApprovalAt, EditReleaseCreatedAt, EditReleaseExpiresAt                                                                                                               time.Time
 }
 type staticAuthority struct{ actors map[string]approval.Identity }
@@ -92,6 +93,8 @@ func productionServices(connector executor.Connector) (Services, error) {
 		}
 		vp := artifact.VerifyPolicy{Now: time.Now, NoEdits: c.NoEdits, Expected: artifact.ExpectedBindings{PlanDigest: c.ExpectedPlanDigest, GeneratedPlanDigest: c.ExpectedPlanDigest, ChecksDigest: c.ExpectedChecksDigest, GuardrailDigest: c.ExpectedGuardrailDigest, SourceRevision: c.SourceRevision, Environment: c.Environment, DatabaseIdentity: c.DatabaseIdentity, ApprovalIdentity: c.ExpectedApprovalIdentity}, Keys: map[string]artifact.KeyRecord{c.KeyID: {PublicKey: ed25519.PublicKey(pub), Issuer: c.Issuer, Identity: c.Signer, Environment: c.Environment, Purpose: c.KeyPurpose, Status: c.KeyStatus, NotBefore: c.KeyNotBefore.UTC(), NotAfter: c.KeyNotAfter.UTC()}}, Issuer: c.Issuer, Identity: c.Signer, Purpose: c.KeyPurpose}
 		vp.ExpectedValidationContextDigests = c.ExpectedValidationContextDigests
+		vp.Expected.ApprovalProofDigest = c.ExpectedApprovalProofDigest
+		vp.ExpectedValidationAttestations = c.ExpectedValidationAttestations
 		if c.GeneratorKeyID != "" || c.GeneratorPublicKey != "" || c.GeneratorPurpose != "" {
 			generatorPub, decodeErr := base64.RawStdEncoding.Strict().DecodeString(c.GeneratorPublicKey)
 			if decodeErr != nil || len(generatorPub) != ed25519.PublicKeySize || c.GeneratorKeyID == "" || c.GeneratorPurpose == "" {
@@ -176,7 +179,7 @@ func productionServices(connector executor.Connector) (Services, error) {
 		if targetID == devID {
 			return Services{}, errors.New("edit development database must be distinct from target")
 		}
-		editService = &productionEditService{editor: c.EditorIdentity, policyFor: policyFor, g: g, input: input, url: url, targetIdentity: targetID, developmentURL: devURL, developmentIdentity: devID, revision: c.SourceRevision, environment: c.Environment, database: c.DatabaseIdentity, keyID: c.EditSigningKeyID, version: c.PostgresVersion, private: private, approval: artifact.Approval{Identity: c.FreshApprovalIdentity, ApprovedAt: c.FreshApprovalAt.UTC()}, created: c.EditReleaseCreatedAt.UTC(), expires: c.EditReleaseExpiresAt.UTC(), audit: &executor.FileAudit{Path: c.LifecycleAuditPath}, schemas: append([]string(nil), c.Schemas...)}
+		editService = &productionEditService{editor: c.EditorIdentity, policyFor: policyFor, g: g, input: input, url: url, targetIdentity: targetID, developmentURL: devURL, developmentIdentity: devID, revision: c.SourceRevision, environment: c.Environment, database: c.DatabaseIdentity, keyID: c.EditSigningKeyID, version: c.PostgresVersion, private: private, approval: artifact.Approval{Identity: c.FreshApprovalIdentity, ApprovedAt: c.FreshApprovalAt.UTC(), ProofDigest: c.FreshApprovalProofDigest}, created: c.EditReleaseCreatedAt.UTC(), expires: c.EditReleaseExpiresAt.UTC(), audit: &executor.FileAudit{Path: c.LifecycleAuditPath}, schemas: append([]string(nil), c.Schemas...)}
 	}
 	return Services{ReadPlan: DefaultReadPlan{}, Apply: resolvingApply{verified: verified, directory: c.ArtifactDirectory}, PlanEdit: editService}, nil
 }

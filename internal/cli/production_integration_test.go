@@ -72,7 +72,7 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 	releaseAt := time.Now().UTC().Add(5 * time.Second)
 	dir := t.TempDir()
 	name := "autosql_prod_" + strings.ToLower(time.Now().Format("150405000000"))
-	cfg := applyConfig{DatabaseURL: "env://AUTOSQL_PROD_TEST_URL", Environment: "test", DatabaseIdentity: "prod-test", SourceRevision: "test-rev", KeyID: "test-key", PublicKey: base64.RawStdEncoding.EncodeToString(pub), Issuer: "test-issuer", Signer: "test-signer", Author: "author", Requester: "requester", ApprovalAuditPath: filepath.Join(dir, "approval.jsonl"), LifecycleAuditPath: filepath.Join(dir, "lifecycle.jsonl"), ArtifactDirectory: dir, PostgresVersion: 15, Schemas: []string{name}, ExpectedPlanDigest: "pending", ExpectedChecksDigest: "pending", ExpectedGuardrailDigest: "pending", ExpectedApprovalIdentity: "release", KeyStatus: "active", KeyPurpose: "plan-artifact", KeyNotBefore: time.Now().UTC().Add(-time.Hour), KeyNotAfter: time.Now().UTC().Add(2 * time.Hour), EditorIdentity: "editor", EditSigningKeyID: "edit-key", EditSigningKeyReference: "env://AUTOSQL_EDIT_TEST_KEY", DevelopmentURLReference: "env://AUTOSQL_DEV_TEST_URL", FreshApprovalIdentity: "fresh-approver", FreshApprovalAt: releaseAt, EditReleaseCreatedAt: releaseAt, EditReleaseExpiresAt: releaseAt.Add(time.Hour)}
+	cfg := applyConfig{DatabaseURL: "env://AUTOSQL_PROD_TEST_URL", Environment: "test", DatabaseIdentity: "prod-test", SourceRevision: "test-rev", KeyID: "test-key", PublicKey: base64.RawStdEncoding.EncodeToString(pub), Issuer: "test-issuer", Signer: "test-signer", Author: "author", Requester: "requester", ApprovalAuditPath: filepath.Join(dir, "approval.jsonl"), LifecycleAuditPath: filepath.Join(dir, "lifecycle.jsonl"), ArtifactDirectory: dir, PostgresVersion: 15, Schemas: []string{name}, ExpectedPlanDigest: "pending", ExpectedChecksDigest: "pending", ExpectedGuardrailDigest: "pending", ExpectedApprovalIdentity: "release", KeyStatus: "active", KeyPurpose: "plan-artifact", KeyNotBefore: time.Now().UTC().Add(-time.Hour), KeyNotAfter: time.Now().UTC().Add(2 * time.Hour), EditorIdentity: "editor", EditSigningKeyID: "edit-key", EditSigningKeyReference: "env://AUTOSQL_EDIT_TEST_KEY", DevelopmentURLReference: "env://AUTOSQL_DEV_TEST_URL", FreshApprovalIdentity: "fresh-approver", FreshApprovalProofDigest: "sha256:" + strings.Repeat("9", 64), FreshApprovalAt: releaseAt, EditReleaseCreatedAt: releaseAt, EditReleaseExpiresAt: releaseAt.Add(time.Hour)}
 	raw, _ := json.Marshal(cfg)
 	configPath := filepath.Join(dir, "apply.json")
 	if err = os.WriteFile(configPath, raw, 0600); err != nil {
@@ -278,9 +278,12 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 	// apply paths consume the freshly published artifact.
 	cfg.ExpectedPlanDigest, cfg.ExpectedChecksDigest, cfg.ExpectedGuardrailDigest = published.Plan.Digest, published.Checks.Digest, published.GuardrailDigest
 	cfg.ExpectedApprovalIdentity, cfg.KeyID, cfg.PublicKey = published.Approval.Identity, "edit-key", base64.RawStdEncoding.EncodeToString(editPriv.Public().(ed25519.PublicKey))
+	cfg.ExpectedApprovalProofDigest = published.Approval.ProofDigest
 	cfg.ExpectedValidationContextDigests = map[string]string{}
+	cfg.ExpectedValidationAttestations = map[string]artifact.ValidationAttestation{}
 	for _, att := range published.EditProvenance.Attestations {
 		cfg.ExpectedValidationContextDigests[att.Stage] = att.ConfigDigest
+		cfg.ExpectedValidationAttestations[att.Stage] = att
 	}
 	raw, _ = json.Marshal(cfg)
 	if err = os.WriteFile(configPath, raw, 0600); err != nil {

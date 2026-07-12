@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"regexp"
 	"strings"
 	"time"
@@ -42,8 +43,9 @@ var digestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 var rawDigestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 type Approval struct {
-	Identity   string    `json:"identity"`
-	ApprovedAt time.Time `json:"approved_at"`
+	Identity    string    `json:"identity"`
+	ApprovedAt  time.Time `json:"approved_at"`
+	ProofDigest string    `json:"proof_digest,omitempty"`
 }
 type Signature struct {
 	KeyID     string `json:"key_id"`
@@ -60,13 +62,50 @@ type EditRecord struct {
 	Source         string    `json:"source"`
 }
 type ValidationAttestation struct {
-	Stage          string    `json:"stage"`
-	Implementation string    `json:"implementation"`
-	Version        string    `json:"version"`
-	ConfigDigest   string    `json:"config_digest"`
-	ResultDigest   string    `json:"result_digest"`
-	At             time.Time `json:"at"`
-	ExpiresAt      time.Time `json:"expires_at"`
+	Stage          string                        `json:"stage"`
+	Implementation string                        `json:"implementation"`
+	Version        string                        `json:"version"`
+	ConfigDigest   string                        `json:"config_digest"`
+	ResultDigest   string                        `json:"result_digest"`
+	At             time.Time                     `json:"at"`
+	ExpiresAt      time.Time                     `json:"expires_at"`
+	Simulation     *SimulationAttestation        `json:"simulation,omitempty"`
+	Safety         *SafetyAttestation            `json:"safety,omitempty"`
+	Policy         *PolicyAttestation            `json:"policy,omitempty"`
+	Precheck       *PrecheckGuardrailAttestation `json:"precheck_guardrail,omitempty"`
+	Editor         *EditorAttestation            `json:"editor,omitempty"`
+}
+type SimulationAttestation struct {
+	TargetIdentity      string `json:"target_identity"`
+	DevelopmentIdentity string `json:"development_identity"`
+	FromFingerprint     string `json:"from_fingerprint"`
+	ToFingerprint       string `json:"to_fingerprint"`
+	DatabaseVersion     string `json:"database_version"`
+	ConfigDigest        string `json:"config_digest"`
+}
+type SafetyAttestation struct {
+	Analyzers          []string `json:"analyzers"`
+	Threshold          string   `json:"threshold"`
+	SuppressionsDigest string   `json:"suppressions_digest"`
+	DiagnosticsDigest  string   `json:"diagnostics_digest"`
+	ConfigDigest       string   `json:"config_digest"`
+}
+type PolicyAttestation struct {
+	DocumentDigest  string `json:"document_digest"`
+	LimitsDigest    string `json:"limits_digest"`
+	ResourcesDigest string `json:"resources_digest"`
+	ConfigDigest    string `json:"config_digest"`
+}
+type PrecheckGuardrailAttestation struct {
+	ChecksDigest    string `json:"checks_digest"`
+	GuardrailDigest string `json:"guardrail_digest"`
+	ConfigDigest    string `json:"config_digest"`
+}
+type EditorAttestation struct {
+	Identity     string `json:"identity"`
+	ReasonDigest string `json:"reason_digest"`
+	ChainDigest  string `json:"chain_digest"`
+	ConfigDigest string `json:"config_digest"`
 }
 type EditProvenance struct {
 	Version                 string                  `json:"version"`
@@ -108,7 +147,7 @@ type Artifact struct {
 	EditProvenance    *EditProvenance   `json:"edit_provenance,omitempty"`
 	Origin            ArtifactOrigin    `json:"origin"`
 }
-type ExpectedBindings struct{ PlanDigest, ChecksDigest, GuardrailDigest, SourceRevision, Environment, DatabaseIdentity, ApprovalIdentity, GeneratedPlanDigest string }
+type ExpectedBindings struct{ PlanDigest, ChecksDigest, GuardrailDigest, SourceRevision, Environment, DatabaseIdentity, ApprovalIdentity, ApprovalProofDigest, GeneratedPlanDigest string }
 type KeyRecord struct {
 	PublicKey                                      ed25519.PublicKey
 	Issuer, Identity, Environment, Purpose, Status string
@@ -123,6 +162,7 @@ type VerifyPolicy struct {
 	GeneratorKeys                    map[string]KeyRecord
 	GeneratorPurpose                 string
 	ExpectedValidationContextDigests map[string]string
+	ExpectedValidationAttestations   map[string]ValidationAttestation
 }
 type VerifiedArtifact struct {
 	artifact Artifact
@@ -218,6 +258,19 @@ func (a Artifact) VerifyTrusted(policy VerifyPolicy) (VerifiedArtifact, error) {
 			return VerifiedArtifact{}, fail("validation_context", ErrInvalid)
 		}
 	}
+	if a.EditProvenance != nil && len(policy.ExpectedValidationAttestations) > 0 {
+		seen := map[string]bool{}
+		for _, got := range a.EditProvenance.Attestations {
+			want, ok := policy.ExpectedValidationAttestations[got.Stage]
+			if !ok || !reflect.DeepEqual(got.Simulation, want.Simulation) || !reflect.DeepEqual(got.Safety, want.Safety) || !reflect.DeepEqual(got.Policy, want.Policy) || !reflect.DeepEqual(got.Precheck, want.Precheck) || !reflect.DeepEqual(got.Editor, want.Editor) {
+				return VerifiedArtifact{}, fail("validation_attestation", ErrInvalid)
+			}
+			seen[got.Stage] = true
+		}
+		if len(seen) != len(policy.ExpectedValidationAttestations) {
+			return VerifiedArtifact{}, fail("validation_attestation", ErrInvalid)
+		}
+	}
 	if err := a.validateUnsigned(); err != nil {
 		return VerifiedArtifact{}, fail("structure", ErrInvalid)
 	}
@@ -231,6 +284,9 @@ func (a Artifact) VerifyTrusted(policy VerifyPolicy) (VerifiedArtifact, error) {
 	expected := policy.Expected
 	if expected.PlanDigest == "" || expected.ChecksDigest == "" || expected.GuardrailDigest == "" || expected.SourceRevision == "" || expected.Environment == "" || expected.DatabaseIdentity == "" || expected.ApprovalIdentity == "" || a.Plan.Digest != expected.PlanDigest || a.Checks.Digest != expected.ChecksDigest || a.GuardrailDigest != expected.GuardrailDigest || a.SourceRevision != expected.SourceRevision || a.TargetEnvironment != expected.Environment || a.DatabaseIdentity != expected.DatabaseIdentity || a.Approval.Identity != expected.ApprovalIdentity {
 		return VerifiedArtifact{}, fail("binding", ErrInvalid)
+	}
+	if expected.ApprovalProofDigest != "" && a.Approval.ProofDigest != expected.ApprovalProofDigest {
+		return VerifiedArtifact{}, fail("approval_proof", ErrInvalid)
 	}
 	changeDigest, ce := guardrail.ChangeDigest(a.Plan.Changes)
 	if ce != nil || changeDigest != a.Checks.ChangeDigest {
@@ -344,6 +400,26 @@ func validateEditProvenance(a Artifact) error {
 	}
 	for _, v := range p.Attestations {
 		if v.Stage == "" || v.Implementation == "" || v.Version == "" || !digestPattern.MatchString(v.ConfigDigest) || !digestPattern.MatchString(v.ResultDigest) || v.At.IsZero() || v.At.Location() != time.UTC || !v.ExpiresAt.After(v.At) || v.ExpiresAt.Location() != time.UTC {
+			return fail("edit_attestation", ErrInvalid)
+		}
+		switch v.Stage {
+		case "parse_rebind":
+			if v.Editor == nil || v.Editor.Identity == "" || !digestPattern.MatchString(v.Editor.ReasonDigest) || v.Editor.ChainDigest != p.ChainDigest || v.Editor.ConfigDigest != v.ConfigDigest {
+				return fail("edit_attestation", ErrInvalid)
+			}
+		case "simulation":
+			if v.Simulation == nil || v.Simulation.TargetIdentity == "" || v.Simulation.DevelopmentIdentity == "" || v.Simulation.TargetIdentity == v.Simulation.DevelopmentIdentity || v.Simulation.FromFingerprint == "" || v.Simulation.ToFingerprint == "" || v.Simulation.ConfigDigest != v.ConfigDigest {
+				return fail("edit_attestation", ErrInvalid)
+			}
+		case "safety":
+			if v.Safety == nil || len(v.Safety.Analyzers) == 0 || v.Safety.Threshold == "" || v.Safety.ConfigDigest != v.ConfigDigest {
+				return fail("edit_attestation", ErrInvalid)
+			}
+		case "policy_precheck_guardrail":
+			if v.Policy == nil || v.Precheck == nil || v.Policy.ConfigDigest != v.ConfigDigest || v.Precheck.ConfigDigest != v.ConfigDigest || (!digestPattern.MatchString(v.Precheck.ChecksDigest) && !rawDigestPattern.MatchString(v.Precheck.ChecksDigest)) || !digestPattern.MatchString(v.Precheck.GuardrailDigest) {
+				return fail("edit_attestation", ErrInvalid)
+			}
+		default:
 			return fail("edit_attestation", ErrInvalid)
 		}
 	}

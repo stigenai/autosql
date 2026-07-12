@@ -162,7 +162,14 @@ func (s *productionEditService) revalidateCore(ctx context.Context, e planedit.E
 	contextRaw := strings.Join([]string{s.targetIdentity, s.developmentIdentity, s.revision, s.environment, s.database, s.editor, fmt.Sprint(s.version), orig.Checks.Digest, orig.GuardrailDigest}, "\x00")
 	contextSum := sha256.Sum256([]byte(contextRaw))
 	contextDigest := "sha256:" + hex.EncodeToString(contextSum[:])
-	eligible, err := (planedit.Pipeline{Simulator: editSimulator{url: s.developmentURL, id: s.developmentIdentity, productionID: s.targetIdentity, from: from}, Safety: editSafety{version: s.version}, Binder: editBinder{s: s, original: orig}, ContextDigest: contextDigest}).Revalidate(ctx, e)
+	reasonDigest, chainDigest, editor := "", "", ""
+	if len(e.Provenance) > 0 {
+		x := sha256.Sum256([]byte(e.Provenance[len(e.Provenance)-1].Reason))
+		reasonDigest = "sha256:" + hex.EncodeToString(x[:])
+		chainDigest = e.Provenance[len(e.Provenance)-1].Digest
+		editor = e.Provenance[len(e.Provenance)-1].EditorIdentity
+	}
+	eligible, err := (planedit.Pipeline{Simulator: editSimulator{url: s.developmentURL, id: s.developmentIdentity, productionID: s.targetIdentity, from: from}, Safety: editSafety{version: s.version}, Binder: editBinder{s: s, original: orig}, ContextDigest: contextDigest, Context: planedit.ValidationContext{TargetIdentity: s.targetIdentity, DevelopmentIdentity: s.developmentIdentity, DatabaseVersion: fmt.Sprint(s.version), EditorIdentity: editor, ReasonDigest: reasonDigest, ChainDigest: chainDigest}}).Revalidate(ctx, e)
 	return eligible, err
 }
 func (s *productionEditService) Publish(ctx context.Context, e planedit.Eligible) (out artifact.Artifact, err error) {
@@ -191,7 +198,7 @@ func (s *productionEditService) Publish(ctx context.Context, e planedit.Eligible
 	}
 	for i := range fresh.Attestations {
 		got, want := e.Attestations[i], fresh.Attestations[i]
-		if got.Stage != want.Stage || got.Implementation != want.Implementation || got.Version != want.Version || got.ConfigDigest != want.ConfigDigest || got.ResultDigest != want.ResultDigest || got.At.Before(e.Edit.Provenance[len(e.Edit.Provenance)-1].EditedAt) || !got.ExpiresAt.After(time.Now().UTC()) {
+		if got.Stage != want.Stage || got.Implementation != want.Implementation || got.Version != want.Version || got.ConfigDigest != want.ConfigDigest || got.ResultDigest != want.ResultDigest || !reflect.DeepEqual(got.Simulation, want.Simulation) || !reflect.DeepEqual(got.Safety, want.Safety) || !reflect.DeepEqual(got.Policy, want.Policy) || !reflect.DeepEqual(got.Precheck, want.Precheck) || !reflect.DeepEqual(got.Editor, want.Editor) || got.At.Before(e.Edit.Provenance[len(e.Edit.Provenance)-1].EditedAt) || !got.ExpiresAt.After(time.Now().UTC()) {
 			return artifact.Artifact{}, errors.New("supplied eligibility attestation mismatch or expiry")
 		}
 	}
