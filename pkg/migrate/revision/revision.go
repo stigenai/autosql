@@ -660,6 +660,22 @@ func (s *Store) Status(ctx context.Context, manifest migrate.Manifest) (Status, 
 		hr.Close()
 	}
 	out := Status{ManifestDigest: manifest.Digest, Counts: map[string]int{}}
+	reversedTo := ""
+	validReversals := map[string]bool{}
+	for v, r := range records {
+		if r.Kind != "reversal" {
+			continue
+		}
+		targetOK := false
+		for _, m := range manifest.Entries {
+			targetOK = targetOK || m.Version == r.ToVersion
+		}
+		valid := r.State == "applied" && targetOK && r.ReversalOf != "" && r.ArtifactDigest != "" && r.PlanDigest != "" && r.ChecksDigest != "" && r.BundleDigest != "" && history[r.ArtifactDigest]["confirmed"] && !history[r.ArtifactDigest]["intended"] && !history[r.ArtifactDigest]["uncertain"]
+		validReversals[v] = valid
+		if valid {
+			reversedTo = r.ToVersion
+		}
+	}
 	seen := map[string]bool{}
 	for index, m := range manifest.Entries {
 		seen[m.Version] = true
@@ -684,6 +700,19 @@ func (s *Store) Status(ctx context.Context, manifest migrate.Manifest) (Status, 
 				entry.Guidance = "reconcile incomplete executor history without rewriting revision state"
 			}
 		}
+		if reversedTo != "" {
+			targetIndex := -1
+			for i, x := range manifest.Entries {
+				if x.Version == reversedTo {
+					targetIndex = i
+				}
+			}
+			if index > targetIndex {
+				entry.Classification = "reversed"
+				entry.Dirty = false
+				entry.Guidance = "append-only reversal applied; forward migration remains available for reapply"
+			}
+		}
 		out.Entries = append(out.Entries, entry)
 		out.Counts[entry.Classification]++
 		out.Dirty = out.Dirty || entry.Dirty
@@ -691,6 +720,11 @@ func (s *Store) Status(ctx context.Context, manifest migrate.Manifest) (Status, 
 	}
 	for v, r := range records {
 		if seen[v] {
+			continue
+		}
+		if r.Kind == "reversal" && validReversals[v] {
+			out.Entries = append(out.Entries, StatusEntry{Version: v, File: r.FileName, Classification: "reversal", RecordedState: r.State, Attempt: r.Attempt, StatementOrdinal: r.StatementOrdinal, Guidance: "verified append-only reversal to " + r.ToVersion})
+			out.Counts["reversal"]++
 			continue
 		}
 		out.Entries = append(out.Entries, StatusEntry{Version: v, File: r.FileName, Classification: "unknown", RecordedState: r.State, Attempt: r.Attempt, StatementOrdinal: r.StatementOrdinal, Unknown: true, Dirty: true, Guidance: "revision is absent from the verified manifest"})

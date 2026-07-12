@@ -3,6 +3,7 @@ package down
 
 import (
 	"autosql/pkg/artifact"
+	"autosql/pkg/executor"
 	"autosql/pkg/guardrail"
 	"autosql/pkg/migrate"
 	"autosql/pkg/migrate/revision"
@@ -57,7 +58,19 @@ type DownPlan struct {
 	Override                                                                           *Override `json:",omitempty"`
 	CreatedAt, ExpiresAt                                                               time.Time
 	SignerKeyID, Digest, Signature                                                     string
+	ArtifactPath, ArtifactDigest, GuardrailDigest                                      string
 }
+
+func (p DownPlan) BindArtifact(path, digestValue, bundle string, key ed25519.PrivateKey) (DownPlan, error) {
+	if path == "" || digestValue == "" || bundle == "" || len(key) != ed25519.PrivateKeySize {
+		return DownPlan{}, ErrRefused
+	}
+	p.ArtifactPath, p.ArtifactDigest, p.GuardrailDigest = path, digestValue, bundle
+	p.Digest = digest(p)
+	p.Signature = base64.RawStdEncoding.EncodeToString(ed25519.Sign(key, []byte("autosql.down-plan.signature/v1\x00"+p.Digest)))
+	return p, nil
+}
+
 type Request struct {
 	Snapshot                  migrate.Snapshot
 	Revisions                 []revision.Revision
@@ -71,6 +84,8 @@ type Request struct {
 	SignerKeyID               string
 	Signer                    ed25519.PrivateKey
 	VerifyOriginal            func(artifact.Artifact) (artifact.VerifiedArtifact, error)
+	Executor                  []revision.ExecutorRecord
+	TargetIdentity            string
 }
 type Reload func(context.Context) (migrate.Snapshot, revision.Revision, error)
 type Authorize func(context.Context, DownPlan) (artifact.VerifiedArtifact, error)
@@ -142,8 +157,26 @@ func Build(ctx context.Context, r Request) (DownPlan, error) {
 	if target < 0 || headIndex < 0 || target >= headIndex {
 		return out, ErrRefused
 	}
+	rows := map[string]revision.Revision{}
+	for _, row := range r.Revisions {
+		if row.Kind == "reversal" {
+			continue
+		}
+		if _, exists := rows[row.Version]; exists {
+			return out, fmt.Errorf("%w: duplicate revision evidence", ErrRefused)
+		}
+		rows[row.Version] = row
+	}
+	for i := target + 1; i <= headIndex; i++ {
+		entry := r.Snapshot.Manifest.Entries[i]
+		row, ok := rows[entry.Version]
+		if !ok || row.State != "applied" || row.Kind == "baseline" || row.FileName != entry.File || row.FileDigest != entry.SQLDigest || row.ArtifactDigest != entry.ArtifactDigest || row.PlanDigest != entry.Directives.PlanDigest || row.ChecksDigest != entry.Directives.CheckDigest || row.BundleDigest != entry.Directives.BundleDigest {
+			return out, fmt.Errorf("%w: revision evidence gap, baseline ambiguity, or digest mismatch", ErrRefused)
+		}
+	}
 	originals := []Original{}
 	originalByVersion := map[string]string{}
+	originalPlans := map[string]artifact.Artifact{}
 	requiredReverse := map[string]bool{}
 	for i := target + 1; i <= headIndex; i++ {
 		e := r.Snapshot.Manifest.Entries[i]
@@ -164,14 +197,54 @@ func Build(ctx context.Context, r Request) (DownPlan, error) {
 		}
 		originals = append(originals, Original{e.Version, p.Digest, p.Plan.Digest})
 		originalByVersion[e.Version] = p.Digest
+		originalPlans[p.Digest] = p
 		for _, c := range p.Plan.Changes.Changes {
 			if c.Before != nil && c.Before.Kind == schema.KindReferenceData || c.After != nil && c.After.Kind == schema.KindReferenceData {
 				requiredReverse[e.Version] = true
 			}
 		}
 	}
-	if len(originals) == 0 || head.Kind != "reversal" && originals[len(originals)-1].ArtifactDigest != head.ArtifactDigest {
-		return out, fmt.Errorf("%w: applied head artifact mismatch", ErrStale)
+	if len(originals) == 0 {
+		return out, ErrRefused
+	}
+	byArtifact := map[string][]revision.ExecutorRecord{}
+	seenHistory := map[string]bool{}
+	for _, x := range r.Executor {
+		k := x.ArtifactDigest + "\x00" + x.StepID + fmt.Sprint(x.Attempt)
+		if seenHistory[k] {
+			return out, fmt.Errorf("%w: duplicate executor evidence", ErrRefused)
+		}
+		seenHistory[k] = true
+		byArtifact[x.ArtifactDigest] = append(byArtifact[x.ArtifactDigest], x)
+	}
+	for _, o := range originals {
+		a := originalPlans[o.ArtifactDigest]
+		expected := map[string]plan.Phase{}
+		for _, phase := range a.Plan.Phases {
+			for _, id := range phase.StepIDs {
+				for _, step := range a.Plan.Steps {
+					if step.ID == id && step.Kind == plan.StepExecutable {
+						expected[id] = phase
+					}
+				}
+			}
+		}
+		historyRows := byArtifact[o.ArtifactDigest]
+		if len(historyRows) != len(expected) {
+			return out, fmt.Errorf("%w: executor evidence gap", ErrRefused)
+		}
+		for _, x := range historyRows {
+			phase, ok := expected[x.StepID]
+			var step plan.Step
+			for _, candidate := range a.Plan.Steps {
+				if candidate.ID == x.StepID {
+					step = candidate
+				}
+			}
+			if !ok || x.State != "confirmed" || x.Attempt != 1 || x.StepHash != executor.StepHash(step) || x.PhaseID != phase.ID || x.PhaseMode != string(phase.Transaction) || x.ExecutionID != a.Digest || x.PlanDigest != a.Plan.Digest || x.BundleDigest != a.GuardrailDigest || r.TargetIdentity != "" && x.TargetIdentity != r.TargetIdentity {
+				return out, fmt.Errorf("%w: executor evidence binding mismatch", ErrRefused)
+			}
+		}
 	}
 	liveFP, e := schema.SemanticFingerprint(r.LockedLive)
 	if e != nil {

@@ -25,6 +25,9 @@ func TestMigrateDownDryRunNeverAppliesAndFailureGuides(t *testing.T) {
 	if err := runMigrateDown(context.Background(), []string{"--to", "1", "--dry-run"}, output{streams: Streams{Out: out, Err: &strings.Builder{}}}, s); err != nil || s.applied {
 		t.Fatalf("err=%v applied=%v", err, s.applied)
 	}
+	if !strings.Contains(out.String(), "DESTRUCTIVE") || !strings.Contains(out.String(), "precondition: empty") {
+		t.Fatal("human dry run omitted impacts or preconditions")
+	}
 	s.err = errors.New("secret postgres://u:p@db")
 	err := runMigrateDown(context.Background(), []string{"--to", "1", "--dry-run"}, output{streams: Streams{Out: &strings.Builder{}, Err: &strings.Builder{}}}, s)
 	var ce *Error

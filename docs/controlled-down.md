@@ -27,9 +27,11 @@ be reconciled before another down operation.
 The shipped production service is enabled by `down_config_path` in the trusted
 apply configuration. The referenced JSON supplies the owner-controlled
 migration directory, revision schema, distinct development database reference
-and runtime identity, plan-signing key reference and ID, plan TTL, approved down
-artifact path, trusted operator, optional reverse statements/checks, and scoped
-override public keys. The approved artifact must be present in the normal
-trusted-migrations release manifest and must use source revision
-`down:<locked-head>:<target>`. Supplying the down file alone grants no mutation
-capability.
+and runtime identity, plan-signing key reference and ID, plan TTL, owner-only
+artifact directory, trusted release and generator key references, trusted
+operator, optional reverse statements/checks, external approval authority data,
+and scoped override public keys. Planning runs the complete static controls and
+approval audit, then generator-attests, release-signs, verifies and atomically
+publishes an artifact for exactly the down plan. The artifact uses source
+revision `down:<locked-head>:<target>` and its digest/path are signed back into
+the down plan. Apply will read no other artifact.

@@ -4,6 +4,8 @@ import (
 	"autosql/pkg/migrate/down"
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 )
 
 type DownService interface {
@@ -28,7 +30,19 @@ func runMigrateDown(ctx context.Context, args []string, o output, s DownService)
 		return &Error{Kind: "migration", Message: "controlled down planning refused", Code: ExitMigration, Cause: e, RecoveryGuidance: "reconcile dirty or uncertain revision state before retry"}
 	}
 	if *dry {
-		return o.success(p, p.Digest)
+		var b strings.Builder
+		fmt.Fprintf(&b, "down plan %s to %s\n", p.Digest, p.TargetVersion)
+		for _, impact := range p.Impacts {
+			kind := "change"
+			if impact.Destructive {
+				kind = "DESTRUCTIVE"
+			}
+			fmt.Fprintf(&b, "- %s %s %s\n", kind, impact.Operation, impact.Object)
+			for _, condition := range impact.Preconditions {
+				fmt.Fprintf(&b, "  precondition: %s\n", condition)
+			}
+		}
+		return o.success(p, strings.TrimSpace(b.String()))
 	}
 	status, e := s.ApplyDown(ctx, p)
 	if e != nil {
