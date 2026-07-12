@@ -33,6 +33,23 @@ type Connector interface {
 }
 type PGXConnector struct{}
 
+// WrapPGX adapts an already-pinned pgx connection. The executor will not own
+// or close it when Config.LockedSession is used.
+func WrapPGX(c *pgx.Conn) Session { return pgxSession{c} }
+func WrapPGXTx(x pgx.Tx) Tx       { return pgxTx{x} }
+
+type borrowedSession struct {
+	Session
+	tx Tx
+}
+
+func (s borrowedSession) Begin(context.Context) (Tx, error) { return borrowedTx{s.tx}, nil }
+
+type borrowedTx struct{ Tx }
+
+func (b borrowedTx) Commit(context.Context) error   { return nil }
+func (b borrowedTx) Rollback(context.Context) error { return nil }
+
 func (PGXConnector) Connect(ctx context.Context, url string) (Session, error) {
 	c, e := pgx.Connect(ctx, url)
 	if e != nil {

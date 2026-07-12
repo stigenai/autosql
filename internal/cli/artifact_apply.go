@@ -15,12 +15,73 @@ import (
 // provide trusted verification policy, the exact bound guardrail input, and an
 // executor mutation factory. No raw plan or SQL execution path exists here.
 type VerifiedArtifactApplyService struct {
-	Policy    artifact.VerifyPolicy
-	PolicyFor func(artifact.Artifact) (artifact.VerifyPolicy, error)
-	Guardrail guardrail.Guardrail
-	Input     func(artifact.Artifact) (guardrail.Input, error)
-	Mutation  func(artifact.VerifiedArtifact) (guardrail.AuthorizedMutation, error)
-	NoEdits   bool
+	Policy         artifact.VerifyPolicy
+	PolicyFor      func(artifact.Artifact) (artifact.VerifyPolicy, error)
+	Guardrail      guardrail.Guardrail
+	Input          func(artifact.Artifact) (guardrail.Input, error)
+	Mutation       func(artifact.VerifiedArtifact) (guardrail.AuthorizedMutation, error)
+	MutationLocked func(artifact.VerifiedArtifact, executor.Session, executor.Tx) (guardrail.AuthorizedMutation, error)
+	NoEdits        bool
+	LifecycleAudit executor.LifecycleAudit
+}
+
+func (s VerifiedArtifactApplyService) DrainLifecycle(ctx context.Context, e executor.LifecycleEvent) error {
+	if s.LifecycleAudit == nil {
+		return errors.New("durable lifecycle audit is not configured")
+	}
+	return s.LifecycleAudit.AppendDurable(ctx, e)
+}
+
+func (s VerifiedArtifactApplyService) ApplyVersioned(ctx context.Context, v artifact.VerifiedArtifact, session executor.Session, tx executor.Tx) (executor.ExternalExecution, error) {
+	var out executor.ExternalExecution
+	p, err := v.Payload()
+	if err != nil || s.Input == nil || s.MutationLocked == nil {
+		return out, errors.New("versioned guarded apply is not configured")
+	}
+	in, err := s.Input(p)
+	if err != nil {
+		return out, err
+	}
+	mutation, err := s.MutationLocked(v, session, tx)
+	if err != nil {
+		return out, err
+	}
+	in.Mutation = mutation
+	if _, err = s.Guardrail.Apply(ctx, in); err != nil {
+		if x, ok := mutation.(*executor.PostgreSQL); ok {
+			if tx != nil {
+				out = x.ExternalExecution()
+			} else {
+				out.Result = x.Result()
+			}
+		}
+		return out, err
+	}
+	if x, ok := mutation.(*executor.PostgreSQL); ok {
+		if tx != nil {
+			out = x.ExternalExecution()
+		} else {
+			out.Result = x.Result()
+		}
+	}
+	return out, nil
+}
+
+// VerifyArtifact exposes exactly the same trusted release-manifest policy used
+// by the single-artifact path, without granting a mutation capability.
+func (s VerifiedArtifactApplyService) VerifyArtifact(a artifact.Artifact) (artifact.VerifiedArtifact, error) {
+	p := s.Policy
+	var err error
+	if s.PolicyFor != nil {
+		p, err = s.PolicyFor(a)
+		if err != nil {
+			return artifact.VerifiedArtifact{}, err
+		}
+	}
+	if s.NoEdits {
+		p.NoEdits = true
+	}
+	return a.VerifyTrusted(p)
 }
 
 func (s VerifiedArtifactApplyService) Apply(ctx context.Context, request ApplyRequest) (ApplyResult, error) {

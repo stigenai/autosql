@@ -13,9 +13,10 @@ import (
 
 	"autosql/pkg/migrate"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
-const SchemaVersion = 3
+const SchemaVersion = 5
 
 var (
 	ErrConfig = errors.New("invalid revision store configuration")
@@ -24,14 +25,14 @@ var (
 )
 
 type Config struct {
-	URL, Schema, MetaTable, RevisionsTable, StatementsTable, EventsTable, ExecutorHistorySchema, ExecutorHistoryTable string
+	URL, Schema, MetaTable, RevisionsTable, StatementsTable, EventsTable, ManifestTable, OutboxTable, ExecutorHistorySchema, ExecutorHistoryTable string
 }
 
 func (c Config) normalized() (Config, error) {
 	if c.URL == "" {
 		return c, ErrConfig
 	}
-	defaults := map[*string]string{&c.Schema: "autosql_revision", &c.MetaTable: "meta", &c.RevisionsTable: "revisions", &c.StatementsTable: "statement_attempts", &c.EventsTable: "events", &c.ExecutorHistorySchema: "public", &c.ExecutorHistoryTable: "autosql_migration_history"}
+	defaults := map[*string]string{&c.Schema: "autosql_revision", &c.MetaTable: "meta", &c.RevisionsTable: "revisions", &c.StatementsTable: "statement_attempts", &c.EventsTable: "events", &c.ManifestTable: "manifest_ancestry", &c.OutboxTable: "lifecycle_outbox", &c.ExecutorHistorySchema: "public", &c.ExecutorHistoryTable: "autosql_migration_history"}
 	for field, value := range defaults {
 		if *field == "" {
 			*field = value
@@ -45,6 +46,127 @@ func (c Config) normalized() (Config, error) {
 func q(parts ...string) string { return pgx.Identifier(parts).Sanitize() }
 
 type Store struct{ config Config }
+
+// Session is a pinned target-database session. Callers use it to keep the
+// advisory lock, revision snapshot, migration SQL and history writes on the
+// same PostgreSQL backend. It deliberately does not expose the connection
+// string or permit a second connection to be opened behind the caller's back.
+type Session struct {
+	conn   *pgx.Conn
+	config Config
+}
+
+// OpenSession connects to the revision database. The caller owns Close.
+func (s *Store) OpenSession(ctx context.Context) (*Session, error) {
+	c, err := pgx.Connect(ctx, s.config.URL)
+	if err != nil {
+		return nil, errors.New("connect revision session")
+	}
+	return &Session{conn: c, config: s.config}, nil
+}
+
+func (s *Session) Close(ctx context.Context) error { return s.conn.Close(ctx) }
+func (s *Session) Raw() *pgx.Conn                  { return s.conn }
+func (s *Session) Lock(ctx context.Context, identity string) (bool, error) {
+	if identity == "" {
+		return false, ErrConfig
+	}
+	var ok bool
+	err := s.conn.QueryRow(ctx, `select pg_try_advisory_lock(hashtextextended($1,0::bigint))`, identity).Scan(&ok)
+	return ok, err
+}
+func (s *Session) Unlock(ctx context.Context, identity string) error {
+	var ok bool
+	if err := s.conn.QueryRow(ctx, `select pg_advisory_unlock(hashtextextended($1,0::bigint))`, identity).Scan(&ok); err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("revision advisory lock was lost")
+	}
+	return nil
+}
+func writerKey(c Config) string { return "autosql.revision-writers/v1/" + c.Schema }
+func (s *Session) LockWriters(ctx context.Context) (bool, error) {
+	return s.Lock(ctx, writerKey(s.config))
+}
+func (s *Session) UnlockWriters(ctx context.Context) error { return s.Unlock(ctx, writerKey(s.config)) }
+func lockWriter(ctx context.Context, c *pgx.Conn, cfg Config) error {
+	var ok bool
+	return c.QueryRow(ctx, `select pg_advisory_lock(hashtextextended($1,0::bigint)) is null`, writerKey(cfg)).Scan(&ok)
+}
+func unlockWriter(ctx context.Context, c *pgx.Conn, cfg Config) {
+	_, _ = c.Exec(ctx, `select pg_advisory_unlock(hashtextextended($1,0::bigint))`, writerKey(cfg))
+}
+func (s *Session) BackendPID(ctx context.Context) (int32, error) {
+	var pid int32
+	err := s.conn.QueryRow(ctx, `select pg_backend_pid()`).Scan(&pid)
+	return pid, err
+}
+func (s *Session) Begin(ctx context.Context) (pgx.Tx, error) { return s.conn.Begin(ctx) }
+
+// LockMutationTables fences legacy/direct writers that do not participate in
+// the canonical target advisory lock. The locks live until tx completion.
+func (s *Session) LockMutationTables(ctx context.Context, tx pgx.Tx) error {
+	for _, table := range []string{q(s.config.Schema, s.config.RevisionsTable), q(s.config.Schema, s.config.StatementsTable), q(s.config.Schema, s.config.EventsTable)} {
+		if _, err := tx.Exec(ctx, `lock table `+table+` in share row exclusive mode`); err != nil {
+			return errors.New("lock revision reconciliation tables")
+		}
+	}
+	var reg *string
+	if err := tx.QueryRow(ctx, `select to_regclass($1)::text`, s.config.ExecutorHistorySchema+"."+s.config.ExecutorHistoryTable).Scan(&reg); err != nil {
+		return err
+	}
+	if reg != nil {
+		if _, err := tx.Exec(ctx, `lock table `+q(s.config.ExecutorHistorySchema, s.config.ExecutorHistoryTable)+` in share row exclusive mode`); err != nil {
+			return errors.New("lock executor reconciliation table")
+		}
+	}
+	return nil
+}
+
+type OutboxRecord struct {
+	ID      string
+	Payload []byte
+}
+
+func (s *Session) EnqueueOutbox(ctx context.Context, tx pgx.Tx, id string, payload []byte) error {
+	if id == "" || len(payload) == 0 {
+		return ErrConfig
+	}
+	_, err := tx.Exec(ctx, `insert into `+q(s.config.Schema, s.config.OutboxTable)+`(event_id,payload) values($1,$2::jsonb) on conflict(event_id) do nothing`, id, payload)
+	return err
+}
+func (s *Session) PendingOutbox(ctx context.Context) ([]OutboxRecord, error) {
+	rows, err := s.conn.Query(ctx, `select event_id,payload::text from `+q(s.config.Schema, s.config.OutboxTable)+` where finalized_at is null order by event_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []OutboxRecord
+	for rows.Next() {
+		var x OutboxRecord
+		var p string
+		if err = rows.Scan(&x.ID, &p); err != nil {
+			return nil, err
+		}
+		x.Payload = []byte(p)
+		out = append(out, x)
+	}
+	return out, rows.Err()
+}
+func (s *Session) FinalizeOutbox(ctx context.Context, id string) error {
+	tag, err := s.conn.Exec(ctx, `update `+q(s.config.Schema, s.config.OutboxTable)+` set finalized_at=clock_timestamp() where event_id=$1 and finalized_at is null`, id)
+	if err != nil || tag.RowsAffected() != 1 {
+		return errors.New("finalize lifecycle outbox")
+	}
+	return nil
+}
+func (s *Session) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	return s.conn.Exec(ctx, sql, args...)
+}
+func (s *Session) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	return s.conn.QueryRow(ctx, sql, args...)
+}
 
 func Open(c Config) (*Store, error) {
 	n, e := c.normalized()
@@ -133,9 +255,58 @@ check (kind in ('migration','baseline','checkpoint','reversal')), check (state i
 	case 3:
 		_, err := tx.Exec(ctx, `alter table `+r+` add column duration_ns bigint not null default 0 check(duration_ns>=0), add column manifest_generation text not null default ''`)
 		return err
+	case 4:
+		var existing *string
+		if err := tx.QueryRow(ctx, `select to_regclass($1)::text`, c.Schema+"."+c.ManifestTable).Scan(&existing); err != nil {
+			return err
+		}
+		if existing != nil {
+			return fmt.Errorf("%w: unexpected manifest ancestry table at schema version 3", ErrConfig)
+		}
+		_, err := tx.Exec(ctx, `create table `+q(c.Schema, c.ManifestTable)+` (generation text primary key,digest text not null unique,parent_generation text not null,entry_count integer not null check(entry_count>=0),head_chain_digest text not null,recorded_at timestamptz not null)`)
+		return err
+	case 5:
+		_, err := tx.Exec(ctx, `create table `+q(c.Schema, c.OutboxTable)+` (event_id text primary key,payload jsonb not null,finalized_at timestamptz)`)
+		return err
 	default:
 		return ErrConfig
 	}
+}
+func (s *Session) RecordManifest(ctx context.Context, tx pgx.Tx, m migrate.Manifest, parent string, at time.Time) error {
+	count, head := migrate.ManifestHead(m)
+	tag, err := tx.Exec(ctx, `insert into `+q(s.config.Schema, s.config.ManifestTable)+`(generation,digest,parent_generation,entry_count,head_chain_digest,recorded_at) values($1,$2,$3,$4,$5,$6) on conflict(generation) do nothing`, m.Generation, m.Digest, parent, count, head, at.UTC())
+	if err != nil {
+		return errors.New("record manifest ancestry")
+	}
+	if tag.RowsAffected() == 0 {
+		var d, p, h string
+		var n int
+		if err = tx.QueryRow(ctx, `select digest,parent_generation,entry_count,head_chain_digest from `+q(s.config.Schema, s.config.ManifestTable)+` where generation=$1`, m.Generation).Scan(&d, &p, &n, &h); err != nil || d != m.Digest || n != count || h != head {
+			return errors.New("manifest ancestry binding conflict")
+		}
+	}
+	return nil
+}
+func (s *Session) ManifestDescendsFrom(ctx context.Context, current migrate.Manifest, ancestorGeneration, ancestorDigest string) (bool, error) {
+	if current.Generation == ancestorGeneration && current.Digest == ancestorDigest {
+		return true, nil
+	}
+	var count int
+	var head string
+	err := s.conn.QueryRow(ctx, `select entry_count,head_chain_digest from `+q(s.config.Schema, s.config.ManifestTable)+` where generation=$1 and digest=$2`, ancestorGeneration, ancestorDigest).Scan(&count, &head)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if count < 0 || count > len(current.Entries) {
+		return false, nil
+	}
+	if count == 0 {
+		return true, nil
+	}
+	return current.Entries[count-1].ChainDigest == head, nil
 }
 
 type Revision struct {
@@ -146,6 +317,62 @@ type Revision struct {
 	CompletedAt                                                                                                                                         *time.Time
 	Supersedes                                                                                                                                          []string
 	Duration                                                                                                                                            time.Duration
+}
+
+// Revisions returns the authoritative rows visible on this pinned session.
+func (s *Session) Revisions(ctx context.Context) ([]Revision, error) {
+	rows, err := s.conn.Query(ctx, `select version,description,kind,file_name,file_digest,manifest_digest,manifest_generation,artifact_digest,plan_digest,checks_digest,bundle_digest,state,statement_ordinal,attempt,redacted_error,operator_identity,started_at,updated_at,completed_at,from_version,to_version,supersedes,reversal_of,duration_ns from `+q(s.config.Schema, s.config.RevisionsTable)+` order by version`)
+	if err != nil {
+		return nil, errors.New("read pinned revision snapshot")
+	}
+	defer rows.Close()
+	var out []Revision
+	for rows.Next() {
+		var r Revision
+		var ns int64
+		if err = rows.Scan(&r.Version, &r.Description, &r.Kind, &r.FileName, &r.FileDigest, &r.ManifestDigest, &r.ManifestGeneration, &r.ArtifactDigest, &r.PlanDigest, &r.ChecksDigest, &r.BundleDigest, &r.State, &r.StatementOrdinal, &r.Attempt, &r.RedactedError, &r.Operator, &r.StartedAt, &r.UpdatedAt, &r.CompletedAt, &r.FromVersion, &r.ToVersion, &r.Supersedes, &r.ReversalOf, &ns); err != nil {
+			return nil, errors.New("scan pinned revision snapshot")
+		}
+		r.Duration = time.Duration(ns)
+		out = append(out, r)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, errors.New("iterate pinned revision snapshot")
+	}
+	return out, nil
+}
+
+// ExecRevision inserts a revision through the caller's transaction so the row,
+// migration DDL and executor evidence share one commit boundary.
+func (s *Session) ExecRevision(ctx context.Context, tx pgx.Tx, r Revision) error {
+	if err := validateRevision(r); err != nil {
+		return err
+	}
+	if r.Supersedes == nil {
+		r.Supersedes = []string{}
+	}
+	_, err := tx.Exec(ctx, `insert into `+q(s.config.Schema, s.config.RevisionsTable)+`(version,description,kind,file_name,file_digest,manifest_digest,manifest_generation,artifact_digest,plan_digest,checks_digest,bundle_digest,state,statement_ordinal,attempt,redacted_error,operator_identity,started_at,updated_at,completed_at,from_version,to_version,supersedes,reversal_of,duration_ns) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`, r.Version, r.Description, r.Kind, r.FileName, r.FileDigest, r.ManifestDigest, r.ManifestGeneration, r.ArtifactDigest, r.PlanDigest, r.ChecksDigest, r.BundleDigest, r.State, r.StatementOrdinal, r.Attempt, r.RedactedError, r.Operator, r.StartedAt.UTC(), r.UpdatedAt.UTC(), r.CompletedAt, r.FromVersion, r.ToVersion, r.Supersedes, r.ReversalOf, r.Duration.Nanoseconds())
+	if err != nil {
+		return errors.New("insert transactional revision")
+	}
+	return nil
+}
+func (s *Session) ExecEvent(ctx context.Context, tx pgx.Tx, e Event) error {
+	_, err := tx.Exec(ctx, `insert into `+q(s.config.Schema, s.config.EventsTable)+`(version,attempt,event_type,statement_ordinal,redacted_detail,operator_identity,at) values($1,$2,$3,$4,$5,$6,$7)`, e.Version, e.Attempt, e.Type, e.Ordinal, e.Detail, e.Operator, e.At.UTC())
+	if err != nil {
+		return errors.New("insert transactional revision event")
+	}
+	return nil
+}
+func (s *Session) FinalizeRevision(ctx context.Context, tx pgx.Tx, version, state string, ordinal int, duration time.Duration, redacted string, at time.Time) error {
+	tag, err := tx.Exec(ctx, `update `+q(s.config.Schema, s.config.RevisionsTable)+` set state=$2,statement_ordinal=$3,duration_ns=$4,redacted_error=$5,updated_at=$6::timestamptz,completed_at=case when $2 in ('applied','baseline','checkpoint') then $6::timestamptz else null::timestamptz end where version=$1`, version, state, ordinal, duration.Nanoseconds(), redacted, at.UTC())
+	if err != nil {
+		return fmt.Errorf("finalize transactional revision: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return errors.New("finalize transactional revision: row missing")
+	}
+	return nil
 }
 
 func validateRevision(r Revision) error {
@@ -170,6 +397,10 @@ func (s *Store) Insert(ctx context.Context, r Revision) error {
 		return err
 	}
 	defer conn.Close(context.WithoutCancel(ctx))
+	if err = lockWriter(ctx, conn, c); err != nil {
+		return err
+	}
+	defer unlockWriter(context.WithoutCancel(ctx), conn, c)
 	_, err = conn.Exec(ctx, `insert into `+q(c.Schema, c.RevisionsTable)+`(version,description,kind,file_name,file_digest,manifest_digest,manifest_generation,artifact_digest,plan_digest,checks_digest,bundle_digest,state,statement_ordinal,attempt,redacted_error,operator_identity,started_at,updated_at,completed_at,from_version,to_version,supersedes,reversal_of,duration_ns) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`, r.Version, r.Description, r.Kind, r.FileName, r.FileDigest, r.ManifestDigest, r.ManifestGeneration, r.ArtifactDigest, r.PlanDigest, r.ChecksDigest, r.BundleDigest, r.State, r.StatementOrdinal, r.Attempt, r.RedactedError, r.Operator, r.StartedAt.UTC(), r.UpdatedAt.UTC(), r.CompletedAt, r.FromVersion, r.ToVersion, r.Supersedes, r.ReversalOf, r.Duration.Nanoseconds())
 	if err != nil {
 		return errors.New("insert revision")
@@ -191,6 +422,10 @@ func (s *Store) InsertStatement(ctx context.Context, a StatementAttempt) error {
 		return e
 	}
 	defer conn.Close(context.WithoutCancel(ctx))
+	if e = lockWriter(ctx, conn, c); e != nil {
+		return e
+	}
+	defer unlockWriter(context.WithoutCancel(ctx), conn, c)
 	_, e = conn.Exec(ctx, `insert into `+q(c.Schema, c.StatementsTable)+`(version,statement_ordinal,attempt,state,statement_digest,redacted_error,operator_identity,started_at,completed_at) values($1,$2,$3,$4,$5,$6,$7,$8,$9)`, a.Version, a.Ordinal, a.Attempt, a.State, a.Digest, a.RedactedError, a.Operator, a.StartedAt.UTC(), a.CompletedAt)
 	return e
 }
@@ -208,11 +443,111 @@ func (s *Store) AppendEvent(ctx context.Context, e Event) error {
 		return x
 	}
 	defer conn.Close(context.WithoutCancel(ctx))
+	if x = lockWriter(ctx, conn, c); x != nil {
+		return x
+	}
+	defer unlockWriter(context.WithoutCancel(ctx), conn, c)
 	_, x = conn.Exec(ctx, `insert into `+q(c.Schema, c.EventsTable)+`(version,attempt,event_type,statement_ordinal,redacted_detail,operator_identity,at) values($1,$2,$3,$4,$5,$6,$7)`, e.Version, e.Attempt, e.Type, e.Ordinal, e.Detail, e.Operator, e.At.UTC())
 	return x
 }
 
+// InsertBatch atomically records a baseline/checkpoint prefix and its distinct events.
+func (s *Store) InsertBatch(ctx context.Context, revisions []Revision, events []Event) error {
+	c := s.config
+	conn, e := pgx.Connect(ctx, c.URL)
+	if e != nil {
+		return e
+	}
+	defer conn.Close(context.WithoutCancel(ctx))
+	if e = lockWriter(ctx, conn, c); e != nil {
+		return e
+	}
+	defer unlockWriter(context.WithoutCancel(ctx), conn, c)
+	tx, e := conn.Begin(ctx)
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
+	for _, r := range revisions {
+		if e = validateRevision(r); e != nil {
+			return e
+		}
+		if r.Supersedes == nil {
+			r.Supersedes = []string{}
+		}
+		_, e = tx.Exec(ctx, `insert into `+q(c.Schema, c.RevisionsTable)+`(version,description,kind,file_name,file_digest,manifest_digest,manifest_generation,artifact_digest,plan_digest,checks_digest,bundle_digest,state,statement_ordinal,attempt,redacted_error,operator_identity,started_at,updated_at,completed_at,from_version,to_version,supersedes,reversal_of,duration_ns) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`, r.Version, r.Description, r.Kind, r.FileName, r.FileDigest, r.ManifestDigest, r.ManifestGeneration, r.ArtifactDigest, r.PlanDigest, r.ChecksDigest, r.BundleDigest, r.State, r.StatementOrdinal, r.Attempt, r.RedactedError, r.Operator, r.StartedAt.UTC(), r.UpdatedAt.UTC(), r.CompletedAt, r.FromVersion, r.ToVersion, r.Supersedes, r.ReversalOf, r.Duration.Nanoseconds())
+		if e != nil {
+			return errors.New("insert revision batch")
+		}
+	}
+	for _, x := range events {
+		_, e = tx.Exec(ctx, `insert into `+q(c.Schema, c.EventsTable)+`(version,attempt,event_type,statement_ordinal,redacted_detail,operator_identity,at) values($1,$2,$3,$4,$5,$6,$7)`, x.Version, x.Attempt, x.Type, x.Ordinal, x.Detail, x.Operator, x.At.UTC())
+		if e != nil {
+			return errors.New("insert revision event batch")
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Store) UpdateState(ctx context.Context, version string, attempt int, state string, ordinal int, redacted string, duration time.Duration, event string, operator string) error {
+	c := s.config
+	conn, e := pgx.Connect(ctx, c.URL)
+	if e != nil {
+		return e
+	}
+	defer conn.Close(context.WithoutCancel(ctx))
+	if e = lockWriter(ctx, conn, c); e != nil {
+		return e
+	}
+	defer unlockWriter(context.WithoutCancel(ctx), conn, c)
+	tx, e := conn.Begin(ctx)
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
+	tag, e := tx.Exec(ctx, `update `+q(c.Schema, c.RevisionsTable)+` set state=$3,statement_ordinal=$4,redacted_error=$5,duration_ns=$6,updated_at=clock_timestamp(),completed_at=case when $3='pending' then null else clock_timestamp() end where version=$1 and attempt=$2`, version, attempt, state, ordinal, redacted, duration.Nanoseconds())
+	if e != nil || tag.RowsAffected() != 1 {
+		return errors.New("update revision state")
+	}
+	if _, e = tx.Exec(ctx, `insert into `+q(c.Schema, c.EventsTable)+`(version,attempt,event_type,statement_ordinal,redacted_detail,operator_identity,at) values($1,$2,$3,$4,$5,$6,clock_timestamp())`, version, attempt, event, ordinal, redacted, operator); e != nil {
+		return errors.New("insert revision state event")
+	}
+	return tx.Commit(ctx)
+}
+
 type ExecutorHistory struct{ ArtifactDigest, State string }
+type ExecutorRecord struct {
+	ArtifactDigest, StepID, StepHash, PhaseID, PhaseMode, State, ExecutionID, TargetIdentity, PlanDigest, BundleDigest string
+	Attempt                                                                                                            int
+}
+
+func (s *Session) ExecutorRecords(ctx context.Context, target string) ([]ExecutorRecord, error) {
+	if target == "" {
+		return nil, ErrConfig
+	}
+	var reg *string
+	if err := s.conn.QueryRow(ctx, `select to_regclass($1)::text`, s.config.ExecutorHistorySchema+"."+s.config.ExecutorHistoryTable).Scan(&reg); err != nil {
+		return nil, err
+	}
+	if reg == nil {
+		return nil, nil
+	}
+	rows, err := s.conn.Query(ctx, `select artifact_digest,step_id,step_hash,phase_id,phase_mode,state,execution_id,target_identity,plan_digest,bundle_digest,attempt from `+q(s.config.ExecutorHistorySchema, s.config.ExecutorHistoryTable)+` where target_identity=$1`, target)
+	if err != nil {
+		return nil, errors.New("read executor reconciliation history")
+	}
+	defer rows.Close()
+	var out []ExecutorRecord
+	for rows.Next() {
+		var x ExecutorRecord
+		if err = rows.Scan(&x.ArtifactDigest, &x.StepID, &x.StepHash, &x.PhaseID, &x.PhaseMode, &x.State, &x.ExecutionID, &x.TargetIdentity, &x.PlanDigest, &x.BundleDigest, &x.Attempt); err != nil {
+			return nil, errors.New("scan executor reconciliation history")
+		}
+		out = append(out, x)
+	}
+	return out, rows.Err()
+}
+
 type StatusEntry struct {
 	Version          string `json:"version"`
 	File             string `json:"file,omitempty"`
