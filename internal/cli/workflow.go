@@ -57,7 +57,7 @@ func validateSelectors(from, to string, r LoadRequest) error {
 
 type ApplyResult struct {
 	Status           string `json:"status"`
-	AppliedSteps     int    `json:"applied_steps,omitempty"`
+	AppliedSteps     int    `json:"applied_steps"`
 	Message          string `json:"message,omitempty"`
 	PendingStep      string `json:"pending_step,omitempty"`
 	ExecutionID      string `json:"execution_id,omitempty"`
@@ -349,7 +349,7 @@ func applyFailure(result ApplyResult, cause error) error {
 	if result.Status == "partial_failure" || result.Status == "uncertain" {
 		status = result.Status
 	}
-	return &Error{Kind: "migration", Message: "apply failed", Code: ExitMigration, Status: status, Cause: cause, PendingStep: result.PendingStep, ExecutionID: result.ExecutionID, RecoveryGuidance: result.RecoveryGuidance}
+	return &Error{Kind: "migration", Message: "apply failed", Code: ExitMigration, Status: status, Cause: cause, PendingStep: result.PendingStep, ExecutionID: result.ExecutionID, RecoveryGuidance: result.RecoveryGuidance, AppliedSteps: result.AppliedSteps}
 }
 func schemaSQL(doc schema.Document) (string, error) {
 	statements, e := postgres.RenderDocument(context.Background(), doc, nil)

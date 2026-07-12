@@ -33,6 +33,7 @@ type EnvelopeError struct {
 	PendingStep      string `json:"pending_step,omitempty"`
 	ExecutionID      string `json:"execution_id,omitempty"`
 	RecoveryGuidance string `json:"recovery_guidance,omitempty"`
+	AppliedSteps     int    `json:"applied_steps"`
 }
 
 type output struct {
@@ -92,12 +93,21 @@ func sanitizeOutput(redactor *secret.Redactor, value string) string {
 func (o output) failure(e *Error) {
 	message := sanitizeOutput(o.redactor, e.Message)
 	if o.json {
-		_ = json.NewEncoder(o.streams.Out).Encode(Envelope{SchemaVersion: OutputSchemaVersion, Command: o.command, OK: false, Error: &EnvelopeError{Kind: e.Kind, Message: message, ExitCode: int(e.Code), Status: e.Status, PendingStep: sanitizeOutput(o.redactor, e.PendingStep), ExecutionID: sanitizeOutput(o.redactor, e.ExecutionID), RecoveryGuidance: sanitizeOutput(o.redactor, e.RecoveryGuidance)}})
+		_ = json.NewEncoder(o.streams.Out).Encode(Envelope{SchemaVersion: OutputSchemaVersion, Command: o.command, OK: false, Error: &EnvelopeError{Kind: e.Kind, Message: message, ExitCode: int(e.Code), Status: e.Status, PendingStep: sanitizeOutput(o.redactor, e.PendingStep), ExecutionID: sanitizeOutput(o.redactor, e.ExecutionID), RecoveryGuidance: sanitizeOutput(o.redactor, e.RecoveryGuidance), AppliedSteps: e.AppliedSteps}})
 		return
 	}
 	fmt.Fprintf(o.streams.Err, "autosql: %s: %s", e.Kind, message)
 	if e.Status != "" {
 		fmt.Fprintf(o.streams.Err, " (%s)", e.Status)
+	}
+	if e.PendingStep != "" {
+		fmt.Fprintf(o.streams.Err, "; pending_step=%s", sanitizeOutput(o.redactor, e.PendingStep))
+	}
+	if e.ExecutionID != "" {
+		fmt.Fprintf(o.streams.Err, "; execution_id=%s", sanitizeOutput(o.redactor, e.ExecutionID))
+	}
+	if e.Status == "uncertain" || e.Status == "partial_failure" {
+		fmt.Fprintf(o.streams.Err, "; applied_steps=%d", e.AppliedSteps)
 	}
 	if e.RecoveryGuidance != "" {
 		fmt.Fprintf(o.streams.Err, "; %s", sanitizeOutput(o.redactor, e.RecoveryGuidance))

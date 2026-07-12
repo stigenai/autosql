@@ -23,6 +23,32 @@ type testRow struct {
 	err  error
 }
 
+func TestSeededSecretsNeverEscapeExecutorErrors(t *testing.T) {
+	secret := "seeded-secret"
+	assertSafe := func(name string, err error) {
+		t.Helper()
+		if err == nil || strings.Contains(err.Error(), secret) {
+			t.Fatalf("%s err=%v", name, err)
+		}
+	}
+	e := &PostgreSQL{artifact: artifact.Artifact{}, config: Config{URL: "x", Connector: testConnector{err: errors.New("connector " + secret)}, Now: time.Now}}
+	_, err := e.ApplyAuthorized(context.Background(), precheck.Plan{})
+	assertSafe("connector", err)
+	now := time.Now()
+	art := artifact.Artifact{Digest: "a", DatabaseIdentity: "db", TargetEnvironment: "prod", SourceRevision: "r", CreatedAt: now.Add(-time.Hour), ExpiresAt: now.Add(time.Hour), Plan: plan.Plan{FromFingerprint: "from"}}
+	s := &testSession{row: testRow{vals: []any{true}}}
+	e = &PostgreSQL{artifact: art, config: Config{URL: "x", Connector: testConnector{s: s}, Now: func() time.Time { return now }, State: func(context.Context, Session) (RuntimeState, error) {
+		return RuntimeState{}, errors.New("state " + secret)
+	}}}
+	_, err = e.ApplyAuthorized(context.Background(), precheck.Plan{})
+	assertSafe("state", err)
+	step := plan.Step{ID: "s", SQL: "ddl", Kind: plan.StepExecutable, Transaction: plan.TransactionRequired}
+	tx := &testTx{execAt: 1, execErr: errors.New("tx " + secret), rollbackErr: errors.New("rollback " + secret)}
+	e = stateExecutor(nil)
+	_, err = e.transactionalPhase(context.Background(), &testSession{tx: tx}, plan.Phase{ID: "p", Transaction: plan.TransactionRequired, StepIDs: []string{"s"}}, map[string]plan.Step{"s": step}, nil, precheck.Plan{}, false)
+	assertSafe("tx rollback", err)
+}
+
 func TestSessionLossBeforeAndAfterIntentStopsAndRequiresRecovery(t *testing.T) {
 	step := plan.Step{ID: "s", SQL: "ddl", Kind: plan.StepExecutable, Transaction: plan.TransactionProhibited}
 	phase := plan.Phase{ID: "p", Transaction: plan.TransactionProhibited, StepIDs: []string{"s"}}

@@ -28,6 +28,7 @@ type Error struct {
 	Cause                                      error
 	Status                                     string
 	PendingStep, ExecutionID, RecoveryGuidance string
+	AppliedSteps                               int
 }
 
 func (e *Error) Error() string { return e.Message }

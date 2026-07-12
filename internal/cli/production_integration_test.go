@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"autosql/pkg/artifact"
+	"autosql/pkg/executor"
 	"autosql/pkg/guardrail"
 	"autosql/pkg/plan"
 	"autosql/pkg/postgres"
@@ -20,6 +22,35 @@ import (
 	"autosql/pkg/schema"
 	"github.com/jackc/pgx/v5"
 )
+
+type ambiguousConnector struct{ executor.PGXConnector }
+
+func (ambiguousConnector) Connect(ctx context.Context, url string) (executor.Session, error) {
+	s, e := (executor.PGXConnector{}).Connect(ctx, url)
+	if e != nil {
+		return nil, e
+	}
+	return ambiguousSession{Session: s}, nil
+}
+
+type ambiguousSession struct{ executor.Session }
+
+func (s ambiguousSession) Begin(ctx context.Context) (executor.Tx, error) {
+	tx, e := s.Session.Begin(ctx)
+	if e != nil {
+		return nil, e
+	}
+	return ambiguousTx{Tx: tx}, nil
+}
+
+type ambiguousTx struct{ executor.Tx }
+
+func (t ambiguousTx) Commit(ctx context.Context) error {
+	if e := t.Tx.Commit(ctx); e != nil {
+		return e
+	}
+	return errors.New("commit password=seeded-commit-secret")
+}
 
 func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
@@ -113,6 +144,41 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 	if err = os.WriteFile(path, artifactRaw, 0600); err != nil {
 		t.Fatal(err)
 	}
+	injected, err := productionServices(ambiguousConnector{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, out, _ := invoke(t, []string{"apply", "--artifact", path, "--json"}, "", false, injected)
+	lastStep := p.Steps[len(p.Steps)-1].ID
+	for _, want := range []string{`"status":"uncertain"`, `"applied_steps":0`, `"pending_step":"` + lastStep + `"`, `"execution_id":"` + a.Digest + `"`, "reconcile transaction outcome"} {
+		if code != int(ExitMigration) || !strings.Contains(out, want) || strings.Contains(out, "seeded-commit-secret") {
+			t.Fatalf("json uncertain code=%d want=%s out=%s", code, want, out)
+		}
+	}
+	reset, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = reset.Exec(ctx, "drop schema if exists "+pgx.Identifier{name}.Sanitize()+" cascade")
+	_, _ = reset.Exec(ctx, "delete from autosql_migration_history where artifact_digest=$1", a.Digest)
+	_ = reset.Close(ctx)
+	injected, err = productionServices(ambiguousConnector{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, _, human := invoke(t, []string{"apply", "--artifact", path}, "", false, injected)
+	for _, want := range []string{"uncertain", lastStep, a.Digest, "reconcile transaction outcome"} {
+		if code != int(ExitMigration) || !strings.Contains(human, want) || strings.Contains(human, "seeded-commit-secret") {
+			t.Fatalf("human uncertain code=%d want=%s stderr=%s", code, want, human)
+		}
+	}
+	reset, err = pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = reset.Exec(ctx, "drop schema if exists "+pgx.Identifier{name}.Sanitize()+" cascade")
+	_, _ = reset.Exec(ctx, "delete from autosql_migration_history where artifact_digest=$1", a.Digest)
+	_ = reset.Close(ctx)
 	defer func() {
 		conn, _ := pgx.Connect(ctx, url)
 		if conn != nil {
@@ -133,7 +199,7 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 		t.Fatal(err)
 	}
 	services.ReadPlan = &fakeRead{from: current, to: desired, p: p}
-	code, out, _ := invoke(t, []string{"apply", "--from", "from", "--to", "to", "--approve-digest", p.Digest, "--json"}, "", false, services)
+	code, out, _ = invoke(t, []string{"apply", "--from", "from", "--to", "to", "--approve-digest", p.Digest, "--json"}, "", false, services)
 	if code != 0 || !strings.Contains(out, "no_op") {
 		t.Fatalf("digest apply code=%d out=%s", code, out)
 	}

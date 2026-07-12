@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +14,38 @@ import (
 	"autosql/pkg/precheck"
 	"github.com/jackc/pgx/v5"
 )
+
+type faultConnector struct {
+	match  string
+	closed *bool
+}
+
+func (f faultConnector) Connect(ctx context.Context, url string) (Session, error) {
+	s, e := (PGXConnector{}).Connect(ctx, url)
+	if e != nil {
+		return nil, e
+	}
+	return &faultSession{Session: s, match: f.match, closed: f.closed}, nil
+}
+
+type faultSession struct {
+	Session
+	match  string
+	failed bool
+	closed *bool
+}
+
+func (s *faultSession) Exec(ctx context.Context, q string, a ...any) (Tag, error) {
+	if !s.failed && strings.Contains(q, s.match) {
+		s.failed = true
+		return testTag(0), errors.New("session lost password=seeded-session-secret")
+	}
+	return s.Session.Exec(ctx, q, a...)
+}
+func (s *faultSession) Close(ctx context.Context) error {
+	*s.closed = true
+	return s.Session.Close(ctx)
+}
 
 func liveURL(t *testing.T) string {
 	t.Helper()
@@ -114,4 +147,33 @@ func TestCompetingApplyFailsDeterministically(t *testing.T) {
 	}
 	defer conn.Close(ctx)
 	_, _ = conn.Exec(ctx, "delete from autosql_migration_history where artifact_digest=$1", digest)
+}
+
+func TestApplyAuthorizedSessionLossAfterIntentPersistsAndRetryRefuses(t *testing.T) {
+	ctx := context.Background()
+	name := fmt.Sprintf("autosql_loss_%d", time.Now().UnixNano())
+	digest := "loss-" + name
+	p := plan.Plan{FromFingerprint: "from", Steps: []plan.Step{{ID: "one", SQL: "create table " + name + "(id int)", Kind: plan.StepExecutable, Transaction: plan.TransactionProhibited}}, Phases: []plan.Phase{{ID: "phase", Transaction: plan.TransactionProhibited, StepIDs: []string{"one"}}}}
+	e := testExecutor(t, p, digest)
+	closed := false
+	e.config.Connector = faultConnector{match: "create table " + name, closed: &closed}
+	_, err := e.ApplyAuthorized(ctx, precheck.Plan{})
+	if !errors.Is(err, ErrReconcile) || !e.Result().Uncertain || !closed {
+		t.Fatalf("err=%v result=%+v closed=%v", err, e.Result(), closed)
+	}
+	retry := testExecutor(t, p, digest)
+	_, err = retry.ApplyAuthorized(ctx, precheck.Plan{})
+	if !errors.Is(err, ErrReconcile) {
+		t.Fatalf("retry=%v", err)
+	}
+	conn, err := pgx.Connect(ctx, liveURL(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	defer conn.Exec(ctx, "delete from autosql_migration_history where artifact_digest=$1", digest)
+	var state string
+	if err = conn.QueryRow(ctx, "select state from autosql_migration_history where artifact_digest=$1 and step_id='one'", digest).Scan(&state); err != nil || state != "intended" {
+		t.Fatalf("state=%s err=%v", state, err)
+	}
 }
