@@ -12,17 +12,34 @@ import (
 	"github.com/jackc/pgx/v5"
 	"net"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
 
-type PostgresFactory struct{ AfterCreate func() error }
+type PostgresFactory struct {
+	// NamePrefix scopes generated databases for ownership and cleanup checks.
+	// It must remain an unquoted PostgreSQL-safe AutoSQL namespace; 38 bytes
+	// leaves room for the separator and 96-bit random suffix within NAMEDATALEN.
+	NamePrefix  string
+	AfterCreate func() error
+}
+
+var safeSimulationPrefix = regexp.MustCompile(`^autosql_sim(?:_[a-z0-9]+)*$`)
+
 type postgresIsolation struct {
 	adminURL, dbURL, name, identity string
 	schemas                         []string
 }
 
 func (f PostgresFactory) Create(ctx context.Context, c Config) (Isolation, error) {
+	prefix := f.NamePrefix
+	if prefix == "" {
+		prefix = "autosql_sim"
+	}
+	if len(prefix) > 38 || !safeSimulationPrefix.MatchString(prefix) {
+		return nil, fail("database_name_prefix", ErrConfig)
+	}
 	u, e := url.Parse(c.DevelopmentURL)
 	hasPassword := false
 	if u != nil && u.User != nil {
@@ -55,7 +72,7 @@ func (f PostgresFactory) Create(ctx context.Context, c Config) (Isolation, error
 	if _, e = rand.Read(random); e != nil {
 		return nil, fail("random", ErrLifecycle)
 	}
-	name := "autosql_sim_" + hex.EncodeToString(random)
+	name := prefix + "_" + hex.EncodeToString(random)
 	conn, e := pgx.Connect(ctx, c.DevelopmentURL)
 	if e != nil {
 		return nil, fail("connect", ErrLifecycle)
