@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -26,14 +27,15 @@ type Config struct {
 }
 
 type Environment struct {
-	Target        secret.Reference  `json:"target"`
-	DevDatabase   secret.Reference  `json:"dev_database,omitempty"`
-	SchemaSources []SchemaSource    `json:"schema_sources"`
-	MigrationDir  string            `json:"migration_dir"`
-	Include       []string          `json:"include,omitempty"`
-	Exclude       []string          `json:"exclude,omitempty"`
-	Variables     map[string]string `json:"variables,omitempty"`
-	Timeout       string            `json:"timeout,omitempty"`
+	Target         secret.Reference  `json:"target"`
+	DevDatabase    secret.Reference  `json:"dev_database,omitempty"`
+	SchemaSources  []SchemaSource    `json:"schema_sources"`
+	MigrationDir   string            `json:"migration_dir"`
+	RevisionSchema string            `json:"revision_schema,omitempty"`
+	Include        []string          `json:"include,omitempty"`
+	Exclude        []string          `json:"exclude,omitempty"`
+	Variables      map[string]string `json:"variables,omitempty"`
+	Timeout        string            `json:"timeout,omitempty"`
 }
 
 type SchemaSource struct {
@@ -44,20 +46,21 @@ type SchemaSource struct {
 
 // Overrides are applied after file and AUTOSQL_* environment values.
 type Overrides struct {
-	Environment, Target, DevDatabase, MigrationDir, Timeout string
-	SchemaSources, Include, Exclude                         []string
+	Environment, Target, DevDatabase, MigrationDir, RevisionSchema, Timeout string
+	SchemaSources, Include, Exclude                                         []string
 }
 
 type Runtime struct {
-	Environment   string
-	Target        string `json:"-"`
-	DevDatabase   string `json:"-"`
-	SchemaSources []SchemaSource
-	MigrationDir  string
-	Include       []string
-	Exclude       []string
-	Variables     map[string]string
-	Timeout       time.Duration
+	Environment    string
+	Target         string `json:"-"`
+	DevDatabase    string `json:"-"`
+	SchemaSources  []SchemaSource
+	MigrationDir   string
+	RevisionSchema string
+	Include        []string
+	Exclude        []string
+	Variables      map[string]string
+	Timeout        time.Duration
 }
 
 func Load(path string, getenv func(string) (string, bool), cli Overrides) (*Config, error) {
@@ -155,6 +158,12 @@ func (c *Config) Validate() error {
 	if strings.TrimSpace(e.MigrationDir) == "" {
 		return errors.New("migration_dir is required")
 	}
+	if e.RevisionSchema == "" {
+		e.RevisionSchema = "autosql_revision"
+	}
+	if !regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}$`).MatchString(e.RevisionSchema) {
+		return errors.New("revision_schema is invalid")
+	}
 	if e.Timeout != "" {
 		d, err := time.ParseDuration(e.Timeout)
 		if err != nil || d <= 0 {
@@ -176,6 +185,9 @@ func (c *Config) Preflight(ctx context.Context, resolver *secret.Resolver) (*Run
 		resolver.BaseDir = filepath.Dir(c.path)
 	}
 	e := c.Environments[c.Environment]
+	if e.RevisionSchema == "" {
+		e.RevisionSchema = "autosql_revision"
+	}
 	target, err := resolver.Resolve(ctx, e.Target)
 	if err != nil {
 		return nil, fmt.Errorf("resolve target: %w", err)
@@ -215,7 +227,7 @@ func (c *Config) Preflight(ctx context.Context, resolver *secret.Resolver) (*Run
 	if e.Timeout != "" {
 		d, _ = time.ParseDuration(e.Timeout)
 	}
-	return &Runtime{Environment: c.Environment, Target: target, DevDatabase: dev, SchemaSources: append([]SchemaSource(nil), e.SchemaSources...), MigrationDir: migrationDir, Include: append([]string(nil), e.Include...), Exclude: append([]string(nil), e.Exclude...), Variables: cloneMap(e.Variables), Timeout: d}, nil
+	return &Runtime{Environment: c.Environment, Target: target, DevDatabase: dev, SchemaSources: append([]SchemaSource(nil), e.SchemaSources...), MigrationDir: migrationDir, RevisionSchema: e.RevisionSchema, Include: append([]string(nil), e.Include...), Exclude: append([]string(nil), e.Exclude...), Variables: cloneMap(e.Variables), Timeout: d}, nil
 }
 
 func applyEnv(c *Config, getenv func(string) (string, bool)) {
@@ -234,6 +246,9 @@ func applyEnv(c *Config, getenv func(string) (string, bool)) {
 	}
 	if v, ok := getenv("AUTOSQL_MIGRATION_DIR"); ok {
 		e.MigrationDir = v
+	}
+	if v, ok := getenv("AUTOSQL_REVISION_SCHEMA"); ok {
+		e.RevisionSchema = v
 	}
 	if v, ok := getenv("AUTOSQL_INCLUDE"); ok {
 		e.Include = split(v)
@@ -266,6 +281,9 @@ func applyCLI(c *Config, o Overrides) {
 	}
 	if o.MigrationDir != "" {
 		e.MigrationDir = o.MigrationDir
+	}
+	if o.RevisionSchema != "" {
+		e.RevisionSchema = o.RevisionSchema
 	}
 	if o.Include != nil {
 		e.Include = append([]string(nil), o.Include...)

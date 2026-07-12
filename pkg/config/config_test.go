@@ -44,7 +44,7 @@ func TestPrecedenceAndPreflight(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rt.Target != "cli-value" || filepath.Base(rt.MigrationDir) != "cli-migrations" {
+	if rt.Target != "cli-value" || filepath.Base(rt.MigrationDir) != "cli-migrations" || rt.RevisionSchema != "autosql_revision" {
 		t.Fatalf("unexpected runtime: %#v", rt)
 	}
 }
