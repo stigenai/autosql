@@ -258,7 +258,10 @@ func (a Artifact) VerifyTrusted(policy VerifyPolicy) (VerifiedArtifact, error) {
 			return VerifiedArtifact{}, fail("validation_context", ErrInvalid)
 		}
 	}
-	if a.EditProvenance != nil && len(policy.ExpectedValidationAttestations) > 0 {
+	if a.EditProvenance != nil && len(policy.ExpectedValidationAttestations) == 0 {
+		return VerifiedArtifact{}, fail("validation_attestation_manifest", ErrInvalid)
+	}
+	if a.EditProvenance != nil {
 		seen := map[string]bool{}
 		for _, got := range a.EditProvenance.Attestations {
 			want, ok := policy.ExpectedValidationAttestations[got.Stage]

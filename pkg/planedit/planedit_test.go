@@ -230,9 +230,28 @@ func TestSuccessfulEditRequiresFreshApproval(t *testing.T) {
 		t.Fatal("tampered provenance signed")
 	}
 	policy := artifact.VerifyPolicy{Now: func() time.Time { return approved }, Expected: artifact.ExpectedBindings{PlanDigest: fresh.Plan.Digest, ChecksDigest: fresh.Checks.Digest, GuardrailDigest: fresh.GuardrailDigest, SourceRevision: fresh.SourceRevision, Environment: fresh.TargetEnvironment, DatabaseIdentity: fresh.DatabaseIdentity, ApprovalIdentity: fresh.Approval.Identity}, Keys: map[string]artifact.KeyRecord{"edited-key": {PublicKey: pub, Issuer: "issuer", Identity: "signer", Environment: fresh.TargetEnvironment, Purpose: "plan-artifact", Status: "active", NotBefore: approved.Add(-time.Hour), NotAfter: approved.Add(time.Hour)}}, Issuer: "issuer", Identity: "signer", Purpose: "plan-artifact"}
+	policy.ExpectedValidationAttestations = map[string]artifact.ValidationAttestation{}
+	for _, att := range fresh.EditProvenance.Attestations {
+		policy.ExpectedValidationAttestations[att.Stage] = att
+	}
 	v, err := fresh.VerifyTrusted(policy)
 	if err != nil {
 		t.Fatal(err)
+	}
+	for stage, att := range policy.ExpectedValidationAttestations {
+		if att.Simulation != nil {
+			copy := *att.Simulation
+			copy.DevelopmentIdentity = "drifted/development"
+			att.Simulation = &copy
+			policy.ExpectedValidationAttestations[stage] = att
+			if _, driftErr := fresh.VerifyTrusted(policy); driftErr == nil {
+				t.Fatal("typed validation drift accepted")
+			}
+			copy.DevelopmentIdentity = fresh.EditProvenance.Attestations[1].Simulation.DevelopmentIdentity
+			att.Simulation = &copy
+			policy.ExpectedValidationAttestations[stage] = att
+			break
+		}
 	}
 	if _, err = executor.NewPostgreSQL(executor.Config{URL: "unused", State: func(context.Context, executor.Session) (executor.RuntimeState, error) {
 		return executor.RuntimeState{}, nil
