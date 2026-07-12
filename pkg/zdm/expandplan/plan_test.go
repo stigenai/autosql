@@ -225,6 +225,22 @@ func TestConservativeIndexEstimateAndTinyBudgetRefusal(t *testing.T) {
 	}
 }
 
+func TestDeferredLockHoldBoundaries(t *testing.T) {
+	ordering := &zerodowntime.Ordering{Columns: []string{"id"}, Unique: zerodowntime.UniqueEvidence{Kind: "constraint", Name: "users_pkey", Columns: []string{"id"}}}
+	cases := []zerodowntime.Operation{{ID: "01", Kind: zerodowntime.AddColumn, Table: "users", Column: "copy", DataType: "text", Expression: "name", SynchronizationMode: "backfill", Ordering: ordering, BatchSize: 10, Effects: effects(zerodowntime.AddColumn), Reversal: zerodowntime.Reversal{Mode: "automatic"}}, {ID: "01", Kind: zerodowntime.SetNotNull, Table: "users", Column: "name", Expression: "coalesce(name, 'x')", Ordering: ordering, BatchSize: 10, Effects: effects(zerodowntime.SetNotNull), Reversal: zerodowntime.Reversal{Mode: "automatic"}}}
+	for _, op := range cases {
+		r := base(migration(t, []zerodowntime.Operation{op}))
+		r.Policy.MaxLockHoldMS = 1999
+		if _, err := Build(r); !errors.Is(err, ErrRefused) {
+			t.Fatalf("%s below-bound accepted", op.Kind)
+		}
+		r.Policy.MaxLockHoldMS = 2000
+		if _, err := Build(r); err != nil {
+			t.Fatalf("%s exact boundary refused: %v", op.Kind, err)
+		}
+	}
+}
+
 func TestBudgetAndEvidenceBoundaries(t *testing.T) {
 	op := zerodowntime.Operation{ID: "01", Kind: zerodowntime.RenameColumn, Table: "users", Column: "name", NewName: "display_name", Expression: "name", Ordering: &zerodowntime.Ordering{Columns: []string{"id"}, Unique: zerodowntime.UniqueEvidence{Kind: "constraint", Name: "users_pkey", Columns: []string{"id"}}}, BatchSize: 10, Effects: effects(zerodowntime.RenameColumn), Reversal: zerodowntime.Reversal{Mode: "automatic"}}
 	r := base(migration(t, []zerodowntime.Operation{op}))

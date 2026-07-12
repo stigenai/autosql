@@ -28,6 +28,9 @@ func TestExpandPlanCLILiveHumanJSONRefusalRedactionAndNoMutation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err = c.Exec(ctx, `select pg_catalog.pg_advisory_lock(pg_catalog.hashtextextended('autosql.expandplan.live-tests/v1',0::bigint))`); err != nil {
+		t.Fatal(err)
+	}
 	suffix := fmt.Sprint(time.Now().UnixNano() % 1e8)
 	meta := "ep_cli_" + suffix
 	app := meta + "_app"
@@ -37,6 +40,7 @@ func TestExpandPlanCLILiveHumanJSONRefusalRedactionAndNoMutation(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		_, _ = c.Exec(context.Background(), "drop schema if exists "+q(meta)+" cascade; drop schema if exists "+q(app)+" cascade")
+		_, _ = c.Exec(context.Background(), `select pg_catalog.pg_advisory_unlock(pg_catalog.hashtextextended('autosql.expandplan.live-tests/v1',0::bigint))`)
 		c.Close(context.Background())
 	})
 	store, err := zdm.Open(zdm.Config{URL: dsn, Schema: meta})

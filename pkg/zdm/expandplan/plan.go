@@ -205,13 +205,9 @@ func Build(r Request) (Plan, error) {
 		PostgresMajor int `json:"postgres_major"`
 	}{r.Snapshot.PostgresMajor}), PolicyDigest: digest(r.Policy)}
 	p.BindingsDigest = digest(bindings{p.ArtifactDigest, p.FromFingerprint, p.Target, p.Environment, p.CapabilityDigest, p.PolicyDigest})
-	planEstimate := 100
-	if planEstimate > r.Policy.MaxLockHoldMS {
-		return Plan{}, refuse("planning lock hold estimate %dms exceeds %dms policy", planEstimate, r.Policy.MaxLockHoldMS)
-	}
-	p.PlanningLocks = append(p.PlanningLocks, LockEvidence{Object: "autosql.zdm.expand-plan/v1/" + r.Target + "/" + r.Environment, Kind: "advisory", Mode: "SHARED", AcquisitionTimeoutMS: r.Policy.MaxLockMS, Phase: "planning", EstimatedHoldMS: planEstimate, MaximumHoldMS: r.Policy.MaxLockHoldMS, TransactionBoundary: "read-only-repeatable-read"})
+	p.PlanningLocks = append(p.PlanningLocks, LockEvidence{Object: "autosql.zdm.expand-plan/v1/" + r.Target + "/" + r.Environment, Kind: "advisory", Mode: "SHARED", AcquisitionTimeoutMS: r.Policy.MaxLockMS, Phase: "planning", EstimatedHoldMS: 0, MaximumHoldMS: r.Policy.MaxLockHoldMS, TransactionBoundary: "read-only-repeatable-read"})
 	for _, t := range r.Snapshot.Tables {
-		p.PlanningLocks = append(p.PlanningLocks, LockEvidence{Schema: t.Schema, Object: t.Name, Kind: "relation", Mode: "ACCESS SHARE", AcquisitionTimeoutMS: r.Policy.MaxLockMS, Phase: "planning", EstimatedHoldMS: planEstimate, MaximumHoldMS: r.Policy.MaxLockHoldMS, TransactionBoundary: "read-only-repeatable-read"})
+		p.PlanningLocks = append(p.PlanningLocks, LockEvidence{Schema: t.Schema, Object: t.Name, Kind: "relation", Mode: "ACCESS SHARE", AcquisitionTimeoutMS: r.Policy.MaxLockMS, Phase: "planning", EstimatedHoldMS: 0, MaximumHoldMS: r.Policy.MaxLockHoldMS, TransactionBoundary: "read-only-repeatable-read"})
 	}
 	sort.Slice(p.PlanningLocks, func(i, j int) bool {
 		return p.PlanningLocks[i].Schema+"/"+p.PlanningLocks[i].Object < p.PlanningLocks[j].Schema+"/"+p.PlanningLocks[j].Object
@@ -348,8 +344,13 @@ func finalizeStep(r Request, s *Step) error {
 		s.Locks[i].MaximumHoldMS = hard
 	}
 	for _, d := range s.Deferred {
-		if d.HardMaximumMS > r.Policy.MaxStatementMS || d.HardMaximumMS > r.Policy.MaxTransactionMS {
+		if d.HardMaximumMS > r.Policy.MaxLockHoldMS || d.HardMaximumMS > r.Policy.MaxStatementMS || d.HardMaximumMS > r.Policy.MaxTransactionMS {
 			return refuse("deferred %s exceeds configured budget", d.Phase)
+		}
+		for _, l := range d.Locks {
+			if l.MaximumHoldMS > r.Policy.MaxLockHoldMS {
+				return refuse("deferred %s lock hold exceeds configured budget", d.Phase)
+			}
 		}
 	}
 	prefix := "SET LOCAL "

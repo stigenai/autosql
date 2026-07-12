@@ -32,6 +32,9 @@ func live(t *testing.T) (context.Context, *pgx.Conn, string, string, *zdm.Store)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err = c.Exec(ctx, `select pg_catalog.pg_advisory_lock(pg_catalog.hashtextextended('autosql.expandplan.live-tests/v1',0::bigint))`); err != nil {
+		t.Fatal(err)
+	}
 	suffix := strings.ToLower(strings.NewReplacer("/", "_", "-", "_").Replace(t.Name()))
 	if len(suffix) > 18 {
 		suffix = suffix[len(suffix)-18:]
@@ -44,6 +47,7 @@ func live(t *testing.T) (context.Context, *pgx.Conn, string, string, *zdm.Store)
 	}
 	t.Cleanup(func() {
 		_, _ = c.Exec(context.Background(), "drop schema if exists "+q(meta)+" cascade; drop schema if exists "+q(app)+" cascade")
+		_, _ = c.Exec(context.Background(), `select pg_catalog.pg_advisory_unlock(pg_catalog.hashtextextended('autosql.expandplan.live-tests/v1',0::bigint))`)
 		c.Close(context.Background())
 	})
 	s, err := zdm.Open(zdm.Config{URL: url, Schema: meta})
@@ -114,7 +118,7 @@ func TestLiveConcurrentDDLWaitsAndPlanRefusesFreshSnapshot(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	ddlCtx, cancelDDL := context.WithCancel(context.Background())
-	hook := func() error {
+	hook := func(_ context.Context) error {
 		go func() {
 			_, e := other.Exec(ddlCtx, "alter table "+pgx.Identifier{app, "accounts"}.Sanitize()+" add column concurrent_ddl text")
 			done <- e
@@ -169,6 +173,58 @@ func TestLivePlanningLockTimeoutIsActuallyBounded(t *testing.T) {
 	elapsed := time.Since(started)
 	if err == nil || elapsed > time.Second || !strings.Contains(strings.ToLower(err.Error()), "lock timeout") {
 		t.Fatalf("bounded refusal elapsed=%v err=%v", elapsed, err)
+	}
+}
+
+func TestLivePlanningTotalHoldDeadlineReleasesCompetingDDL(t *testing.T) {
+	ctx, c, meta, app, _ := live(t)
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	other, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close(ctx)
+	var pid int
+	if err = other.QueryRow(ctx, "select pg_backend_pid()").Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	hook := func(hold context.Context) error {
+		go func() {
+			_, e := other.Exec(context.Background(), "alter table "+pgx.Identifier{app, "accounts"}.Sanitize()+" add column hold_probe text")
+			done <- e
+		}()
+		for {
+			select {
+			case <-hold.Done():
+				return hold.Err()
+			default:
+			}
+			var waiting bool
+			if e := c.QueryRow(ctx, `select coalesce(wait_event_type='Lock',false) from pg_catalog.pg_stat_activity where pid=$1`, pid).Scan(&waiting); e == nil && waiting {
+				<-hold.Done()
+				return hold.Err()
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	policy := livePolicy()
+	policy.MaxLockMS = 1000
+	policy.MaxLockHoldMS = 300
+	started := time.Now()
+	_, err = expandplan.InspectLive(ctx, expandplan.InspectRequest{URL: url, MetadataSchema: meta, Target: "primary", Environment: "test", ArtifactDigest: "sha256:hold", Schemas: []string{app}, Policy: policy, BeforeFinalInspection: hook})
+	elapsed := time.Since(started)
+	var ddlErr error
+	select {
+	case ddlErr = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("competing ACCESS EXCLUSIVE did not proceed after hold bound")
+	}
+	if ddlErr != nil {
+		t.Fatal(ddlErr)
+	}
+	if !errors.Is(err, expandplan.ErrRefused) || !strings.Contains(err.Error(), "hold deadline") || elapsed > time.Second {
+		t.Fatalf("hold deadline elapsed=%v err=%v", elapsed, err)
 	}
 }
 
