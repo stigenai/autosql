@@ -85,6 +85,7 @@ type Service struct {
 	Keys            map[string]ed25519.PublicKey
 	Now             func() time.Time
 	LockIdentity    string
+	Authorize       func(context.Context, Proposal, revision.Revision) error
 }
 
 type Divergence struct {
@@ -173,6 +174,61 @@ func (s Service) Diagnose(ctx context.Context, dir string) (Diagnosis, error) {
 			break
 		}
 	}
+	artifacts := map[string]artifact.Artifact{}
+	versions := map[string]string{}
+	for _, m := range snap.Manifest.Entries {
+		raw := snap.Files[m.ArtifactFile]
+		a, er := artifact.Parse(raw)
+		if er != nil {
+			return out, ErrRefused
+		}
+		v, er := s.Verify(a)
+		if er != nil {
+			return out, ErrRefused
+		}
+		p, er := v.Payload()
+		if er != nil {
+			return out, ErrRefused
+		}
+		artifacts[p.Digest] = p
+		versions[p.Digest] = m.Version
+	}
+	seenHistory := map[string]bool{}
+	if out.First == nil {
+		for _, h := range history {
+			key := fmt.Sprintf("%s\x00%s\x00%d", h.ArtifactDigest, h.StepID, h.Attempt)
+			if seenHistory[key] {
+				out.First = &Divergence{Version: versions[h.ArtifactDigest], Kind: "executor_duplicate", Actual: h.StepID, RootCause: "duplicate executor step evidence", SuggestedCommand: safeCommand("reconcile", versions[h.ArtifactDigest])}
+				break
+			}
+			seenHistory[key] = true
+			a, ok := artifacts[h.ArtifactDigest]
+			if !ok {
+				out.First = &Divergence{Kind: "executor_unknown", Actual: h.ArtifactDigest, RootCause: "executor history references an untrusted artifact", SuggestedCommand: "autosql migrate diagnose --config <trusted-config> --env <environment>"}
+				break
+			}
+			expectedStep := false
+			for _, st := range a.Plan.Steps {
+				if st.ID == h.StepID {
+					expectedStep = true
+					break
+				}
+			}
+			r := by[versions[h.ArtifactDigest]]
+			if !expectedStep || h.ExecutionID != a.Digest || h.PlanDigest != a.Plan.Digest || h.BundleDigest != a.GuardrailDigest || h.Attempt != r.Attempt {
+				out.First = &Divergence{Version: r.Version, Kind: "executor_linkage", Expected: a.Digest, Actual: h.ExecutionID, RootCause: "executor attempt or artifact linkage is inconsistent", SuggestedCommand: safeCommand("reconcile", r.Version)}
+				break
+			}
+			if r.State == "applied" && h.State != "confirmed" {
+				out.First = &Divergence{Version: r.Version, Kind: "executor_partial", Expected: "confirmed", Actual: h.State, RootCause: "applied revision has an unconfirmed executor step", SuggestedCommand: safeCommand("reconcile", r.Version)}
+				break
+			}
+			if (r.State == "partial" || r.State == "pending") && h.State == "intended" {
+				out.First = &Divergence{Version: r.Version, Kind: "executor_uncertain", Expected: "confirmed or failed", Actual: "intended", RootCause: "statement outcome is uncertain at the first intended step", SuggestedCommand: safeCommand("reconcile", r.Version)}
+				break
+			}
+		}
+	}
 	if out.First == nil {
 		for _, m := range snap.Manifest.Entries {
 			if _, ok := by[m.Version]; !ok {
@@ -211,7 +267,7 @@ func safeCommand(action, version string) string {
 }
 
 func (s Service) Apply(ctx context.Context, p Proposal) error {
-	if s.Store == nil || s.Audit == nil || s.Now == nil || p.Verify(s.Keys, s.Now()) != nil {
+	if s.Store == nil || s.Audit == nil || s.Now == nil || s.Authorize == nil || p.Verify(s.Keys, s.Now()) != nil {
 		return ErrRefused
 	}
 	if p.Action == "remove" && p.ApprovalLevel != "destructive" {
@@ -244,6 +300,9 @@ func (s Service) Apply(ctx context.Context, p Proposal) error {
 		}
 	}
 	if before == nil || before.State != p.ExpectedBeforeState || revisionDigest(*before) != p.ExpectedBeforeDigest || before.ManifestDigest != p.ManifestDigest || before.BundleDigest != p.GuardrailDigest {
+		return s.refuse(ctx, p)
+	}
+	if e = s.Authorize(ctx, p, *before); e != nil {
 		return s.refuse(ctx, p)
 	}
 	if e = s.Audit.AppendDurable(ctx, AuditRecord{Type: "repair_requested", ProposalDigest: p.Digest, Action: p.Action, TargetVersion: p.TargetVersion, Operator: p.Operator, At: s.Now()}); e != nil {

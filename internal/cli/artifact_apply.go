@@ -9,20 +9,30 @@ import (
 	"autosql/pkg/artifact"
 	"autosql/pkg/executor"
 	"autosql/pkg/guardrail"
+	"autosql/pkg/migrate/repair"
+	"autosql/pkg/migrate/revision"
 )
 
 // VerifiedArtifactApplyService is the only CLI bridge to mutation. Callers must
 // provide trusted verification policy, the exact bound guardrail input, and an
 // executor mutation factory. No raw plan or SQL execution path exists here.
 type VerifiedArtifactApplyService struct {
-	Policy         artifact.VerifyPolicy
-	PolicyFor      func(artifact.Artifact) (artifact.VerifyPolicy, error)
-	Guardrail      guardrail.Guardrail
-	Input          func(artifact.Artifact) (guardrail.Input, error)
-	Mutation       func(artifact.VerifiedArtifact) (guardrail.AuthorizedMutation, error)
-	MutationLocked func(artifact.VerifiedArtifact, executor.Session, executor.Tx) (guardrail.AuthorizedMutation, error)
-	NoEdits        bool
-	LifecycleAudit executor.LifecycleAudit
+	Policy              artifact.VerifyPolicy
+	PolicyFor           func(artifact.Artifact) (artifact.VerifyPolicy, error)
+	Guardrail           guardrail.Guardrail
+	Input               func(artifact.Artifact) (guardrail.Input, error)
+	Mutation            func(artifact.VerifiedArtifact) (guardrail.AuthorizedMutation, error)
+	MutationLocked      func(artifact.VerifiedArtifact, executor.Session, executor.Tx) (guardrail.AuthorizedMutation, error)
+	NoEdits             bool
+	LifecycleAudit      executor.LifecycleAudit
+	RepairAuthorization func(context.Context, repair.Proposal, revision.Revision) error
+}
+
+func (s VerifiedArtifactApplyService) AuthorizeRepair(ctx context.Context, p repair.Proposal, r revision.Revision) error {
+	if s.RepairAuthorization == nil {
+		return errors.New("production repair authorization is not configured")
+	}
+	return s.RepairAuthorization(ctx, p, r)
 }
 
 func (s VerifiedArtifactApplyService) DrainLifecycle(ctx context.Context, e executor.LifecycleEvent) error {

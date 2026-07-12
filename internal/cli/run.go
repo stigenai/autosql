@@ -82,7 +82,7 @@ func RunWithServices(ctx context.Context, args []string, streams Streams, servic
 	case len(args) >= 2 && args[0] == "migrate" && args[1] == "diagnose":
 		err = runMigrateDiagnose(ctx, args[2:], o, services, redactor)
 	case len(args) >= 3 && args[0] == "migrate" && args[1] == "repair" && (args[2] == "mark" || args[2] == "remove" || args[2] == "reconcile"):
-		err = runMigrateRepair(ctx, args[2], args[3:], o, redactor)
+		err = runMigrateRepair(ctx, args[2], args[3:], o, services, redactor)
 	case len(args) >= 2 && args[0] == "plan" && args[1] == "edit":
 		err = runPlanEdit(ctx, args[2:], o, services.PlanEdit)
 	case len(args) >= 2 && args[0] == "plan" && args[1] == "review":

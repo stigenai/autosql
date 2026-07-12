@@ -16,6 +16,8 @@ import (
 	"autosql/pkg/artifact"
 	"autosql/pkg/executor"
 	"autosql/pkg/guardrail"
+	"autosql/pkg/migrate/repair"
+	"autosql/pkg/migrate/revision"
 	"autosql/pkg/plan"
 	"autosql/pkg/policy"
 	"autosql/pkg/postgres"
@@ -38,6 +40,7 @@ type applyConfig struct {
 	EditorIdentity, EditSigningKeyID, EditSigningKeyReference, DevelopmentURLReference, FreshApprovalIdentity, FreshApprovalProofDigest                                       string
 	FreshApprovalAt, EditReleaseCreatedAt, EditReleaseExpiresAt                                                                                                               time.Time
 	TrustedMigrations                                                                                                                                                         map[string]migrationTrust
+	RepairApprovalDigest, RepairDestructiveApprovalDigest                                                                                                                     string
 }
 type migrationTrust struct {
 	Expected                 artifact.ExpectedBindings
@@ -169,7 +172,20 @@ func productionServices(connector executor.Connector) (Services, error) {
 	mutation := func(v artifact.VerifiedArtifact) (guardrail.AuthorizedMutation, error) {
 		return mutationFor(v, nil, nil)
 	}
-	verified := VerifiedArtifactApplyService{PolicyFor: policyFor, Guardrail: g, Input: input, Mutation: mutation, MutationLocked: mutationFor, NoEdits: c.NoEdits, LifecycleAudit: lifecycle}
+	repairAuthorization := func(_ context.Context, p repair.Proposal, r revision.Revision) error {
+		if p.DatabaseIdentity != c.DatabaseIdentity || p.Environment != c.Environment || p.GuardrailDigest != r.BundleDigest {
+			return errors.New("repair target or guardrail policy denied")
+		}
+		want := c.RepairApprovalDigest
+		if p.Action == "remove" {
+			want = c.RepairDestructiveApprovalDigest
+		}
+		if want == "" || p.ApprovalDigest != want {
+			return errors.New("repair approval policy denied")
+		}
+		return nil
+	}
+	verified := VerifiedArtifactApplyService{PolicyFor: policyFor, Guardrail: g, Input: input, Mutation: mutation, MutationLocked: mutationFor, NoEdits: c.NoEdits, LifecycleAudit: lifecycle, RepairAuthorization: repairAuthorization}
 	var editService PlanEditService
 	if c.EditorIdentity != "" {
 		if c.EditorIdentity == c.Author || c.EditorIdentity == c.Requester {

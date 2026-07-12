@@ -108,7 +108,7 @@ func runMigrateDiagnose(ctx context.Context, args []string, o output, services S
 	return o.success(result, redactor.String(human))
 }
 
-func runMigrateRepair(ctx context.Context, action string, args []string, o output, redactor *secret.Redactor) error {
+func runMigrateRepair(ctx context.Context, action string, args []string, o output, services Services, redactor *secret.Redactor) error {
 	fs := newFlags("migrate repair "+action, o.streams.Err)
 	urlRef := fs.String("url", "", "database URL secret reference")
 	rs := fs.String("revision-schema", "autosql_revision", "revision schema")
@@ -143,7 +143,13 @@ func runMigrateRepair(ctx context.Context, action string, args []string, o outpu
 	if e != nil {
 		return e
 	}
-	svc := repair.Service{Store: store, Audit: repairAuditFile{*audit}, Keys: map[string]ed25519.PublicKey{p.Signature.KeyID: ed25519.PublicKey(pub)}, Now: time.Now, LockIdentity: "autosql.migrate.repair/v1/" + *rs}
+	authorizer, ok := services.Apply.(interface {
+		AuthorizeRepair(context.Context, repair.Proposal, revision.Revision) error
+	})
+	if !ok {
+		return &Error{Kind: "config", Message: "production repair authorization required", Code: ExitConfig}
+	}
+	svc := repair.Service{Store: store, Audit: repairAuditFile{*audit}, Keys: map[string]ed25519.PublicKey{p.Signature.KeyID: ed25519.PublicKey(pub)}, Now: time.Now, LockIdentity: "autosql.migrate.repair/v1/" + *rs, Authorize: authorizer.AuthorizeRepair}
 	if e = svc.Apply(ctx, p); e != nil {
 		return &Error{Kind: "migration", Message: "repair refused", Code: ExitMigration, Cause: e}
 	}

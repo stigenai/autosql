@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -78,7 +79,7 @@ func TestLiveMarkRemoveStaleAuditAtomicity(t *testing.T) {
 	}
 	pub, key, _ := ed25519.GenerateKey(rand.Reader)
 	audit := &auditLog{}
-	svc := Service{Store: store, Audit: audit, Keys: map[string]ed25519.PublicKey{"operator": pub}, Now: func() time.Time { return now }, LockIdentity: "repair/" + schema}
+	svc := Service{Store: store, Audit: audit, Keys: map[string]ed25519.PublicKey{"operator": pub}, Now: func() time.Time { return now }, LockIdentity: "repair/" + schema, Authorize: func(context.Context, Proposal, revision.Revision) error { return nil }}
 	mark := proposal(t, base, "mark", "applied", key, now)
 	if e = svc.Apply(ctx, mark); e != nil {
 		t.Fatal(e)
@@ -115,5 +116,50 @@ func TestLiveMarkRemoveStaleAuditAtomicity(t *testing.T) {
 	s.Close(ctx)
 	if len(final) != 2 || final[1].Kind != "reversal" || final[1].ReversalOf != "1.0.0" {
 		t.Fatalf("tombstone=%+v", final)
+	}
+	second := base
+	second.Version = "2.0.0"
+	second.State = "partial"
+	if e = store.Insert(ctx, second); e != nil {
+		t.Fatal(e)
+	}
+	race := proposal(t, second, "reconcile", "applied", key, now)
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); <-start; results <- svc.Apply(ctx, race) }()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	wins, refused := 0, 0
+	for er := range results {
+		if er == nil {
+			wins++
+		} else if errors.Is(er, ErrRefused) {
+			refused++
+		}
+	}
+	if wins != 1 || refused != 1 {
+		t.Fatalf("concurrent CAS wins=%d refused=%d", wins, refused)
+	}
+	denied := svc
+	denied.Authorize = func(context.Context, Proposal, revision.Revision) error { return errors.New("policy denied") }
+	third := base
+	third.Version = "3.0.0"
+	third.State = "partial"
+	if e = store.Insert(ctx, third); e != nil {
+		t.Fatal(e)
+	}
+	if e = denied.Apply(ctx, proposal(t, third, "mark", "applied", key, now)); !errors.Is(e, ErrRefused) {
+		t.Fatalf("authorization=%v", e)
+	}
+	s, _ = store.OpenSession(ctx)
+	afterDenied, _ := s.Revisions(ctx)
+	s.Close(ctx)
+	if afterDenied[len(afterDenied)-1].State != "partial" {
+		t.Fatal("authorization denial mutated")
 	}
 }
