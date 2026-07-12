@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"autosql/pkg/artifact"
 	"autosql/pkg/plan"
+	"autosql/pkg/planedit"
 	"autosql/pkg/postgres"
 	"autosql/pkg/schema"
 	"autosql/pkg/secret"
@@ -30,6 +32,7 @@ type ApplyRequest struct {
 	ArtifactPath   string
 	AssertedDigest string
 	ApprovalMode   string
+	NoEdits        bool
 }
 
 type optionalInt struct {
@@ -69,6 +72,13 @@ type ApplyService interface {
 type Services struct {
 	ReadPlan ReadPlanService
 	Apply    ApplyService
+	PlanEdit PlanEditService
+}
+type PlanEditService interface {
+	TrustedEditor() string
+	VerifyOriginal(artifact.Artifact) error
+	Revalidate(context.Context, planedit.EditedArtifact) (planedit.Eligible, error)
+	Publish(context.Context, planedit.Eligible) (artifact.Artifact, error)
 }
 type Provider interface {
 	Load(context.Context, string) (schema.Document, error)
@@ -239,6 +249,7 @@ func runApply(ctx context.Context, args []string, o output, s Services, tty bool
 	artifact := fs.String("artifact", "", "signed artifact")
 	dry := fs.Bool("dry-run", false, "plan only")
 	approveDigest := fs.String("approve-digest", "", "assert the exact computed plan digest")
+	noEdits := fs.Bool("no-edits", false, "refuse edited artifacts")
 	var max optionalInt
 	fs.Var(&max, "max-changes", "maximum changes")
 	jsonFlag := fs.Bool("json", false, "JSON")
@@ -273,7 +284,7 @@ func runApply(ctx context.Context, args []string, o output, s Services, tty bool
 		if s.Apply == nil {
 			return &Error{Kind: "migration", Message: "verified artifact apply service is not wired", Code: ExitMigration, Status: "refused"}
 		}
-		result, err := s.Apply.Apply(ctx, ApplyRequest{ArtifactPath: *artifact, ApprovalMode: "artifact"})
+		result, err := s.Apply.Apply(ctx, ApplyRequest{ArtifactPath: *artifact, ApprovalMode: "artifact", NoEdits: *noEdits})
 		if err != nil {
 			return applyFailure(result, err)
 		}
@@ -334,7 +345,7 @@ func runApply(ctx context.Context, args []string, o output, s Services, tty bool
 	if approvalMode == "interactive" {
 		asserted = p.Digest
 	}
-	result, e := s.Apply.Apply(ctx, ApplyRequest{Plan: p, ArtifactPath: *artifact, AssertedDigest: asserted, ApprovalMode: approvalMode})
+	result, e := s.Apply.Apply(ctx, ApplyRequest{Plan: p, ArtifactPath: *artifact, AssertedDigest: asserted, ApprovalMode: approvalMode, NoEdits: *noEdits})
 	if e != nil {
 		return applyFailure(result, e)
 	}

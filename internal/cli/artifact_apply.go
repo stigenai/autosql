@@ -20,6 +20,7 @@ type VerifiedArtifactApplyService struct {
 	Guardrail guardrail.Guardrail
 	Input     func(artifact.Artifact) (guardrail.Input, error)
 	Mutation  func(artifact.VerifiedArtifact) (guardrail.AuthorizedMutation, error)
+	NoEdits   bool
 }
 
 func (s VerifiedArtifactApplyService) Apply(ctx context.Context, request ApplyRequest) (ApplyResult, error) {
@@ -40,6 +41,9 @@ func (s VerifiedArtifactApplyService) Apply(ctx context.Context, request ApplyRe
 		if err != nil {
 			return ApplyResult{Status: "refused"}, err
 		}
+	}
+	if s.NoEdits || request.NoEdits {
+		verifyPolicy.NoEdits = true
 	}
 	v, err := a.VerifyTrusted(verifyPolicy)
 	if err != nil {

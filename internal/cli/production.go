@@ -22,14 +22,21 @@ import (
 	"autosql/pkg/safety"
 	"autosql/pkg/schema"
 	"autosql/pkg/secret"
+	"autosql/pkg/simulate"
 )
 
 type applyConfig struct {
 	DatabaseURL, Environment, DatabaseIdentity, SourceRevision, KeyID, PublicKey, Issuer, Signer, Author, Requester, ApprovalAuditPath, LifecycleAuditPath, ArtifactDirectory string
 	PostgresVersion                                                                                                                                                           int
 	Schemas                                                                                                                                                                   []string
-	ExpectedPlanDigest, ExpectedChecksDigest, ExpectedGuardrailDigest, ExpectedApprovalIdentity, KeyStatus, KeyPurpose                                                        string
+	ExpectedPlanDigest, ExpectedChecksDigest, ExpectedGuardrailDigest, ExpectedApprovalIdentity, ExpectedApprovalProofDigest, KeyStatus, KeyPurpose                           string
 	KeyNotBefore, KeyNotAfter                                                                                                                                                 time.Time
+	NoEdits                                                                                                                                                                   bool
+	GeneratorKeyID, GeneratorPublicKey, GeneratorPurpose                                                                                                                      string
+	ExpectedValidationContextDigests                                                                                                                                          map[string]string
+	ExpectedValidationAttestations                                                                                                                                            map[string]artifact.ValidationAttestation
+	EditorIdentity, EditSigningKeyID, EditSigningKeyReference, DevelopmentURLReference, FreshApprovalIdentity, FreshApprovalProofDigest                                       string
+	FreshApprovalAt, EditReleaseCreatedAt, EditReleaseExpiresAt                                                                                                               time.Time
 }
 type staticAuthority struct{ actors map[string]approval.Identity }
 
@@ -84,7 +91,19 @@ func productionServices(connector executor.Connector) (Services, error) {
 		if c.ExpectedPlanDigest == "" || c.ExpectedChecksDigest == "" || c.ExpectedGuardrailDigest == "" || c.ExpectedApprovalIdentity == "" || c.KeyStatus == "" || c.KeyPurpose == "" || c.KeyNotBefore.IsZero() || c.KeyNotAfter.IsZero() {
 			return artifact.VerifyPolicy{}, errors.New("trusted release manifest bindings required")
 		}
-		return artifact.VerifyPolicy{Now: time.Now, Expected: artifact.ExpectedBindings{PlanDigest: c.ExpectedPlanDigest, ChecksDigest: c.ExpectedChecksDigest, GuardrailDigest: c.ExpectedGuardrailDigest, SourceRevision: c.SourceRevision, Environment: c.Environment, DatabaseIdentity: c.DatabaseIdentity, ApprovalIdentity: c.ExpectedApprovalIdentity}, Keys: map[string]artifact.KeyRecord{c.KeyID: {PublicKey: ed25519.PublicKey(pub), Issuer: c.Issuer, Identity: c.Signer, Environment: c.Environment, Purpose: c.KeyPurpose, Status: c.KeyStatus, NotBefore: c.KeyNotBefore.UTC(), NotAfter: c.KeyNotAfter.UTC()}}, Issuer: c.Issuer, Identity: c.Signer, Purpose: c.KeyPurpose}, nil
+		vp := artifact.VerifyPolicy{Now: time.Now, NoEdits: c.NoEdits, Expected: artifact.ExpectedBindings{PlanDigest: c.ExpectedPlanDigest, GeneratedPlanDigest: c.ExpectedPlanDigest, ChecksDigest: c.ExpectedChecksDigest, GuardrailDigest: c.ExpectedGuardrailDigest, SourceRevision: c.SourceRevision, Environment: c.Environment, DatabaseIdentity: c.DatabaseIdentity, ApprovalIdentity: c.ExpectedApprovalIdentity}, Keys: map[string]artifact.KeyRecord{c.KeyID: {PublicKey: ed25519.PublicKey(pub), Issuer: c.Issuer, Identity: c.Signer, Environment: c.Environment, Purpose: c.KeyPurpose, Status: c.KeyStatus, NotBefore: c.KeyNotBefore.UTC(), NotAfter: c.KeyNotAfter.UTC()}}, Issuer: c.Issuer, Identity: c.Signer, Purpose: c.KeyPurpose}
+		vp.ExpectedValidationContextDigests = c.ExpectedValidationContextDigests
+		vp.Expected.ApprovalProofDigest = c.ExpectedApprovalProofDigest
+		vp.ExpectedValidationAttestations = c.ExpectedValidationAttestations
+		if c.GeneratorKeyID != "" || c.GeneratorPublicKey != "" || c.GeneratorPurpose != "" {
+			generatorPub, decodeErr := base64.RawStdEncoding.Strict().DecodeString(c.GeneratorPublicKey)
+			if decodeErr != nil || len(generatorPub) != ed25519.PublicKeySize || c.GeneratorKeyID == "" || c.GeneratorPurpose == "" {
+				return artifact.VerifyPolicy{}, errors.New("trusted generator manifest required")
+			}
+			vp.GeneratorPurpose = c.GeneratorPurpose
+			vp.GeneratorKeys = map[string]artifact.KeyRecord{c.GeneratorKeyID: {PublicKey: ed25519.PublicKey(generatorPub), Purpose: c.GeneratorPurpose}}
+		}
+		return vp, nil
 	}
 	input := func(a artifact.Artifact) (guardrail.Input, error) {
 		doc := policy.Document{Version: policy.LanguageVersion, Rules: []policy.Rule{{Name: "configured apply", Target: "all", Assert: policy.Expression{Eq: []any{true, true}}, Message: "apply allowed"}}}
@@ -111,7 +130,7 @@ func productionServices(connector executor.Connector) (Services, error) {
 				last = s.ID
 			}
 		}
-		return executor.NewPostgreSQL(executor.Config{URL: url, Connector: connector, Audit: &executor.FileAudit{Path: c.LifecycleAuditPath}, Reauthorize: func(ctx context.Context, a artifact.Artifact) error {
+		return executor.NewPostgreSQL(executor.Config{URL: url, Connector: connector, NoEdits: c.NoEdits, Audit: &executor.FileAudit{Path: c.LifecycleAuditPath}, Reauthorize: func(ctx context.Context, a artifact.Artifact) error {
 			fresh, _ := policyFor(a)
 			_, err := a.VerifyTrusted(fresh)
 			return err
@@ -131,8 +150,38 @@ func productionServices(connector executor.Connector) (Services, error) {
 			return nil
 		}}, v)
 	}
-	verified := VerifiedArtifactApplyService{PolicyFor: policyFor, Guardrail: g, Input: input, Mutation: mutation}
-	return Services{ReadPlan: DefaultReadPlan{}, Apply: resolvingApply{verified: verified, directory: c.ArtifactDirectory}}, nil
+	verified := VerifiedArtifactApplyService{PolicyFor: policyFor, Guardrail: g, Input: input, Mutation: mutation, NoEdits: c.NoEdits}
+	var editService PlanEditService
+	if c.EditorIdentity != "" {
+		if c.EditorIdentity == c.Author || c.EditorIdentity == c.Requester {
+			return Services{}, errors.New("editor must be separated from author and requester")
+		}
+		keyText, resolveErr := resolver.Resolve(context.Background(), secret.Reference(c.EditSigningKeyReference))
+		if resolveErr != nil {
+			return Services{}, errors.New("resolve edit signing key")
+		}
+		private, decodeErr := decodePrivate(keyText)
+		if decodeErr != nil {
+			return Services{}, decodeErr
+		}
+		devURL, resolveErr := resolver.Resolve(context.Background(), secret.Reference(c.DevelopmentURLReference))
+		if resolveErr != nil {
+			return Services{}, errors.New("resolve edit development URL")
+		}
+		targetID, identityErr := simulate.ResolvePostgresIdentity(context.Background(), url)
+		if identityErr != nil {
+			return Services{}, errors.New("resolve edit target identity")
+		}
+		devID, identityErr := simulate.ResolvePostgresIdentity(context.Background(), devURL)
+		if identityErr != nil {
+			return Services{}, errors.New("resolve edit development identity")
+		}
+		if targetID == devID {
+			return Services{}, errors.New("edit development database must be distinct from target")
+		}
+		editService = &productionEditService{editor: c.EditorIdentity, policyFor: policyFor, g: g, input: input, url: url, targetIdentity: targetID, developmentURL: devURL, developmentIdentity: devID, revision: c.SourceRevision, environment: c.Environment, database: c.DatabaseIdentity, keyID: c.EditSigningKeyID, version: c.PostgresVersion, private: private, approval: artifact.Approval{Identity: c.FreshApprovalIdentity, ApprovedAt: c.FreshApprovalAt.UTC(), ProofDigest: c.FreshApprovalProofDigest}, created: c.EditReleaseCreatedAt.UTC(), expires: c.EditReleaseExpiresAt.UTC(), audit: &executor.FileAudit{Path: c.LifecycleAuditPath}, schemas: append([]string(nil), c.Schemas...)}
+	}
+	return Services{ReadPlan: DefaultReadPlan{}, Apply: resolvingApply{verified: verified, directory: c.ArtifactDirectory}, PlanEdit: editService}, nil
 }
 
 type resolvingApply struct {

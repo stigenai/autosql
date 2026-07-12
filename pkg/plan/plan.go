@@ -8,13 +8,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
 	"sort"
 	"strings"
 
 	"autosql/pkg/plugin"
 	"autosql/pkg/safety"
 	"autosql/pkg/schema"
+	pg_query "github.com/pganalyze/pg_query_go/v6"
 )
 
 const Version = "autosql.plan/v1"
@@ -160,10 +160,12 @@ func (p Plan) Validate() error {
 		stepIDs[s.ID] = true
 	}
 	rebuilt, err := bindSteps(p.Changes, p.renderedStatements())
-	if err != nil || !reflect.DeepEqual(rebuilt, p.Steps) {
+	gotSteps, _ := json.Marshal(rebuilt)
+	wantSteps, _ := json.Marshal(p.Steps)
+	if err != nil || string(gotSteps) != string(wantSteps) {
 		return fmt.Errorf("%w: step identity, coverage, order, or topology", ErrInvalidPlan)
 	}
-	if expected := phases(p.Steps); !reflect.DeepEqual(expected, p.Phases) {
+	if expected := phases(p.Steps); !jsonEqual(expected, p.Phases) {
 		return fmt.Errorf("%w: phase identity, coverage, or order", ErrInvalidPlan)
 	}
 	for _, s := range p.Steps {
@@ -178,6 +180,11 @@ func (p Plan) Validate() error {
 		return fmt.Errorf("%w: digest mismatch", ErrInvalidPlan)
 	}
 	return nil
+}
+func jsonEqual(a, b any) bool {
+	x, _ := json.Marshal(a)
+	y, _ := json.Marshal(b)
+	return string(x) == string(y)
 }
 
 func validFingerprint(value string) bool {
@@ -244,6 +251,60 @@ func (p Plan) SafetyStatements() []safety.Statement {
 		out = append(out, safety.Statement{SQL: step.SQL, ChangeID: step.ChangeID})
 	}
 	return out
+}
+
+// EditSQL replaces executable SQL in order, rebuilds step/phase identities and
+// returns a new unsigned plan digest. It cannot add, remove, or reorder the
+// renderer's exact statement/change bindings.
+func EditSQL(p Plan, sql []string) (Plan, error) {
+	if err := p.Validate(); err != nil {
+		return Plan{}, err
+	}
+	raw, err := json.Marshal(p)
+	if err != nil {
+		return Plan{}, err
+	}
+	if err = json.Unmarshal(raw, &p); err != nil {
+		return Plan{}, err
+	}
+	count := 0
+	for _, s := range p.Steps {
+		if s.Kind == StepExecutable {
+			count++
+		}
+	}
+	if len(sql) != count {
+		return Plan{}, fmt.Errorf("%w: edited statement count", ErrInvalidPlan)
+	}
+	var rendered []plugin.Statement
+	idx := 0
+	for _, s := range p.Steps {
+		if s.Kind == StepTopology {
+			rendered = append(rendered, plugin.Statement{ChangeID: s.ChangeID, Transactional: true, Kind: plugin.StatementTopology})
+			continue
+		}
+		if strings.TrimSpace(sql[idx]) == "" {
+			return Plan{}, fmt.Errorf("%w: empty edited SQL", ErrInvalidPlan)
+		}
+		transactional := s.Transaction == TransactionRequired
+		rendered = append(rendered, plugin.Statement{SQL: sql[idx], ChangeID: s.ChangeID, Transactional: transactional, Kind: plugin.StatementExecutable})
+		idx++
+	}
+	p.Steps, err = bindSteps(p.Changes, rendered)
+	if err != nil {
+		return Plan{}, err
+	}
+	p.Phases = phases(p.Steps)
+	p.Digest = ""
+	d, err := digestPlan(p)
+	if err != nil {
+		return Plan{}, err
+	}
+	p.Digest = d
+	if err = p.Validate(); err != nil {
+		return Plan{}, err
+	}
+	return p, nil
 }
 
 func bindSteps(changes schema.ChangeSet, statements []plugin.Statement) ([]Step, error) {
@@ -318,13 +379,21 @@ func lockFor(c schema.Change, sql string) LockLevel {
 	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(sql)), "-- AUTOSQL TOPOLOGY:") {
 		return LockNone
 	}
-	if strings.Contains(strings.ToUpper(sql), "CONCURRENTLY") {
+	if sqlIndexConcurrent(sql) {
 		return LockShare
 	}
 	if c.Operation == schema.OperationCreate && c.After != nil && c.After.Kind == schema.KindSchema {
 		return LockNone
 	}
 	return LockExclusive
+}
+func sqlIndexConcurrent(sql string) bool {
+	tree, err := pg_query.Parse(sql)
+	if err != nil || len(tree.Stmts) != 1 {
+		return false
+	}
+	idx := tree.Stmts[0].Stmt.GetIndexStmt()
+	return idx != nil && idx.Concurrent
 }
 func impactFor(c schema.Change, sql string) Impact {
 	u := strings.ToUpper(sql)

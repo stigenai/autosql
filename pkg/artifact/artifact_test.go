@@ -8,6 +8,7 @@ import (
 	"autosql/pkg/schema"
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"os"
@@ -392,4 +393,52 @@ func TestZeroVerifiedArtifactCannotAuthorizeStaleCheck(t *testing.T) {
 }
 func trustedPolicy(a Artifact, pub ed25519.PublicKey, now time.Time) VerifyPolicy {
 	return VerifyPolicy{Now: func() time.Time { return now }, Expected: ExpectedBindings{PlanDigest: a.Plan.Digest, ChecksDigest: a.Checks.Digest, GuardrailDigest: a.GuardrailDigest, SourceRevision: a.SourceRevision, Environment: a.TargetEnvironment, DatabaseIdentity: "db-1", ApprovalIdentity: a.Approval.Identity}, Keys: map[string]KeyRecord{"key-1": {PublicKey: pub, Issuer: "issuer", Identity: "signer", Environment: a.TargetEnvironment, Purpose: "plan-artifact", Status: "active", NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour)}}, Issuer: "issuer", Identity: "signer", Purpose: "plan-artifact"}
+}
+
+func TestNoEditsPolicyDoesNotTrustForgedMetadataMarker(t *testing.T) {
+	a, pub, priv := fixture(t)
+	a.Metadata["autosql.edited"] = "true"
+	a.Metadata["autosql.edit_digest"] = "sha256:" + strings.Repeat("b", 64)
+	if err := a.Sign("key-1", priv); err != nil {
+		t.Fatal(err)
+	}
+	policy := trustedPolicy(a, pub, a.CreatedAt)
+	if _, err := a.VerifyTrusted(policy); err != nil {
+		t.Fatalf("ordinary policy=%v", err)
+	}
+	policy.NoEdits = true
+	if _, err := a.VerifyTrusted(policy); err == nil {
+		t.Fatal("ordinary artifact self-asserted generated origin")
+	}
+}
+
+func TestNoEditsRequiresSignedGeneratedOrigin(t *testing.T) {
+	base, pub, priv := fixture(t)
+	genPub, genPriv, _ := ed25519.GenerateKey(rand.Reader)
+	a, err := NewGenerated(base.Plan, base.Checks, base.CreatedAt, base.ExpiresAt, base.SourceRevision, base.TargetEnvironment, base.DatabaseIdentity, base.GuardrailDigest, base.Approval, base.Metadata, "generator-key", "plan-generator", genPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = a.Sign("key-1", priv); err != nil {
+		t.Fatal(err)
+	}
+	policy := trustedPolicy(a, pub, a.CreatedAt)
+	policy.NoEdits = true
+	policy.Expected.GeneratedPlanDigest = a.Plan.Digest
+	policy.GeneratorPurpose = "plan-generator"
+	policy.GeneratorKeys = map[string]KeyRecord{"generator-key": {PublicKey: genPub, Purpose: "plan-generator"}}
+	if _, err := a.VerifyTrusted(policy); err != nil {
+		t.Fatalf("generated artifact rejected: %v", err)
+	}
+	a.MarkEditedOrigin("forged-generator")
+	if err := a.Sign("key-1", priv); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.VerifyTrusted(policy); err == nil {
+		t.Fatal("signed edited origin accepted in no-edits mode")
+	}
+	a.Origin = ArtifactOrigin{}
+	if err := a.Sign("key-1", priv); err == nil {
+		t.Fatal("artifact without typed origin signed")
+	}
 }
