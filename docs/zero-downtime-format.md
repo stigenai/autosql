@@ -8,10 +8,17 @@ the canonical JSON content digest is the signing identity in both cases.
 Every operation signs its stable ID, object names, exact four-phase effects,
 reversal mode, transformation, stable backfill ordering, unique constraint or
 unique-index evidence, and batch size. IDs must be unique and sorted. Backfills
-require a positive batch. PostgreSQL expressions are parsed into an AST and a
+require a positive batch. The ordering evidence contains the catalog object
+kind (`constraint` or `unique_index`), its safe name, and an ordered column list
+that must exactly equal the backfill ordering; a free-form uniqueness claim is
+never accepted. PostgreSQL expressions are parsed into an AST and a
 conservative node, immutable-function, and cast-type allowlist is applied;
 subqueries, privileged calls, side effects, volatility, parameters, and extra
-statements are rejected. Unknown or duplicated fields, YAML aliases, anchors,
+statements are rejected. Function, cast, and operator names are read from AST
+fields and must be unqualified and unquoted. Data types are separately parsed
+as a probe column and accepted only when the AST contains one allowlisted type
+and no default, nullability, identity, generated, or other column clause.
+Unknown or duplicated fields, YAML aliases, anchors,
 custom tags, multiple documents, and trailing content are errors. Errors
 identify the invalid field or operation but never echo source content.
 
@@ -28,9 +35,9 @@ must still compare the artifact's minimum version with the discovered target.
 |---|---|---|---|---|---|---|
 | add table | online | create table | none | publish | none / brief access-exclusive | drop if unused |
 | add column | online | nullable column | stable batched backfill and dual-write | final constraints | none / brief access-exclusive | drop destination |
-| rename column | conditional | compatibility destination | backfill and dual-write | remove source | shadow copy / brief access-exclusive | restore source name |
+| rename column | conditional | compatibility destination | signed source transform, uniquely ordered batched backfill, and dual-write | remove source | shadow copy / brief access-exclusive | restore source name |
 | alter column type | conditional | typed shadow column | immutable transform and dual-write | swap and remove source | shadow copy / brief access-exclusive | only for declared lossless transform |
-| set not null | conditional | NOT VALID check | backfill and validate | set constraint | scan, no table rewrite / brief access-exclusive | drop constraint |
+| set not null | conditional | NOT VALID check | signed fill transform, uniquely ordered batched backfill, and validate | set constraint | scan, no table rewrite / brief access-exclusive | drop constraint |
 | create index | conditional | concurrently create | wait until valid | publish | none / share-update-exclusive | concurrently drop |
 | drop index | conditional | hide from version schema | verify query paths | concurrently drop | none / share-update-exclusive | concurrently recreate |
 | drop column | maintenance-required | hide | stop writes/readers | destructive drop | destructive / access-exclusive | backup only |

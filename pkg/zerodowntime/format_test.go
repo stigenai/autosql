@@ -12,7 +12,7 @@ import (
 func valid(t *testing.T) Migration {
 	t.Helper()
 	m, err := New("add_accounts", VersionSchema{Name: "v_accounts", ExposeDuringExpand: true}, Requirements{MinimumPostgres: 14, LockTimeoutMS: 1000, StatementTimeoutMS: 60000}, []Operation{
-		{ID: "01", Kind: AddColumn, Table: "accounts", Column: "display_name", DataType: "text", Expression: "coalesce(name, 'unknown')", Ordering: &Ordering{Columns: []string{"id"}, UniqueEvidence: "constraint:accounts_pkey"}, BatchSize: 500, Effects: mustEffects(AddColumn), Reversal: Reversal{Mode: "automatic"}},
+		{ID: "01", Kind: AddColumn, Table: "accounts", Column: "display_name", DataType: "text", Expression: "coalesce(name, 'unknown')", Ordering: &Ordering{Columns: []string{"id"}, Unique: UniqueEvidence{Kind: "constraint", Name: "accounts_pkey", Columns: []string{"id"}}}, BatchSize: 500, Effects: mustEffects(AddColumn), Reversal: Reversal{Mode: "automatic"}},
 		{ID: "02", Kind: CreateIndex, Table: "accounts", Index: "accounts_display_name_idx", Expression: "display_name", IndexMode: &IndexMode{Concurrent: true}, Effects: mustEffects(CreateIndex), Reversal: Reversal{Mode: "automatic"}},
 	}, map[string]string{"owner": "database"})
 	if err != nil {
@@ -91,7 +91,7 @@ func TestSignedArtifactDetectsEverySemanticTamper(t *testing.T) {
 }
 
 func TestExpressionASTAllowlistRejectsAdversarialForms(t *testing.T) {
-	bad := []string{"pg_read_file('/etc/passwd')", "pg_notify('x','y')", "set_config('x','y',false)", "gen_random_uuid()", "nextval('s')", "(SELECT secret FROM users)", "current_user", "name::regclass", "name; SELECT 1", "$1"}
+	bad := []string{"pg_read_file('/etc/passwd')", `"pg_read_file"('/etc/passwd')`, "pg_read_file/**/('/etc/passwd')", "pg_catalog.lower(name)", "pg_notify('x','y')", "set_config('x','y',false)", "gen_random_uuid()", "nextval('s')", "(SELECT secret FROM users)", "current_user", "name::regclass", "name::pg_catalog.text", "name OPERATOR(pg_catalog.+) 1", "name; SELECT 1", "$1"}
 	for _, expression := range bad {
 		t.Run(expression, func(t *testing.T) {
 			m := valid(t)
@@ -111,9 +111,52 @@ func TestExpressionASTAllowlistRejectsAdversarialForms(t *testing.T) {
 	}
 }
 
+func TestDataTypeUsesStandaloneASTPolicy(t *testing.T) {
+	good := []string{"text", "int8", "numeric(10,2)", "timestamp(3)"}
+	for _, v := range good {
+		if err := validateDataType(v); err != nil {
+			t.Errorf("safe type %q: %v", v, err)
+		}
+	}
+	bad := []string{"text default current_user", "text not null", "int generated always as identity", "text; drop table users", "regclass", "pg_catalog.text", "\"text\""}
+	for _, v := range bad {
+		if err := validateDataType(v); err == nil {
+			t.Errorf("unsafe type %q accepted", v)
+		}
+	}
+}
+
+func TestEveryBackfillClaimRequiresExecutionEvidence(t *testing.T) {
+	for _, kind := range []OperationKind{RenameColumn, SetNotNull} {
+		m := valid(t)
+		op := m.Operations[0]
+		op.Kind = kind
+		op.Effects = mustEffects(kind)
+		op.DataType = ""
+		switch kind {
+		case RenameColumn:
+			op.NewName = "display_name_v2"
+		case SetNotNull:
+			op.NewName = ""
+		}
+		m.Operations = []Operation{op}
+		d, _ := digest(m)
+		m.Digest = d
+		if err := m.Validate(); err != nil {
+			t.Fatalf("%s complete evidence: %v", kind, err)
+		}
+		m.Operations[0].Ordering = nil
+		d, _ = digest(m)
+		m.Digest = d
+		if err := m.Validate(); err == nil {
+			t.Fatalf("%s accepted without ordering", kind)
+		}
+	}
+}
+
 func TestBackfillReversalAndIndexContracts(t *testing.T) {
 	mutations := []func(*Migration){
-		func(m *Migration) { m.Operations[0].Ordering = nil }, func(m *Migration) { m.Operations[0].Ordering.UniqueEvidence = "" }, func(m *Migration) { m.Operations[0].Ordering.UniqueEvidence = "claimed:true" }, func(m *Migration) { m.Operations[0].BatchSize = 0 },
+		func(m *Migration) { m.Operations[0].Ordering = nil }, func(m *Migration) { m.Operations[0].Ordering.Unique.Name = "" }, func(m *Migration) { m.Operations[0].Ordering.Unique.Kind = "claimed" }, func(m *Migration) { m.Operations[0].BatchSize = 0 }, func(m *Migration) { m.Operations[0].Ordering.Unique.Columns = []string{"other"} },
 		func(m *Migration) { m.Operations[1].IndexMode.Concurrent = false }, func(m *Migration) { m.Operations[1].IndexMode.Partitioned = true }, func(m *Migration) { m.Operations[1].IndexMode.BacksConstraint = true }, func(m *Migration) { m.Operations[1].Column = "illegal" },
 	}
 	for i, mutate := range mutations {
@@ -126,7 +169,7 @@ func TestBackfillReversalAndIndexContracts(t *testing.T) {
 		}
 	}
 	e := mustEffects(AlterColumnType)
-	op := Operation{ID: "01", Kind: AlterColumnType, Table: "items", Column: "amount", DataType: "numeric", Expression: "amount::numeric", Ordering: &Ordering{Columns: []string{"id"}, UniqueEvidence: "constraint:items_pkey"}, BatchSize: 100, Effects: e, Reversal: Reversal{Mode: "lossless", Expression: "amount::int8"}}
+	op := Operation{ID: "01", Kind: AlterColumnType, Table: "items", Column: "amount", DataType: "numeric", Expression: "amount::numeric", Ordering: &Ordering{Columns: []string{"id"}, Unique: UniqueEvidence{Kind: "constraint", Name: "items_pkey", Columns: []string{"id"}}}, BatchSize: 100, Effects: e, Reversal: Reversal{Mode: "lossless", Expression: "amount::int8"}}
 	if _, err := New("alter_items", VersionSchema{Name: "v_items"}, Requirements{MinimumPostgres: 14, LockTimeoutMS: 1, StatementTimeoutMS: 2}, []Operation{op}, nil); err != nil {
 		t.Fatal(err)
 	}

@@ -60,8 +60,13 @@ type Operation struct {
 }
 
 type Ordering struct {
-	Columns        []string `json:"columns" yaml:"columns"`
-	UniqueEvidence string   `json:"unique_evidence" yaml:"unique_evidence"`
+	Columns []string       `json:"columns" yaml:"columns"`
+	Unique  UniqueEvidence `json:"unique" yaml:"unique"`
+}
+type UniqueEvidence struct {
+	Kind    string   `json:"kind" yaml:"kind"`
+	Name    string   `json:"name" yaml:"name"`
+	Columns []string `json:"columns" yaml:"columns"`
 }
 type IndexMode struct {
 	Concurrent      bool `json:"concurrent" yaml:"concurrent"`
@@ -127,9 +132,6 @@ type Capability struct {
 }
 
 var identifier = regexp.MustCompile(`^[a-z_][a-z0-9_]*$`)
-var dataType = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_ ]*(?:\([0-9]+(?:,[0-9]+)?\))?$`)
-var functionCall = regexp.MustCompile(`(?i)\b([a-z_][a-z0-9_]*)\s*\(`)
-var castOperator = regexp.MustCompile(`(?i)::\s*([a-z_][a-z0-9_]*)`)
 
 func New(name string, schema VersionSchema, req Requirements, ops []Operation, metadata map[string]string) (Migration, error) {
 	m := Migration{Version: Version, Name: name, VersionSchema: schema, Requirements: req, Operations: append([]Operation(nil), ops...), Metadata: clone(metadata)}
@@ -230,7 +232,7 @@ func validateOperation(op Operation, pg int) error {
 			return errors.New("table operation has incompatible fields")
 		}
 	case AddColumn:
-		if op.Column == "" || !dataType.MatchString(op.DataType) {
+		if op.Column == "" || validateDataType(op.DataType) != nil {
 			return errors.New("column and safe data_type are required")
 		}
 		if op.NewName != "" || op.Index != "" || op.Unique || op.IndexMode != nil {
@@ -244,7 +246,7 @@ func validateOperation(op Operation, pg int) error {
 			return errors.New("ordering and batch_size require an expression")
 		}
 	case AlterColumnType:
-		if op.Column == "" || !dataType.MatchString(op.DataType) || op.Expression == "" {
+		if op.Column == "" || validateDataType(op.DataType) != nil || op.Expression == "" {
 			return errors.New("column, safe data_type, and transform expression are required")
 		}
 		if op.NewName != "" || op.Index != "" || op.Unique || op.IndexMode != nil {
@@ -254,13 +256,26 @@ func validateOperation(op Operation, pg int) error {
 			return err
 		}
 	case RenameColumn:
-		if op.Column == "" || op.NewName == "" {
-			return errors.New("column and new_name are required")
+		if op.Column == "" || op.NewName == "" || op.Expression == "" {
+			return errors.New("column, new_name, and source transform are required")
 		}
-		if op.DataType != "" || op.Index != "" || op.Expression != "" || op.Ordering != nil || op.BatchSize != 0 || op.Unique || op.IndexMode != nil {
+		if op.DataType != "" || op.Index != "" || op.Unique || op.IndexMode != nil {
 			return errors.New("rename_column has incompatible fields")
 		}
-	case SetNotNull, DropColumn:
+		if err := validateBackfill(op); err != nil {
+			return err
+		}
+	case SetNotNull:
+		if op.Column == "" || op.Expression == "" {
+			return errors.New("set_not_null requires column and fill expression")
+		}
+		if op.NewName != "" || op.DataType != "" || op.Index != "" || op.Unique || op.IndexMode != nil {
+			return errors.New("set_not_null has incompatible fields")
+		}
+		if err := validateBackfill(op); err != nil {
+			return err
+		}
+	case DropColumn:
 		if op.Column == "" {
 			return errors.New("column is required")
 		}
@@ -313,7 +328,7 @@ func hasColumnFields(op Operation) bool {
 	return op.Column != "" || op.NewName != "" || op.DataType != "" || op.Expression != ""
 }
 func validateBackfill(op Operation) error {
-	if op.Ordering == nil || len(op.Ordering.Columns) == 0 || op.Ordering.UniqueEvidence == "" {
+	if op.Ordering == nil || len(op.Ordering.Columns) == 0 {
 		return errors.New("backfill requires deterministic unique ordering evidence")
 	}
 	if op.BatchSize <= 0 {
@@ -326,12 +341,14 @@ func validateBackfill(op Operation) error {
 		}
 		seen[v] = true
 	}
-	if !strings.HasPrefix(op.Ordering.UniqueEvidence, "constraint:") && !strings.HasPrefix(op.Ordering.UniqueEvidence, "index:") {
-		return errors.New("unique_evidence must reference a constraint or unique index")
+	e := op.Ordering.Unique
+	if (e.Kind != "constraint" && e.Kind != "unique_index") || !identifier.MatchString(e.Name) || len(e.Columns) != len(op.Ordering.Columns) {
+		return errors.New("unique evidence must identify a constraint or unique index over the exact ordering")
 	}
-	_, evidence, _ := strings.Cut(op.Ordering.UniqueEvidence, ":")
-	if !identifier.MatchString(evidence) {
-		return errors.New("unique_evidence must name a safe catalog object")
+	for i, c := range e.Columns {
+		if c != op.Ordering.Columns[i] {
+			return errors.New("unique evidence columns must exactly match ordering")
+		}
 	}
 	return nil
 }
@@ -358,6 +375,9 @@ var allowedFunctions = map[string]bool{"coalesce": true, "lower": true, "upper":
 var allowedCastTypes = map[string]bool{"text": true, "int2": true, "int4": true, "int8": true, "numeric": true, "bool": true, "date": true, "timestamp": true, "timestamptz": true, "uuid": true}
 
 func validateExpression(expression string) error {
+	if strings.Contains(expression, "/*") || strings.Contains(expression, "--") || strings.Contains(expression, "\"") {
+		return errors.New("expression comments and quoted identifiers are forbidden")
+	}
 	parsed, err := pg_query.Parse("SELECT " + expression)
 	if err != nil || len(parsed.Stmts) != 1 {
 		return errors.New("expression is not a single valid PostgreSQL expression")
@@ -373,16 +393,6 @@ func validateExpression(expression string) error {
 	if err := walkAST(tree); err != nil {
 		return err
 	}
-	for _, m := range functionCall.FindAllStringSubmatch(expression, -1) {
-		if !allowedFunctions[strings.ToLower(m[1])] {
-			return errors.New("expression function is not in immutable allowlist")
-		}
-	}
-	for _, m := range castOperator.FindAllStringSubmatch(expression, -1) {
-		if !allowedCastTypes[strings.ToLower(m[1])] {
-			return errors.New("expression cast type is not approved")
-		}
-	}
 	return nil
 }
 func walkAST(v any) error {
@@ -395,6 +405,33 @@ func walkAST(v any) error {
 			if err := walkAST(v); err != nil {
 				return err
 			}
+			if node, ok := v.(map[string]any); ok {
+				switch k {
+				case "FuncCall":
+					names := astNames(node["funcname"])
+					if len(names) != 1 || !allowedFunctions[names[0]] {
+						return errors.New("expression function must be an unqualified immutable allowlisted name")
+					}
+				case "TypeCast":
+					typeNode, _ := node["typeName"].(map[string]any)
+					names := astNames(typeNode["names"])
+					if len(names) == 2 && names[0] == "pg_catalog" && names[1] == "numeric" {
+						names = names[1:]
+					}
+					if len(names) != 1 || !allowedCastTypes[names[0]] {
+						return errors.New("expression cast must use an unqualified approved type")
+					}
+				case "A_Expr":
+					names := astNames(node["name"])
+					if len(names) != 1 || !allowedOperators[names[0]] {
+						return errors.New("expression operator must be unqualified and approved")
+					}
+				case "ColumnRef":
+					if len(astNames(node["fields"])) != 1 {
+						return errors.New("expression column must be unqualified")
+					}
+				}
+			}
 		}
 	case []any:
 		for _, v := range x {
@@ -404,6 +441,89 @@ func walkAST(v any) error {
 		}
 	}
 	return nil
+}
+
+var allowedOperators = map[string]bool{"+": true, "-": true, "*": true, "/": true, "=": true, "<>": true, "<": true, "<=": true, ">": true, ">=": true, "||": true}
+
+func astNames(v any) []string {
+	items, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		m, ok := item.(map[string]any)
+		if !ok {
+			return nil
+		}
+		snode, ok := m["String"].(map[string]any)
+		if !ok {
+			return nil
+		}
+		s, ok := snode["sval"].(string)
+		if !ok {
+			return nil
+		}
+		out = append(out, strings.ToLower(s))
+	}
+	return out
+}
+
+func validateDataType(value string) error {
+	if value == "" || strings.ContainsAny(value, ";\".") || strings.Contains(value, "/*") || strings.Contains(value, "--") {
+		return errors.New("data_type contains forbidden syntax")
+	}
+	raw, err := pg_query.ParseToJSON("CREATE TABLE autosql_type_probe (value " + value + ")")
+	if err != nil {
+		return errors.New("data_type is not valid PostgreSQL type syntax")
+	}
+	var tree any
+	if json.Unmarshal([]byte(raw), &tree) != nil {
+		return errors.New("data_type AST invalid")
+	}
+	defs := findASTNodes(tree, "ColumnDef")
+	if len(defs) != 1 {
+		return errors.New("data_type did not produce exactly one column")
+	}
+	def := defs[0]
+	if _, ok := def["constraints"]; ok {
+		return errors.New("data_type must not contain column modifiers or constraints")
+	}
+	tn, ok := def["typeName"].(map[string]any)
+	if !ok {
+		return errors.New("data_type AST missing type")
+	}
+	names := astNames(tn["names"])
+	if len(names) == 2 && names[0] == "pg_catalog" {
+		names = names[1:]
+	}
+	if len(names) != 1 || !allowedCastTypes[names[0]] {
+		return errors.New("data_type is not in approved type allowlist")
+	}
+	return nil
+}
+func findASTNodes(v any, name string) []map[string]any {
+	var out []map[string]any
+	var walk func(any)
+	walk = func(v any) {
+		switch x := v.(type) {
+		case map[string]any:
+			for k, v := range x {
+				if k == name {
+					if m, ok := v.(map[string]any); ok {
+						out = append(out, m)
+					}
+				}
+				walk(v)
+			}
+		case []any:
+			for _, v := range x {
+				walk(v)
+			}
+		}
+	}
+	walk(v)
+	return out
 }
 
 func Effects(kind OperationKind) (PhaseEffect, bool) {
