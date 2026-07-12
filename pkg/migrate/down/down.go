@@ -30,7 +30,10 @@ var ErrIrreversible = errors.New("migration requires trusted irreversible overri
 type Original struct {
 	Version, ArtifactDigest, PlanDigest string `json:",omitempty"`
 }
-type ReverseStatement struct{ OriginalVersion, OriginalArtifactDigest, Scope, SQL, Digest string }
+type ReverseStatement struct {
+	OriginalVersion, OriginalArtifactDigest, Scope, SQL, Digest string
+	Transactional                                               bool
+}
 type Impact struct {
 	ChangeID, Operation, Object string
 	Destructive                 bool
@@ -114,16 +117,25 @@ func Build(ctx context.Context, r Request) (DownPlan, error) {
 	if r.Snapshot.Manifest.Digest == "" || r.TargetVersion == "" || len(r.Revisions) == 0 || r.VerifyOriginal == nil || r.Now.IsZero() || !r.ExpiresAt.After(r.Now) || r.SignerKeyID == "" || len(r.Signer) != ed25519.PrivateKeySize {
 		return out, ErrRefused
 	}
+	targetVersion, versionErr := migrate.ParseVersion(r.TargetVersion)
+	if versionErr != nil {
+		return out, ErrRefused
+	}
+	r.TargetVersion = targetVersion.String()
 	head := r.Revisions[len(r.Revisions)-1]
 	if head.State != "applied" && head.State != "baseline" && head.State != "checkpoint" {
 		return out, fmt.Errorf("%w: current revision is partial, failed, or uncertain; reconcile status before down", ErrRefused)
 	}
 	target, headIndex := -1, -1
+	logicalHead := head.Version
+	if head.Kind == "reversal" && head.ToVersion != "" {
+		logicalHead = head.ToVersion
+	}
 	for i, e := range r.Snapshot.Manifest.Entries {
 		if e.Version == r.TargetVersion {
 			target = i
 		}
-		if e.Version == head.Version {
+		if e.Version == logicalHead {
 			headIndex = i
 		}
 	}
@@ -131,6 +143,7 @@ func Build(ctx context.Context, r Request) (DownPlan, error) {
 		return out, ErrRefused
 	}
 	originals := []Original{}
+	originalByVersion := map[string]string{}
 	requiredReverse := map[string]bool{}
 	for i := target + 1; i <= headIndex; i++ {
 		e := r.Snapshot.Manifest.Entries[i]
@@ -150,13 +163,14 @@ func Build(ctx context.Context, r Request) (DownPlan, error) {
 			return out, ErrRefused
 		}
 		originals = append(originals, Original{e.Version, p.Digest, p.Plan.Digest})
+		originalByVersion[e.Version] = p.Digest
 		for _, c := range p.Plan.Changes.Changes {
 			if c.Before != nil && c.Before.Kind == schema.KindReferenceData || c.After != nil && c.After.Kind == schema.KindReferenceData {
 				requiredReverse[e.Version] = true
 			}
 		}
 	}
-	if len(originals) == 0 || originals[len(originals)-1].ArtifactDigest != head.ArtifactDigest {
+	if len(originals) == 0 || head.Kind != "reversal" && originals[len(originals)-1].ArtifactDigest != head.ArtifactDigest {
 		return out, fmt.Errorf("%w: applied head artifact mismatch", ErrStale)
 	}
 	liveFP, e := schema.SemanticFingerprint(r.LockedLive)
@@ -183,17 +197,31 @@ func Build(ctx context.Context, r Request) (DownPlan, error) {
 	seen := map[string]bool{}
 	for i := range reverse {
 		x := &reverse[i]
-		if strings.TrimSpace(x.SQL) == "" || x.OriginalArtifactDigest == "" || x.Scope == "" {
+		if strings.TrimSpace(x.SQL) == "" || x.OriginalArtifactDigest == "" || x.Scope == "" || originalByVersion[x.OriginalVersion] != x.OriginalArtifactDigest || seen[x.OriginalVersion+"\x00"+x.Scope] {
 			return out, ErrRefused
 		}
-		x.Digest = hash("reverse", []byte(strings.Join([]string{x.OriginalVersion, x.OriginalArtifactDigest, x.Scope, x.SQL}, "\x00")))
+		x.Digest = hash("reverse", []byte(strings.Join([]string{x.OriginalVersion, x.OriginalArtifactDigest, x.Scope, x.SQL, fmt.Sprint(x.Transactional)}, "\x00")))
 		seen[x.OriginalVersion] = true
+		seen[x.OriginalVersion+"\x00"+x.Scope] = true
 	}
 	for version := range requiredReverse {
 		if !seen[version] {
 			if !validOverride(r.Override, r.OverrideKeys, r.Now, "data:"+version) {
 				return out, ErrIrreversible
 			}
+		}
+	}
+	author := make([]plan.AuthorSQL, len(reverse))
+	for i, x := range reverse {
+		author[i] = plan.AuthorSQL{ID: x.OriginalVersion + ":" + x.Scope, SQL: x.SQL, Transactional: x.Transactional}
+	}
+	p, e = plan.AppendAuthorSQL(p, author)
+	if e != nil {
+		return out, e
+	}
+	for _, phase := range p.Phases {
+		if phase.Transaction == plan.TransactionProhibited && !validOverride(r.Override, r.OverrideKeys, r.Now, "nontransactional") {
+			return out, fmt.Errorf("%w: nontransactional reversal has ambiguous recovery semantics", ErrIrreversible)
 		}
 	}
 	impacts := impacts(p)

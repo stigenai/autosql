@@ -36,6 +36,7 @@ type applyConfig struct {
 	ExpectedValidationContextDigests                                                                                                                                          map[string]string
 	ExpectedValidationAttestations                                                                                                                                            map[string]artifact.ValidationAttestation
 	EditorIdentity, EditSigningKeyID, EditSigningKeyReference, DevelopmentURLReference, FreshApprovalIdentity, FreshApprovalProofDigest                                       string
+	DownConfigPath                                                                                                                                                            string
 	FreshApprovalAt, EditReleaseCreatedAt, EditReleaseExpiresAt                                                                                                               time.Time
 	TrustedMigrations                                                                                                                                                         map[string]migrationTrust
 }
@@ -200,7 +201,11 @@ func productionServices(connector executor.Connector) (Services, error) {
 		}
 		editService = &productionEditService{editor: c.EditorIdentity, policyFor: policyFor, g: g, input: input, url: url, targetIdentity: targetID, developmentURL: devURL, developmentIdentity: devID, revision: c.SourceRevision, environment: c.Environment, database: c.DatabaseIdentity, keyID: c.EditSigningKeyID, version: c.PostgresVersion, private: private, approval: artifact.Approval{Identity: c.FreshApprovalIdentity, ApprovedAt: c.FreshApprovalAt.UTC(), ProofDigest: c.FreshApprovalProofDigest}, created: c.EditReleaseCreatedAt.UTC(), expires: c.EditReleaseExpiresAt.UTC(), audit: &executor.FileAudit{Path: c.LifecycleAuditPath}, schemas: append([]string(nil), c.Schemas...)}
 	}
-	return Services{ReadPlan: DefaultReadPlan{}, Apply: resolvingApply{verified: verified, directory: c.ArtifactDirectory}, PlanEdit: editService}, nil
+	downService, err := newProductionDownService(c.DownConfigPath, resolver, verified, url, c)
+	if err != nil {
+		return Services{}, err
+	}
+	return Services{ReadPlan: DefaultReadPlan{}, Apply: resolvingApply{verified: verified, directory: c.ArtifactDirectory}, PlanEdit: editService, Down: downService}, nil
 }
 
 type resolvingApply struct {
