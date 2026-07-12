@@ -36,14 +36,26 @@ type LifecycleAudit interface {
 type StepConfirmer func(context.Context, Session, plan.Step) error
 
 type Config struct {
-	URL         string
-	State       StateReader
-	Now         Clock
-	Reauthorize func(context.Context, artifact.Artifact) error
-	Confirm     StepConfirmer
-	Audit       LifecycleAudit
-	Connector   Connector
-	NoEdits     bool
+	URL             string
+	State           StateReader
+	Now             Clock
+	Reauthorize     func(context.Context, artifact.Artifact) error
+	Confirm         StepConfirmer
+	Audit           LifecycleAudit
+	Connector       Connector
+	NoEdits         bool
+	LockedSession   Session
+	LockAlreadyHeld bool
+	Transaction     Tx // caller-owned all-in-one transaction; executor never commits it
+}
+
+// LockKey is the single canonical cross-workflow lock identity. It is derived
+// only from signed artifact target fields, never caller-provided aliases.
+func LockKey(databaseIdentity, environment string) (string, error) {
+	if databaseIdentity == "" || environment == "" {
+		return "", errors.New("executor lock identity invalid")
+	}
+	return fmt.Sprintf("autosql.target/v1:%d:%s:%d:%s", len(databaseIdentity), databaseIdentity, len(environment), environment), nil
 }
 
 type Result struct {
@@ -69,7 +81,7 @@ func NewPostgreSQL(config Config, verified artifact.VerifiedArtifact) (*PostgreS
 	if config.NoEdits && payload.EditProvenance != nil {
 		return nil, errors.New("edited artifacts are forbidden")
 	}
-	if config.URL == "" || config.State == nil {
+	if (config.URL == "" && config.LockedSession == nil) || config.State == nil || config.LockAlreadyHeld && config.LockedSession == nil || config.Transaction != nil && config.LockedSession == nil {
 		return nil, errors.New("executor configuration invalid")
 	}
 	if config.Now == nil {
@@ -94,14 +106,31 @@ func (e *PostgreSQL) ApplyAuthorized(ctx context.Context, checks precheck.Plan) 
 	if err := e.audit(ctx, "requested", "", ""); err != nil {
 		return nil, errors.New("durable lifecycle audit failed")
 	}
-	conn, err := e.config.Connector.Connect(ctx, e.config.URL)
-	if err != nil {
-		return nil, errors.New("connect executor database")
+	conn := e.config.LockedSession
+	owned := false
+	var err error
+	if conn == nil {
+		conn, err = e.config.Connector.Connect(ctx, e.config.URL)
+		owned = true
+		if err != nil {
+			return nil, errors.New("connect executor database")
+		}
 	}
-	defer conn.Close(context.WithoutCancel(ctx))
-	var locked bool
-	identity := fmt.Sprintf("%d:%s%d:%s", len(e.artifact.DatabaseIdentity), e.artifact.DatabaseIdentity, len(e.artifact.TargetEnvironment), e.artifact.TargetEnvironment)
-	if err = conn.QueryRow(ctx, `select pg_try_advisory_lock(hashtextextended($1, 0))`, identity).Scan(&locked); err != nil || !locked {
+	if owned {
+		defer conn.Close(context.WithoutCancel(ctx))
+	}
+	if e.config.Transaction != nil {
+		conn = borrowedSession{Session: conn, tx: e.config.Transaction}
+	}
+	identity, keyErr := LockKey(e.artifact.DatabaseIdentity, e.artifact.TargetEnvironment)
+	if keyErr != nil {
+		return nil, keyErr
+	}
+	var locked = e.config.LockAlreadyHeld
+	if !locked {
+		err = conn.QueryRow(ctx, `select pg_try_advisory_lock(hashtextextended($1, 0))`, identity).Scan(&locked)
+	}
+	if err != nil || !locked {
 		if err == nil {
 			err = ErrBusy
 		}
@@ -110,7 +139,9 @@ func (e *PostgreSQL) ApplyAuthorized(ctx context.Context, checks precheck.Plan) 
 		}
 		return nil, err
 	}
-	defer conn.Exec(context.WithoutCancel(ctx), `select pg_advisory_unlock(hashtextextended($1, 0))`, identity)
+	if !e.config.LockAlreadyHeld {
+		defer conn.Exec(context.WithoutCancel(ctx), `select pg_advisory_unlock(hashtextextended($1, 0))`, identity)
+	}
 	if err := e.audit(ctx, "lock_acquired", "", ""); err != nil {
 		return nil, errors.New("durable lifecycle audit failed")
 	}
@@ -189,6 +220,7 @@ func (e *PostgreSQL) ApplyAuthorized(ctx context.Context, checks precheck.Plan) 
 			}
 		}
 	}
+	if e.config.Transaction!=nil{return results,nil}
 	return results, e.finish(ctx)
 }
 func (e *PostgreSQL) finish(ctx context.Context) error {
@@ -376,15 +408,15 @@ func (e *PostgreSQL) transactionalPhase(ctx context.Context, conn Session, phase
 	committed = true
 	e.result.AppliedSteps += pendingCount
 	e.result.LastConfirmed = last
-	if auditErr := e.audit(ctx, "transaction_committed", last, ""); auditErr != nil {
+	if e.config.Transaction==nil { if auditErr := e.audit(ctx, "transaction_committed", last, ""); auditErr != nil {
 		e.result.Partial = true
 		e.result.ExecutionID = e.artifact.Digest
 		e.result.RecoveryGuidance = "repair transaction commit audit before retry"
 		return results, ErrPartial
-	}
+	} }
 	for _, id := range phase.StepIDs {
 		if s := steps[id]; s.Kind == plan.StepExecutable && !confirmed[id] {
-			if auditErr := e.audit(ctx, "confirmed", id, ""); auditErr != nil {
+			if e.config.Transaction!=nil{continue};if auditErr := e.audit(ctx, "confirmed", id, ""); auditErr != nil {
 				e.result.Partial = true
 				e.result.ExecutionID = e.artifact.Digest
 				e.result.RecoveryGuidance = "repair lifecycle audit before retry"

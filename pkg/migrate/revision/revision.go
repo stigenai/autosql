@@ -16,7 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-const SchemaVersion = 3
+const SchemaVersion = 4
 
 var (
 	ErrConfig = errors.New("invalid revision store configuration")
@@ -25,14 +25,14 @@ var (
 )
 
 type Config struct {
-	URL, Schema, MetaTable, RevisionsTable, StatementsTable, EventsTable, ExecutorHistorySchema, ExecutorHistoryTable string
+	URL, Schema, MetaTable, RevisionsTable, StatementsTable, EventsTable, ManifestTable, ExecutorHistorySchema, ExecutorHistoryTable string
 }
 
 func (c Config) normalized() (Config, error) {
 	if c.URL == "" {
 		return c, ErrConfig
 	}
-	defaults := map[*string]string{&c.Schema: "autosql_revision", &c.MetaTable: "meta", &c.RevisionsTable: "revisions", &c.StatementsTable: "statement_attempts", &c.EventsTable: "events", &c.ExecutorHistorySchema: "public", &c.ExecutorHistoryTable: "autosql_migration_history"}
+	defaults := map[*string]string{&c.Schema: "autosql_revision", &c.MetaTable: "meta", &c.RevisionsTable: "revisions", &c.StatementsTable: "statement_attempts", &c.EventsTable: "events", &c.ManifestTable: "manifest_ancestry", &c.ExecutorHistorySchema: "public", &c.ExecutorHistoryTable: "autosql_migration_history"}
 	for field, value := range defaults {
 		if *field == "" {
 			*field = value
@@ -66,6 +66,7 @@ func (s *Store) OpenSession(ctx context.Context) (*Session, error) {
 }
 
 func (s *Session) Close(ctx context.Context) error { return s.conn.Close(ctx) }
+func (s *Session) Raw() *pgx.Conn                  { return s.conn }
 func (s *Session) Lock(ctx context.Context, identity string) (bool, error) {
 	if identity == "" {
 		return false, ErrConfig
@@ -184,9 +185,27 @@ check (kind in ('migration','baseline','checkpoint','reversal')), check (state i
 	case 3:
 		_, err := tx.Exec(ctx, `alter table `+r+` add column duration_ns bigint not null default 0 check(duration_ns>=0), add column manifest_generation text not null default ''`)
 		return err
+	case 4:
+		_, err := tx.Exec(ctx, `create table `+q(c.Schema, c.ManifestTable)+` (generation text primary key,digest text not null unique,parent_generation text not null,recorded_at timestamptz not null)`)
+		return err
 	default:
 		return ErrConfig
 	}
+}
+func (s *Session) RecordManifest(ctx context.Context, tx pgx.Tx, m migrate.Manifest, parent string, at time.Time) error {
+	_, err := tx.Exec(ctx, `insert into `+q(s.config.Schema, s.config.ManifestTable)+`(generation,digest,parent_generation,recorded_at) values($1,$2,$3,$4) on conflict(generation) do update set digest=excluded.digest where `+q(s.config.Schema, s.config.ManifestTable)+`.digest=excluded.digest`, m.Generation, m.Digest, parent, at.UTC())
+	if err != nil {
+		return errors.New("record manifest ancestry")
+	}
+	return nil
+}
+func (s *Session) ManifestDescendsFrom(ctx context.Context, current migrate.Manifest, ancestorGeneration, ancestorDigest string) (bool, error) {
+	if current.Generation == ancestorGeneration && current.Digest == ancestorDigest {
+		return true, nil
+	}
+	var ok bool
+	err := s.conn.QueryRow(ctx, `with recursive chain as (select generation,digest,parent_generation from `+q(s.config.Schema, s.config.ManifestTable)+` where generation=$1 union all select m.generation,m.digest,m.parent_generation from `+q(s.config.Schema, s.config.ManifestTable)+` m join chain c on m.generation=c.parent_generation) select exists(select 1 from chain where generation=$2 and digest=$3)`, current.Generation, ancestorGeneration, ancestorDigest).Scan(&ok)
+	return ok, err
 }
 
 type Revision struct {
@@ -244,20 +263,6 @@ func (s *Session) ExecEvent(ctx context.Context, tx pgx.Tx, e Event) error {
 	}
 	return nil
 }
-func (s *Session) ExecStatement(ctx context.Context, tx pgx.Tx, a StatementAttempt) error {
-	_, err := tx.Exec(ctx, `insert into `+q(s.config.Schema, s.config.StatementsTable)+`(version,statement_ordinal,attempt,state,statement_digest,redacted_error,operator_identity,started_at,completed_at) values($1,$2,$3,$4,$5,$6,$7,$8,$9)`, a.Version, a.Ordinal, a.Attempt, a.State, a.Digest, a.RedactedError, a.Operator, a.StartedAt.UTC(), a.CompletedAt)
-	if err != nil {
-		return errors.New("insert transactional statement evidence")
-	}
-	return nil
-}
-func (s *Session) ConfirmStatement(ctx context.Context, tx pgx.Tx, version string, ordinal, attempt int, at time.Time) error {
-	tag, err := tx.Exec(ctx, `update `+q(s.config.Schema, s.config.StatementsTable)+` set state='confirmed',completed_at=$4 where version=$1 and statement_ordinal=$2 and attempt=$3 and state='intended'`, version, ordinal, attempt, at.UTC())
-	if err != nil || tag.RowsAffected() != 1 {
-		return errors.New("confirm transactional statement evidence")
-	}
-	return nil
-}
 func (s *Session) FinalizeRevision(ctx context.Context, tx pgx.Tx, version, state string, ordinal int, duration time.Duration, redacted string, at time.Time) error {
 	tag, err := tx.Exec(ctx, `update `+q(s.config.Schema, s.config.RevisionsTable)+` set state=$2,statement_ordinal=$3,duration_ns=$4,redacted_error=$5,updated_at=$6::timestamptz,completed_at=case when $2 in ('applied','baseline','checkpoint') then $6::timestamptz else null::timestamptz end where version=$1`, version, state, ordinal, duration.Nanoseconds(), redacted, at.UTC())
 	if err != nil {
@@ -265,35 +270,6 @@ func (s *Session) FinalizeRevision(ctx context.Context, tx pgx.Tx, version, stat
 	}
 	if tag.RowsAffected() != 1 {
 		return errors.New("finalize transactional revision: row missing")
-	}
-	return nil
-}
-
-func (s *Session) EnsureExecutorHistory(ctx context.Context, tx pgx.Tx) error {
-	_, err := tx.Exec(ctx, `create table if not exists `+q(s.config.ExecutorHistorySchema, s.config.ExecutorHistoryTable)+` (
-artifact_digest text not null, step_id text not null, step_hash text not null,
-execution_id text not null, target_identity text not null, plan_digest text not null, bundle_digest text not null,
-attempt integer not null, phase_id text not null, phase_mode text not null,
-state text not null, intended_at timestamptz, confirmed_at timestamptz,
-last_confirmed_step text not null default '', recovery_guidance text not null default '',
-primary key (artifact_digest, step_id, attempt))`)
-	if err != nil {
-		return errors.New("initialize executor history")
-	}
-	return nil
-}
-
-func (s *Session) ExecHistory(ctx context.Context, tx pgx.Tx, artifactDigest, stepID, stepHash, phaseID, phaseMode, state, last, guidance, target, planDigest, bundleDigest string) error {
-	_, err := tx.Exec(ctx, `insert into `+q(s.config.ExecutorHistorySchema, s.config.ExecutorHistoryTable)+`(artifact_digest,step_id,step_hash,attempt,phase_id,phase_mode,state,intended_at,confirmed_at,last_confirmed_step,recovery_guidance,execution_id,target_identity,plan_digest,bundle_digest) values($1,$2,$3,1,$4,$5,$6,clock_timestamp(),case when $6='confirmed' then clock_timestamp() end,$7,$8,$1,$9,$10,$11)`, artifactDigest, stepID, stepHash, phaseID, phaseMode, state, last, guidance, target, planDigest, bundleDigest)
-	if err != nil {
-		return errors.New("write transactional executor history")
-	}
-	return nil
-}
-func (s *Session) ConfirmHistory(ctx context.Context, tx pgx.Tx, artifactDigest, stepID string, at time.Time) error {
-	tag, err := tx.Exec(ctx, `update `+q(s.config.ExecutorHistorySchema, s.config.ExecutorHistoryTable)+` set state='confirmed',confirmed_at=$3,last_confirmed_step=step_id,recovery_guidance='' where artifact_digest=$1 and step_id=$2 and attempt=1 and state='intended'`, artifactDigest, stepID, at.UTC())
-	if err != nil || tag.RowsAffected() != 1 {
-		return errors.New("confirm transactional executor history")
 	}
 	return nil
 }

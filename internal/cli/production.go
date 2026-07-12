@@ -129,7 +129,7 @@ func productionServices(connector executor.Connector) (Services, error) {
 		}
 		return guardrail.Input{Changes: a.Plan.Changes, Safety: si, Policy: doc, PolicyIdentity: "production-config/v1", Precheck: a.Checks, Approval: approval.Request{Plan: approval.Plan{Digest: a.GuardrailDigest, Environment: c.Environment, Author: c.Author, ExpiresAt: a.ExpiresAt}, RequestedBy: c.Requester}, StatementBindings: bindings}, nil
 	}
-	mutation := func(v artifact.VerifiedArtifact) (guardrail.AuthorizedMutation, error) {
+	mutationFor := func(v artifact.VerifiedArtifact, locked executor.Session, tx executor.Tx) (guardrail.AuthorizedMutation, error) {
 		a, _ := v.Payload()
 		state := func(ctx context.Context, conn executor.Session) (executor.RuntimeState, error) {
 			doc, err := postgres.InspectConn(ctx, conn.Raw(), postgres.Options{Schemas: c.Schemas})
@@ -145,7 +145,7 @@ func productionServices(connector executor.Connector) (Services, error) {
 				last = s.ID
 			}
 		}
-		return executor.NewPostgreSQL(executor.Config{URL: url, Connector: connector, NoEdits: c.NoEdits, Audit: &executor.FileAudit{Path: c.LifecycleAuditPath}, Reauthorize: func(ctx context.Context, a artifact.Artifact) error {
+		return executor.NewPostgreSQL(executor.Config{URL: url, Connector: connector, LockedSession: locked, LockAlreadyHeld: locked != nil, Transaction: tx, NoEdits: c.NoEdits, Audit: &executor.FileAudit{Path: c.LifecycleAuditPath}, Reauthorize: func(ctx context.Context, a artifact.Artifact) error {
 			fresh, _ := policyFor(a)
 			_, err := a.VerifyTrusted(fresh)
 			return err
@@ -165,7 +165,10 @@ func productionServices(connector executor.Connector) (Services, error) {
 			return nil
 		}}, v)
 	}
-	verified := VerifiedArtifactApplyService{PolicyFor: policyFor, Guardrail: g, Input: input, Mutation: mutation, NoEdits: c.NoEdits}
+	mutation := func(v artifact.VerifiedArtifact) (guardrail.AuthorizedMutation, error) {
+		return mutationFor(v, nil, nil)
+	}
+	verified := VerifiedArtifactApplyService{PolicyFor: policyFor, Guardrail: g, Input: input, Mutation: mutation, MutationLocked: mutationFor, NoEdits: c.NoEdits}
 	var editService PlanEditService
 	if c.EditorIdentity != "" {
 		if c.EditorIdentity == c.Author || c.EditorIdentity == c.Requester {
@@ -202,6 +205,13 @@ func productionServices(connector executor.Connector) (Services, error) {
 type resolvingApply struct {
 	verified  VerifiedArtifactApplyService
 	directory string
+}
+
+func (s resolvingApply) VerifyArtifact(a artifact.Artifact) (artifact.VerifiedArtifact, error) {
+	return s.verified.VerifyArtifact(a)
+}
+func (s resolvingApply) ApplyVersioned(ctx context.Context, v artifact.VerifiedArtifact, session executor.Session, tx executor.Tx) (executor.Result, error) {
+	return s.verified.ApplyVersioned(ctx, v, session, tx)
 }
 
 func (s resolvingApply) Apply(ctx context.Context, r ApplyRequest) (ApplyResult, error) {

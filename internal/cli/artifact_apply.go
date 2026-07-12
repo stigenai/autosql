@@ -15,12 +15,40 @@ import (
 // provide trusted verification policy, the exact bound guardrail input, and an
 // executor mutation factory. No raw plan or SQL execution path exists here.
 type VerifiedArtifactApplyService struct {
-	Policy    artifact.VerifyPolicy
-	PolicyFor func(artifact.Artifact) (artifact.VerifyPolicy, error)
-	Guardrail guardrail.Guardrail
-	Input     func(artifact.Artifact) (guardrail.Input, error)
-	Mutation  func(artifact.VerifiedArtifact) (guardrail.AuthorizedMutation, error)
-	NoEdits   bool
+	Policy         artifact.VerifyPolicy
+	PolicyFor      func(artifact.Artifact) (artifact.VerifyPolicy, error)
+	Guardrail      guardrail.Guardrail
+	Input          func(artifact.Artifact) (guardrail.Input, error)
+	Mutation       func(artifact.VerifiedArtifact) (guardrail.AuthorizedMutation, error)
+	MutationLocked func(artifact.VerifiedArtifact, executor.Session, executor.Tx) (guardrail.AuthorizedMutation, error)
+	NoEdits        bool
+}
+
+func (s VerifiedArtifactApplyService) ApplyVersioned(ctx context.Context, v artifact.VerifiedArtifact, session executor.Session, tx executor.Tx) (executor.Result, error) {
+	var out executor.Result
+	p, err := v.Payload()
+	if err != nil || s.Input == nil || s.MutationLocked == nil {
+		return out, errors.New("versioned guarded apply is not configured")
+	}
+	in, err := s.Input(p)
+	if err != nil {
+		return out, err
+	}
+	mutation, err := s.MutationLocked(v, session, tx)
+	if err != nil {
+		return out, err
+	}
+	in.Mutation = mutation
+	if _, err = s.Guardrail.Apply(ctx, in); err != nil {
+		if x, ok := mutation.(*executor.PostgreSQL); ok {
+			out = x.Result()
+		}
+		return out, err
+	}
+	if x, ok := mutation.(*executor.PostgreSQL); ok {
+		out = x.Result()
+	}
+	return out, nil
 }
 
 // VerifyArtifact exposes exactly the same trusted release-manifest policy used

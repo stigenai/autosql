@@ -410,7 +410,7 @@ func parseFile(f File) (Migration, error) {
 	}
 	stmts := make([]Statement, len(split))
 	for i, s := range split {
-		stmts[i] = Statement{i + 1, s.Position.Line, s.Position.Column, digest("statement", []byte(s.SQL))}
+		stmts[i] = Statement{i + 1, s.Position.Line, s.Position.Column, digest("statement", []byte(canonicalExecutableSQL(s.SQL)))}
 	}
 	dd := digest("directives", canonical(dirs))
 	bd := digest("boundaries", canonical(stmts))
@@ -427,6 +427,18 @@ func parseFile(f File) (Migration, error) {
 		entry.ArtifactFile, entry.ArtifactDigest = f.ArtifactName, digest("artifact", f.Artifact)
 	}
 	return entry, nil
+}
+func canonicalExecutableSQL(v string) string {
+	lines := strings.Split(v, "\n")
+	for len(lines) > 0 {
+		t := strings.TrimSpace(lines[0])
+		if strings.HasPrefix(t, "-- autosql:") || strings.HasPrefix(t, "-- autosql-rename-hints-") {
+			lines = lines[1:]
+			continue
+		}
+		break
+	}
+	return strings.TrimSuffix(strings.TrimSpace(strings.Join(lines, "\n")), ";")
 }
 func build(files []File) (Manifest, error) {
 	seenName := map[string]bool{}
@@ -937,7 +949,8 @@ func LoadSnapshot(dir string) (Snapshot, error) {
 // ArtifactDigest returns the manifest's byte-domain digest for an artifact.
 // It intentionally differs from Artifact.Digest, which authenticates the
 // canonical artifact payload rather than the exact directory bytes.
-func ArtifactDigest(raw []byte) string { return digest("artifact", raw) }
+func ArtifactDigest(raw []byte) string  { return digest("artifact", raw) }
+func StatementDigest(sql string) string { return digest("statement", []byte(sql)) }
 func Verify(dir string) (Manifest, error) {
 	s, e := LoadSnapshot(dir)
 	if e != nil {
