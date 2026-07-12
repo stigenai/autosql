@@ -291,6 +291,9 @@ func (e *PostgreSQL) transactionalPhase(ctx context.Context, conn Session, phase
 	}
 	tx, err := conn.Begin(ctx)
 	if err != nil {
+		if auditErr := e.audit(ctx, "transaction_begin_failed", "", ""); auditErr != nil {
+			return nil, errors.Join(errors.New("begin migration phase"), errors.New("durable lifecycle audit failed"))
+		}
 		return nil, errors.New("begin migration phase")
 	}
 	committed := false
@@ -298,15 +301,27 @@ func (e *PostgreSQL) transactionalPhase(ctx context.Context, conn Session, phase
 	defer func() {
 		if err != nil && !committed && !commitAttempted {
 			rollbackErr := tx.Rollback(context.WithoutCancel(ctx))
-			auditErr := e.audit(context.WithoutCancel(ctx), "transaction_rollback", "", "")
-			if rollbackErr != nil || auditErr != nil {
-				err = errors.Join(err, errors.New("transaction rollback or audit failed"))
+			if rollbackErr != nil {
+				e.result.Uncertain = true
+				e.result.ExecutionID = e.artifact.Digest
+				e.result.RecoveryGuidance = "reconcile failed rollback before retry"
+				auditErr := e.audit(context.WithoutCancel(ctx), "rollback_failed", "", e.result.RecoveryGuidance)
+				if auditErr != nil {
+					err = errors.Join(err, ErrReconcile, errors.New("rollback and lifecycle audit failed"))
+				} else {
+					err = errors.Join(err, ErrReconcile)
+				}
+			} else if auditErr := e.audit(context.WithoutCancel(ctx), "transaction_rollback", "", ""); auditErr != nil {
+				err = errors.Join(err, errors.New("transaction rollback audit failed"))
 			}
 		}
 	}()
 	if runPrechecks {
 		results, err = runChecks(ctx, tx, checks)
 		if err != nil {
+			if auditErr := e.audit(ctx, "transaction_failed", "", ""); auditErr != nil {
+				return results, errors.Join(err, errors.New("durable lifecycle audit failed"))
+			}
 			return results, err
 		}
 	}
