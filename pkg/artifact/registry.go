@@ -53,7 +53,14 @@ func (r *MemoryRegistry) Get(_ context.Context, d string) (Artifact, error) {
 	if !ok {
 		return Artifact{}, ErrNotFound
 	}
-	return Parse(b)
+	a, e := Parse(b)
+	if e != nil {
+		return Artifact{}, e
+	}
+	if e = a.validateStored(); e != nil {
+		return Artifact{}, e
+	}
+	return a, nil
 }
 
 type LocalRegistry struct {

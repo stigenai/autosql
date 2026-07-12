@@ -87,6 +87,9 @@ func (v VerifiedArtifact) forRegistry() (Artifact, error) {
 	if v.marker != verifiedMarker(v.artifact) || v.artifact.Digest == "" {
 		return Artifact{}, fail("verified_token", ErrInvalid)
 	}
+	if err := v.artifact.validateStored(); err != nil {
+		return Artifact{}, fail("verified_token", ErrInvalid)
+	}
 	return v.artifact, nil
 }
 
@@ -169,8 +172,16 @@ func (a Artifact) VerifyTrusted(policy VerifyPolicy) (VerifiedArtifact, error) {
 	if e != nil || !ed25519.Verify(record.PublicKey, []byte(signatureDomain+a.Digest), sig) {
 		return VerifiedArtifact{}, fail("signature", ErrInvalid)
 	}
-	v := VerifiedArtifact{artifact: a}
-	v.marker = verifiedMarker(a)
+	b, marshalErr := a.MarshalCanonical()
+	if marshalErr != nil {
+		return VerifiedArtifact{}, fail("clone", ErrInvalid)
+	}
+	immutable, parseErr := Parse(b)
+	if parseErr != nil || immutable.validateStored() != nil {
+		return VerifiedArtifact{}, fail("clone", ErrInvalid)
+	}
+	v := VerifiedArtifact{artifact: immutable}
+	v.marker = verifiedMarker(immutable)
 	return v, nil
 }
 func (a Artifact) validateUnsigned() error {

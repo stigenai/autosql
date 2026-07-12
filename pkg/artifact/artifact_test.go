@@ -206,6 +206,11 @@ func registryConformance(t *testing.T, r Registry) {
 	if e != nil {
 		t.Fatal(e)
 	}
+	original, _ := a.MarshalCanonical()
+	a.Plan.Steps[0].SQL = "DROP TABLE secret"
+	a.Plan.Changes.Changes[0].ID = "changed"
+	a.Checks.Statements[0] = "DROP TABLE secret"
+	a.Metadata["ticket"] = "changed"
 	ctx := context.Background()
 	if e := r.Put(ctx, v); e != nil {
 		t.Fatal(e)
@@ -216,6 +221,10 @@ func registryConformance(t *testing.T, r Registry) {
 	got, e := r.Get(ctx, a.Digest)
 	if e != nil || got.Digest != a.Digest {
 		t.Fatalf("get=%v %v", got.Digest, e)
+	}
+	gotBytes, _ := got.MarshalCanonical()
+	if string(gotBytes) != string(original) {
+		t.Fatal("post-verify caller mutation reached registry")
 	}
 }
 func TestRegistriesImmutableAndConcurrent(t *testing.T) {
@@ -253,6 +262,30 @@ func TestRegistriesImmutableAndConcurrent(t *testing.T) {
 			t.Fatalf("temporary files: %v", matches)
 		}
 	})
+}
+func TestVerifiedTokenAndMemoryReadRevalidateIntegrity(t *testing.T) {
+	a, pub, _ := fixture(t)
+	v, e := a.VerifyTrusted(trustedPolicy(a, pub, a.CreatedAt))
+	if e != nil {
+		t.Fatal(e)
+	}
+	tampered := v
+	tampered.artifact.Metadata["ticket"] = "changed"
+	if e = NewMemoryRegistry().Put(context.Background(), tampered); e == nil {
+		t.Fatal("tampered token published")
+	}
+	v, e = a.VerifyTrusted(trustedPolicy(a, pub, a.CreatedAt))
+	if e != nil {
+		t.Fatal(e)
+	}
+	r := NewMemoryRegistry()
+	if e = r.Put(context.Background(), v); e != nil {
+		t.Fatal(e)
+	}
+	r.m[a.Digest][10] ^= 1
+	if _, e = r.Get(context.Background(), a.Digest); e == nil {
+		t.Fatal("corrupt memory bytes returned")
+	}
 }
 func TestLocalRegistryRejectsTraversalSymlinkHardlinkAndWrongMode(t *testing.T) {
 	a, pub, _ := fixture(t)
