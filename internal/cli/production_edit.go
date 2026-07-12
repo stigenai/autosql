@@ -85,10 +85,10 @@ type editBinder struct {
 	original artifact.Artifact
 }
 
-func (b editBinder) Bind(ctx context.Context, p plan.Plan) (precheck.Plan, string, error) {
+func (b editBinder) BuildPrechecks(_ context.Context, p plan.Plan) (precheck.Plan, error) {
 	cd, err := guardrail.ChangeDigest(p.Changes)
 	if err != nil {
-		return precheck.Plan{}, "", err
+		return precheck.Plan{}, err
 	}
 	checks := b.original.Checks
 	checks.ChangeDigest = cd
@@ -104,25 +104,35 @@ func (b editBinder) Bind(ctx context.Context, p plan.Plan) (precheck.Plan, strin
 	}
 	checks.Digest, err = precheck.Digest(checks)
 	if err != nil {
-		return checks, "", err
+		return checks, err
 	}
 	for i := range checks.Assertions {
 		checks.Assertions[i].PlanDigest = checks.Digest
 	}
+	return checks, nil
+}
+func (b editBinder) ValidatePolicy(_ context.Context, _ plan.Plan) error {
+	_, err := b.s.input(b.original)
+	return err
+}
+func (b editBinder) BindGuardrail(_ context.Context, p plan.Plan, checks precheck.Plan) (string, error) {
 	tmp, err := artifact.New(p, checks, b.s.created, b.s.expires, b.s.revision, b.s.environment, b.s.database, "sha256:"+strings.Repeat("0", 64), b.s.approval, map[string]string{})
 	if err != nil {
-		return checks, "", err
+		return "", err
 	}
 	in, err := b.s.input(tmp)
 	if err != nil {
-		return checks, "", err
+		return "", err
 	}
 	bundle, err := b.s.g.BundleDigest(in)
-	return checks, bundle, err
+	return bundle, err
 }
 func (s *productionEditService) Revalidate(ctx context.Context, e planedit.EditedArtifact) (planedit.Eligible, error) {
 	if s.audit == nil {
 		return planedit.Eligible{}, errors.New("durable edit audit required")
+	}
+	if err := s.checkpoint("audit_requested"); err != nil {
+		return planedit.Eligible{}, err
 	}
 	reason := ""
 	if len(e.Provenance) > 0 {
@@ -153,7 +163,13 @@ func (s *productionEditService) revalidateCore(ctx context.Context, e planedit.E
 	if err != nil {
 		return planedit.Eligible{}, err
 	}
+	if err = s.checkpoint("original_verify"); err != nil {
+		return planedit.Eligible{}, err
+	}
 	if err = s.VerifyOriginal(orig); err != nil {
+		return planedit.Eligible{}, err
+	}
+	if err = s.checkpoint("target_inspect_stale"); err != nil {
 		return planedit.Eligible{}, err
 	}
 	from, err := postgres.InspectURL(ctx, s.url, postgres.Options{Schemas: s.schemas})
@@ -167,6 +183,9 @@ func (s *productionEditService) revalidateCore(ctx context.Context, e planedit.E
 	if s.developmentIdentity == "" || s.targetIdentity == "" || s.developmentIdentity == s.targetIdentity {
 		return planedit.Eligible{}, errors.New("isolated development database must be distinct from target")
 	}
+	if err = s.checkpoint("identity_isolation"); err != nil {
+		return planedit.Eligible{}, err
+	}
 	contextRaw := strings.Join([]string{s.targetIdentity, s.developmentIdentity, s.revision, s.environment, s.database, s.editor, fmt.Sprint(s.version), orig.Checks.Digest, orig.GuardrailDigest}, "\x00")
 	contextSum := sha256.Sum256([]byte(contextRaw))
 	contextDigest := "sha256:" + hex.EncodeToString(contextSum[:])
@@ -177,12 +196,16 @@ func (s *productionEditService) revalidateCore(ctx context.Context, e planedit.E
 		chainDigest = e.Provenance[len(e.Provenance)-1].Digest
 		editor = e.Provenance[len(e.Provenance)-1].EditorIdentity
 	}
-	eligible, err := (planedit.Pipeline{Simulator: editSimulator{url: s.developmentURL, id: s.developmentIdentity, productionID: s.targetIdentity, from: from}, Safety: editSafety{version: s.version}, Binder: editBinder{s: s, original: orig}, ContextDigest: contextDigest, Stage: s.stage, Context: planedit.ValidationContext{TargetIdentity: s.targetIdentity, DevelopmentIdentity: s.developmentIdentity, DatabaseVersion: fmt.Sprint(s.version), EditorIdentity: editor, ReasonDigest: reasonDigest, ChainDigest: chainDigest}}).Revalidate(ctx, e)
+	binder := editBinder{s: s, original: orig}
+	eligible, err := (planedit.Pipeline{Simulator: editSimulator{url: s.developmentURL, id: s.developmentIdentity, productionID: s.targetIdentity, from: from}, Safety: editSafety{version: s.version}, Policy: binder, Prechecks: binder, Guardrails: binder, ContextDigest: contextDigest, Stage: s.stage, Context: planedit.ValidationContext{TargetIdentity: s.targetIdentity, DevelopmentIdentity: s.developmentIdentity, DatabaseVersion: fmt.Sprint(s.version), EditorIdentity: editor, ReasonDigest: reasonDigest, ChainDigest: chainDigest}}).Revalidate(ctx, e)
 	return eligible, err
 }
 func (s *productionEditService) Publish(ctx context.Context, e planedit.Eligible) (out artifact.Artifact, err error) {
 	if s.audit == nil {
 		return out, errors.New("durable edit audit required")
+	}
+	if err = s.checkpoint("audit_publish_requested"); err != nil {
+		return out, err
 	}
 	if err = s.audit.AppendDurable(ctx, executor.LifecycleEvent{Type: "edit_publish_requested", ExecutionID: e.Edit.Digest, Target: s.editor, PlanDigest: e.Edit.CandidatePlan.Digest, At: time.Now().UTC()}); err != nil {
 		return out, err
@@ -210,9 +233,15 @@ func (s *productionEditService) Publish(ctx context.Context, e planedit.Eligible
 			return artifact.Artifact{}, errors.New("supplied eligibility attestation mismatch or expiry")
 		}
 	}
+	if err = s.checkpoint("approval_freshness_proof"); err != nil {
+		return out, err
+	}
 	out, err = fresh.FreshArtifact(s.created, s.expires, s.revision, s.environment, s.database, s.approval)
 	if err != nil {
 		return out, err
+	}
+	if err = s.checkpoint("sign"); err != nil {
+		return artifact.Artifact{}, err
 	}
 	if err = out.Sign(s.keyID, s.private); err != nil {
 		return out, err

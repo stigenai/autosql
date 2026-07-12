@@ -199,10 +199,22 @@ type Safety interface {
 type Binder interface {
 	Bind(context.Context, plan.Plan) (precheck.Plan, string, error)
 }
+type PolicyValidator interface {
+	ValidatePolicy(context.Context, plan.Plan) error
+}
+type PrecheckBuilder interface {
+	BuildPrechecks(context.Context, plan.Plan) (precheck.Plan, error)
+}
+type GuardrailBinder interface {
+	BindGuardrail(context.Context, plan.Plan, precheck.Plan) (string, error)
+}
 type Pipeline struct {
 	Simulator     Simulator
 	Safety        Safety
 	Binder        Binder
+	Policy        PolicyValidator
+	Prechecks     PrecheckBuilder
+	Guardrails    GuardrailBinder
 	ContextDigest string
 	Context       ValidationContext
 	Stage         func(string) error
@@ -269,13 +281,30 @@ func (p Pipeline) Revalidate(ctx context.Context, e EditedArtifact) (Eligible, e
 	if err = stage("policy"); err != nil {
 		return out, err
 	}
+	if p.Policy != nil {
+		if err = p.Policy.ValidatePolicy(ctx, rebuilt); err != nil {
+			return out, fmt.Errorf("policy: %w", err)
+		}
+	}
 	if err = stage("precheck"); err != nil {
 		return out, err
+	}
+	var checks precheck.Plan
+	if p.Prechecks != nil {
+		checks, err = p.Prechecks.BuildPrechecks(ctx, rebuilt)
+		if err != nil {
+			return out, fmt.Errorf("precheck: %w", err)
+		}
 	}
 	if err = stage("guardrail"); err != nil {
 		return out, err
 	}
-	checks, bundle, err := p.Binder.Bind(ctx, rebuilt)
+	var bundle string
+	if p.Guardrails != nil {
+		bundle, err = p.Guardrails.BindGuardrail(ctx, rebuilt, checks)
+	} else {
+		checks, bundle, err = p.Binder.Bind(ctx, rebuilt)
+	}
 	if err != nil {
 		return out, fmt.Errorf("policy precheck guardrail: %w", err)
 	}
