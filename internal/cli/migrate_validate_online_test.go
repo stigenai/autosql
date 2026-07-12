@@ -12,7 +12,8 @@ import (
 )
 
 func TestMigrateValidateOnlineJSONAndYAML(t *testing.T) {
-	m, err := zerodowntime.New("add_name", zerodowntime.VersionSchema{Name: "v1", ExposeDuringExpand: true}, zerodowntime.Requirements{MinimumPostgres: 14, LockTimeoutMS: 1000, StatementTimeoutMS: 5000}, []zerodowntime.Operation{{ID: "01", Kind: zerodowntime.AddColumn, Table: "users", Column: "name", DataType: "text"}}, nil)
+	effects, _ := zerodowntime.Effects(zerodowntime.AddColumn)
+	m, err := zerodowntime.New("add_name", zerodowntime.VersionSchema{Name: "v1", ExposeDuringExpand: true}, zerodowntime.Requirements{MinimumPostgres: 14, LockTimeoutMS: 1000, StatementTimeoutMS: 5000}, []zerodowntime.Operation{{ID: "01", Kind: zerodowntime.AddColumn, Table: "users", Column: "name", DataType: "text", Effects: effects, Reversal: zerodowntime.Reversal{Mode: "automatic"}}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

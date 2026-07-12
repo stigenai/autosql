@@ -5,12 +5,15 @@ artifact. `pkg/zerodowntime` validates it entirely offline, before target
 discovery or connection. JSON and YAML are interchangeable authoring formats;
 the canonical JSON content digest is the signing identity in both cases.
 
-Every operation declares its stable ID, object names, transformation, stable
-backfill ordering, and batch size. IDs must be unique and sorted. PostgreSQL
-expressions are parsed and volatile, multi-statement, comment, sequence, sleep,
-large-object, and remote-call constructs are rejected. Unknown fields and
-versions are errors. Errors identify the invalid field or operation but never
-echo source content.
+Every operation signs its stable ID, object names, exact four-phase effects,
+reversal mode, transformation, stable backfill ordering, unique constraint or
+unique-index evidence, and batch size. IDs must be unique and sorted. Backfills
+require a positive batch. PostgreSQL expressions are parsed into an AST and a
+conservative node, immutable-function, and cast-type allowlist is applied;
+subqueries, privileged calls, side effects, volatility, parameters, and extra
+statements are rejected. Unknown or duplicated fields, YAML aliases, anchors,
+custom tags, multiple documents, and trailing content are errors. Errors
+identify the invalid field or operation but never echo source content.
 
 The minimum supported server is PostgreSQL 14. Artifacts may select 14–18 and
 are rejected before execution when the target is older. Version schemas expose
@@ -28,14 +31,24 @@ must still compare the artifact's minimum version with the discovered target.
 | rename column | conditional | compatibility destination | backfill and dual-write | remove source | shadow copy / brief access-exclusive | restore source name |
 | alter column type | conditional | typed shadow column | immutable transform and dual-write | swap and remove source | shadow copy / brief access-exclusive | only for declared lossless transform |
 | set not null | conditional | NOT VALID check | backfill and validate | set constraint | scan, no table rewrite / brief access-exclusive | drop constraint |
-| create index | online | concurrently create | wait until valid | publish | none / share-update-exclusive | concurrently drop |
-| drop index | online | hide from version schema | verify query paths | concurrently drop | none / share-update-exclusive | concurrently recreate |
+| create index | conditional | concurrently create | wait until valid | publish | none / share-update-exclusive | concurrently drop |
+| drop index | conditional | hide from version schema | verify query paths | concurrently drop | none / share-update-exclusive | concurrently recreate |
 | drop column | maintenance-required | hide | stop writes/readers | destructive drop | destructive / access-exclusive | backup only |
 | drop table | maintenance-required | hide | stop writes/readers | destructive drop | destructive / access-exclusive | backup only |
 
 The library exposes this matrix as structured data via `CapabilityMatrix` and
 the exact four-phase effect via `Effects` so CLI and policy code do not need to
-reimplement these decisions.
+reimplement these decisions. Each artifact must carry those effects verbatim,
+making phase intent part of its digest and signature. Concurrent index actions
+must explicitly opt in and are rejected for partitioned indexes and indexes
+backing constraints on PostgreSQL 14–18; those cases need a separately reviewed
+maintenance plan.
+
+Reversal is also signed. Ordinary additive and compatibility operations use
+`automatic`; type transforms require `lossless` plus a separately validated
+reverse expression; destructive table/column removal requires `backup` plus an
+explicit backup reference. These are claims enforced by structure and policy,
+not inferred from a generic operation label.
 
 ## Compatibility and upgrades
 

@@ -51,9 +51,27 @@ type Operation struct {
 	DataType   string        `json:"data_type,omitempty" yaml:"data_type,omitempty"`
 	Index      string        `json:"index,omitempty" yaml:"index,omitempty"`
 	Expression string        `json:"expression,omitempty" yaml:"expression,omitempty"`
-	OrderBy    []string      `json:"order_by,omitempty" yaml:"order_by,omitempty"`
+	Ordering   *Ordering     `json:"ordering,omitempty" yaml:"ordering,omitempty"`
 	BatchSize  int           `json:"batch_size,omitempty" yaml:"batch_size,omitempty"`
 	Unique     bool          `json:"unique,omitempty" yaml:"unique,omitempty"`
+	IndexMode  *IndexMode    `json:"index_mode,omitempty" yaml:"index_mode,omitempty"`
+	Effects    PhaseEffect   `json:"effects" yaml:"effects"`
+	Reversal   Reversal      `json:"reversal" yaml:"reversal"`
+}
+
+type Ordering struct {
+	Columns        []string `json:"columns" yaml:"columns"`
+	UniqueEvidence string   `json:"unique_evidence" yaml:"unique_evidence"`
+}
+type IndexMode struct {
+	Concurrent      bool `json:"concurrent" yaml:"concurrent"`
+	Partitioned     bool `json:"partitioned" yaml:"partitioned"`
+	BacksConstraint bool `json:"backs_constraint" yaml:"backs_constraint"`
+}
+type Reversal struct {
+	Mode            string `json:"mode" yaml:"mode"`
+	Expression      string `json:"expression,omitempty" yaml:"expression,omitempty"`
+	BackupReference string `json:"backup_reference,omitempty" yaml:"backup_reference,omitempty"`
 }
 
 type VersionSchema struct {
@@ -84,7 +102,12 @@ type Signature struct {
 	Algorithm string `json:"algorithm" yaml:"algorithm"`
 	Value     string `json:"value" yaml:"value"`
 }
-type PhaseEffect struct{ Expand, Synchronize, Contract, Reverse string }
+type PhaseEffect struct {
+	Expand      string `json:"expand" yaml:"expand"`
+	Synchronize string `json:"synchronize" yaml:"synchronize"`
+	Contract    string `json:"contract" yaml:"contract"`
+	Reverse     string `json:"reverse" yaml:"reverse"`
+}
 type Availability string
 
 const (
@@ -94,18 +117,19 @@ const (
 )
 
 type Capability struct {
-	Operation    OperationKind
-	Postgres     int
-	Availability Availability
-	Lock         string
-	Rewrite      string
-	Reversible   bool
-	Notes        string
+	Operation    OperationKind `json:"operation"`
+	Postgres     int           `json:"postgres"`
+	Availability Availability  `json:"availability"`
+	Lock         string        `json:"lock"`
+	Rewrite      string        `json:"rewrite"`
+	Reversible   bool          `json:"reversible"`
+	Notes        string        `json:"notes"`
 }
 
 var identifier = regexp.MustCompile(`^[a-z_][a-z0-9_]*$`)
 var dataType = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_ ]*(?:\([0-9]+(?:,[0-9]+)?\))?$`)
-var unsafeExpression = regexp.MustCompile(`(?i)(;|--|/\*|\b(random|clock_timestamp|statement_timestamp|transaction_timestamp|timeofday|nextval|setval|pg_sleep|dblink|lo_import|lo_export)\s*\()`)
+var functionCall = regexp.MustCompile(`(?i)\b([a-z_][a-z0-9_]*)\s*\(`)
+var castOperator = regexp.MustCompile(`(?i)::\s*([a-z_][a-z0-9_]*)`)
 
 func New(name string, schema VersionSchema, req Requirements, ops []Operation, metadata map[string]string) (Migration, error) {
 	m := Migration{Version: Version, Name: name, VersionSchema: schema, Requirements: req, Operations: append([]Operation(nil), ops...), Metadata: clone(metadata)}
@@ -185,58 +209,199 @@ func validateOperation(op Operation, pg int) error {
 	if !identifier.MatchString(op.Table) || op.Column != "" && !identifier.MatchString(op.Column) || op.NewName != "" && !identifier.MatchString(op.NewName) || op.Index != "" && !identifier.MatchString(op.Index) {
 		return errors.New("object names must be safe identifiers")
 	}
-	cap, ok := capability(op.Kind, pg)
+	_, ok := capability(op.Kind, pg)
 	if !ok {
 		return errors.New("unsupported operation or PostgreSQL version")
 	}
-	_ = cap
+	expected, _ := Effects(op.Kind)
+	if op.Effects != expected {
+		return errors.New("signed phase effects do not match operation capability")
+	}
+	if err := validateReversal(op); err != nil {
+		return err
+	}
 	switch op.Kind {
-	case AddTable, DropTable:
-		if op.Column != "" || op.Expression != "" {
+	case AddTable:
+		if hasColumnFields(op) || op.Index != "" || op.Ordering != nil || op.BatchSize != 0 || op.Unique || op.IndexMode != nil {
 			return errors.New("table operation has incompatible fields")
 		}
-	case AddColumn, AlterColumnType:
+	case DropTable:
+		if hasColumnFields(op) || op.Index != "" || op.Ordering != nil || op.BatchSize != 0 || op.Unique || op.IndexMode != nil {
+			return errors.New("table operation has incompatible fields")
+		}
+	case AddColumn:
 		if op.Column == "" || !dataType.MatchString(op.DataType) {
 			return errors.New("column and safe data_type are required")
+		}
+		if op.NewName != "" || op.Index != "" || op.Unique || op.IndexMode != nil {
+			return errors.New("add_column has incompatible fields")
+		}
+		if op.Expression != "" {
+			if err := validateBackfill(op); err != nil {
+				return err
+			}
+		} else if op.Ordering != nil || op.BatchSize != 0 {
+			return errors.New("ordering and batch_size require an expression")
+		}
+	case AlterColumnType:
+		if op.Column == "" || !dataType.MatchString(op.DataType) || op.Expression == "" {
+			return errors.New("column, safe data_type, and transform expression are required")
+		}
+		if op.NewName != "" || op.Index != "" || op.Unique || op.IndexMode != nil {
+			return errors.New("alter_column_type has incompatible fields")
+		}
+		if err := validateBackfill(op); err != nil {
+			return err
 		}
 	case RenameColumn:
 		if op.Column == "" || op.NewName == "" {
 			return errors.New("column and new_name are required")
 		}
+		if op.DataType != "" || op.Index != "" || op.Expression != "" || op.Ordering != nil || op.BatchSize != 0 || op.Unique || op.IndexMode != nil {
+			return errors.New("rename_column has incompatible fields")
+		}
 	case SetNotNull, DropColumn:
 		if op.Column == "" {
 			return errors.New("column is required")
+		}
+		if op.NewName != "" || op.DataType != "" || op.Index != "" || op.Expression != "" || op.Ordering != nil || op.BatchSize != 0 || op.Unique || op.IndexMode != nil {
+			return errors.New("column operation has incompatible fields")
 		}
 	case CreateIndex:
 		if op.Index == "" || op.Expression == "" {
 			return errors.New("index and expression are required")
 		}
+		if op.Column != "" || op.NewName != "" || op.DataType != "" || op.Ordering != nil || op.BatchSize != 0 {
+			return errors.New("create_index has incompatible fields")
+		}
+		if op.IndexMode == nil || !op.IndexMode.Concurrent {
+			return errors.New("create_index requires explicit concurrent index mode")
+		}
+		if op.IndexMode.Partitioned || op.IndexMode.BacksConstraint {
+			return errors.New("concurrent index operation does not support partitioned indexes or constraint backing")
+		}
 	case DropIndex:
 		if op.Index == "" {
 			return errors.New("index is required")
+		}
+		if op.Column != "" || op.NewName != "" || op.DataType != "" || op.Expression != "" || op.Ordering != nil || op.BatchSize != 0 || op.Unique {
+			return errors.New("drop_index has incompatible fields")
+		}
+		if op.IndexMode == nil || !op.IndexMode.Concurrent {
+			return errors.New("drop_index requires explicit concurrent index mode")
+		}
+		if op.IndexMode.Partitioned || op.IndexMode.BacksConstraint {
+			return errors.New("concurrent index operation does not support partitioned indexes or constraint backing")
 		}
 	default:
 		return errors.New("unsupported operation")
 	}
 	if op.Expression != "" {
-		if unsafeExpression.MatchString(op.Expression) {
-			return errors.New("expression contains volatile or injection-prone construct")
-		}
-		if _, err := pg_query.Parse("SELECT " + op.Expression); err != nil {
-			return errors.New("expression is not valid PostgreSQL syntax")
+		if err := validateExpression(op.Expression); err != nil {
+			return err
 		}
 	}
-	if len(op.OrderBy) > 0 {
-		seen := map[string]bool{}
-		for _, v := range op.OrderBy {
-			if !identifier.MatchString(v) || seen[v] {
-				return errors.New("order_by must contain unique safe identifiers")
+	if op.Reversal.Expression != "" {
+		if err := validateExpression(op.Reversal.Expression); err != nil {
+			return fmt.Errorf("reverse expression: %w", err)
+		}
+	}
+	return nil
+}
+
+func hasColumnFields(op Operation) bool {
+	return op.Column != "" || op.NewName != "" || op.DataType != "" || op.Expression != ""
+}
+func validateBackfill(op Operation) error {
+	if op.Ordering == nil || len(op.Ordering.Columns) == 0 || op.Ordering.UniqueEvidence == "" {
+		return errors.New("backfill requires deterministic unique ordering evidence")
+	}
+	if op.BatchSize <= 0 {
+		return errors.New("backfill requires a positive batch_size")
+	}
+	seen := map[string]bool{}
+	for _, v := range op.Ordering.Columns {
+		if !identifier.MatchString(v) || seen[v] {
+			return errors.New("ordering columns must be unique safe identifiers")
+		}
+		seen[v] = true
+	}
+	if !strings.HasPrefix(op.Ordering.UniqueEvidence, "constraint:") && !strings.HasPrefix(op.Ordering.UniqueEvidence, "index:") {
+		return errors.New("unique_evidence must reference a constraint or unique index")
+	}
+	_, evidence, _ := strings.Cut(op.Ordering.UniqueEvidence, ":")
+	if !identifier.MatchString(evidence) {
+		return errors.New("unique_evidence must name a safe catalog object")
+	}
+	return nil
+}
+func validateReversal(op Operation) error {
+	switch op.Kind {
+	case DropColumn, DropTable:
+		if op.Reversal.Mode != "backup" || op.Reversal.BackupReference == "" || op.Reversal.Expression != "" {
+			return errors.New("destructive operation requires backup reversal with reference")
+		}
+	case AlterColumnType:
+		if op.Reversal.Mode != "lossless" || op.Reversal.Expression == "" || op.Reversal.BackupReference != "" {
+			return errors.New("alter_column_type requires explicit lossless reverse expression")
+		}
+	default:
+		if op.Reversal.Mode != "automatic" || op.Reversal.Expression != "" || op.Reversal.BackupReference != "" {
+			return errors.New("operation requires automatic reversal without extra fields")
+		}
+	}
+	return nil
+}
+
+var allowedNodes = map[string]bool{"SelectStmt": true, "ResTarget": true, "ColumnRef": true, "String": true, "A_Const": true, "Integer": true, "Float": true, "Boolean": true, "CoalesceExpr": true, "FuncCall": true, "TypeCast": true, "TypeName": true, "A_Expr": true, "BoolExpr": true, "NullTest": true, "CaseExpr": true, "CaseWhen": true}
+var allowedFunctions = map[string]bool{"coalesce": true, "lower": true, "upper": true, "trim": true, "btrim": true, "ltrim": true, "rtrim": true, "abs": true, "round": true, "length": true, "substring": true}
+var allowedCastTypes = map[string]bool{"text": true, "int2": true, "int4": true, "int8": true, "numeric": true, "bool": true, "date": true, "timestamp": true, "timestamptz": true, "uuid": true}
+
+func validateExpression(expression string) error {
+	parsed, err := pg_query.Parse("SELECT " + expression)
+	if err != nil || len(parsed.Stmts) != 1 {
+		return errors.New("expression is not a single valid PostgreSQL expression")
+	}
+	raw, err := pg_query.ParseToJSON("SELECT " + expression)
+	if err != nil {
+		return errors.New("expression AST unavailable")
+	}
+	var tree any
+	if json.Unmarshal([]byte(raw), &tree) != nil {
+		return errors.New("expression AST invalid")
+	}
+	if err := walkAST(tree); err != nil {
+		return err
+	}
+	for _, m := range functionCall.FindAllStringSubmatch(expression, -1) {
+		if !allowedFunctions[strings.ToLower(m[1])] {
+			return errors.New("expression function is not in immutable allowlist")
+		}
+	}
+	for _, m := range castOperator.FindAllStringSubmatch(expression, -1) {
+		if !allowedCastTypes[strings.ToLower(m[1])] {
+			return errors.New("expression cast type is not approved")
+		}
+	}
+	return nil
+}
+func walkAST(v any) error {
+	switch x := v.(type) {
+	case map[string]any:
+		for k, v := range x {
+			if len(k) > 0 && k[0] >= 'A' && k[0] <= 'Z' && !allowedNodes[k] {
+				return errors.New("expression contains an unapproved AST node")
 			}
-			seen[v] = true
+			if err := walkAST(v); err != nil {
+				return err
+			}
 		}
-	}
-	if op.BatchSize < 0 {
-		return errors.New("batch_size cannot be negative")
+	case []any:
+		for _, v := range x {
+			if err := walkAST(v); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -274,9 +439,9 @@ func capability(kind OperationKind, pg int) (Capability, bool) {
 	case SetNotNull:
 		c.Availability, c.Notes = Conditional, "NOT VALID check avoids validation lock; final lock is bounded"
 	case CreateIndex:
-		c.Availability, c.Lock, c.Notes = Online, "SHARE UPDATE EXCLUSIVE", "uses CONCURRENTLY outside a transaction"
+		c.Availability, c.Lock, c.Notes = Conditional, "SHARE UPDATE EXCLUSIVE", "CONCURRENTLY outside a transaction; excludes partitioned and constraint-backing indexes"
 	case DropIndex:
-		c.Availability, c.Lock, c.Notes = Online, "SHARE UPDATE EXCLUSIVE", "uses CONCURRENTLY outside a transaction"
+		c.Availability, c.Lock, c.Notes = Conditional, "SHARE UPDATE EXCLUSIVE", "CONCURRENTLY outside a transaction; excludes partitioned and constraint-backing indexes"
 	case DropColumn, DropTable:
 		c.Availability, c.Reversible, c.Notes = MaintenanceRequired, false, "destructive contract requires explicit maintenance approval and backup"
 	default:
@@ -312,6 +477,9 @@ func (m Migration) MarshalYAMLCanonical() ([]byte, error) {
 }
 
 func ParseJSON(data []byte) (Migration, error) {
+	if err := rejectDuplicateJSON(data); err != nil {
+		return Migration{}, err
+	}
 	var m Migration
 	d := json.NewDecoder(bytes.NewReader(data))
 	d.DisallowUnknownFields()
@@ -324,6 +492,9 @@ func ParseJSON(data []byte) (Migration, error) {
 	return m, m.Validate()
 }
 func ParseYAML(data []byte) (Migration, error) {
+	if err := validateYAMLNode(data); err != nil {
+		return Migration{}, err
+	}
 	var m Migration
 	d := yaml.NewDecoder(bytes.NewReader(data))
 	d.KnownFields(true)
@@ -347,7 +518,7 @@ func (m *Migration) Sign(keyID string, key ed25519.PrivateKey) error {
 		return err
 	}
 	m.Digest = d
-	m.Signature.Value = base64.RawStdEncoding.EncodeToString(ed25519.Sign(key, []byte(signatureDomain+d)))
+	m.Signature.Value = base64.RawStdEncoding.EncodeToString(ed25519.Sign(key, signaturePayload(*m.Signature, d)))
 	return m.Validate()
 }
 func (m Migration) Verify(key ed25519.PublicKey) error {
@@ -358,7 +529,7 @@ func (m Migration) Verify(key ed25519.PublicKey) error {
 		return invalid("signature is required")
 	}
 	sig, err := base64.RawStdEncoding.Strict().DecodeString(m.Signature.Value)
-	if err != nil || !ed25519.Verify(key, []byte(signatureDomain+m.Digest), sig) {
+	if err != nil || !ed25519.Verify(key, signaturePayload(*m.Signature, m.Digest), sig) {
 		return invalid("signature verification failed")
 	}
 	return nil
@@ -373,11 +544,17 @@ type legacyMigration struct {
 }
 
 func UpgradeLegacyJSON(data []byte) (Migration, error) {
+	if err := rejectDuplicateJSON(data); err != nil {
+		return Migration{}, err
+	}
 	var old legacyMigration
 	d := json.NewDecoder(bytes.NewReader(data))
 	d.DisallowUnknownFields()
 	if err := d.Decode(&old); err != nil {
 		return Migration{}, invalid("malformed legacy JSON")
+	}
+	if err := ensureEOF(d); err != nil {
+		return Migration{}, err
 	}
 	if old.Version != LegacyVersion {
 		return Migration{}, invalid("not a supported legacy artifact")
@@ -386,7 +563,114 @@ func UpgradeLegacyJSON(data []byte) (Migration, error) {
 	if err != nil {
 		return Migration{}, invalid("legacy minimum_postgres is invalid")
 	}
+	for i := range old.Operations {
+		e, ok := Effects(old.Operations[i].Kind)
+		if !ok {
+			return Migration{}, invalid("legacy operation unsupported")
+		}
+		old.Operations[i].Effects = e
+		switch old.Operations[i].Kind {
+		case AlterColumnType, DropColumn, DropTable, CreateIndex, DropIndex:
+			return Migration{}, invalid("legacy operation requires explicit v1 semantics and cannot be silently upgraded")
+		default:
+			old.Operations[i].Reversal = Reversal{Mode: "automatic"}
+		}
+	}
 	return New(old.Name, VersionSchema{Name: old.Schema, ExposeDuringExpand: true}, Requirements{MinimumPostgres: pg, LockTimeoutMS: 5000, StatementTimeoutMS: 300000}, old.Operations, map[string]string{"upgraded_from": LegacyVersion})
+}
+
+func signaturePayload(s Signature, digest string) []byte {
+	return []byte(signatureDomain + s.Algorithm + "\x00" + s.KeyID + "\x00" + digest)
+}
+
+func rejectDuplicateJSON(data []byte) error {
+	d := json.NewDecoder(bytes.NewReader(data))
+	var walk func() error
+	walk = func() error {
+		tok, err := d.Token()
+		if err != nil {
+			return invalid("malformed JSON")
+		}
+		switch v := tok.(type) {
+		case json.Delim:
+			switch v {
+			case '{':
+				seen := map[string]bool{}
+				for d.More() {
+					k, err := d.Token()
+					if err != nil {
+						return invalid("malformed JSON")
+					}
+					key, ok := k.(string)
+					if !ok || seen[key] {
+						return invalid("duplicate JSON object key")
+					}
+					seen[key] = true
+					if err := walk(); err != nil {
+						return err
+					}
+				}
+				_, err = d.Token()
+				return err
+			case '[':
+				for d.More() {
+					if err := walk(); err != nil {
+						return err
+					}
+				}
+				_, err = d.Token()
+				return err
+			}
+		}
+		return nil
+	}
+	if err := walk(); err != nil {
+		return err
+	}
+	if _, err := d.Token(); err != io.EOF {
+		return invalid("trailing JSON content")
+	}
+	return nil
+}
+func validateYAMLNode(data []byte) error {
+	var root yaml.Node
+	d := yaml.NewDecoder(bytes.NewReader(data))
+	if err := d.Decode(&root); err != nil {
+		return invalid("malformed YAML")
+	}
+	var walk func(*yaml.Node) error
+	walk = func(n *yaml.Node) error {
+		if n.Kind == yaml.AliasNode || n.Anchor != "" {
+			return invalid("YAML aliases and anchors are forbidden")
+		}
+		if n.Tag != "" && n.Tag != "!!map" && n.Tag != "!!seq" && n.Tag != "!!str" && n.Tag != "!!int" && n.Tag != "!!bool" && n.Tag != "!!null" {
+			return invalid("custom YAML tags are forbidden")
+		}
+		if n.Kind == yaml.MappingNode {
+			seen := map[string]bool{}
+			for i := 0; i < len(n.Content); i += 2 {
+				k := n.Content[i]
+				if k.Kind != yaml.ScalarNode || seen[k.Value] {
+					return invalid("duplicate or non-scalar YAML key")
+				}
+				seen[k.Value] = true
+			}
+		}
+		for _, c := range n.Content {
+			if err := walk(c); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := walk(&root); err != nil {
+		return err
+	}
+	var extra any
+	if err := d.Decode(&extra); err != io.EOF {
+		return invalid("multiple YAML documents")
+	}
+	return nil
 }
 
 func digest(m Migration) (string, error) {

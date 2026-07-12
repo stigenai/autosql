@@ -12,14 +12,16 @@ import (
 func valid(t *testing.T) Migration {
 	t.Helper()
 	m, err := New("add_accounts", VersionSchema{Name: "v_accounts", ExposeDuringExpand: true}, Requirements{MinimumPostgres: 14, LockTimeoutMS: 1000, StatementTimeoutMS: 60000}, []Operation{
-		{ID: "01", Kind: AddColumn, Table: "accounts", Column: "display_name", DataType: "text", Expression: "coalesce(name, 'unknown')", OrderBy: []string{"id"}, BatchSize: 500},
-		{ID: "02", Kind: CreateIndex, Table: "accounts", Index: "accounts_display_name_idx", Expression: "display_name"},
+		{ID: "01", Kind: AddColumn, Table: "accounts", Column: "display_name", DataType: "text", Expression: "coalesce(name, 'unknown')", Ordering: &Ordering{Columns: []string{"id"}, UniqueEvidence: "constraint:accounts_pkey"}, BatchSize: 500, Effects: mustEffects(AddColumn), Reversal: Reversal{Mode: "automatic"}},
+		{ID: "02", Kind: CreateIndex, Table: "accounts", Index: "accounts_display_name_idx", Expression: "display_name", IndexMode: &IndexMode{Concurrent: true}, Effects: mustEffects(CreateIndex), Reversal: Reversal{Mode: "automatic"}},
 	}, map[string]string{"owner": "database"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return m
 }
+
+func mustEffects(kind OperationKind) PhaseEffect { e, _ := Effects(kind); return e }
 
 func TestJSONYAMLRoundTripsAreDeterministic(t *testing.T) {
 	m := valid(t)
@@ -62,9 +64,16 @@ func TestSignedArtifactDetectsEverySemanticTamper(t *testing.T) {
 		t.Fatal(err)
 	}
 	tests := []func(*Migration){
+		func(x *Migration) { x.Version = "other" },
 		func(x *Migration) { x.Name = "other" }, func(x *Migration) { x.Requirements.MinimumPostgres = 15 },
 		func(x *Migration) { x.Operations[0].Expression = "lower(name)" }, func(x *Migration) { x.VersionSchema.Name = "other" },
 		func(x *Migration) { x.Metadata["owner"] = "attacker" },
+		func(x *Migration) { x.Operations[0].Effects.Expand = "evil" },
+		func(x *Migration) { x.Operations[0].Reversal.Mode = "backup" },
+		func(x *Migration) { x.Signature.KeyID = "other" },
+		func(x *Migration) { x.Signature.Algorithm = "RSA" },
+		func(x *Migration) { x.Signature.Value = "AAAA" },
+		func(x *Migration) { x.Digest = "sha256:" + strings.Repeat("0", 64) },
 	}
 	for i, mutate := range tests {
 		x := m
@@ -81,6 +90,52 @@ func TestSignedArtifactDetectsEverySemanticTamper(t *testing.T) {
 	}
 }
 
+func TestExpressionASTAllowlistRejectsAdversarialForms(t *testing.T) {
+	bad := []string{"pg_read_file('/etc/passwd')", "pg_notify('x','y')", "set_config('x','y',false)", "gen_random_uuid()", "nextval('s')", "(SELECT secret FROM users)", "current_user", "name::regclass", "name; SELECT 1", "$1"}
+	for _, expression := range bad {
+		t.Run(expression, func(t *testing.T) {
+			m := valid(t)
+			m.Operations[0].Expression = expression
+			d, _ := digest(m)
+			m.Digest = d
+			if err := m.Validate(); err == nil {
+				t.Fatal("adversarial expression accepted")
+			}
+		})
+	}
+	good := []string{"lower(name)", "coalesce(name, 'unknown')", "id::text", "CASE WHEN name IS NULL THEN 'x' ELSE name END"}
+	for _, expression := range good {
+		if err := validateExpression(expression); err != nil {
+			t.Errorf("safe expression %q: %v", expression, err)
+		}
+	}
+}
+
+func TestBackfillReversalAndIndexContracts(t *testing.T) {
+	mutations := []func(*Migration){
+		func(m *Migration) { m.Operations[0].Ordering = nil }, func(m *Migration) { m.Operations[0].Ordering.UniqueEvidence = "" }, func(m *Migration) { m.Operations[0].Ordering.UniqueEvidence = "claimed:true" }, func(m *Migration) { m.Operations[0].BatchSize = 0 },
+		func(m *Migration) { m.Operations[1].IndexMode.Concurrent = false }, func(m *Migration) { m.Operations[1].IndexMode.Partitioned = true }, func(m *Migration) { m.Operations[1].IndexMode.BacksConstraint = true }, func(m *Migration) { m.Operations[1].Column = "illegal" },
+	}
+	for i, mutate := range mutations {
+		m := valid(t)
+		mutate(&m)
+		d, _ := digest(m)
+		m.Digest = d
+		if err := m.Validate(); err == nil {
+			t.Fatalf("invalid contract %d accepted", i)
+		}
+	}
+	e := mustEffects(AlterColumnType)
+	op := Operation{ID: "01", Kind: AlterColumnType, Table: "items", Column: "amount", DataType: "numeric", Expression: "amount::numeric", Ordering: &Ordering{Columns: []string{"id"}, UniqueEvidence: "constraint:items_pkey"}, BatchSize: 100, Effects: e, Reversal: Reversal{Mode: "lossless", Expression: "amount::int8"}}
+	if _, err := New("alter_items", VersionSchema{Name: "v_items"}, Requirements{MinimumPostgres: 14, LockTimeoutMS: 1, StatementTimeoutMS: 2}, []Operation{op}, nil); err != nil {
+		t.Fatal(err)
+	}
+	op.Reversal.Expression = ""
+	if _, err := New("alter_items", VersionSchema{Name: "v_items"}, Requirements{MinimumPostgres: 14, LockTimeoutMS: 1, StatementTimeoutMS: 2}, []Operation{op}, nil); err == nil {
+		t.Fatal("missing reverse transform accepted")
+	}
+}
+
 func TestOfflineValidationRejectsUnsafeAndUnstableInputs(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -93,7 +148,7 @@ func TestOfflineValidationRejectsUnsafeAndUnstableInputs(t *testing.T) {
 		{"unstable", func(m *Migration) { m.Operations[0], m.Operations[1] = m.Operations[1], m.Operations[0] }},
 		{"old postgres", func(m *Migration) { m.Requirements.MinimumPostgres = 13 }},
 		{"unsafe object", func(m *Migration) { m.Operations[0].Table = "accounts;drop" }},
-		{"duplicate order", func(m *Migration) { m.Operations[0].OrderBy = []string{"id", "id"} }},
+		{"duplicate order", func(m *Migration) { m.Operations[0].Ordering.Columns = []string{"id", "id"} }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -129,6 +184,29 @@ func TestStrictDecodersAndRedactedErrors(t *testing.T) {
 	_, err = ParseYAML(y)
 	if err == nil || strings.Contains(err.Error(), "super-secret") {
 		t.Fatalf("unsafe YAML error: %v", err)
+	}
+}
+
+func TestStrictInputRejectsDuplicatesAliasesTagsAndTrailingDocuments(t *testing.T) {
+	m := valid(t)
+	b, _ := m.MarshalJSONCanonical()
+	duplicate := bytes.Replace(b, []byte(`"name":"add_accounts"`), []byte(`"name":"add_accounts","name":"other"`), 1)
+	if _, err := ParseJSON(duplicate); err == nil {
+		t.Fatal("duplicate JSON key accepted")
+	}
+	if _, err := ParseJSON(append(b, []byte(` {}`)...)); err == nil {
+		t.Fatal("trailing JSON accepted")
+	}
+	y, _ := m.MarshalYAMLCanonical()
+	cases := [][]byte{append([]byte(nil), append(y, []byte("name: duplicate\n")...)...), []byte("version: &v autosql.zero-downtime/v1\nname: *v\n"), []byte("version: !evil autosql.zero-downtime/v1\n"), append(append([]byte(nil), y...), []byte("---\n{}\n")...)}
+	for i, input := range cases {
+		if _, err := ParseYAML(input); err == nil {
+			t.Fatalf("unsafe YAML %d accepted", i)
+		}
+	}
+	legacy := `{"version":"autosql.zero-downtime/v0","version":"autosql.zero-downtime/v0"}`
+	if _, err := UpgradeLegacyJSON([]byte(legacy)); err == nil {
+		t.Fatal("legacy duplicate accepted")
 	}
 }
 
