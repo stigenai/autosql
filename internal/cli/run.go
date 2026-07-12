@@ -69,6 +69,12 @@ func RunWithServices(ctx context.Context, args []string, streams Streams, servic
 		}
 	case len(args) >= 2 && args[0] == "migrate" && args[1] == "checkpoint":
 		err = runMigrateCheckpoint(ctx, args[2:], o)
+	case len(args) >= 2 && args[0] == "migrate" && args[1] == "metadata-init":
+		err = runMetadataInit(ctx, args[2:], o, redactor)
+	case len(args) >= 2 && args[0] == "migrate" && args[1] == "metadata-status":
+		err = runMetadataStatus(ctx, args[2:], o, redactor)
+	case len(args) >= 2 && args[0] == "migrate" && args[1] == "metadata-baseline":
+		err = runMetadataBaseline(ctx, args[2:], o, redactor)
 	case len(args) >= 2 && args[0] == "migrate" && args[1] == "validate-online":
 		err = runMigrateValidateOnline(args[2:], o)
 	case len(args) >= 2 && args[0] == "schema" && args[1] == "load":
@@ -316,7 +322,7 @@ func usageError(err error) *Error {
 	return &Error{Kind: "usage", Message: err.Error(), Code: ExitUsage, Cause: err}
 }
 func usage() string {
-	return "usage: autosql <command>\n\ncommands:\n  version [--json]\n  config validate [--config path] [--env name] [--preflight] [--json]\n  migrate generate --dir path --from source --to source --version semver --label name [--rename-hints value] [--json]\n  migrate checkpoint create|verify --dir path [--json]\n  migrate validate-online --file path --format json|yaml [--json]\n  migrate status [--config path --env name | --url env://NAME --migration-dir path] [--revision-schema name] [--json]\n  migrate apply|baseline [--config path | --url env://NAME --migration-dir path] [--from version] [--to version] [--count n] [--dry-run] [--json]\n  migrate down --to version [--dry-run] [--json]\n  migrate diagnose --url env://NAME --migration-dir path [--json]\n  migrate repair mark|remove|reconcile --url env://NAME --proposal file --operator-public-key env://NAME --audit path [--json]\n  schema load --source sql:path|json:path [--source ...] [--json]\n  schema inspect --url env://NAME|file://path [--format native|sql|json]\n  schema diff --from source --to source [--max-changes n] [--json]\n  plan --from source --to source [--max-changes n] [--json]\n  plan edit --artifact file --sql file --editor id --reason text --output file\n  plan review --artifact file [--json]\n  plan revalidate --draft file --output file [--json]\n  plan publish --attested file --output file [--json]\n  apply --from source --to source [--dry-run|--approve-digest digest|--artifact path] [--no-edits] [--json]"
+	return "usage: autosql <command>\n\ncommands:\n  version [--json]\n  config validate [--config path] [--env name] [--preflight] [--json]\n  migrate generate --dir path --from source --to source --version semver --label name [--rename-hints value] [--json]\n  migrate checkpoint create|verify --dir path [--json]\n  migrate validate-online --file path --format json|yaml [--json]\n  migrate metadata-init|metadata-status --url env://NAME [--metadata-schema name] [--json]\n  migrate metadata-baseline --url env://NAME --id id --target id --env name --operator id --schema name [--json]\n  migrate status [--config path --env name | --url env://NAME --migration-dir path] [--revision-schema name] [--json]\n  migrate apply|baseline [--config path | --url env://NAME --migration-dir path] [--from version] [--to version] [--count n] [--dry-run] [--json]\n  migrate down --to version [--dry-run] [--json]\n  migrate diagnose --url env://NAME --migration-dir path [--json]\n  migrate repair mark|remove|reconcile --url env://NAME --proposal file --operator-public-key env://NAME --audit path [--json]\n  schema load --source sql:path|json:path [--source ...] [--json]\n  schema inspect --url env://NAME|file://path [--format native|sql|json]\n  schema diff --from source --to source [--max-changes n] [--json]\n  plan --from source --to source [--max-changes n] [--json]\n  plan edit --artifact file --sql file --editor id --reason text --output file\n  plan review --artifact file [--json]\n  plan revalidate --draft file --output file [--json]\n  plan publish --attested file --output file [--json]\n  apply --from source --to source [--dry-run|--approve-digest digest|--artifact path] [--no-edits] [--json]"
 }
 func contains(args []string, want string) bool {
 	for _, a := range args {
@@ -333,6 +339,9 @@ func commandName(args []string) string {
 	}
 	if len(args) >= 2 && args[0] == "config" && args[1] == "validate" {
 		return "config validate"
+	}
+	if len(args) >= 2 && args[0] == "migrate" {
+		return "migrate " + args[1]
 	}
 	if len(args) >= 2 && args[0] == "schema" && args[1] == "load" {
 		return "schema load"
