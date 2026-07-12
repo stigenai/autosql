@@ -99,6 +99,9 @@ func (e *PostgreSQL) ApplyAuthorized(ctx context.Context, checks precheck.Plan) 
 		if err == nil {
 			err = ErrBusy
 		}
+		if auditErr := e.audit(ctx, "contended", "", ""); auditErr != nil {
+			return nil, errors.New("durable lifecycle audit failed")
+		}
 		return nil, err
 	}
 	defer conn.Exec(context.WithoutCancel(ctx), `select pg_advisory_unlock(hashtextextended($1, 0))`, identity)
@@ -107,6 +110,9 @@ func (e *PostgreSQL) ApplyAuthorized(ctx context.Context, checks precheck.Plan) 
 	}
 	if e.config.Reauthorize != nil {
 		if err := e.config.Reauthorize(ctx, e.artifact); err != nil {
+			if auditErr := e.audit(ctx, "authorization_refused", "", ""); auditErr != nil {
+				return nil, errors.New("durable lifecycle audit failed")
+			}
 			return nil, ErrExpired
 		}
 	}
@@ -114,6 +120,9 @@ func (e *PostgreSQL) ApplyAuthorized(ctx context.Context, checks precheck.Plan) 
 	// Time and live state are intentionally checked only after the session lock.
 	now := e.config.Now().UTC()
 	if now.Before(e.artifact.CreatedAt) || !now.Before(e.artifact.ExpiresAt) {
+		if auditErr := e.audit(ctx, "expiry_refused", "", ""); auditErr != nil {
+			return nil, errors.New("durable lifecycle audit failed")
+		}
 		return nil, ErrExpired
 	}
 	state, err := e.config.State(ctx, conn)
@@ -134,6 +143,11 @@ func (e *PostgreSQL) ApplyAuthorized(ctx context.Context, checks precheck.Plan) 
 		return nil, err
 	}
 	if err = refuseUncertain(ctx, conn, e.artifact.Digest); err != nil {
+		if errors.Is(err, ErrReconcile) {
+			if auditErr := e.audit(ctx, "reconcile_refused", "", "reconcile pending execution before retry"); auditErr != nil {
+				return nil, errors.New("durable lifecycle audit failed")
+			}
+		}
 		return nil, err
 	}
 	confirmed, err := confirmedSteps(ctx, conn, e.artifact)
@@ -369,8 +383,14 @@ func (e *PostgreSQL) nontransactionalPhase(ctx context.Context, conn *pgx.Conn, 
 		}
 		tag, err := conn.Exec(ctx, `update autosql_migration_history set state='confirmed', confirmed_at=clock_timestamp(), last_confirmed_step=$4, recovery_guidance='' where artifact_digest=$1 and step_id=$2 and attempt=$3 and state='intended' and step_hash=$5 and phase_id=$6 and phase_mode=$7 and execution_id=$1 and target_identity=$8 and plan_digest=$9 and bundle_digest=$10`, e.artifact.Digest, step.ID, 1, step.ID, stepHash(step), phase.ID, phase.Transaction, e.artifact.DatabaseIdentity+"/"+e.artifact.TargetEnvironment, e.artifact.Plan.Digest, e.artifact.GuardrailDigest)
 		if err != nil || tag.RowsAffected() != 1 {
-			e.result.Partial = true
-			return ErrPartial
+			e.result.Uncertain = true
+			e.result.PendingStep = step.ID
+			e.result.ExecutionID = e.artifact.Digest
+			e.result.RecoveryGuidance = "reconcile confirmation persistence before retry"
+			if auditErr := e.audit(ctx, "uncertain", step.ID, e.result.RecoveryGuidance); auditErr != nil {
+				return errors.Join(ErrReconcile, errors.New("durable lifecycle audit failed"))
+			}
+			return ErrReconcile
 		}
 		var state, hash string
 		if err := conn.QueryRow(ctx, `select state,step_hash from autosql_migration_history where artifact_digest=$1 and step_id=$2 and attempt=1`, e.artifact.Digest, step.ID).Scan(&state, &hash); err != nil || state != "confirmed" || hash != stepHash(step) {
@@ -378,6 +398,9 @@ func (e *PostgreSQL) nontransactionalPhase(ctx context.Context, conn *pgx.Conn, 
 			e.result.PendingStep = step.ID
 			e.result.ExecutionID = e.artifact.Digest
 			e.result.RecoveryGuidance = "reconcile confirmation readback"
+			if auditErr := e.audit(ctx, "uncertain", step.ID, e.result.RecoveryGuidance); auditErr != nil {
+				return errors.Join(ErrReconcile, errors.New("durable lifecycle audit failed"))
+			}
 			return ErrReconcile
 		}
 		e.result.AppliedSteps++

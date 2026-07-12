@@ -47,15 +47,6 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 		t.Fatal(err)
 	}
 	resolved := services.Apply.(resolvingApply)
-	clean, err := pgx.Connect(ctx, url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = clean.Exec(ctx, "drop table if exists autosql_migration_history")
-	_ = clean.Close(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
 	current := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{}}}
 	current, _ = postgres.New().Normalize(ctx, current)
 	desired := current
