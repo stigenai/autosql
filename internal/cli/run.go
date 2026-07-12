@@ -338,6 +338,9 @@ func commandName(args []string) string {
 	if len(args) >= 2 && args[0] == "config" && args[1] == "validate" {
 		return "config validate"
 	}
+	if len(args) >= 2 && args[0] == "migrate" {
+		return "migrate " + args[1]
+	}
 	if len(args) >= 2 && args[0] == "schema" && args[1] == "load" {
 		return "schema load"
 	}

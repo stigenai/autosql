@@ -130,7 +130,7 @@ func TestLiveExplicitUpgradeFromSupportedV1AndCorruptLayoutRefusal(t *testing.T)
 		t.Fatal(err)
 	}
 	st, err := s.Status(ctx)
-	if err != nil || st.SchemaVersion != 2 {
+	if err != nil || st.SchemaVersion != CurrentSchemaVersion {
 		t.Fatalf("upgraded status=%+v err=%v", st, err)
 	}
 	if _, err = c.Exec(ctx, `alter table `+q(n, "baselines")+` drop column fingerprint`); err != nil {
@@ -140,6 +140,121 @@ func TestLiveExplicitUpgradeFromSupportedV1AndCorruptLayoutRefusal(t *testing.T)
 	if !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("corrupt layout accepted: %v", err)
 	}
+}
+
+func TestLiveExplicitUpgradeFromSupportedV2PreservesEvidence(t *testing.T) {
+	s, c, n, _ := liveStore(t)
+	ctx := context.Background()
+	tx, err := c.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tx.Exec(ctx, `create schema `+q(n)); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.createV1(ctx, tx); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.upgrade(ctx, tx, 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tx.Exec(ctx, `insert into `+q(n, "baselines")+`(baseline_id,target_identity,environment,fingerprint,canonical_schema,operator_identity,created_at) values('old','t','e','fp','{}'::jsonb,'o',clock_timestamp())`); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var version int
+	var typ, value string
+	if err = c.QueryRow(ctx, `select schema_version from `+q(n, "meta")+` where singleton`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if err = c.QueryRow(ctx, `select format_type(a.atttypid,a.atttypmod) from pg_attribute a where a.attrelid=$1::regclass and a.attname='canonical_schema'`, n+".baselines").Scan(&typ); err != nil {
+		t.Fatal(err)
+	}
+	if err = c.QueryRow(ctx, `select canonical_schema from `+q(n, "baselines")+` where baseline_id='old'`).Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	if version != CurrentSchemaVersion || typ != "text" || value != "{}" {
+		t.Fatalf("upgrade version=%d type=%s value=%q", version, typ, value)
+	}
+}
+
+func TestLiveTrustedManifestRejectsEveryMaterialDeviation(t *testing.T) {
+	cases := map[string]string{
+		"type":             `alter table %s alter column active_version type varchar`,
+		"default":          `alter table %s alter column active_version drop default`,
+		"nullability":      `alter table %s alter column active_version drop not null`,
+		"progress_check":   `alter table %s drop constraint operations_progress_check`,
+		"omitted_operator": `alter table %s drop column operator_identity`,
+		"extra_column":     `alter table %s add column attacker text`,
+		"extra_index":      `create index attacker_index on %s(active_version)`,
+	}
+	for name, format := range cases {
+		t.Run(name, func(t *testing.T) {
+			s, c, n, _ := liveStore(t)
+			ctx := context.Background()
+			if err := s.Init(ctx); err != nil {
+				t.Fatal(err)
+			}
+			table := "meta"
+			if name == "progress_check" {
+				table = "operations"
+			}
+			if name == "omitted_operator" {
+				table = "baselines"
+			}
+			sql := fmt.Sprintf(format, q(n, table))
+			if _, err := c.Exec(ctx, sql); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Init(ctx); !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("mutation accepted: %v", err)
+			}
+		})
+	}
+	t.Run("relkind", func(t *testing.T) {
+		s, c, n, _ := liveStore(t)
+		ctx := context.Background()
+		if err := s.Init(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Exec(ctx, `drop table `+q(n, "audit")+` cascade; create view `+q(n, "audit")+` as select 1::bigint as sequence`); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Init(ctx); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("relkind accepted: %v", err)
+		}
+	})
+	t.Run("ownership", func(t *testing.T) {
+		s, c, n, _ := liveStore(t)
+		ctx := context.Background()
+		if err := s.Init(ctx); err != nil {
+			t.Fatal(err)
+		}
+		role := n + "_owner"
+		if _, err := c.Exec(ctx, `create role `+q(role)+`; alter table `+q(n, "meta")+` owner to `+q(role)); err != nil {
+			t.Skip(err)
+		}
+		err := s.Init(ctx)
+		_, _ = c.Exec(ctx, `alter table `+q(n, "meta")+` owner to current_user; drop role `+q(role))
+		if !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("ownership accepted: %v", err)
+		}
+	})
+	t.Run("attacker_precreated_namespace", func(t *testing.T) {
+		s, c, n, _ := liveStore(t)
+		ctx := context.Background()
+		if _, err := c.Exec(ctx, `create schema `+q(n)+`; create table `+q(n, "meta")+`(singleton boolean primary key,schema_version integer not null); insert into `+q(n, "meta")+` values(true,2)`); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Init(ctx); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("precreated namespace accepted: %v", err)
+		}
+	})
 }
 
 func TestLiveLeastPrivilegeRoleCanInitializeAndBaseline(t *testing.T) {
@@ -217,12 +332,103 @@ func TestLiveBaselineRetryDriftTamperIsolationAndNoMutation(t *testing.T) {
 	if !errors.Is(err, ErrConflict) {
 		t.Fatalf("drift accepted: %v", err)
 	}
-	if _, err = c.Exec(ctx, `update `+q(n, "baselines")+` set canonical_schema='{}'::jsonb`); err != nil {
+	if _, err = c.Exec(ctx, `update `+q(n, "baselines")+` set canonical_schema='{}'`); err != nil {
 		t.Fatal(err)
 	}
 	_, err = s.Baseline(ctx, req)
 	if !errors.Is(err, ErrConflict) {
 		t.Fatalf("tamper accepted: %v", err)
+	}
+}
+
+func TestLiveBaselineRetryBindsOperatorDocumentAndAudit(t *testing.T) {
+	t.Run("operator", func(t *testing.T) {
+		s, _, _, app := liveStore(t)
+		ctx := context.Background()
+		if err := s.Init(ctx); err != nil {
+			t.Fatal(err)
+		}
+		r := BaselineRequest{ID: "b", Target: "t", Environment: "prod", Operator: "operator_a", Schemas: []string{app}}
+		if _, err := s.Baseline(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+		r.Operator = "operator_b"
+		if _, err := s.Baseline(ctx, r); !errors.Is(err, ErrConflict) {
+			t.Fatalf("operator mismatch accepted: %v", err)
+		}
+	})
+	t.Run("document", func(t *testing.T) {
+		s, c, n, app := liveStore(t)
+		ctx := context.Background()
+		if err := s.Init(ctx); err != nil {
+			t.Fatal(err)
+		}
+		r := BaselineRequest{ID: "b", Target: "t", Environment: "prod", Operator: "o", Schemas: []string{app}}
+		if _, err := s.Baseline(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Exec(ctx, `update `+q(n, "baselines")+` set canonical_schema=canonical_schema||' '`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Baseline(ctx, r); !errors.Is(err, ErrConflict) {
+			t.Fatalf("document tamper accepted: %v", err)
+		}
+	})
+	t.Run("audit", func(t *testing.T) {
+		s, c, n, app := liveStore(t)
+		ctx := context.Background()
+		if err := s.Init(ctx); err != nil {
+			t.Fatal(err)
+		}
+		r := BaselineRequest{ID: "b", Target: "t", Environment: "prod", Operator: "o", Schemas: []string{app}}
+		if _, err := s.Baseline(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Exec(ctx, `update `+q(n, "audit")+` set operator_identity='attacker'`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Baseline(ctx, r); !errors.Is(err, ErrConflict) {
+			t.Fatalf("audit tamper accepted: %v", err)
+		}
+	})
+}
+
+func TestLiveBaselineLocksConcurrentDDLThroughCommit(t *testing.T) {
+	s, _, _, app := liveStore(t)
+	ctx := context.Background()
+	if err := s.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ddlDone := make(chan error, 1)
+	started := make(chan struct{})
+	hook := BaselineHooks{BeforeFinalInspection: func() error {
+		go func() {
+			close(started)
+			c, err := pgx.Connect(ctx, os.Getenv("AUTOSQL_TEST_POSTGRES_URL"))
+			if err == nil {
+				_, err = c.Exec(ctx, `alter table `+q(app, "accounts")+` add column concurrent_change text`)
+				c.Close(ctx)
+			}
+			ddlDone <- err
+		}()
+		<-started
+		time.Sleep(150 * time.Millisecond)
+		select {
+		case err := <-ddlDone:
+			return fmt.Errorf("DDL crossed baseline lock early: %v", err)
+		default:
+			return nil
+		}
+	}}
+	r := BaselineRequest{ID: "locked", Target: "t", Environment: "prod", Operator: "o", Schemas: []string{app}}
+	if _, err := s.BaselineWithHooks(ctx, r, hook); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-ddlDone; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Baseline(ctx, r); !errors.Is(err, ErrConflict) {
+		t.Fatalf("post-commit DDL drift accepted: %v", err)
 	}
 }
 

@@ -2,6 +2,7 @@
 package zdm
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
-	"sort"
 	"strings"
 	"time"
 
@@ -18,7 +18,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-const CurrentSchemaVersion = 2
+const CurrentSchemaVersion = 3
 const DefaultSchema = "autosql_zdm"
 
 var (
@@ -61,6 +61,7 @@ type BaselineRequest struct {
 	ID, Target, Environment, Operator, ExpectedFingerprint string
 	Schemas                                                []string
 }
+type BaselineHooks struct{ BeforeFinalInspection func() error }
 
 func Open(c Config) (*Store, error) {
 	if c.URL == "" {
@@ -136,7 +137,7 @@ func (s *Store) InitWithHooks(ctx context.Context, hooks InitHooks) error {
 	for version < CurrentSchemaVersion {
 		version++
 		if err = s.upgrade(ctx, tx, version); err != nil {
-			return err
+			return fmt.Errorf("%w: supported metadata upgrade to v%d failed: %v; restore the last audited schema before retry", ErrCorrupt, version, err)
 		}
 		if hooks.AfterVersion != nil {
 			if err = hooks.AfterVersion(version); err != nil {
@@ -166,17 +167,18 @@ func (s *Store) createV1(ctx context.Context, tx pgx.Tx) error {
 }
 
 func (s *Store) upgrade(ctx context.Context, tx pgx.Tx, to int) error {
-	if to != 2 {
+	var ddl []string
+	switch to {
+	case 2:
+		ddl = []string{`create table ` + q(s.cfg.Schema, "baselines") + ` (baseline_id text primary key,target_identity text not null,environment text not null,fingerprint text not null,canonical_schema jsonb not null,operator_identity text not null,created_at timestamptz not null,unique(target_identity,environment))`, `create table ` + q(s.cfg.Schema, "audit") + ` (sequence bigint generated always as identity primary key,event_type text not null,subject_id text not null,target_identity text not null,environment text not null,fingerprint text not null,operator_identity text not null,detail jsonb not null,at timestamptz not null)`, `update ` + q(s.cfg.Schema, "meta") + ` set schema_version=2,updated_at=clock_timestamp() where singleton`}
+	case 3:
+		ddl = []string{`alter table ` + q(s.cfg.Schema, "baselines") + ` alter column canonical_schema type text using canonical_schema::text`, `update ` + q(s.cfg.Schema, "meta") + ` set schema_version=3,updated_at=clock_timestamp() where singleton`}
+	default:
 		return fmt.Errorf("%w: no upgrade path to %d", ErrIncompatible, to)
-	}
-	ddl := []string{
-		`create table ` + q(s.cfg.Schema, "baselines") + ` (baseline_id text primary key,target_identity text not null,environment text not null,fingerprint text not null,canonical_schema jsonb not null,operator_identity text not null,created_at timestamptz not null,unique(target_identity,environment))`,
-		`create table ` + q(s.cfg.Schema, "audit") + ` (sequence bigint generated always as identity primary key,event_type text not null,subject_id text not null,target_identity text not null,environment text not null,fingerprint text not null,operator_identity text not null,detail jsonb not null,at timestamptz not null)`,
-		`update ` + q(s.cfg.Schema, "meta") + ` set schema_version=2,updated_at=clock_timestamp() where singleton`,
 	}
 	for _, sql := range ddl {
 		if _, err := tx.Exec(ctx, sql); err != nil {
-			return fmt.Errorf("upgrade metadata to v2: %w", err)
+			return fmt.Errorf("upgrade metadata to v%d: %w", to, err)
 		}
 	}
 	return nil
@@ -194,21 +196,6 @@ func (s *Store) readVersion(ctx context.Context, qry interface {
 		return 0, fmt.Errorf("%w: read meta: %v", ErrCorrupt, err)
 	}
 	return v, nil
-}
-
-func (s *Store) validateLayout(ctx context.Context, qry interface {
-	QueryRow(context.Context, string, ...any) pgx.Row
-}) error {
-	required := map[string][]string{"meta": {"schema_version", "active_version", "completed_version", "phase", "progress", "recovery_state"}, "operations": {"operation_id", "phase", "progress", "recovery_state"}, "object_mappings": {"operation_id", "logical_id", "physical_schema", "physical_name"}, "baselines": {"baseline_id", "target_identity", "environment", "fingerprint", "canonical_schema"}, "audit": {"event_type", "subject_id", "detail"}}
-	for table, cols := range required {
-		sort.Strings(cols)
-		var got []string
-		err := qry.QueryRow(ctx, `select coalesce(array_agg(column_name order by column_name),'{}') from information_schema.columns where table_schema=$1 and table_name=$2 and column_name=any($3)`, s.cfg.Schema, table, cols).Scan(&got)
-		if err != nil || strings.Join(got, "\x00") != strings.Join(cols, "\x00") {
-			return fmt.Errorf("%w: table %s is missing required columns; restore metadata or use the documented upgrade path", ErrCorrupt, table)
-		}
-	}
-	return nil
 }
 
 func (s *Store) Status(ctx context.Context) (Status, error) {
@@ -231,6 +218,9 @@ func (s *Store) Status(ctx context.Context) (Status, error) {
 	if v > CurrentSchemaVersion {
 		return Status{}, fmt.Errorf("%w: schema version %d is newer than supported %d", ErrIncompatible, v, CurrentSchemaVersion)
 	}
+	if v < CurrentSchemaVersion {
+		return Status{}, fmt.Errorf("%w: schema version %d requires explicit migrate metadata-init upgrade to %d", ErrIncompatible, v, CurrentSchemaVersion)
+	}
 	if v == CurrentSchemaVersion {
 		if err = s.validateLayout(ctx, c); err != nil {
 			return Status{}, err
@@ -243,7 +233,7 @@ func (s *Store) Status(ctx context.Context) (Status, error) {
 	if v >= 2 {
 		var b Baseline
 		var raw []byte
-		err = c.QueryRow(ctx, `select baseline_id,target_identity,environment,fingerprint,canonical_schema::text,operator_identity,created_at from `+q(s.cfg.Schema, "baselines")+` order by created_at desc limit 1`).Scan(&b.ID, &b.Target, &b.Environment, &b.Fingerprint, &raw, &b.Operator, &b.CreatedAt)
+		err = c.QueryRow(ctx, `select baseline_id,target_identity,environment,fingerprint,canonical_schema,operator_identity,created_at from `+q(s.cfg.Schema, "baselines")+` order by created_at desc limit 1`).Scan(&b.ID, &b.Target, &b.Environment, &b.Fingerprint, &raw, &b.Operator, &b.CreatedAt)
 		if err == nil {
 			b.CanonicalSchema = raw
 			st.Baseline = &b
@@ -255,6 +245,10 @@ func (s *Store) Status(ctx context.Context) (Status, error) {
 }
 
 func (s *Store) Baseline(ctx context.Context, r BaselineRequest) (Baseline, error) {
+	return s.BaselineWithHooks(ctx, r, BaselineHooks{})
+}
+
+func (s *Store) BaselineWithHooks(ctx context.Context, r BaselineRequest, hooks BaselineHooks) (Baseline, error) {
 	if r.ID == "" || r.Target == "" || r.Environment == "" || r.Operator == "" || len(r.Schemas) == 0 {
 		return Baseline{}, errors.New("baseline ID, target, environment, operator, and application schemas are required")
 	}
@@ -268,7 +262,10 @@ func (s *Store) Baseline(ctx context.Context, r BaselineRequest) (Baseline, erro
 		return Baseline{}, err
 	}
 	defer c.Close(context.WithoutCancel(ctx))
-	tx, err := c.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	// READ COMMITTED deliberately gives the final catalog reinspection a new
+	// snapshot. Relation locks fence changes to existing objects; cooperating
+	// object creation is ordered by the target advisory lock.
+	tx, err := c.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return Baseline{}, err
 	}
@@ -300,6 +297,9 @@ func (s *Store) Baseline(ctx context.Context, r BaselineRequest) (Baseline, erro
 	if operations != 0 {
 		return Baseline{}, fmt.Errorf("%w: baseline refused with unfinished operations", ErrConflict)
 	}
+	if err = s.lockApplicationRelations(ctx, tx, r.Schemas); err != nil {
+		return Baseline{}, err
+	}
 	doc, err := postgres.InspectTx(ctx, tx, postgres.Options{Schemas: r.Schemas})
 	if err != nil {
 		return Baseline{}, fmt.Errorf("inspect baseline schema: %w", err)
@@ -318,7 +318,7 @@ func (s *Store) Baseline(ctx context.Context, r BaselineRequest) (Baseline, erro
 	b := Baseline{ID: r.ID, Target: r.Target, Environment: r.Environment, Fingerprint: fp, CanonicalSchema: canonical, Operator: r.Operator}
 	var existing Baseline
 	var raw []byte
-	err = tx.QueryRow(ctx, `select baseline_id,target_identity,environment,fingerprint,canonical_schema::text,operator_identity,created_at from `+q(s.cfg.Schema, "baselines")+` where target_identity=$1 and environment=$2`, r.Target, r.Environment).Scan(&existing.ID, &existing.Target, &existing.Environment, &existing.Fingerprint, &raw, &existing.Operator, &existing.CreatedAt)
+	err = tx.QueryRow(ctx, `select baseline_id,target_identity,environment,fingerprint,canonical_schema,operator_identity,created_at from `+q(s.cfg.Schema, "baselines")+` where target_identity=$1 and environment=$2`, r.Target, r.Environment).Scan(&existing.ID, &existing.Target, &existing.Environment, &existing.Fingerprint, &raw, &existing.Operator, &existing.CreatedAt)
 	if err == nil {
 		existing.CanonicalSchema = raw
 		var stored schema.Document
@@ -326,16 +326,38 @@ func (s *Store) Baseline(ctx context.Context, r BaselineRequest) (Baseline, erro
 		if json.Unmarshal(raw, &stored) == nil {
 			storedFP, _ = schema.SemanticFingerprint(stored)
 		}
-		if existing.ID != r.ID || existing.Fingerprint != fp || storedFP != existing.Fingerprint {
+		if existing.ID != r.ID || existing.Target != r.Target || existing.Environment != r.Environment || existing.Operator != r.Operator || existing.Fingerprint != fp || storedFP != existing.Fingerprint || !bytes.Equal(existing.CanonicalSchema, canonical) {
 			return Baseline{}, fmt.Errorf("%w: existing baseline is stale or live schema drifted; diagnose before retry", ErrConflict)
+		}
+		if err = s.validateBaselineAudit(ctx, tx, existing); err != nil {
+			return Baseline{}, err
 		}
 		return existing, nil
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		return Baseline{}, err
 	}
-	digest := sha256.Sum256([]byte(r.Target + "\x00" + r.Environment + "\x00" + fp))
-	detail, _ := json.Marshal(map[string]string{"evidence_digest": hex.EncodeToString(digest[:]), "schema_version": fmt.Sprint(CurrentSchemaVersion)})
-	err = tx.QueryRow(ctx, `insert into `+q(s.cfg.Schema, "baselines")+`(baseline_id,target_identity,environment,fingerprint,canonical_schema,operator_identity,created_at) values($1,$2,$3,$4,$5::jsonb,$6,clock_timestamp()) returning created_at`, r.ID, r.Target, r.Environment, fp, canonical, r.Operator).Scan(&b.CreatedAt)
+	if hooks.BeforeFinalInspection != nil {
+		if err = hooks.BeforeFinalInspection(); err != nil {
+			return Baseline{}, err
+		}
+	}
+	finalDoc, err := postgres.InspectTx(ctx, tx, postgres.Options{Schemas: r.Schemas})
+	if err != nil {
+		return Baseline{}, fmt.Errorf("final baseline inspection: %w", err)
+	}
+	finalCanonical, err := finalDoc.MarshalCanonical()
+	if err != nil {
+		return Baseline{}, err
+	}
+	finalFP, err := schema.SemanticFingerprint(finalDoc)
+	if err != nil {
+		return Baseline{}, err
+	}
+	if finalFP != fp || !bytes.Equal(finalCanonical, canonical) {
+		return Baseline{}, fmt.Errorf("%w: application schema changed during baseline; retry from a stable state", ErrConflict)
+	}
+	detail := baselineAuditDetail(b)
+	err = tx.QueryRow(ctx, `insert into `+q(s.cfg.Schema, "baselines")+`(baseline_id,target_identity,environment,fingerprint,canonical_schema,operator_identity,created_at) values($1,$2,$3,$4,$5,$6,clock_timestamp()) returning created_at`, r.ID, r.Target, r.Environment, fp, canonical, r.Operator).Scan(&b.CreatedAt)
 	if err != nil {
 		return Baseline{}, fmt.Errorf("record baseline: %w", err)
 	}
@@ -346,4 +368,57 @@ func (s *Store) Baseline(ctx context.Context, r BaselineRequest) (Baseline, erro
 		return Baseline{}, err
 	}
 	return b, nil
+}
+
+func baselineAuditDetail(b Baseline) []byte {
+	digest := sha256.Sum256([]byte(b.ID + "\x00" + b.Target + "\x00" + b.Environment + "\x00" + b.Operator + "\x00" + b.Fingerprint + "\x00" + string(b.CanonicalSchema)))
+	raw, _ := json.Marshal(map[string]string{"evidence_digest": hex.EncodeToString(digest[:]), "schema_version": fmt.Sprint(CurrentSchemaVersion)})
+	return raw
+}
+
+func (s *Store) validateBaselineAudit(ctx context.Context, tx pgx.Tx, b Baseline) error {
+	var count int
+	if err := tx.QueryRow(ctx, `select count(*) from `+q(s.cfg.Schema, "audit")+` where event_type='baseline_recorded' and subject_id=$1`, b.ID).Scan(&count); err != nil || count != 1 {
+		return fmt.Errorf("%w: baseline audit evidence missing or ambiguous", ErrConflict)
+	}
+	var event, subject, target, env, fp, operator string
+	var detail []byte
+	var at time.Time
+	err := tx.QueryRow(ctx, `select event_type,subject_id,target_identity,environment,fingerprint,operator_identity,detail::text,at from `+q(s.cfg.Schema, "audit")+` where subject_id=$1`, b.ID).Scan(&event, &subject, &target, &env, &fp, &operator, &detail, &at)
+	if err != nil {
+		return fmt.Errorf("%w: baseline audit evidence missing or ambiguous", ErrConflict)
+	}
+	got, want := map[string]string{}, map[string]string{}
+	_ = json.Unmarshal(detail, &got)
+	_ = json.Unmarshal(baselineAuditDetail(b), &want)
+	if len(got) != len(want) || got["evidence_digest"] != want["evidence_digest"] || got["schema_version"] != want["schema_version"] || event != "baseline_recorded" || subject != b.ID || target != b.Target || env != b.Environment || fp != b.Fingerprint || operator != b.Operator || at.Before(b.CreatedAt) {
+		return fmt.Errorf("%w: baseline audit evidence is inconsistent or tampered", ErrConflict)
+	}
+	return nil
+}
+
+func (s *Store) lockApplicationRelations(ctx context.Context, tx pgx.Tx, schemas []string) error {
+	rows, err := tx.Query(ctx, `select n.nspname,c.relname from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname=any($1) and c.relkind in ('r','p','v','m','f') order by n.nspname,c.relname`, schemas)
+	if err != nil {
+		return err
+	}
+	var names []string
+	for rows.Next() {
+		var ns, name string
+		if err = rows.Scan(&ns, &name); err != nil {
+			rows.Close()
+			return err
+		}
+		names = append(names, q(ns, name))
+	}
+	rows.Close()
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	if len(names) > 0 {
+		if _, err = tx.Exec(ctx, `lock table `+strings.Join(names, ",")+` in access share mode`); err != nil {
+			return fmt.Errorf("lock application relations for baseline: %w", err)
+		}
+	}
+	return nil
 }
