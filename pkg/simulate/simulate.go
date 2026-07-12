@@ -24,9 +24,9 @@ func (e *Error) Unwrap() error           { return e.kind }
 func fail(code string, kind error) error { return &Error{Code: code, kind: kind} }
 
 type Config struct {
-	DevelopmentURL, ProductionIdentity string
-	CleanupTimeout                     time.Duration
-	AllowedHosts                       []string
+	DevelopmentURL, DevelopmentIdentity, ProductionIdentity string
+	CleanupTimeout                                          time.Duration
+	AllowedHosts                                            []string
 }
 type Factory interface {
 	Create(context.Context, Config) (Isolation, error)
@@ -71,8 +71,8 @@ func Run(ctx context.Context, f Factory, req Request) (result Result, err error)
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 		defer cancel()
-		if ce := iso.Cleanup(cleanupCtx); ce != nil && err == nil {
-			err = fail("cleanup", ErrLifecycle)
+		if ce := iso.Cleanup(cleanupCtx); ce != nil {
+			err = errors.Join(err, fail("cleanup", ErrLifecycle))
 		}
 	}()
 	if e = iso.Materialize(ctx, req.From); e != nil {

@@ -7,19 +7,22 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"github.com/jackc/pgx/v5"
 	"net"
 	"net/url"
 	"strings"
+	"time"
 )
 
-type PostgresFactory struct{}
+type PostgresFactory struct{ AfterCreate func() error }
 type postgresIsolation struct {
 	adminURL, dbURL, name, identity string
 	schemas                         []string
 }
 
-func (PostgresFactory) Create(ctx context.Context, c Config) (Isolation, error) {
+func (f PostgresFactory) Create(ctx context.Context, c Config) (Isolation, error) {
 	u, e := url.Parse(c.DevelopmentURL)
 	hasPassword := false
 	if u != nil && u.User != nil {
@@ -42,6 +45,9 @@ func (PostgresFactory) Create(ctx context.Context, c Config) (Isolation, error) 
 	}
 	db := strings.TrimPrefix(u.Path, "/")
 	identity := net.JoinHostPort(host, port) + "/" + db
+	if c.DevelopmentIdentity == "" {
+		return nil, fail("development_identity", ErrConfig)
+	}
 	if identity == c.ProductionIdentity || sameResolvedEndpoint(u, c.ProductionIdentity) {
 		return nil, fail("credential_separation", ErrConfig)
 	}
@@ -55,13 +61,55 @@ func (PostgresFactory) Create(ctx context.Context, c Config) (Isolation, error) 
 		return nil, fail("connect", ErrLifecycle)
 	}
 	defer conn.Close(context.Background())
-	if _, e = conn.Exec(ctx, "CREATE DATABASE "+quote(name)); e != nil {
-		return nil, fail("create_database", ErrLifecycle)
+	actual, e := runtimeIdentity(ctx, conn)
+	if e != nil {
+		return nil, fail("runtime_identity", ErrLifecycle)
+	}
+	if actual != c.DevelopmentIdentity || actual == c.ProductionIdentity {
+		return nil, fail("runtime_separation", ErrConfig)
+	}
+	_, e = conn.Exec(ctx, "CREATE DATABASE "+quote(name))
+	if e == nil && f.AfterCreate != nil {
+		e = f.AfterCreate()
+	}
+	if e != nil {
+		timeout := c.CleanupTimeout
+		if timeout <= 0 {
+			timeout = 15 * time.Second
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+		defer cancel()
+		cleanupErr := cleanupDatabase(cleanupCtx, c.DevelopmentURL, name)
+		primary := fail("create_database", ErrLifecycle)
+		if cleanupErr != nil {
+			return nil, errors.Join(primary, cleanupErr)
+		}
+		return nil, primary
 	}
 	copy := *u
 	copy.Path = "/" + name
 	copy.RawQuery = u.RawQuery
-	return &postgresIsolation{adminURL: c.DevelopmentURL, dbURL: copy.String(), name: name, identity: identity + "/" + name}, nil
+	return &postgresIsolation{adminURL: c.DevelopmentURL, dbURL: copy.String(), name: name, identity: actual + "/" + name}, nil
+}
+func ResolvePostgresIdentity(ctx context.Context, developmentURL string) (string, error) {
+	conn, e := pgx.Connect(ctx, developmentURL)
+	if e != nil {
+		return "", fail("identity_connect", ErrLifecycle)
+	}
+	defer conn.Close(context.Background())
+	id, e := runtimeIdentity(ctx, conn)
+	if e != nil {
+		return "", fail("identity_query", ErrLifecycle)
+	}
+	return id, nil
+}
+func runtimeIdentity(ctx context.Context, conn *pgx.Conn) (string, error) {
+	var address, database, system string
+	var port int
+	if e := conn.QueryRow(ctx, `select coalesce(inet_server_addr()::text,''),inet_server_port(),current_database(),system_identifier::text from pg_control_system()`).Scan(&address, &port, &database, &system); e != nil {
+		return "", e
+	}
+	return net.JoinHostPort(address, fmt.Sprint(port)) + "/" + database + "#" + system, nil
 }
 func sameResolvedEndpoint(dev *url.URL, production string) bool {
 	p, e := url.Parse(production)
@@ -184,13 +232,16 @@ func (p *postgresIsolation) Inspect(ctx context.Context) (schema.Document, error
 	return postgres.New().Normalize(ctx, doc)
 }
 func (p *postgresIsolation) Cleanup(ctx context.Context) error {
-	conn, e := pgx.Connect(ctx, p.adminURL)
+	return cleanupDatabase(ctx, p.adminURL, p.name)
+}
+func cleanupDatabase(ctx context.Context, adminURL, name string) error {
+	conn, e := pgx.Connect(ctx, adminURL)
 	if e != nil {
 		return fail("cleanup_connect", ErrLifecycle)
 	}
 	defer conn.Close(context.Background())
-	_, _ = conn.Exec(ctx, "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1 AND pid<>pg_backend_pid()", p.name)
-	_, e = conn.Exec(ctx, "DROP DATABASE IF EXISTS "+quote(p.name))
+	_, _ = conn.Exec(ctx, "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1 AND pid<>pg_backend_pid()", name)
+	_, e = conn.Exec(ctx, "DROP DATABASE IF EXISTS "+quote(name))
 	if e != nil {
 		return fail("cleanup_database", ErrLifecycle)
 	}

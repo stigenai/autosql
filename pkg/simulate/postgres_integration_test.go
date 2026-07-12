@@ -45,6 +45,10 @@ func TestPostgresSimulationConcurrentIsolationAndCleanup(t *testing.T) {
 		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
 	}
 	from, p := liveFixture(t)
+	devIdentity, e := ResolvePostgresIdentity(context.Background(), url)
+	if e != nil {
+		t.Fatal(e)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	const count = 4
@@ -56,7 +60,7 @@ func TestPostgresSimulationConcurrentIsolationAndCleanup(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			r, e := Run(ctx, PostgresFactory{}, Request{Config: Config{DevelopmentURL: url, ProductionIdentity: "production.example:5432/prod", CleanupTimeout: 15 * time.Second}, From: from, Plan: p})
+			r, e := Run(ctx, PostgresFactory{}, Request{Config: Config{DevelopmentURL: url, DevelopmentIdentity: devIdentity, ProductionIdentity: "production.example:5432/prod", CleanupTimeout: 15 * time.Second}, From: from, Plan: p})
 			if e == nil {
 				mu.Lock()
 				if ids[r.IsolationIdentity] {
@@ -90,14 +94,44 @@ func TestPostgresFactoryRejectsProductionIdentityAndRemoteByDefault(t *testing.T
 	if url == "" {
 		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
 	}
-	if _, e := (PostgresFactory{}).Create(context.Background(), Config{DevelopmentURL: url, ProductionIdentity: "127.0.0.1:32768/autosql"}); !errors.Is(e, ErrConfig) {
+	devIdentity, e := ResolvePostgresIdentity(context.Background(), url)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if _, e := (PostgresFactory{}).Create(context.Background(), Config{DevelopmentURL: url, DevelopmentIdentity: devIdentity, ProductionIdentity: devIdentity}); !errors.Is(e, ErrConfig) {
 		t.Fatalf("same endpoint=%v", e)
 	}
-	if _, e := (PostgresFactory{}).Create(context.Background(), Config{DevelopmentURL: url, ProductionIdentity: "postgres://different:credentials@localhost:32768/autosql"}); !errors.Is(e, ErrConfig) {
+	if _, e := (PostgresFactory{}).Create(context.Background(), Config{DevelopmentURL: url, DevelopmentIdentity: devIdentity, ProductionIdentity: "postgres://different:credentials@localhost:32768/autosql"}); !errors.Is(e, ErrConfig) {
 		t.Fatalf("resolved same endpoint=%v", e)
+	}
+	if _, e := (PostgresFactory{}).Create(context.Background(), Config{DevelopmentURL: url, DevelopmentIdentity: devIdentity + "-stale", ProductionIdentity: "other"}); !errors.Is(e, ErrConfig) {
+		t.Fatalf("stale dev identity=%v", e)
 	}
 	if _, e := (PostgresFactory{}).Create(context.Background(), Config{DevelopmentURL: "postgres://user:secret@production.example/prod", ProductionIdentity: "other"}); !errors.Is(e, ErrConfig) || contains(e.Error(), "secret") {
 		t.Fatalf("remote=%v", e)
+	}
+}
+func TestAmbiguousCreateAlwaysCleansGeneratedDatabase(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	id, e := ResolvePostgresIdentity(context.Background(), url)
+	if e != nil {
+		t.Fatal(e)
+	}
+	factory := PostgresFactory{AfterCreate: func() error { return errors.New("server committed but client saw seeded secret") }}
+	if _, e = factory.Create(context.Background(), Config{DevelopmentURL: url, DevelopmentIdentity: id, ProductionIdentity: "other", CleanupTimeout: 10 * time.Second}); e == nil || contains(e.Error(), "seeded") {
+		t.Fatalf("error=%v", e)
+	}
+	conn, e := pgx.Connect(context.Background(), url)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer conn.Close(context.Background())
+	var remaining int
+	if e = conn.QueryRow(context.Background(), `select count(*) from pg_database where datname like 'autosql_sim_%'`).Scan(&remaining); e != nil || remaining != 0 {
+		t.Fatalf("remaining=%d err=%v", remaining, e)
 	}
 }
 
@@ -138,6 +172,10 @@ func TestPostgresCleanupAfterLiveFailureCancelAndMismatch(t *testing.T) {
 		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
 	}
 	from, p := liveFixture(t)
+	devIdentity, e := ResolvePostgresIdentity(context.Background(), url)
+	if e != nil {
+		t.Fatal(e)
+	}
 	for _, mode := range []string{"fail", "cancel", "mismatch"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -145,7 +183,7 @@ func TestPostgresCleanupAfterLiveFailureCancelAndMismatch(t *testing.T) {
 			if mode == "cancel" {
 				go func() { time.Sleep(50 * time.Millisecond); cancel() }()
 			}
-			_, e := Run(ctx, liveWrapperFactory{mode: mode}, Request{Config: Config{DevelopmentURL: url, ProductionIdentity: "production.example:5432/prod", CleanupTimeout: 10 * time.Second}, From: from, Plan: p})
+			_, e := Run(ctx, liveWrapperFactory{mode: mode}, Request{Config: Config{DevelopmentURL: url, DevelopmentIdentity: devIdentity, ProductionIdentity: "production.example:5432/prod", CleanupTimeout: 10 * time.Second}, From: from, Plan: p})
 			if e == nil || contains(e.Error(), "seeded") {
 				t.Fatalf("error=%v", e)
 			}

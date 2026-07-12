@@ -29,6 +29,7 @@ type fakeIsolation struct {
 	events              []string
 	actual              schema.Document
 	fail                string
+	cleanupFail         bool
 	cleanupContextAlive bool
 }
 
@@ -66,10 +67,27 @@ func (f *fakeIsolation) Inspect(context.Context) (schema.Document, error) {
 func (f *fakeIsolation) Cleanup(ctx context.Context) error {
 	f.event("cleanup")
 	f.cleanupContextAlive = ctx.Err() == nil
-	if f.fail == "cleanup" {
+	if f.fail == "cleanup" || f.cleanupFail {
 		return errors.New("secret cleanup")
 	}
 	return nil
+}
+func TestPrimaryAndCancelErrorsJoinCleanupFailure(t *testing.T) {
+	from, to, p := plans(t)
+	for _, mode := range []string{"execute", "cancel"} {
+		t.Run(mode, func(t *testing.T) {
+			iso := &fakeIsolation{actual: to, fail: mode, cleanupFail: true}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if mode == "cancel" {
+				go func() { time.Sleep(10 * time.Millisecond); cancel() }()
+			}
+			_, e := Run(ctx, fakeFactory{iso: iso}, Request{Config: Config{DevelopmentURL: "postgres://dev", ProductionIdentity: "prod/db", CleanupTimeout: time.Second}, From: from, Plan: p})
+			if e == nil || !contains(e.Error(), "simulation execute") || !contains(e.Error(), "simulation cleanup") {
+				t.Fatalf("joined error=%v", e)
+			}
+		})
+	}
 }
 func plans(t *testing.T) (schema.Document, schema.Document, plan.Plan) {
 	empty := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{}}}
