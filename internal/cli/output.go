@@ -13,6 +13,7 @@ const OutputSchemaVersion = "autosql.output/v1"
 type Streams struct {
 	In       io.Reader
 	Out, Err io.Writer
+	IsTTY    func() bool
 }
 
 type Envelope struct {
@@ -27,6 +28,7 @@ type EnvelopeError struct {
 	Kind     string `json:"kind"`
 	Message  string `json:"message"`
 	ExitCode int    `json:"exit_code"`
+	Status   string `json:"status,omitempty"`
 }
 
 type output struct {
@@ -50,7 +52,7 @@ func (o output) failure(e *Error) {
 		message = o.redactor.String(message)
 	}
 	if o.json {
-		_ = json.NewEncoder(o.streams.Out).Encode(Envelope{SchemaVersion: OutputSchemaVersion, Command: o.command, OK: false, Error: &EnvelopeError{Kind: e.Kind, Message: message, ExitCode: int(e.Code)}})
+		_ = json.NewEncoder(o.streams.Out).Encode(Envelope{SchemaVersion: OutputSchemaVersion, Command: o.command, OK: false, Error: &EnvelopeError{Kind: e.Kind, Message: message, ExitCode: int(e.Code), Status: e.Status}})
 		return
 	}
 	fmt.Fprintf(o.streams.Err, "autosql: %s: %s\n", e.Kind, message)

@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -20,6 +22,9 @@ import (
 var Version = "dev"
 
 func Run(ctx context.Context, args []string, streams Streams) int {
+	return RunWithServices(ctx, args, streams, Services{})
+}
+func RunWithServices(ctx context.Context, args []string, streams Streams, services Services) int {
 	if streams.In == nil {
 		streams.In = strings.NewReader("")
 	}
@@ -30,6 +35,17 @@ func Run(ctx context.Context, args []string, streams Streams) int {
 		streams.Err = io.Discard
 	}
 	redactor := secret.NewRedactor()
+	if services.ReadPlan == nil {
+		services.ReadPlan = DefaultReadPlan{Redactor: redactor}
+	}
+	tty := false
+	if streams.IsTTY != nil {
+		tty = streams.IsTTY()
+	} else if f, ok := streams.In.(*os.File); ok {
+		if info, e := f.Stat(); e == nil {
+			tty = info.Mode()&os.ModeCharDevice != 0
+		}
+	}
 	command := commandName(args)
 	jsonMode := contains(args, "--json")
 	o := output{streams: streams, json: jsonMode, command: command, redactor: redactor}
@@ -45,6 +61,12 @@ func Run(ctx context.Context, args []string, streams Streams) int {
 		err = runSchemaLoad(ctx, args[2:], o)
 	case len(args) >= 2 && args[0] == "schema" && args[1] == "inspect":
 		err = runSchemaInspect(ctx, args[2:], o, redactor)
+	case len(args) >= 2 && args[0] == "schema" && args[1] == "diff":
+		err = runSchemaDiff(ctx, args[2:], o, services.ReadPlan)
+	case args[0] == "plan":
+		err = runPlan(ctx, args[1:], o, services.ReadPlan)
+	case args[0] == "apply":
+		err = runApply(ctx, args[1:], o, services, tty)
 	case args[0] == "help" || args[0] == "--help" || args[0] == "-h":
 		if e := o.success(map[string]string{"usage": usage()}, usage()); e != nil {
 			err = e
@@ -67,6 +89,7 @@ func runSchemaInspect(parent context.Context, args []string, o output, redactor 
 	urlRef := fs.String("url", "", "database URL secret reference (env:// or file://)")
 	timeout := fs.Duration("timeout", 30*time.Second, "maximum command duration")
 	advanced := fs.Bool("advanced", false, "inspect roles and grants")
+	format := fs.String("format", "native", "native, sql, or json")
 	jsonFlag := fs.Bool("json", false, "emit JSON envelope")
 	var schemas, include, exclude stringList
 	fs.Var(&schemas, "schema", "schema to inspect (repeatable)")
@@ -101,11 +124,27 @@ func runSchemaInspect(parent context.Context, args []string, o output, redactor 
 		}
 		return &Error{Kind: "connection", Message: redactor.String(err.Error()), Code: ExitConnection, Cause: err}
 	}
+	if *format != "native" && *format != "json" && *format != "sql" {
+		return usageError(fmt.Errorf("invalid --format"))
+	}
 	human, err := doc.MarshalCanonical()
 	if err != nil {
 		return &Error{Kind: "validation", Message: err.Error(), Code: ExitValidation, Cause: err}
 	}
-	return o.success(doc, strings.TrimSuffix(string(human), "\n"))
+	text := strings.TrimSuffix(string(human), "\n")
+	if *format == "sql" {
+		text, err = schemaSQL(doc)
+		if err != nil {
+			return &Error{Kind: "validation", Message: "SQL rendering failed", Code: ExitValidation, Cause: err}
+		}
+	}
+	if *format == "json" {
+		var pretty bytes.Buffer
+		if e := json.Indent(&pretty, human, "", "  "); e == nil {
+			text = pretty.String()
+		}
+	}
+	return o.success(doc, text)
 }
 
 func runSchemaLoad(parent context.Context, args []string, o output) error {
@@ -243,7 +282,7 @@ func usageError(err error) *Error {
 	return &Error{Kind: "usage", Message: err.Error(), Code: ExitUsage, Cause: err}
 }
 func usage() string {
-	return "usage: autosql <command>\n\ncommands:\n  version [--json]\n  config validate [--config path] [--env name] [--preflight] [--json]\n  schema load --source sql:path|json:path [--source ...] [--json]\n  schema inspect --url env://NAME|file://path [--schema name] [--include pattern] [--exclude pattern] [--advanced] [--json]"
+	return "usage: autosql <command>\n\ncommands:\n  version [--json]\n  config validate [--config path] [--env name] [--preflight] [--json]\n  schema load --source sql:path|json:path [--source ...] [--json]\n  schema inspect --url env://NAME|file://path [--format native|sql|json]\n  schema diff --from source --to source [--max-changes n] [--json]\n  plan --from source --to source [--max-changes n] [--json]\n  apply --from source --to source [--dry-run|--auto-approve|--artifact path] [--json]"
 }
 func contains(args []string, want string) bool {
 	for _, a := range args {
@@ -266,6 +305,9 @@ func commandName(args []string) string {
 	}
 	if len(args) >= 2 && args[0] == "schema" && args[1] == "inspect" {
 		return "schema inspect"
+	}
+	if len(args) >= 2 && args[0] == "schema" && args[1] == "diff" {
+		return "schema diff"
 	}
 	return args[0]
 }

@@ -15,7 +15,8 @@
       "properties": {
         "kind": { "enum": ["internal", "usage", "config", "secret", "validation", "permission", "connection", "migration", "conflict", "timeout", "canceled"] },
         "message": { "type": "string" },
-        "exit_code": { "type": "integer" }
+        "exit_code": { "type": "integer" },
+        "status": { "enum": ["no_op", "success", "refused", "partial_failure"] }
       },
       "additionalProperties": true
     }
