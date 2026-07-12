@@ -3,6 +3,7 @@ package migrate
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -139,6 +140,29 @@ func TestDeterminismAndInputOrder(t *testing.T) {
 		if m.Digest != ma.Digest || m.Generation != ma.Generation {
 			t.Fatal("unstable output")
 		}
+	}
+}
+
+func TestCheckpointMetadataDeterministicAfterLongHistory(t *testing.T) {
+	files := make([]File, 0, 102)
+	for i := 1; i <= 101; i++ {
+		files = append(files, File{Name: fmt.Sprintf("V%d__revision.sql", i), SQL: []byte(fmt.Sprintf("SELECT %d;", i))})
+	}
+	fp := "sha256:" + strings.Repeat("a", 64)
+	files = append(files, File{Name: "V102__checkpoint.sql", SQL: []byte("SELECT 102;"), Kind: "checkpoint", CoveredFrom: "1.0.0", CoveredTo: "101.0.0", SchemaFingerprint: fp, DataPolicy: "schema_only"})
+	want, err := build(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 120; i++ {
+		got, e := build(append([]File(nil), files...))
+		if e != nil || got.Digest != want.Digest || got.Generation != want.Generation {
+			t.Fatalf("iteration %d is not deterministic: %v", i, e)
+		}
+	}
+	e := want.Entries[len(want.Entries)-1]
+	if e.Kind != "checkpoint" || e.CoveredFrom != "1.0.0" || e.CoveredTo != "101.0.0" || e.SchemaFingerprint != fp || e.DataPolicy != "schema_only" {
+		t.Fatalf("checkpoint binding lost: %+v", e)
 	}
 }
 

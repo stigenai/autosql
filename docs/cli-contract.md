@@ -101,3 +101,29 @@ Successful executor messages are sanitized before human or JSON serialization.
 ## JSON envelope
 
 The normative schema is [`json-output.schema.json`](json-output.schema.json). Consumers must branch on `ok`; failed commands include `error.kind`, `error.message`, and the numeric `error.exit_code`. Unknown additive fields must be ignored.
+
+## Checkpoints
+
+`migrate checkpoint create --dir PATH --version VERSION --generation-config FILE`
+replays the verified directory (or its latest checkpoint plus suffix) in a
+distinct development database, inspects the canonical schema, renders the full
+schema from empty, and proves the rendered SQL reaches the identical semantic
+fingerprint in another empty database. Publication uses the migration
+directory's manifest compare-and-swap, so concurrent creators have one winner
+and failures before publication leave no visible checkpoint.
+
+Every checkpoint manifest entry and generator/release-signed artifact bind the
+covered first and last revision, covered-head chain digest, exact schema
+fingerprint, and data policy. `schema_only` refuses covered INSERT, COPY, UPDATE,
+or DELETE migrations. `declared_replay` requires every such revision through
+repeatable `--declare-replay VERSION` and matching `CheckpointDataPolicy`,
+`CheckpointDeclaredReplay`, and `CheckpointPolicyApproved` values in the
+trusted generation configuration; checkpoints never silently claim that schema rendering
+preserves data or seed rows.
+
+`migrate checkpoint verify --dir PATH [--json]` is read-only and verifies the
+immutable generation plus checkpoint range, head, artifact, fingerprint, and
+data-policy bindings. A fresh database applies only the latest valid checkpoint
+and its suffix. A database with any recorded revision in a checkpoint's covered
+range ignores that checkpoint and continues with the suffix, preventing schema
+re-creation on incremental targets.

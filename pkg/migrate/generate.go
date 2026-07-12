@@ -384,7 +384,7 @@ func parseRenameHints(raw string, current, desired schema.Document) ([]schema.Re
 func snapshotFiles(s Snapshot) []File {
 	out := make([]File, 0, len(s.Manifest.Entries)+1)
 	for _, x := range s.Manifest.Entries {
-		f := File{Name: x.File, SQL: append([]byte(nil), s.Files[x.File]...), Parents: append([]string(nil), x.Parents...), NonLinear: x.NonLinear}
+		f := File{Name: x.File, SQL: append([]byte(nil), s.Files[x.File]...), Parents: append([]string(nil), x.Parents...), NonLinear: x.NonLinear, Kind: x.Kind, CoveredFrom: x.CoveredFrom, CoveredTo: x.CoveredTo, SchemaFingerprint: x.SchemaFingerprint, DataPolicy: x.DataPolicy}
 		if x.ArtifactFile != "" {
 			f.ArtifactName = x.ArtifactFile
 			f.Artifact = append([]byte(nil), s.Files[x.ArtifactFile]...)
@@ -469,7 +469,13 @@ func replaySnapshot(ctx context.Context, snap Snapshot, r GenerateRequest) (out 
 		return out, e
 	}
 	defer conn.Close(context.Background())
-	for _, m := range snap.Manifest.Entries {
+	start := 0
+	for i, m := range snap.Manifest.Entries {
+		if m.Kind == "checkpoint" {
+			start = i
+		}
+	}
+	for _, m := range snap.Manifest.Entries[start:] {
 		if _, e = conn.Exec(ctx, string(snap.Files[m.File])); e != nil {
 			return out, e
 		}

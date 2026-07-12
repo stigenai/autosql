@@ -53,6 +53,9 @@ type generationConfig struct {
 	Lifetime                                                                                                 string
 	GeneratorKeyID, GeneratorPurpose, GeneratorPrivateKeyReference, SigningKeyID, SigningPrivateKeyReference string
 	Metadata                                                                                                 map[string]string
+	CheckpointDataPolicy                                                                                     string
+	CheckpointDeclaredReplay                                                                                 []string
+	CheckpointPolicyApproved                                                                                 bool
 }
 type configuredGenerationAuthority struct {
 	actors   map[string]approval.Identity

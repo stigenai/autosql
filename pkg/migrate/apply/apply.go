@@ -435,7 +435,30 @@ func selectTrusted(snap migrate.Snapshot, records []revision.Revision, r Request
 	}
 	started := false
 	var out []candidate
-	for _, m := range snap.Manifest.Entries {
+	freshCheckpoint := -1
+	if len(records) == 0 {
+		for i, m := range snap.Manifest.Entries {
+			if m.Kind == "checkpoint" {
+				freshCheckpoint = i
+			}
+		}
+	}
+	for i, m := range snap.Manifest.Entries {
+		if freshCheckpoint >= 0 && i < freshCheckpoint {
+			continue
+		}
+		if m.Kind == "checkpoint" && len(records) > 0 {
+			covered := false
+			for _, x := range records {
+				if versionInRange(x.Version, m.CoveredFrom, m.CoveredTo) {
+					covered = true
+					break
+				}
+			}
+			if covered {
+				continue
+			}
+		}
 		if x, ok := by[m.Version]; ok {
 			if started {
 				return nil, fmt.Errorf("%w: applied revision gap", ErrRefused)
@@ -495,6 +518,12 @@ func selectTrusted(snap migrate.Snapshot, records []revision.Revision, r Request
 		return nil, fmt.Errorf("%w: target is not contiguous pending boundary", ErrRefused)
 	}
 	return out, nil
+}
+func versionInRange(value, from, to string) bool {
+	v, e1 := migrate.ParseVersion(value)
+	f, e2 := migrate.ParseVersion(from)
+	t, e3 := migrate.ParseVersion(to)
+	return e1 == nil && e2 == nil && e3 == nil && v.Compare(f) >= 0 && v.Compare(t) <= 0
 }
 func directiveCompatible(d migrate.TransactionMode, a artifact.Artifact) bool {
 	allReq, allNo := true, true
@@ -683,7 +712,11 @@ func applyPerFile(ctx context.Context, s *revision.Session, cs []candidate, snap
 func executeGuarded(ctx context.Context, s *revision.Session, tx pgx.Tx, c candidate, m migrate.Manifest, r Request, apply GuardedApply, parent string) (FileResult, error) {
 	start := r.Now()
 	fr := FileResult{Version: c.entry.Version, File: c.entry.File}
-	x := baseRevision(c, m, r, start.UTC(), "pending", "migration")
+	kind, finalState, appliedEvent := "migration", "applied", "migration_applied"
+	if c.entry.Kind == "checkpoint" {
+		kind, finalState, appliedEvent = "checkpoint", "checkpoint", "checkpoint_applied"
+	}
+	x := baseRevision(c, m, r, start.UTC(), "pending", kind)
 	if tx == nil && !artifactTransactional(c.payload) {
 		initial, e := s.Begin(ctx)
 		if e != nil {
@@ -711,7 +744,7 @@ func executeGuarded(ctx context.Context, s *revision.Session, tx pgx.Tx, c candi
 		if be != nil {
 			return fr, ErrUncertain
 		}
-		state, event, redacted := "applied", "migration_applied", ""
+		state, event, redacted := finalState, appliedEvent, ""
 		if e != nil {
 			state, event, redacted = "partial", "migration_uncertain", "uncertain executor outcome"
 		}
@@ -768,10 +801,10 @@ func executeGuarded(ctx context.Context, s *revision.Session, tx pgx.Tx, c candi
 	done := r.Now().UTC()
 	fr.Duration = done.Sub(start)
 	fr.Status = "applied"
-	if err := s.FinalizeRevision(ctx, tx, x.Version, "applied", fr.Statements, fr.Duration, "", done); err != nil {
+	if err := s.FinalizeRevision(ctx, tx, x.Version, finalState, fr.Statements, fr.Duration, "", done); err != nil {
 		return fr, err
 	}
-	if err := s.ExecEvent(ctx, tx, revision.Event{Version: x.Version, Attempt: 1, Type: "migration_applied", Ordinal: fr.Statements, Operator: r.Operator, At: done}); err != nil {
+	if err := s.ExecEvent(ctx, tx, revision.Event{Version: x.Version, Attempt: 1, Type: appliedEvent, Ordinal: fr.Statements, Operator: r.Operator, At: done}); err != nil {
 		return fr, err
 	}
 	if owned {
