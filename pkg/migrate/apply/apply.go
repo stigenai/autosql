@@ -40,6 +40,8 @@ type Request struct {
 	Operator, TargetIdentity string
 	Now                      func() time.Time
 	beforeLock               func()
+	afterDrain               func() error
+	afterWriterLock          func()
 }
 type FileResult struct {
 	Version, File, Status string
@@ -118,6 +120,9 @@ func (e Engine) Run(ctx context.Context, r Request) (out Result, err error) {
 	if writerErr != nil || !writers {
 		return out, errors.New("acquire revision writer barrier")
 	}
+	if r.afterWriterLock != nil {
+		r.afterWriterLock()
+	}
 	defer func() {
 		if u := s.UnlockWriters(context.WithoutCancel(ctx)); u != nil && err == nil {
 			err = errors.Join(ErrUncertain, u)
@@ -137,6 +142,11 @@ func (e Engine) Run(ctx context.Context, r Request) (out Result, err error) {
 		}
 		if drainErr = e.Drain(ctx, event); drainErr != nil {
 			return out, errors.New("durable lifecycle audit drain failed")
+		}
+		if r.afterDrain != nil {
+			if drainErr = r.afterDrain(); drainErr != nil {
+				return out, drainErr
+			}
 		}
 		if drainErr = s.FinalizeOutbox(ctx, p.ID); drainErr != nil {
 			return out, drainErr
@@ -186,7 +196,7 @@ func (e Engine) Run(ctx context.Context, r Request) (out Result, err error) {
 	if err != nil {
 		return out, err
 	}
-	history, he := s.ExecutorRecords(ctx)
+	history, he := s.ExecutorRecords(ctx, lockedDB+"/"+lockedEnv)
 	if he != nil {
 		return out, he
 	}
@@ -325,7 +335,11 @@ func revalidateLocked(ctx context.Context, s *revision.Session, snap migrate.Sna
 	if _, e = selectTrusted(snap, records, Request{Transaction: "file", Operator: "reconcile"}, verify); e != nil {
 		return e
 	}
-	history, e := s.ExecutorRecords(ctx)
+	db, env, te := trustedTarget(snap, verify)
+	if te != nil {
+		return te
+	}
+	history, e := s.ExecutorRecords(ctx, db+"/"+env)
 	if e != nil {
 		return e
 	}

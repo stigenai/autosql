@@ -65,19 +65,27 @@ func (mixedDriver) Render(_ context.Context, r plugin.RenderRequest) ([]plugin.S
 }
 
 type replayAudit struct {
-	fail bool
-	seen map[string]int
+	failAfter, delivered int
+	failed               bool
+	seen                 map[string]int
 }
 
 func (a *replayAudit) AppendDurable(_ context.Context, e executor.LifecycleEvent) error {
-	if a.fail && e.Type == "transaction_committed" {
-		a.fail = false
-		return errors.New("injected audit failure")
-	}
 	if a.seen == nil {
 		a.seen = map[string]int{}
 	}
-	a.seen[e.EventID]++
+	if a.seen[e.EventID] > 0 {
+		return nil
+	}
+	isFinal := e.Type == "transaction_committed" || e.Type == "confirmed" || e.Type == "completed"
+	if isFinal && !a.failed && a.delivered == a.failAfter {
+		a.failed = true
+		return errors.New("injected audit failure after N events")
+	}
+	a.seen[e.EventID] = 1
+	if isFinal {
+		a.delivered++
+	}
 	return nil
 }
 
@@ -250,7 +258,7 @@ func TestCoordinatorGeneratedMixedPhaseFaultsStopAndRequireReconcile(t *testing.
 				t.Fatal(e)
 			}
 			rows, _ := s.Revisions(context.Background())
-			history, _ := s.ExecutorRecords(context.Background())
+			history, _ := s.ExecutorRecords(context.Background(), "mixed-db/test")
 			_ = s.Close(context.Background())
 			if len(rows) != 1 || rows[0].State != "partial" || len(history) != 1 {
 				t.Fatalf("rows=%+v history=%+v", rows, history)
@@ -331,6 +339,15 @@ func TestCoordinatorOutboxPartialDrainTwoFileAllInOneIsIdempotent(t *testing.T) 
 	if e != nil || retry.Status != "applied" || retry.FinalVersion != "2.0.0" {
 		t.Fatalf("retry=%+v err=%v", retry, e)
 	}
+	coexist, e := pgx.Connect(context.Background(), prod)
+	if e != nil {
+		t.Fatal(e)
+	}
+	_, e = coexist.Exec(context.Background(), `insert into autosql_migration_history(artifact_digest,step_id,step_hash,execution_id,target_identity,plan_digest,bundle_digest,attempt,phase_id,phase_mode,state,intended_at,last_confirmed_step,recovery_guidance) values('other-artifact','other-step','other-hash','other-artifact','other-db/other-env','other-plan','other-bundle',1,'other-phase','required','intended',clock_timestamp(),'','other target')`)
+	_ = coexist.Close(context.Background())
+	if e != nil {
+		t.Fatal(e)
+	}
 	no, e := engine.Run(context.Background(), retryReq)
 	if e != nil || no.Status != "no_op" {
 		t.Fatalf("no-op=%+v err=%v", no, e)
@@ -369,11 +386,22 @@ func TestCoordinatorOutboxPartialDrainTwoFileAllInOneIsIdempotent(t *testing.T) 
 	if e = all.Init(context.Background()); e != nil {
 		t.Fatal(e)
 	}
-	ra := &replayAudit{fail: true}
+	ra := &replayAudit{failAfter: 2}
 	lifecycle = ra
 	atomic, e := (Engine{Store: all, Verify: verify, Apply: guarded}).Run(context.Background(), Request{Directory: dir, Operator: "operator", TargetIdentity: allSchema, Transaction: "all"})
 	if e == nil || atomic.Status != "partial_failure" {
 		t.Fatalf("atomic=%+v err=%v", atomic, e)
+	}
+	crashed := false
+	_, e = (Engine{Store: all, Verify: verify, Apply: guarded, Drain: ra.AppendDurable}).Run(context.Background(), Request{Directory: dir, Operator: "operator", TargetIdentity: allSchema, Transaction: "all", afterDrain: func() error {
+		if !crashed {
+			crashed = true
+			return errors.New("injected crash after drain before finalize")
+		}
+		return nil
+	}})
+	if e == nil || !crashed {
+		t.Fatalf("drain crash=%v", e)
 	}
 	repaired, e := (Engine{Store: all, Verify: verify, Apply: guarded, Drain: ra.AppendDurable}).Run(context.Background(), Request{Directory: dir, Operator: "operator", TargetIdentity: allSchema, Transaction: "all"})
 	if e != nil || repaired.Status != "no_op" {
@@ -460,6 +488,23 @@ func TestCoordinatorManifestReplacementWhileAcquiringCanonicalLock(t *testing.T)
 	if e = store.Init(context.Background()); e != nil {
 		t.Fatal(e)
 	}
+	initial, _ := migrate.LoadSnapshot(dir)
+	ia, _ := artifact.Parse(initial.Files[initial.Manifest.Entries[0].ArtifactFile])
+	key, _ := executor.LockKey(ia.DatabaseIdentity, ia.TargetEnvironment)
+	holder, e := store.OpenSession(context.Background())
+	if e != nil {
+		t.Fatal(e)
+	}
+	ok, e := holder.Lock(context.Background(), key)
+	if e != nil || !ok {
+		t.Fatal(e)
+	}
+	_, busyErr := (Engine{Store: store, Verify: verify}).Run(context.Background(), Request{Directory: dir, Operator: "op", Transaction: "file", DryRun: true})
+	if !errors.Is(busyErr, ErrBusy) {
+		t.Fatalf("canonical holder did not yield busy: %v", busyErr)
+	}
+	_ = holder.Unlock(context.Background(), key)
+	_ = holder.Close(context.Background())
 	called := false
 	_, e = (Engine{Store: store, Verify: verify}).Run(context.Background(), Request{Directory: dir, Operator: "op", Transaction: "file", DryRun: true, beforeLock: func() { called = true; appendSecond() }})
 	if !called || !errors.Is(e, ErrRefused) {
@@ -470,7 +515,9 @@ func TestCoordinatorManifestReplacementWhileAcquiringCanonicalLock(t *testing.T)
 		t.Fatal(e)
 	}
 	rows, e := s.Revisions(context.Background())
-	hist, he := s.ExecutorRecords(context.Background())
+	ls, _ := migrate.LoadSnapshot(dir)
+	aa, _ := artifact.Parse(ls.Files[ls.Manifest.Entries[0].ArtifactFile])
+	hist, he := s.ExecutorRecords(context.Background(), aa.DatabaseIdentity+"/"+aa.TargetEnvironment)
 	_ = s.Close(context.Background())
 	if e != nil || he != nil || len(rows) != 0 || len(hist) != 0 {
 		t.Fatalf("rows=%v history=%v err=%v/%v", rows, hist, e, he)
@@ -517,6 +564,35 @@ func TestCoordinatorDirectRevisionWriterRacesFileAllAndBaseline(t *testing.T) {
 			_, e = (Engine{Store: store, Verify: verify}).Run(context.Background(), req)
 			if !errors.Is(e, ErrRefused) {
 				t.Fatalf("race accepted: %v", e)
+			}
+			schema2 := schema + "engine"
+			store2, _ := revision.Open(revision.Config{URL: prod, Schema: schema2})
+			if e = store2.Init(context.Background()); e != nil {
+				t.Fatal(e)
+			}
+			acquired, release := make(chan struct{}), make(chan struct{})
+			engineDone := make(chan error, 1)
+			req.afterWriterLock = func() { close(acquired); <-release }
+			go func() {
+				_, x := (Engine{Store: store2, Verify: verify}).Run(context.Background(), req)
+				engineDone <- x
+			}()
+			<-acquired
+			writerDone := make(chan error, 1)
+			go func() {
+				writerDone <- store2.Insert(context.Background(), revision.Revision{Version: "9.0.0", Description: "after", Kind: "migration", FileName: "after.sql", FileDigest: "sha256:x", ManifestDigest: "sha256:y", ManifestGeneration: "after", State: "applied", Attempt: 1, Operator: "racer", StartedAt: now, UpdatedAt: now})
+			}()
+			select {
+			case x := <-writerDone:
+				t.Fatalf("writer beat Engine barrier: %v", x)
+			case <-time.After(30 * time.Millisecond):
+			}
+			close(release)
+			if x := <-engineDone; x != nil {
+				t.Fatalf("Engine winner failed: %v", x)
+			}
+			if x := <-writerDone; x != nil {
+				t.Fatalf("writer did not commit after Engine: %v", x)
 			}
 		})
 	}

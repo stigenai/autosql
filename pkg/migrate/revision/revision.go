@@ -521,7 +521,10 @@ type ExecutorRecord struct {
 	Attempt                                                                                                            int
 }
 
-func (s *Session) ExecutorRecords(ctx context.Context) ([]ExecutorRecord, error) {
+func (s *Session) ExecutorRecords(ctx context.Context, target string) ([]ExecutorRecord, error) {
+	if target == "" {
+		return nil, ErrConfig
+	}
 	var reg *string
 	if err := s.conn.QueryRow(ctx, `select to_regclass($1)::text`, s.config.ExecutorHistorySchema+"."+s.config.ExecutorHistoryTable).Scan(&reg); err != nil {
 		return nil, err
@@ -529,7 +532,7 @@ func (s *Session) ExecutorRecords(ctx context.Context) ([]ExecutorRecord, error)
 	if reg == nil {
 		return nil, nil
 	}
-	rows, err := s.conn.Query(ctx, `select artifact_digest,step_id,step_hash,phase_id,phase_mode,state,execution_id,target_identity,plan_digest,bundle_digest,attempt from `+q(s.config.ExecutorHistorySchema, s.config.ExecutorHistoryTable))
+	rows, err := s.conn.Query(ctx, `select artifact_digest,step_id,step_hash,phase_id,phase_mode,state,execution_id,target_identity,plan_digest,bundle_digest,attempt from `+q(s.config.ExecutorHistorySchema, s.config.ExecutorHistoryTable)+` where target_identity=$1`, target)
 	if err != nil {
 		return nil, errors.New("read executor reconciliation history")
 	}
