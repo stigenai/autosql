@@ -375,6 +375,39 @@ func (s *Session) FinalizeRevision(ctx context.Context, tx pgx.Tx, version, stat
 	return nil
 }
 
+// Repair performs a proposal-bound CAS and always leaves append-only evidence.
+// Remove creates a reversal tombstone; it never deletes the original row.
+func (s *Session) Repair(ctx context.Context, tx pgx.Tx, version, action, before, after, proposal, operator string, at time.Time) error {
+	if action == "remove" {
+		var r Revision
+		var ns int64
+		if err := tx.QueryRow(ctx, `select version,description,kind,file_name,file_digest,manifest_digest,manifest_generation,artifact_digest,plan_digest,checks_digest,bundle_digest,state,statement_ordinal,attempt,redacted_error,operator_identity,started_at,updated_at,completed_at,from_version,to_version,supersedes,reversal_of,duration_ns from `+q(s.config.Schema, s.config.RevisionsTable)+` where version=$1 and state=$2 for update`, version, before).Scan(&r.Version, &r.Description, &r.Kind, &r.FileName, &r.FileDigest, &r.ManifestDigest, &r.ManifestGeneration, &r.ArtifactDigest, &r.PlanDigest, &r.ChecksDigest, &r.BundleDigest, &r.State, &r.StatementOrdinal, &r.Attempt, &r.RedactedError, &r.Operator, &r.StartedAt, &r.UpdatedAt, &r.CompletedAt, &r.FromVersion, &r.ToVersion, &r.Supersedes, &r.ReversalOf, &ns); err != nil {
+			return errors.New("repair stale revision")
+		}
+		r.Version = version + "~repair~" + strings.TrimPrefix(proposal, "sha256:")[:12]
+		r.Description = "repair tombstone"
+		r.Kind = "reversal"
+		r.State = "applied"
+		r.Attempt = 1
+		r.Operator = operator
+		r.StartedAt = at.UTC()
+		r.UpdatedAt = at.UTC()
+		r.CompletedAt = &at
+		r.Supersedes = []string{version}
+		r.ReversalOf = version
+		r.Duration = 0
+		if err := s.ExecRevision(ctx, tx, r); err != nil {
+			return err
+		}
+		return s.ExecEvent(ctx, tx, Event{Version: r.Version, Attempt: 1, Type: "repair_applied", Detail: "proposal=" + proposal, Operator: operator, At: at})
+	}
+	tag, err := tx.Exec(ctx, `update `+q(s.config.Schema, s.config.RevisionsTable)+` set state=$3,operator_identity=$4,updated_at=$5,completed_at=case when $3 in ('applied','baseline','checkpoint') then $5 else completed_at end where version=$1 and state=$2`, version, before, after, operator, at.UTC())
+	if err != nil || tag.RowsAffected() != 1 {
+		return errors.New("repair stale revision")
+	}
+	return s.ExecEvent(ctx, tx, Event{Version: version, Attempt: 1, Type: "repair_applied", Detail: "proposal=" + proposal, Operator: operator, At: at})
+}
+
 func validateRevision(r Revision) error {
 	if r.Version == "" || r.FileName == "" || r.FileDigest == "" || r.ManifestDigest == "" || r.ManifestGeneration == "" || r.Attempt < 1 || r.Operator == "" || r.StartedAt.IsZero() || r.UpdatedAt.IsZero() || r.Duration < 0 {
 		return ErrConfig
