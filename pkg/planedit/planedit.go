@@ -194,13 +194,13 @@ type Simulator interface {
 	Simulate(context.Context, plan.Plan) (string, error)
 }
 type Safety interface {
-	Analyze(context.Context, plan.Plan) error
+	Analyze(context.Context, plan.Plan) (artifact.SafetyAttestation, error)
 }
 type Binder interface {
 	Bind(context.Context, plan.Plan) (precheck.Plan, string, error)
 }
 type PolicyValidator interface {
-	ValidatePolicy(context.Context, plan.Plan) error
+	ValidatePolicy(context.Context, plan.Plan) (artifact.PolicyAttestation, error)
 }
 type PrecheckBuilder interface {
 	BuildPrechecks(context.Context, plan.Plan) (precheck.Plan, error)
@@ -275,14 +275,16 @@ func (p Pipeline) Revalidate(ctx context.Context, e EditedArtifact) (Eligible, e
 	if err = stage("safety"); err != nil {
 		return out, err
 	}
-	if err = p.Safety.Analyze(ctx, rebuilt); err != nil {
+	safetyEvidence, err := p.Safety.Analyze(ctx, rebuilt)
+	if err != nil {
 		return out, fmt.Errorf("safety: %w", err)
 	}
 	if err = stage("policy"); err != nil {
 		return out, err
 	}
+	var policyEvidence artifact.PolicyAttestation
 	if p.Policy != nil {
-		if err = p.Policy.ValidatePolicy(ctx, rebuilt); err != nil {
+		if policyEvidence, err = p.Policy.ValidatePolicy(ctx, rebuilt); err != nil {
 			return out, fmt.Errorf("policy: %w", err)
 		}
 	}
@@ -308,6 +310,9 @@ func (p Pipeline) Revalidate(ctx context.Context, e EditedArtifact) (Eligible, e
 	if err != nil {
 		return out, fmt.Errorf("policy precheck guardrail: %w", err)
 	}
+	if policyEvidence.ConfigDigest == "" {
+		policyEvidence = artifact.PolicyAttestation{DocumentDigest: hash("legacy-policy", js(rebuilt.Changes)), LimitsDigest: hash("legacy-limits", nil), ResourcesDigest: hash("legacy-resources", js(checks)), ConfigDigest: hash("legacy-policy-config", js(rebuilt.Changes))}
+	}
 	now := time.Now().UTC()
 	vc := p.Context
 	if vc.EditorIdentity == "" {
@@ -332,9 +337,11 @@ func (p Pipeline) Revalidate(ctx context.Context, e EditedArtifact) (Eligible, e
 		case "simulation":
 			a.Simulation = &artifact.SimulationAttestation{TargetIdentity: vc.TargetIdentity, DevelopmentIdentity: vc.DevelopmentIdentity, FromFingerprint: rebuilt.FromFingerprint, ToFingerprint: rebuilt.ToFingerprint, DatabaseVersion: vc.DatabaseVersion, ConfigDigest: a.ConfigDigest}
 		case "safety":
-			a.Safety = &artifact.SafetyAttestation{Analyzers: []string{"postgres-builtins/v1"}, Threshold: "error", SuppressionsDigest: hash("suppressions", nil), DiagnosticsDigest: result, ConfigDigest: a.ConfigDigest}
+			a.ConfigDigest = safetyEvidence.ConfigDigest
+			a.Safety = &safetyEvidence
 		case "policy_precheck_guardrail":
-			a.Policy = &artifact.PolicyAttestation{DocumentDigest: hash("policy-document", []byte(p.ContextDigest)), LimitsDigest: hash("policy-limits", nil), ResourcesDigest: hash("policy-resources", []byte(rebuilt.Digest)), ConfigDigest: a.ConfigDigest}
+			a.ConfigDigest = policyEvidence.ConfigDigest
+			a.Policy = &policyEvidence
 			a.Precheck = &artifact.PrecheckGuardrailAttestation{ChecksDigest: checks.Digest, GuardrailDigest: bundle, ConfigDigest: a.ConfigDigest}
 		}
 		return a

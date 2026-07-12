@@ -97,9 +97,9 @@ type safe struct {
 	err error
 }
 
-func (s safe) Analyze(context.Context, plan.Plan) error {
+func (s safe) Analyze(context.Context, plan.Plan) (artifact.SafetyAttestation, error) {
 	*s.log = append(*s.log, "safety")
-	return s.err
+	return artifact.SafetyAttestation{Analyzers: []string{"test-analyzer"}, Threshold: "error", SuppressionsDigest: "sha256:" + strings.Repeat("1", 64), DiagnosticsDigest: "sha256:" + strings.Repeat("2", 64), ConfigDigest: "sha256:" + strings.Repeat("3", 64)}, s.err
 }
 
 type bind struct {

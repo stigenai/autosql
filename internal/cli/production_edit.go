@@ -16,6 +16,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -67,17 +68,37 @@ func (s editSimulator) Simulate(ctx context.Context, p plan.Plan) (string, error
 
 type editSafety struct{ version int }
 
-func (s editSafety) Analyze(ctx context.Context, p plan.Plan) error {
-	d, err := (safety.Runner{Analyzers: safety.Builtins()}).Run(ctx, safety.Input{Changes: p.Changes, Statements: p.SafetyStatements(), Target: safety.Target{Engine: "postgresql", Version: s.version}})
+func evidenceDigest(v any) string {
+	b, _ := json.Marshal(v)
+	x := sha256.Sum256(b)
+	return "sha256:" + hex.EncodeToString(x[:])
+}
+func (s editSafety) Analyze(ctx context.Context, p plan.Plan) (artifact.SafetyAttestation, error) {
+	in := safety.Input{Changes: p.Changes, Statements: p.SafetyStatements(), Target: safety.Target{Engine: "postgresql", Version: s.version}}
+	builtins := safety.Builtins()
+	d, err := (safety.Runner{Analyzers: builtins}).Run(ctx, in)
 	if err != nil {
-		return err
+		return artifact.SafetyAttestation{}, err
 	}
+	rules := make([]string, 0, len(builtins))
+	for _, analyzer := range builtins {
+		rules = append(rules, fmt.Sprintf("%T", analyzer))
+	}
+	seen := map[string]bool{}
+	suppressed := []safety.Diagnostic{}
 	for _, v := range d {
+		if !seen[v.Rule] {
+			seen[v.Rule] = true
+			rules = append(rules, v.Rule)
+		}
+		if v.Suppressed != nil {
+			suppressed = append(suppressed, v)
+		}
 		if v.Severity == safety.SeverityError {
-			return errors.New("edited plan has blocking safety diagnostics")
+			return artifact.SafetyAttestation{}, errors.New("edited plan has blocking safety diagnostics")
 		}
 	}
-	return nil
+	return artifact.SafetyAttestation{Analyzers: rules, Threshold: string(safety.SeverityError), SuppressionsDigest: evidenceDigest(suppressed), DiagnosticsDigest: evidenceDigest(d), ConfigDigest: evidenceDigest(in)}, nil
 }
 
 type editBinder struct {
@@ -111,9 +132,12 @@ func (b editBinder) BuildPrechecks(_ context.Context, p plan.Plan) (precheck.Pla
 	}
 	return checks, nil
 }
-func (b editBinder) ValidatePolicy(_ context.Context, _ plan.Plan) error {
-	_, err := b.s.input(b.original)
-	return err
+func (b editBinder) ValidatePolicy(_ context.Context, _ plan.Plan) (artifact.PolicyAttestation, error) {
+	in, err := b.s.input(b.original)
+	if err != nil {
+		return artifact.PolicyAttestation{}, err
+	}
+	return artifact.PolicyAttestation{DocumentDigest: evidenceDigest(in.Policy), LimitsDigest: evidenceDigest(map[string]any{"identity": in.PolicyIdentity}), ResourcesDigest: evidenceDigest([]any{in.Changes, in.StatementBindings}), ConfigDigest: evidenceDigest(in.Policy)}, nil
 }
 func (b editBinder) BindGuardrail(_ context.Context, p plan.Plan, checks precheck.Plan) (string, error) {
 	tmp, err := artifact.New(p, checks, b.s.created, b.s.expires, b.s.revision, b.s.environment, b.s.database, "sha256:"+strings.Repeat("0", 64), b.s.approval, map[string]string{})
