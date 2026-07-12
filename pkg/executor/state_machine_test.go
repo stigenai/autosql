@@ -23,6 +23,88 @@ type testRow struct {
 	err  error
 }
 
+func TestSessionLossBeforeAndAfterIntentStopsAndRequiresRecovery(t *testing.T) {
+	step := plan.Step{ID: "s", SQL: "ddl", Kind: plan.StepExecutable, Transaction: plan.TransactionProhibited}
+	phase := plan.Phase{ID: "p", Transaction: plan.TransactionProhibited, StepIDs: []string{"s"}}
+	for name, at := range map[string]int{"intent": 0, "sql": 1, "confirmation": 2} {
+		t.Run(name, func(t *testing.T) {
+			errs := make([]error, 3)
+			errs[at] = errors.New("session lost password=seeded")
+			s := &testSession{execErrs: errs}
+			e := stateExecutor(&failingAudit{})
+			err := e.nontransactionalPhase(context.Background(), s, phase, map[string]plan.Step{"s": step}, nil)
+			if at == 0 && err == nil {
+				t.Fatal("intent loss accepted")
+			}
+			if at > 0 && (!errors.Is(err, ErrReconcile) || !e.result.Uncertain || e.result.PendingStep != "s") {
+				t.Fatalf("err=%v result=%+v", err, e.result)
+			}
+		})
+	}
+	e := &PostgreSQL{artifact: artifact.Artifact{}, config: Config{URL: "x", Connector: testConnector{err: errors.New("connect secret=password")}, Now: time.Now}}
+	if _, err := e.ApplyAuthorized(context.Background(), precheck.Plan{}); err == nil {
+		t.Fatal("connector loss accepted")
+	}
+}
+
+func TestCompletedAuditFailureZeroOutcome(t *testing.T) {
+	e := stateExecutor(&failingAudit{fail: "completed"})
+	err := e.finish(context.Background())
+	if err == nil || e.result.Partial || e.result.Uncertain || e.result.AppliedSteps != 0 {
+		t.Fatalf("err=%v result=%+v", err, e.result)
+	}
+}
+func TestCompletedAuditFailureAppliedOutcome(t *testing.T) {
+	e := stateExecutor(&failingAudit{fail: "completed"})
+	e.result.AppliedSteps = 2
+	e.result.LastConfirmed = "two"
+	err := e.finish(context.Background())
+	if !errors.Is(err, ErrPartial) || !e.result.Partial || e.result.ExecutionID != "artifact" || e.result.RecoveryGuidance == "" {
+		t.Fatalf("err=%v result=%+v", err, e.result)
+	}
+}
+
+func TestTwoStepConfirmationUncertaintyStopsSubsequentExecution(t *testing.T) {
+	one := plan.Step{ID: "one", SQL: "ddl1", Kind: plan.StepExecutable, Transaction: plan.TransactionProhibited}
+	two := plan.Step{ID: "two", SQL: "ddl2", Kind: plan.StepExecutable, Transaction: plan.TransactionProhibited}
+	three := plan.Step{ID: "three", SQL: "ddl3", Kind: plan.StepExecutable, Transaction: plan.TransactionProhibited}
+	s := &testSession{execTags: []Tag{testTag(1), testTag(1), testTag(1), testTag(1), testTag(1), testTag(0)}, row: testRow{vals: []any{"confirmed", stepHash(one)}}}
+	e := stateExecutor(&failingAudit{})
+	err := e.nontransactionalPhase(context.Background(), s, plan.Phase{ID: "p", Transaction: plan.TransactionProhibited, StepIDs: []string{"one", "two", "three"}}, map[string]plan.Step{"one": one, "two": two, "three": three}, map[string]bool{})
+	if !errors.Is(err, ErrReconcile) || e.result.PendingStep != "two" || e.result.AppliedSteps != 1 || s.execs != 6 {
+		t.Fatalf("err=%v result=%+v execs=%d", err, e.result, s.execs)
+	}
+}
+
+func TestConfirmedHistoryMalformedRowsAreRejected(t *testing.T) {
+	step := plan.Step{ID: "s", SQL: "ddl", Kind: plan.StepExecutable, Transaction: plan.TransactionRequired}
+	phase := plan.Phase{ID: "p", Transaction: plan.TransactionRequired, StepIDs: []string{"s"}}
+	a := artifact.Artifact{Digest: "artifact", DatabaseIdentity: "db", TargetEnvironment: "prod", GuardrailDigest: "bundle", Plan: plan.Plan{Digest: "plan", Steps: []plan.Step{step}, Phases: []plan.Phase{phase}}}
+	valid := []any{"s", stepHash(step), "p", "required", "artifact", "db/prod", "plan", "bundle"}
+	cases := map[string]*valueRows{"unknown_step": {values: [][]any{{"unknown", stepHash(step), "p", "required", "artifact", "db/prod", "plan", "bundle"}}}, "duplicate": {values: [][]any{valid, valid}}, "scan_error": {values: [][]any{valid}, scanErr: errors.New("scan")}, "rows_error": {err: errors.New("rows")}}
+	top := step
+	top.ID = "top"
+	top.Kind = plan.StepTopology
+	aTop := a
+	aTop.Plan.Steps = []plan.Step{top}
+	aTop.Plan.Phases = []plan.Phase{{ID: "p", Transaction: plan.TransactionRequired, StepIDs: []string{"top"}}}
+	for name, rows := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, err := confirmedSteps(context.Background(), &testSession{rows: rows}, a)
+			if err == nil || len(got) != 0 {
+				t.Fatalf("got=%v err=%v", got, err)
+			}
+		})
+	}
+	t.Run("topology", func(t *testing.T) {
+		row := []any{"top", stepHash(top), "p", "required", "artifact", "db/prod", "plan", "bundle"}
+		got, err := confirmedSteps(context.Background(), &testSession{rows: &valueRows{values: [][]any{row}}}, aTop)
+		if err == nil || len(got) != 0 {
+			t.Fatalf("got=%v err=%v", got, err)
+		}
+	})
+}
+
 func TestReconcileRefusedLifecycle(t *testing.T) {
 	a := &failingAudit{}
 	s := &testSession{row: testRow{vals: []any{true}}}
@@ -165,9 +247,10 @@ func (testRows) Err() error        { return nil }
 func (testRows) Close()            {}
 
 type valueRows struct {
-	values [][]any
-	i      int
-	err    error
+	values  [][]any
+	i       int
+	err     error
+	scanErr error
 }
 
 func (r *valueRows) Next() bool {
@@ -177,9 +260,14 @@ func (r *valueRows) Next() bool {
 	}
 	return false
 }
-func (r *valueRows) Scan(dst ...any) error { return testRow{vals: r.values[r.i-1]}.Scan(dst...) }
-func (r *valueRows) Err() error            { return r.err }
-func (r *valueRows) Close()                {}
+func (r *valueRows) Scan(dst ...any) error {
+	if r.scanErr != nil {
+		return r.scanErr
+	}
+	return testRow{vals: r.values[r.i-1]}.Scan(dst...)
+}
+func (r *valueRows) Err() error { return r.err }
+func (r *valueRows) Close()     {}
 
 type testTx struct {
 	execAt, execs      int

@@ -185,16 +185,19 @@ func (e *PostgreSQL) ApplyAuthorized(ctx context.Context, checks precheck.Plan) 
 			}
 		}
 	}
+	return results, e.finish(ctx)
+}
+func (e *PostgreSQL) finish(ctx context.Context) error {
 	if auditErr := e.audit(ctx, "completed", e.result.LastConfirmed, ""); auditErr != nil {
 		if e.result.AppliedSteps > 0 {
 			e.result.Partial = true
 			e.result.ExecutionID = e.artifact.Digest
 			e.result.RecoveryGuidance = "repair lifecycle audit before retry"
-			return results, ErrPartial
+			return ErrPartial
 		}
-		return results, errors.New("durable lifecycle audit failed")
+		return errors.New("durable lifecycle audit failed")
 	}
-	return results, nil
+	return nil
 }
 
 func confirmedSteps(ctx context.Context, conn Session, a artifact.Artifact) (map[string]bool, error) {
@@ -223,6 +226,9 @@ func confirmedSteps(ctx context.Context, conn Session, a artifact.Artifact) (map
 		p, pok := phases[id]
 		if !ok || !pok || s.Kind == plan.StepTopology || hash != stepHash(s) || phaseID != p.ID || mode != string(p.Transaction) || executionID != a.Digest || target != a.DatabaseIdentity+"/"+a.TargetEnvironment || planDigest != a.Plan.Digest || bundleDigest != a.GuardrailDigest {
 			return nil, errors.New("migration history binding conflict")
+		}
+		if out[id] {
+			return nil, errors.New("duplicate confirmed migration history")
 		}
 		out[id] = true
 	}
