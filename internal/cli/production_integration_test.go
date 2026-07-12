@@ -59,7 +59,7 @@ func (t ambiguousTx) Commit(ctx context.Context) error {
 
 type productionTargetSnapshot struct {
 	Fingerprint, SchemaDefinition string
-	HistoryRows, AdvisoryLocks    int
+	HistoryRows                   int
 }
 
 func freshProductionDatabase(t *testing.T, ctx context.Context, baseURL, suffix string) string {
@@ -131,11 +131,28 @@ func snapshotProductionTarget(t *testing.T, ctx context.Context, url, schemaName
 			t.Fatal(err)
 		}
 	}
-	var locks int
-	if err = conn.QueryRow(ctx, `select count(*) from pg_locks where locktype='advisory' and database=(select oid from pg_database where datname=current_database())`).Scan(&locks); err != nil {
+	return productionTargetSnapshot{Fingerprint: fingerprint, SchemaDefinition: definition, HistoryRows: history}
+}
+
+func assertExecutorLockAvailable(t *testing.T, ctx context.Context, url, databaseIdentity, environment string) {
+	t.Helper()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
 		t.Fatal(err)
 	}
-	return productionTargetSnapshot{Fingerprint: fingerprint, SchemaDefinition: definition, HistoryRows: history, AdvisoryLocks: locks}
+	defer conn.Close(ctx)
+	identity := fmt.Sprintf("%d:%s%d:%s", len(databaseIdentity), databaseIdentity, len(environment), environment)
+	var locked bool
+	if err = conn.QueryRow(ctx, `select pg_try_advisory_lock(hashtextextended($1, 0))`, identity).Scan(&locked); err != nil {
+		t.Fatal(err)
+	}
+	if !locked {
+		t.Fatalf("executor lock remains held for exact identity %q", identity)
+	}
+	var unlocked bool
+	if err = conn.QueryRow(ctx, `select pg_advisory_unlock(hashtextextended($1, 0))`, identity).Scan(&unlocked); err != nil || !unlocked {
+		t.Fatalf("release exact executor lock %q: unlocked=%v err=%v", identity, unlocked, err)
+	}
 }
 
 func fileSize(t *testing.T, path string) int64 {
@@ -365,6 +382,7 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 			if beforeTarget != afterTarget {
 				t.Fatalf("revalidate failure %s mutated production: before=%+v after=%+v", fail, beforeTarget, afterTarget)
 			}
+			assertExecutorLockAvailable(t, ctx, url, cfg.DatabaseIdentity, cfg.Environment)
 		})
 	}
 
@@ -385,6 +403,7 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 			if beforeTarget != afterTarget {
 				t.Fatalf("publish failure %s mutated production: before=%+v after=%+v", fail, beforeTarget, afterTarget)
 			}
+			assertExecutorLockAvailable(t, ctx, url, cfg.DatabaseIdentity, cfg.Environment)
 		})
 	}
 	tampered.GuardrailDigest = "sha256:" + strings.Repeat("f", 64)
@@ -556,17 +575,19 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 			args = []string{"apply", "--from", "from", "--to", "to", "--approve-digest", published.Plan.Digest, "--json"}
 		}
 		before := snapshotProductionTarget(t, ctx, targetURL, name, published.Digest)
-		if before.Fingerprint != published.Plan.FromFingerprint || before.SchemaDefinition != "" || before.HistoryRows != 0 || before.AdvisoryLocks != 0 {
+		if before.Fingerprint != published.Plan.FromFingerprint || before.SchemaDefinition != "" || before.HistoryRows != 0 {
 			t.Fatalf("%s target not fresh: %+v from=%s url=%s", mode, before, published.Plan.FromFingerprint, targetURL)
 		}
+		assertExecutorLockAvailable(t, ctx, targetURL, cfg.DatabaseIdentity, cfg.Environment)
 		code, out, _ = invoke(t, args, "", false, modeServices)
 		if code != 0 || strings.Contains(out, "no_op") || !strings.Contains(out, fmt.Sprintf(`"applied_steps":%d`, executableSteps)) {
 			t.Fatalf("edited %s first apply code=%d out=%s", mode, code, out)
 		}
 		after := snapshotProductionTarget(t, ctx, targetURL, name, published.Digest)
-		if after.SchemaDefinition != name || after.Fingerprint != published.Plan.ToFingerprint || after.HistoryRows != executableSteps || after.AdvisoryLocks != 0 {
+		if after.SchemaDefinition != name || after.Fingerprint != published.Plan.ToFingerprint || after.HistoryRows != executableSteps {
 			t.Fatalf("edited %s mutation evidence=%+v want fingerprint=%s history=%d", mode, after, published.Plan.ToFingerprint, executableSteps)
 		}
+		assertExecutorLockAvailable(t, ctx, targetURL, cfg.DatabaseIdentity, cfg.Environment)
 		conn, connectErr := pgx.Connect(ctx, targetURL)
 		if connectErr != nil {
 			t.Fatal(connectErr)
@@ -602,9 +623,10 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 			t.Fatalf("edited %s second apply code=%d out=%s", mode, code, out)
 		}
 		second := snapshotProductionTarget(t, ctx, targetURL, name, published.Digest)
-		if second.Fingerprint != after.Fingerprint || second.SchemaDefinition != after.SchemaDefinition || second.HistoryRows != after.HistoryRows || second.AdvisoryLocks != 0 {
+		if second != after {
 			t.Fatalf("edited %s no-op changed target: first=%+v second=%+v", mode, after, second)
 		}
+		assertExecutorLockAvailable(t, ctx, targetURL, cfg.DatabaseIdentity, cfg.Environment)
 	}
 
 	artifactTarget := freshProductionDatabase(t, ctx, url, "artifact")
@@ -612,7 +634,7 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 	applyEdited("artifact", artifactTarget)
 	applyEdited("digest", digestTarget)
 
-	assertRefused := func(label, targetURL, artifactPath string, requestNoEdits, configuredNoEdits bool) {
+	assertRefused := func(label, mode, targetURL, artifactPath string, refusedPlan plan.Plan, requestNoEdits, configuredNoEdits bool) {
 		t.Helper()
 		cfg.NoEdits = configuredNoEdits
 		cfg.LifecycleAuditPath = filepath.Join(dir, label+"-lifecycle.jsonl")
@@ -626,7 +648,9 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 		if serviceErr != nil {
 			t.Fatal(serviceErr)
 		}
+		refusingServices.ReadPlan = &fakeRead{from: current, to: desired, p: refusedPlan}
 		before := snapshotProductionTarget(t, ctx, targetURL, name, published.Digest)
+		assertExecutorLockAvailable(t, ctx, targetURL, cfg.DatabaseIdentity, cfg.Environment)
 		artifactBefore, readErr := os.ReadFile(artifactPath)
 		if readErr != nil {
 			t.Fatal(readErr)
@@ -637,8 +661,11 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 		}
 		lifecycleBytes, approvalBytes := fileSize(t, cfg.LifecycleAuditPath), fileSize(t, cfg.ApprovalAuditPath)
 		args := []string{"apply", "--artifact", artifactPath, "--json"}
+		if mode == "digest" {
+			args = []string{"apply", "--from", "from", "--to", "to", "--approve-digest", refusedPlan.Digest, "--json"}
+		}
 		if requestNoEdits {
-			args = append(args[:3], "--no-edits", "--json")
+			args = append(args[:len(args)-1], "--no-edits", "--json")
 		}
 		code, _, _ = invoke(t, args, "", false, refusingServices)
 		if code == 0 {
@@ -646,6 +673,7 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 		}
 		after := snapshotProductionTarget(t, ctx, targetURL, name, published.Digest)
 		assertTargetUnchanged(t, before, after, cfg.LifecycleAuditPath, cfg.ApprovalAuditPath, lifecycleBytes, approvalBytes)
+		assertExecutorLockAvailable(t, ctx, targetURL, cfg.DatabaseIdentity, cfg.Environment)
 		artifactAfter, readErr := os.ReadFile(artifactPath)
 		if readErr != nil || !bytes.Equal(artifactBefore, artifactAfter) {
 			t.Fatalf("%s changed artifact bytes: err=%v", label, readErr)
@@ -656,10 +684,14 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 		}
 	}
 
-	assertRefused("request-no-edits", freshProductionDatabase(t, ctx, url, "request_no_edits"), publishedPath, true, false)
-	assertRefused("configured-no-edits", freshProductionDatabase(t, ctx, url, "configured_no_edits"), publishedPath, false, true)
+	for _, mode := range []string{"artifact", "digest"} {
+		assertRefused("request-no-edits-"+mode, mode, freshProductionDatabase(t, ctx, url, "request_no_edits_"+mode), publishedPath, published.Plan, true, false)
+		assertRefused("configured-no-edits-"+mode, mode, freshProductionDatabase(t, ctx, url, "configured_no_edits_"+mode), publishedPath, published.Plan, false, true)
+	}
 	// Once the trusted manifest advances to the edited release, replaying the
 	// originally approved artifact must fail before audit, lock, history, SQL,
 	// schema, or fingerprint state changes on a fresh target.
-	assertRefused("original-approval-replay", freshProductionDatabase(t, ctx, url, "approval_replay"), path, false, false)
+	for _, mode := range []string{"artifact", "digest"} {
+		assertRefused("original-approval-replay-"+mode, mode, freshProductionDatabase(t, ctx, url, "approval_replay_"+mode), path, p, false, false)
+	}
 }
