@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	"golang.org/x/sys/unix"
 )
 
 func checkpointLiveURLs(t *testing.T) (string, string) {
@@ -157,6 +158,60 @@ func TestCheckpointLiveLongHistoryEquivalenceCASPolicyAndFaults(t *testing.T) {
 			}
 			if treeState(t, fd) != before {
 				t.Fatal("fault published output")
+			}
+		})
+	}
+	makeFault := func(t *testing.T) (string, GenerateRequest) {
+		fd := t.TempDir()
+		_ = os.Chmod(fd, 0700)
+		_, _ = Update(fd, UpdateRequest{Files: []File{{Name: "V1__schema.sql", SQL: []byte("CREATE SCHEMA checkpoint_live; CREATE TABLE checkpoint_live.t(id bigint);")}}})
+		fr := generationFixture(t, fd, dev, prod)
+		fr.Version = "2"
+		fr.Label = "checkpoint"
+		fr.Desired = r.Desired
+		return fd, fr
+	}
+	count := 0
+	_, fr := makeFault(t)
+	counter := Ops{Write: func(x int, p []byte) (int, error) { count++; return unix.Write(x, p) }, Fsync: func(x int) error { count++; return unix.Fsync(x) }, Renameat: func(a int, ap string, b int, bp string) error { count++; return unix.Renameat(a, ap, b, bp) }}
+	if _, e = (GenerateService{Ops: counter}).CreateCheckpoint(context.Background(), CheckpointRequest{GenerateRequest: fr, DataPolicy: "schema_only"}); e != nil {
+		t.Fatal(e)
+	}
+	for fail := 1; fail <= count; fail++ {
+		t.Run(fmt.Sprintf("publish_crash_%d", fail), func(t *testing.T) {
+			fd, fr := makeFault(t)
+			before := treeState(t, fd)
+			calls := 0
+			boom := errors.New("crash")
+			ops := Ops{Write: func(x int, p []byte) (int, error) {
+				calls++
+				if calls == fail {
+					return 0, boom
+				}
+				return unix.Write(x, p)
+			}, Fsync: func(x int) error {
+				calls++
+				if calls == fail {
+					return boom
+				}
+				return unix.Fsync(x)
+			}, Renameat: func(a int, ap string, b int, bp string) error {
+				calls++
+				if calls == fail {
+					return boom
+				}
+				return unix.Renameat(a, ap, b, bp)
+			}}
+			_, _ = (GenerateService{Ops: ops}).CreateCheckpoint(context.Background(), CheckpointRequest{GenerateRequest: fr, DataPolicy: "schema_only"})
+			if _, er := LoadSnapshot(fd); er != nil {
+				t.Fatalf("recovery failed: %v", er)
+			}
+			after := treeState(t, fd)
+			if after != before {
+				snap, er := LoadSnapshot(fd)
+				if er != nil || (len(snap.Manifest.Entries) != 1 && len(snap.Manifest.Entries) != 2) {
+					t.Fatalf("crash exposed neither old nor new generation")
+				}
 			}
 		})
 	}

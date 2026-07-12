@@ -66,14 +66,11 @@ func runMigrateCheckpointVerify(ctx context.Context, args []string, o output) er
 	if err != nil {
 		return &Error{Kind: "config", Message: "decode signing key failed", Code: ExitConfig}
 	}
+	if len(c.CheckpointExpectedValidationContextDigests) != 3 || len(c.CheckpointExpectedValidationAttestations) != 3 || c.CheckpointExpectedApprovalIdentity == "" || c.CheckpointReleaseIssuer == "" || c.CheckpointReleaseIdentity == "" || c.CheckpointReleasePurpose == "" {
+		return &Error{Kind: "config", Message: "independent checkpoint release expectations required", Code: ExitConfig}
+	}
 	verify := func(a artifact.Artifact) (artifact.VerifiedArtifact, error) {
-		contexts := map[string]string{}
-		atts := map[string]artifact.ValidationAttestation{}
-		for _, v := range a.ValidationAttestations {
-			contexts[v.Stage] = v.ConfigDigest
-			atts[v.Stage] = v
-		}
-		p := artifact.VerifyPolicy{Now: time.Now, NoEdits: true, Expected: artifact.ExpectedBindings{PlanDigest: a.Plan.Digest, GeneratedPlanDigest: a.Plan.Digest, ChecksDigest: a.Checks.Digest, GuardrailDigest: a.GuardrailDigest, SourceRevision: c.SourceRevision, Environment: c.Environment, DatabaseIdentity: c.DatabaseIdentity, ApprovalIdentity: a.Approval.Identity, ApprovalProofDigest: a.Approval.ProofDigest}, Keys: map[string]artifact.KeyRecord{c.SigningKeyID: {PublicKey: sk.Public().(ed25519.PublicKey), Issuer: "checkpoint-config", Identity: "release", Environment: c.Environment, Purpose: "release", Status: "active", NotBefore: a.CreatedAt.Add(-time.Second), NotAfter: a.ExpiresAt}}, Issuer: "checkpoint-config", Identity: "release", Purpose: "release", GeneratorKeys: map[string]artifact.KeyRecord{c.GeneratorKeyID: {PublicKey: gk.Public().(ed25519.PublicKey), Purpose: c.GeneratorPurpose}}, GeneratorPurpose: c.GeneratorPurpose, ExpectedValidationContextDigests: contexts, ExpectedValidationAttestations: atts}
+		p := artifact.VerifyPolicy{Now: time.Now, NoEdits: true, Expected: artifact.ExpectedBindings{PlanDigest: a.Plan.Digest, GeneratedPlanDigest: a.Plan.Digest, ChecksDigest: a.Checks.Digest, GuardrailDigest: a.GuardrailDigest, SourceRevision: c.SourceRevision, Environment: c.Environment, DatabaseIdentity: c.DatabaseIdentity, ApprovalIdentity: c.CheckpointExpectedApprovalIdentity, ApprovalProofDigest: c.CheckpointExpectedApprovalProofDigest}, Keys: map[string]artifact.KeyRecord{c.SigningKeyID: {PublicKey: sk.Public().(ed25519.PublicKey), Issuer: c.CheckpointReleaseIssuer, Identity: c.CheckpointReleaseIdentity, Environment: c.Environment, Purpose: c.CheckpointReleasePurpose, Status: "active", NotBefore: a.CreatedAt.Add(-time.Second), NotAfter: a.ExpiresAt}}, Issuer: c.CheckpointReleaseIssuer, Identity: c.CheckpointReleaseIdentity, Purpose: c.CheckpointReleasePurpose, GeneratorKeys: map[string]artifact.KeyRecord{c.GeneratorKeyID: {PublicKey: gk.Public().(ed25519.PublicKey), Purpose: c.GeneratorPurpose}}, GeneratorPurpose: c.GeneratorPurpose, ExpectedValidationContextDigests: c.CheckpointExpectedValidationContextDigests, ExpectedValidationAttestations: c.CheckpointExpectedValidationAttestations}
 		return a.VerifyTrusted(p)
 	}
 	r, err := migrate.VerifyCheckpointsTrusted(*dir, verify)

@@ -169,6 +169,16 @@ func (s GenerateService) CreateCheckpoint(ctx context.Context, r CheckpointReque
 	if err != nil {
 		return out, generationFailure("data_replay", ErrGenerateStage)
 	}
+	if r.DataPolicy == "declared_replay" {
+		wantData, er := checkpointDataFingerprint(ctx, workspace.URL, schemas)
+		if er != nil {
+			return out, generationFailure("data_evidence", ErrGenerateStage)
+		}
+		gotSchema, gotData, er := simulateCheckpointPlan(ctx, r.GenerateRequest, doc, p.Statements(), schemas)
+		if er != nil || gotSchema != fingerprint || gotData != wantData {
+			return out, generationFailure("data_evidence", ErrGenerateStage)
+		}
+	}
 	checks, err := generationChecks(p, executableStatements(p), r.PrecheckAssertions)
 	if err != nil {
 		return out, generationFailure("prechecks", ErrGenerateStage)
@@ -487,4 +497,78 @@ func emptyCheckpointWorkspace(ctx context.Context, r GenerateRequest) (replayWor
 	du := *u
 	du.Path = "/" + name
 	return replayWorkspace{URL: du.String(), adminURL: r.DevelopmentURL, name: name}, nil
+}
+
+func simulateCheckpointPlan(ctx context.Context, r GenerateRequest, want schema.Document, statements []plugin.Statement, schemas []string) (string, string, error) {
+	w, err := emptyCheckpointWorkspace(ctx, r)
+	if err != nil {
+		return "", "", err
+	}
+	defer w.Close()
+	c, err := pgx.Connect(ctx, w.URL)
+	if err != nil {
+		return "", "", err
+	}
+	for _, s := range statements {
+		if s.Kind == plugin.StatementExecutable {
+			if _, err = c.Exec(ctx, s.SQL); err != nil {
+				c.Close(context.Background())
+				return "", "", err
+			}
+		}
+	}
+	c.Close(context.Background())
+	doc, err := postgres.InspectURL(ctx, w.URL, postgres.Options{Schemas: schemas})
+	if err != nil {
+		return "", "", err
+	}
+	doc, err = postgres.New().Normalize(ctx, doc)
+	if err != nil {
+		return "", "", err
+	}
+	fp, err := schema.SemanticFingerprint(doc)
+	if err != nil {
+		return "", "", err
+	}
+	data, err := checkpointDataFingerprint(ctx, w.URL, schemas)
+	return fp, data, err
+}
+
+func checkpointDataFingerprint(ctx context.Context, databaseURL string, schemas []string) (string, error) {
+	c, err := pgx.Connect(ctx, databaseURL)
+	if err != nil {
+		return "", err
+	}
+	defer c.Close(context.Background())
+	var material strings.Builder
+	for _, ns := range schemas {
+		rows, er := c.Query(ctx, `select tablename from pg_tables where schemaname=$1 order by tablename`, ns)
+		if er != nil {
+			return "", er
+		}
+		var tables []string
+		for rows.Next() {
+			var n string
+			if er = rows.Scan(&n); er != nil {
+				rows.Close()
+				return "", er
+			}
+			tables = append(tables, n)
+		}
+		rows.Close()
+		for _, table := range tables {
+			q := `select coalesce(jsonb_agg(to_jsonb(t) order by to_jsonb(t)::text),'[]'::jsonb)::text from ` + pgx.Identifier{ns, table}.Sanitize() + ` t`
+			var value string
+			if er = c.QueryRow(ctx, q).Scan(&value); er != nil {
+				return "", er
+			}
+			material.WriteString(ns)
+			material.WriteByte(0)
+			material.WriteString(table)
+			material.WriteByte(0)
+			material.WriteString(value)
+			material.WriteByte(0)
+		}
+	}
+	return sha(material.String()), nil
 }
