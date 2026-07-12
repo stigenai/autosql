@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -30,6 +31,7 @@ type SessionStore interface {
 }
 type VerifyArtifact func(artifact.Artifact) (artifact.VerifiedArtifact, error)
 type GuardedApply func(context.Context, artifact.VerifiedArtifact, executor.Session, executor.Tx) (executor.ExternalExecution, error)
+type GuardedReapply func(context.Context, artifact.VerifiedArtifact, executor.Session, executor.Tx, int) (executor.ExternalExecution, error)
 type Request struct {
 	Directory                string
 	Snapshot                 migrate.Snapshot // tests/offline callers; production should use Directory
@@ -67,20 +69,36 @@ type Result struct {
 	BackendPID   int32         `json:"backend_pid,omitempty"`
 }
 type candidate struct {
-	entry    migrate.Migration
-	raw      []byte
-	verified artifact.VerifiedArtifact
-	payload  artifact.Artifact
+	entry                     migrate.Migration
+	raw                       []byte
+	verified                  artifact.VerifiedArtifact
+	payload                   artifact.Artifact
+	recordVersion, reversalOf string
+	executionAttempt          int
 }
 type Engine struct {
-	Store  SessionStore
-	Verify VerifyArtifact
-	Apply  GuardedApply
-	Drain  func(context.Context, executor.LifecycleEvent) error
+	Store        SessionStore
+	Verify       VerifyArtifact
+	Apply        GuardedApply
+	ApplyAttempt GuardedReapply
+	Drain        func(context.Context, executor.LifecycleEvent) error
+}
+
+func invokeApply(ctx context.Context, c candidate, s executor.Session, tx executor.Tx, apply GuardedApply, reapply GuardedReapply) (executor.ExternalExecution, error) {
+	if c.executionAttempt > 1 {
+		if reapply == nil {
+			return executor.ExternalExecution{}, fmt.Errorf("%w: trusted reapply attempt boundary unavailable", ErrRefused)
+		}
+		return reapply(ctx, c.verified, s, tx, c.executionAttempt)
+	}
+	if apply != nil {
+		return apply(ctx, c.verified, s, tx)
+	}
+	return reapply(ctx, c.verified, s, tx, 1)
 }
 
 func (e Engine) Run(ctx context.Context, r Request) (out Result, err error) {
-	if e.Store == nil || e.Verify == nil || (!r.DryRun && !r.Baseline && e.Apply == nil) || r.Operator == "" || (r.Transaction != "file" && r.Transaction != "all") || r.DryRun && r.Baseline || r.Count != nil && *r.Count < 0 {
+	if e.Store == nil || e.Verify == nil || (!r.DryRun && !r.Baseline && e.Apply == nil && e.ApplyAttempt == nil) || r.Operator == "" || (r.Transaction != "file" && r.Transaction != "all") || r.DryRun && r.Baseline || r.Count != nil && *r.Count < 0 {
 		return out, ErrRefused
 	}
 	if r.Now == nil {
@@ -233,9 +251,9 @@ func (e Engine) Run(ctx context.Context, r Request) (out Result, err error) {
 				return out, fmt.Errorf("%w: all transaction requires transaction=required", ErrRefused)
 			}
 		}
-		err = applyAtomic(ctx, s, candidates, snap, r, &out, e.Apply, parentGeneration(records), e.Verify)
+		err = applyAtomic(ctx, s, candidates, snap, r, &out, e.Apply, e.ApplyAttempt, parentGeneration(records), e.Verify)
 	} else {
-		err = applyPerFile(ctx, s, candidates, snap, r, &out, e.Apply, parentGeneration(records), e.Verify)
+		err = applyPerFile(ctx, s, candidates, snap, r, &out, e.Apply, e.ApplyAttempt, parentGeneration(records), e.Verify)
 	}
 	if err != nil {
 		return out, err
@@ -275,6 +293,32 @@ func reconcileHistory(snap migrate.Snapshot, revs []revision.Revision, rows []re
 	known := map[string]bool{}
 	for _, r := range revs {
 		a, ok := arts[r.ArtifactDigest]
+		if r.Kind == "reversal" {
+			raw, e := os.ReadFile(r.FileName)
+			if e != nil {
+				return fmt.Errorf("%w: reversal artifact missing", ErrRefused)
+			}
+			parsed, e := artifact.Parse(raw)
+			if e != nil {
+				return ErrRefused
+			}
+			v, e := verify(parsed)
+			if e != nil {
+				return ErrRefused
+			}
+			a, e = v.Payload()
+			if e != nil || a.Digest != r.ArtifactDigest {
+				return ErrRefused
+			}
+			ok = true
+		}
+		if r.Kind == "reapply" {
+			for _, m := range snap.Manifest.Entries {
+				if m.Version == r.ToVersion {
+					a, ok = arts[m.ArtifactDigest]
+				}
+			}
+		}
 		if !ok {
 			return fmt.Errorf("%w: revision artifact absent", ErrRefused)
 		}
@@ -294,13 +338,19 @@ func reconcileHistory(snap migrate.Snapshot, revs []revision.Revision, rows []re
 				}
 			}
 		}
-		if len(by[a.Digest]) != len(expected) {
+		attemptRows := []revision.ExecutorRecord{}
+		for _, x := range by[a.Digest] {
+			if x.Attempt == r.Attempt {
+				attemptRows = append(attemptRows, x)
+			}
+		}
+		if len(attemptRows) != len(expected) {
 			return fmt.Errorf("%w: incomplete executor history", ErrRefused)
 		}
-		for _, x := range by[a.Digest] {
+		for _, x := range attemptRows {
 			p, ok := expected[x.StepID]
 			st := stepByID(a, x.StepID)
-			if !ok || x.Attempt != 1 || x.State != "confirmed" || x.StepHash != executor.StepHash(st) || x.PhaseID != p.ID || x.PhaseMode != string(p.Transaction) || x.ExecutionID != a.Digest || x.TargetIdentity != a.DatabaseIdentity+"/"+a.TargetEnvironment || x.PlanDigest != a.Plan.Digest || x.BundleDigest != a.GuardrailDigest {
+			if !ok || x.Attempt != r.Attempt || x.State != "confirmed" || x.StepHash != executor.StepHash(st) || x.PhaseID != p.ID || x.PhaseMode != string(p.Transaction) || x.ExecutionID != a.Digest || x.TargetIdentity != a.DatabaseIdentity+"/"+a.TargetEnvironment || x.PlanDigest != a.Plan.Digest || x.BundleDigest != a.GuardrailDigest {
 				return fmt.Errorf("%w: executor history binding conflict", ErrRefused)
 			}
 		}
@@ -398,11 +448,42 @@ func selectTrusted(snap migrate.Snapshot, records []revision.Revision, r Request
 		}
 	}
 	by := map[string]revision.Revision{}
+	manifestIndex := map[string]int{}
+	for i, m := range snap.Manifest.Entries {
+		manifestIndex[m.Version] = i
+	}
+	activeReversal := ""
+	reversalHeadIndex := -1
+	reapplyAttempt := map[string]int{}
 	for _, x := range records {
-		if _, ok := by[x.Version]; ok {
-			return nil, fmt.Errorf("%w: duplicate revision", ErrRefused)
+		switch x.Kind {
+		case "reversal":
+			idx, ok := manifestIndex[x.ToVersion]
+			headIdx, headOK := manifestIndex[x.FromVersion]
+			if !ok || !headOK || headIdx <= idx || x.State != "applied" || x.ReversalOf == "" {
+				return nil, fmt.Errorf("%w: invalid reversal record", ErrRefused)
+			}
+			for version, i := range manifestIndex {
+				if i > idx && i <= headIdx {
+					delete(by, version)
+				}
+			}
+			activeReversal = x.Version
+			reversalHeadIndex = headIdx
+		case "reapply":
+			if _, ok := manifestIndex[x.ToVersion]; !ok || x.State != "applied" || x.ReversalOf == "" {
+				return nil, fmt.Errorf("%w: invalid reapply record", ErrRefused)
+			}
+			by[x.ToVersion] = x
+			if x.Attempt > reapplyAttempt[x.ToVersion] {
+				reapplyAttempt[x.ToVersion] = x.Attempt
+			}
+		default:
+			if _, ok := by[x.Version]; ok {
+				return nil, fmt.Errorf("%w: duplicate revision", ErrRefused)
+			}
+			by[x.Version] = x
 		}
-		by[x.Version] = x
 	}
 	applied := map[string]bool{}
 	for _, m := range snap.Manifest.Entries {
@@ -426,7 +507,7 @@ func selectTrusted(snap migrate.Snapshot, records []revision.Revision, r Request
 		manifestVersions[m.Version] = true
 	}
 	for _, x := range records {
-		if !manifestVersions[x.Version] {
+		if !manifestVersions[x.Version] && x.Kind != "reversal" && x.Kind != "reapply" {
 			return nil, fmt.Errorf("%w: unknown applied revision", ErrRefused)
 		}
 		if x.State == "failed" || x.State == "partial" || x.State == "pending" {
@@ -486,7 +567,17 @@ func selectTrusted(snap migrate.Snapshot, records []revision.Revision, r Request
 		if !directiveCompatible(m.Directives.Transaction, p) {
 			return nil, fmt.Errorf("%w: transaction directive conflicts with signed phases", ErrRefused)
 		}
-		out = append(out, candidate{m, raw, v, p})
+		candidate := candidate{entry: m, raw: raw, verified: v, payload: p, executionAttempt: 1}
+		if activeReversal != "" && manifestIndex[m.Version] <= reversalHeadIndex {
+			previous := reapplyAttempt[m.Version]
+			if previous < 1 {
+				previous = 1
+			}
+			candidate.reversalOf = activeReversal
+			candidate.executionAttempt = previous + 1
+			candidate.recordVersion = "zz_reapply_" + strings.ReplaceAll(m.Version, ".", "_") + "_" + fmt.Sprint(candidate.executionAttempt)
+		}
+		out = append(out, candidate)
 		if r.To != "" && m.Version == canonicalVersion(r.To) {
 			break
 		}
@@ -533,7 +624,16 @@ func parentGeneration(rs []revision.Revision) string {
 }
 
 func baseRevision(c candidate, m migrate.Manifest, r Request, at time.Time, state, kind string) revision.Revision {
-	return revision.Revision{Version: c.entry.Version, Description: c.entry.Name, Kind: kind, FileName: c.entry.File, FileDigest: c.entry.SQLDigest, ManifestDigest: m.Digest, ManifestGeneration: m.Generation, ArtifactDigest: c.entry.ArtifactDigest, PlanDigest: c.entry.Directives.PlanDigest, ChecksDigest: c.entry.Directives.CheckDigest, BundleDigest: c.entry.Directives.BundleDigest, State: state, Attempt: 1, Operator: r.Operator, StartedAt: at, UpdatedAt: at, FromVersion: c.payload.Metadata["autosql.migration.from"], ToVersion: c.entry.Version}
+	version := c.entry.Version
+	if c.recordVersion != "" {
+		version = c.recordVersion
+		kind = "reapply"
+	}
+	attempt := c.executionAttempt
+	if attempt < 1 {
+		attempt = 1
+	}
+	return revision.Revision{Version: version, Description: c.entry.Name, Kind: kind, FileName: c.entry.File, FileDigest: c.entry.SQLDigest, ManifestDigest: m.Digest, ManifestGeneration: m.Generation, ArtifactDigest: c.entry.ArtifactDigest, PlanDigest: c.entry.Directives.PlanDigest, ChecksDigest: c.entry.Directives.CheckDigest, BundleDigest: c.entry.Directives.BundleDigest, State: state, Attempt: attempt, Operator: r.Operator, StartedAt: at, UpdatedAt: at, FromVersion: c.payload.Metadata["autosql.migration.from"], ToVersion: c.entry.Version, ReversalOf: c.reversalOf}
 }
 func baseline(ctx context.Context, s *revision.Session, cs []candidate, snap migrate.Snapshot, r Request, now func() time.Time, parent string, verify VerifyArtifact) error {
 	m := snap.Manifest
@@ -566,7 +666,7 @@ func baseline(ctx context.Context, s *revision.Session, cs []candidate, snap mig
 	return tx.Commit(ctx)
 }
 
-func applyAtomic(ctx context.Context, s *revision.Session, cs []candidate, snap migrate.Snapshot, r Request, out *Result, apply GuardedApply, parent string, verify VerifyArtifact) error {
+func applyAtomic(ctx context.Context, s *revision.Session, cs []candidate, snap migrate.Snapshot, r Request, out *Result, apply GuardedApply, reapply GuardedReapply, parent string, verify VerifyArtifact) error {
 	m := snap.Manifest
 	tx, e := s.Begin(ctx)
 	if e != nil {
@@ -580,7 +680,7 @@ func applyAtomic(ctx context.Context, s *revision.Session, cs []candidate, snap 
 		return e
 	}
 	for i, c := range cs {
-		fr, fe := executeGuarded(ctx, s, tx, c, m, r, apply, parent)
+		fr, fe := executeGuarded(ctx, s, tx, c, m, r, apply, reapply, parent)
 		out.FileResults = append(out.FileResults, fr)
 		out.Statements += fr.Statements
 		if fe != nil {
@@ -615,13 +715,13 @@ func applyAtomic(ctx context.Context, s *revision.Session, cs []candidate, snap 
 	}
 	return nil
 }
-func applyPerFile(ctx context.Context, s *revision.Session, cs []candidate, snap migrate.Snapshot, r Request, out *Result, apply GuardedApply, parent string, verify VerifyArtifact) error {
+func applyPerFile(ctx context.Context, s *revision.Session, cs []candidate, snap migrate.Snapshot, r Request, out *Result, apply GuardedApply, reapply GuardedReapply, parent string, verify VerifyArtifact) error {
 	m := snap.Manifest
 	for i, c := range cs {
 		var fr FileResult
 		var e error
 		if !artifactTransactional(c.payload) {
-			fr, e = executeGuarded(ctx, s, nil, c, m, r, apply, parent)
+			fr, e = executeGuarded(ctx, s, nil, c, m, r, apply, reapply, parent)
 		} else {
 			tx, be := s.Begin(ctx)
 			if be != nil {
@@ -635,7 +735,7 @@ func applyPerFile(ctx context.Context, s *revision.Session, cs []candidate, snap
 				_ = tx.Rollback(context.WithoutCancel(ctx))
 				return be
 			}
-			fr, e = executeGuarded(ctx, s, tx, c, m, r, apply, parent)
+			fr, e = executeGuarded(ctx, s, tx, c, m, r, apply, reapply, parent)
 			if e == nil {
 				if ce := tx.Commit(ctx); ce != nil {
 					e = ErrUncertain
@@ -680,7 +780,7 @@ func applyPerFile(ctx context.Context, s *revision.Session, cs []candidate, snap
 	}
 	return nil
 }
-func executeGuarded(ctx context.Context, s *revision.Session, tx pgx.Tx, c candidate, m migrate.Manifest, r Request, apply GuardedApply, parent string) (FileResult, error) {
+func executeGuarded(ctx context.Context, s *revision.Session, tx pgx.Tx, c candidate, m migrate.Manifest, r Request, apply GuardedApply, reapply GuardedReapply, parent string) (FileResult, error) {
 	start := r.Now()
 	fr := FileResult{Version: c.entry.Version, File: c.entry.File}
 	x := baseRevision(c, m, r, start.UTC(), "pending", "migration")
@@ -693,7 +793,7 @@ func executeGuarded(ctx context.Context, s *revision.Session, tx pgx.Tx, c candi
 			e = s.ExecRevision(ctx, initial, x)
 		}
 		if e == nil {
-			e = s.ExecEvent(ctx, initial, revision.Event{Version: x.Version, Attempt: 1, Type: "migration_requested", Operator: r.Operator, At: start.UTC()})
+			e = s.ExecEvent(ctx, initial, revision.Event{Version: x.Version, Attempt: x.Attempt, Type: "migration_requested", Operator: r.Operator, At: start.UTC()})
 		}
 		if e == nil {
 			e = initial.Commit(ctx)
@@ -703,7 +803,7 @@ func executeGuarded(ctx context.Context, s *revision.Session, tx pgx.Tx, c candi
 		if e != nil {
 			return fr, e
 		}
-		eres, e := apply(ctx, c.verified, executor.WrapPGX(s.Raw()), nil)
+		eres, e := invokeApply(ctx, c, executor.WrapPGX(s.Raw()), nil, apply, reapply)
 		fr.Statements = eres.Result.AppliedSteps
 		fr.finalize = eres.Finalize
 		done := r.Now().UTC()
@@ -717,7 +817,7 @@ func executeGuarded(ctx context.Context, s *revision.Session, tx pgx.Tx, c candi
 		}
 		be = s.FinalizeRevision(context.WithoutCancel(ctx), final, x.Version, state, fr.Statements, done.Sub(start), redacted, done)
 		if be == nil {
-			be = s.ExecEvent(context.WithoutCancel(ctx), final, revision.Event{Version: x.Version, Attempt: 1, Type: event, Ordinal: fr.Statements, Operator: r.Operator, At: done})
+			be = s.ExecEvent(context.WithoutCancel(ctx), final, revision.Event{Version: x.Version, Attempt: x.Attempt, Type: event, Ordinal: fr.Statements, Operator: r.Operator, At: done})
 		}
 		if be == nil {
 			be = final.Commit(context.WithoutCancel(ctx))
@@ -748,10 +848,10 @@ func executeGuarded(ctx context.Context, s *revision.Session, tx pgx.Tx, c candi
 	if err := s.ExecRevision(ctx, tx, x); err != nil {
 		return fr, err
 	}
-	if err := s.ExecEvent(ctx, tx, revision.Event{Version: x.Version, Attempt: 1, Type: "migration_requested", Operator: r.Operator, At: start.UTC()}); err != nil {
+	if err := s.ExecEvent(ctx, tx, revision.Event{Version: x.Version, Attempt: x.Attempt, Type: "migration_requested", Operator: r.Operator, At: start.UTC()}); err != nil {
 		return fr, err
 	}
-	eres, err := apply(ctx, c.verified, executor.WrapPGX(s.Raw()), executor.WrapPGXTx(tx))
+	eres, err := invokeApply(ctx, c, executor.WrapPGX(s.Raw()), executor.WrapPGXTx(tx), apply, reapply)
 	fr.Statements = eres.Result.AppliedSteps
 	fr.finalize = eres.Finalize
 	fr.events = eres.Events
@@ -771,7 +871,7 @@ func executeGuarded(ctx context.Context, s *revision.Session, tx pgx.Tx, c candi
 	if err := s.FinalizeRevision(ctx, tx, x.Version, "applied", fr.Statements, fr.Duration, "", done); err != nil {
 		return fr, err
 	}
-	if err := s.ExecEvent(ctx, tx, revision.Event{Version: x.Version, Attempt: 1, Type: "migration_applied", Ordinal: fr.Statements, Operator: r.Operator, At: done}); err != nil {
+	if err := s.ExecEvent(ctx, tx, revision.Event{Version: x.Version, Attempt: x.Attempt, Type: "migration_applied", Ordinal: fr.Statements, Operator: r.Operator, At: done}); err != nil {
 		return fr, err
 	}
 	if owned {

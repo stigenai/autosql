@@ -125,7 +125,7 @@ func newProductionDownService(path string, resolver *secret.Resolver, v Verified
 	if e = d.Decode(&c); e != nil {
 		return nil, errors.New("parse down configuration")
 	}
-	if c.MigrationDirectory == "" || c.Operator == "" || c.PlanTTL <= 0 || c.ArtifactDirectory == "" || c.ReleaseKeyID == "" || c.GeneratorKeyID == "" || c.GeneratorPurpose == "" || c.Issuer == "" || c.Signer == "" || c.Purpose == "" {
+	if c.MigrationDirectory == "" || c.Operator == "" || c.PlanTTL <= 0 || !filepath.IsAbs(c.ArtifactDirectory) || c.ReleaseKeyID == "" || c.GeneratorKeyID == "" || c.GeneratorPurpose == "" || c.Issuer == "" || c.Signer == "" || c.Purpose == "" {
 		return nil, errors.New("invalid down configuration")
 	}
 	dev, e := resolver.Resolve(context.Background(), secret.Reference(c.DevelopmentURLReference))
@@ -227,6 +227,11 @@ func (s *productionDownService) PlanDown(ctx context.Context, to string) (migrat
 		return migratedown.DownPlan{}, executor.ErrBusy
 	}
 	defer session.Unlock(context.WithoutCancel(ctx), key)
+	writers, e := session.LockWriters(ctx)
+	if e != nil || !writers {
+		return migratedown.DownPlan{}, executor.ErrBusy
+	}
+	defer session.UnlockWriters(context.WithoutCancel(ctx))
 	if e = s.drainOutbox(ctx, session); e != nil {
 		return migratedown.DownPlan{}, errors.New("drain pending down lifecycle audit")
 	}
@@ -426,7 +431,7 @@ func (s *productionDownService) ApplyDown(ctx context.Context, p migratedown.Dow
 		originals[i] = x.ArtifactDigest
 	}
 	done := now
-	r := revision.Revision{Version: version, Description: "controlled down to " + p.TargetVersion, Kind: "reversal", FileName: "DOWN__" + p.TargetVersion, FileDigest: p.Digest, ManifestDigest: p.ManifestDigest, ManifestGeneration: p.ManifestGeneration, ArtifactDigest: payload.Digest, PlanDigest: payload.Plan.Digest, ChecksDigest: payload.Checks.Digest, BundleDigest: payload.GuardrailDigest, State: "applied", StatementOrdinal: external.Result.AppliedSteps, Attempt: 1, Operator: s.cfg.Operator, StartedAt: now, UpdatedAt: now, CompletedAt: &done, FromVersion: p.HeadVersion, ToVersion: p.TargetVersion, ReversalOf: strings.Join(originals, ",")}
+	r := revision.Revision{Version: version, Description: "controlled down to " + p.TargetVersion, Kind: "reversal", FileName: p.ArtifactPath, FileDigest: p.Digest, ManifestDigest: p.ManifestDigest, ManifestGeneration: p.ManifestGeneration, ArtifactDigest: payload.Digest, PlanDigest: payload.Plan.Digest, ChecksDigest: payload.Checks.Digest, BundleDigest: payload.GuardrailDigest, State: "applied", StatementOrdinal: external.Result.AppliedSteps, Attempt: 1, Operator: s.cfg.Operator, StartedAt: now, UpdatedAt: now, CompletedAt: &done, FromVersion: p.HeadVersion, ToVersion: p.TargetVersion, ReversalOf: strings.Join(originals, ",")}
 	if e = session.ExecReversal(ctx, tx, r, originals); e != nil {
 		return "failed", e
 	}
