@@ -16,3 +16,14 @@ each statement and confirmation afterward. History records bind artifact,
 phase, step ID, step hash, attempt, state, timestamps, last confirmed step, and
 recovery guidance. An intended-but-unconfirmed step refuses retry: an operator
 must reconcile and explicitly skip it, or create a new signed plan.
+
+## Production CLI configuration
+
+The shipped binary never uses nil apply services. Without configuration it uses
+an explicit refusing service. To enable apply, set `AUTOSQL_APPLY_CONFIG` to a
+strict JSON file containing the database URL secret reference, environment,
+database identity, source revision, trusted Ed25519 key metadata, distinct
+author/requester identities, PostgreSQL version, managed schemas, durable
+approval/lifecycle audit paths, and an artifact directory. Artifact mode verifies
+the supplied file. Digest mode resolves `<artifact_directory>/<digest>.json` and
+enters the identical signature, binding, guardrail, lock, and executor boundary.

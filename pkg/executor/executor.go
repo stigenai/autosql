@@ -134,7 +134,7 @@ func (e *PostgreSQL) ApplyAuthorized(ctx context.Context, checks precheck.Plan) 
 	if err = refuseUncertain(ctx, conn, e.artifact.Digest); err != nil {
 		return nil, err
 	}
-	confirmed, err := confirmedSteps(ctx, conn, e.artifact.Digest)
+	confirmed, err := confirmedSteps(ctx, conn, e.artifact)
 	if err != nil {
 		return nil, err
 	}
@@ -171,17 +171,32 @@ func (e *PostgreSQL) ApplyAuthorized(ctx context.Context, checks precheck.Plan) 
 	return results, nil
 }
 
-func confirmedSteps(ctx context.Context, conn *pgx.Conn, digest string) (map[string]bool, error) {
-	rows, err := conn.Query(ctx, `select step_id from autosql_migration_history where artifact_digest=$1 and state='confirmed'`, digest)
+func confirmedSteps(ctx context.Context, conn *pgx.Conn, a artifact.Artifact) (map[string]bool, error) {
+	rows, err := conn.Query(ctx, `select step_id,step_hash,phase_id,phase_mode,execution_id,target_identity,plan_digest,bundle_digest from autosql_migration_history where artifact_digest=$1 and state='confirmed'`, a.Digest)
 	if err != nil {
 		return nil, errors.New("read confirmed migration history")
 	}
 	defer rows.Close()
 	out := map[string]bool{}
+	steps := map[string]plan.Step{}
+	phases := map[string]plan.Phase{}
+	for _, s := range a.Plan.Steps {
+		steps[s.ID] = s
+	}
+	for _, p := range a.Plan.Phases {
+		for _, id := range p.StepIDs {
+			phases[id] = p
+		}
+	}
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var id, hash, phaseID, mode, executionID, target, planDigest, bundleDigest string
+		if err := rows.Scan(&id, &hash, &phaseID, &mode, &executionID, &target, &planDigest, &bundleDigest); err != nil {
 			return nil, errors.New("read confirmed migration history")
+		}
+		s, ok := steps[id]
+		p, pok := phases[id]
+		if !ok || !pok || s.Kind == plan.StepTopology || hash != stepHash(s) || phaseID != p.ID || mode != string(p.Transaction) || executionID != a.Digest || target != a.DatabaseIdentity+"/"+a.TargetEnvironment || planDigest != a.Plan.Digest || bundleDigest != a.GuardrailDigest {
+			return nil, errors.New("migration history binding conflict")
 		}
 		out[id] = true
 	}
@@ -190,6 +205,7 @@ func confirmedSteps(ctx context.Context, conn *pgx.Conn, digest string) (map[str
 
 const historyDDL = `create table if not exists autosql_migration_history (
  artifact_digest text not null, step_id text not null, step_hash text not null,
+ execution_id text not null, target_identity text not null, plan_digest text not null, bundle_digest text not null,
  attempt integer not null, phase_id text not null, phase_mode text not null,
  state text not null, intended_at timestamptz, confirmed_at timestamptz,
  last_confirmed_step text not null default '', recovery_guidance text not null default '',
@@ -199,6 +215,10 @@ func ensureHistory(ctx context.Context, conn *pgx.Conn) error {
 	_, err := conn.Exec(ctx, historyDDL)
 	if err != nil {
 		return errors.New("initialize migration history")
+	}
+	_, err = conn.Exec(ctx, `alter table autosql_migration_history add column if not exists execution_id text, add column if not exists target_identity text, add column if not exists plan_digest text, add column if not exists bundle_digest text`)
+	if err != nil {
+		return errors.New("upgrade migration history")
 	}
 	return nil
 }
@@ -270,7 +290,7 @@ func (e *PostgreSQL) transactionalPhase(ctx context.Context, conn *pgx.Conn, pha
 				return results, errors.New("execute transactional migration step")
 			}
 		}
-		if err = insertHistory(ctx, tx, e.artifact.Digest, step, phase, "confirmed", last, ""); err != nil {
+		if err = insertHistory(ctx, tx, e.artifact, step, phase, "confirmed", last, ""); err != nil {
 			return results, err
 		}
 		pendingCount++
@@ -285,6 +305,13 @@ func (e *PostgreSQL) transactionalPhase(ctx context.Context, conn *pgx.Conn, pha
 	}
 	e.result.AppliedSteps += pendingCount
 	e.result.LastConfirmed = last
+	for _, id := range phase.StepIDs {
+		if s := steps[id]; s.Kind == plan.StepExecutable && !confirmed[id] {
+			if auditErr := e.audit(ctx, "confirmed", id, ""); auditErr != nil {
+				return results, errors.New("durable lifecycle audit failed")
+			}
+		}
+	}
 	return results, nil
 }
 
@@ -297,7 +324,7 @@ func (e *PostgreSQL) nontransactionalPhase(ctx context.Context, conn *pgx.Conn, 
 		if step.Kind == plan.StepTopology {
 			continue
 		}
-		if err := insertHistory(ctx, conn, e.artifact.Digest, step, phase, "intended", e.result.LastConfirmed, "reconcile, explicitly skip, or create a new signed plan"); err != nil {
+		if err := insertHistory(ctx, conn, e.artifact, step, phase, "intended", e.result.LastConfirmed, "reconcile, explicitly skip, or create a new signed plan"); err != nil {
 			return err
 		}
 		if err := e.audit(ctx, "intent", step.ID, ""); err != nil {
@@ -305,8 +332,16 @@ func (e *PostgreSQL) nontransactionalPhase(ctx context.Context, conn *pgx.Conn, 
 		}
 		if step.Kind == plan.StepExecutable {
 			if _, err := conn.Exec(ctx, step.SQL); err != nil {
-				e.result.Partial = true
-				return ErrPartial
+				e.result.PendingStep = step.ID
+				e.result.ExecutionID = e.artifact.Digest
+				e.result.RecoveryGuidance = "reconcile statement outcome before retry"
+				if e.result.AppliedSteps > 0 {
+					e.result.Partial = true
+					return ErrPartial
+				}
+				e.result.Uncertain = true
+				_ = e.audit(ctx, "uncertain", step.ID, e.result.RecoveryGuidance)
+				return ErrReconcile
 			}
 		}
 		if e.config.Confirm != nil {
@@ -334,8 +369,9 @@ func (e *PostgreSQL) nontransactionalPhase(ctx context.Context, conn *pgx.Conn, 
 
 func insertHistory(ctx context.Context, x interface {
 	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
-}, digest string, step plan.Step, phase plan.Phase, state, last, guidance string) error {
-	_, err := x.Exec(ctx, `insert into autosql_migration_history(artifact_digest,step_id,step_hash,attempt,phase_id,phase_mode,state,intended_at,confirmed_at,last_confirmed_step,recovery_guidance) values($1,$2,$3,1,$4,$5,$6,clock_timestamp(),case when $6='confirmed' then clock_timestamp() end,$7,$8)`, digest, step.ID, stepHash(step), phase.ID, phase.Transaction, state, last, guidance)
+}, a artifact.Artifact, step plan.Step, phase plan.Phase, state, last, guidance string) error {
+	target := a.DatabaseIdentity + "/" + a.TargetEnvironment
+	_, err := x.Exec(ctx, `insert into autosql_migration_history(artifact_digest,step_id,step_hash,attempt,phase_id,phase_mode,state,intended_at,confirmed_at,last_confirmed_step,recovery_guidance,execution_id,target_identity,plan_digest,bundle_digest) values($1,$2,$3,1,$4,$5,$6,clock_timestamp(),case when $6='confirmed' then clock_timestamp() end,$7,$8,$1,$9,$10,$11)`, a.Digest, step.ID, stepHash(step), phase.ID, phase.Transaction, state, last, guidance, target, a.Plan.Digest, a.GuardrailDigest)
 	if err != nil {
 		return errors.New("write durable migration history")
 	}
