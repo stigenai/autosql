@@ -13,6 +13,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -161,6 +162,36 @@ func TestRevalidationFixedOrderAndFailureStopsLaterStages(t *testing.T) {
 			want := map[string]int{"simulate": 1, "safety": 2, "bind": 3}[stage]
 			if len(log) != want {
 				t.Fatalf("log=%v", log)
+			}
+		})
+	}
+}
+
+func TestPipelineExplicitStageFailureMatrix(t *testing.T) {
+	a, raw, _ := fixture(t)
+	e, err := New(raw, a, a.Plan.Steps[0].SQL, "edit.sql", Editor{Identity: "editor", At: time.Now().UTC(), Reason: "review"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	order := []string{"parse", "ast_bind", "rebind", "simulation", "fingerprint", "safety", "policy", "precheck", "guardrail"}
+	for failAt := range order {
+		t.Run(order[failAt], func(t *testing.T) {
+			var stages, calls []string
+			p := Pipeline{Simulator: sim{log: &calls, fp: a.Plan.ToFingerprint}, Safety: safe{log: &calls}, Binder: bind{log: &calls}, Stage: func(name string) error {
+				stages = append(stages, name)
+				if name == order[failAt] {
+					return errors.New("injected")
+				}
+				return nil
+			}}
+			if _, err := p.Revalidate(context.Background(), e); err == nil {
+				t.Fatal("injected failure accepted")
+			}
+			if !reflect.DeepEqual(stages, order[:failAt+1]) {
+				t.Fatalf("stages=%v want=%v", stages, order[:failAt+1])
+			}
+			if failAt < 3 && len(calls) != 0 {
+				t.Fatalf("later mutation-capable dependency called: %v", calls)
 			}
 		})
 	}

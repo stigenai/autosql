@@ -205,6 +205,7 @@ type Pipeline struct {
 	Binder        Binder
 	ContextDigest string
 	Context       ValidationContext
+	Stage         func(string) error
 }
 type ValidationContext struct{ TargetIdentity, DevelopmentIdentity, DatabaseVersion, EditorIdentity, ReasonDigest, ChainDigest string }
 type Eligible struct {
@@ -216,6 +217,15 @@ type Eligible struct {
 
 func (p Pipeline) Revalidate(ctx context.Context, e EditedArtifact) (Eligible, error) {
 	var out Eligible
+	stage := func(name string) error {
+		if p.Stage != nil {
+			return p.Stage(name)
+		}
+		return nil
+	}
+	if err := stage("parse"); err != nil {
+		return out, err
+	}
 	if err := e.Validate(); err != nil {
 		return out, err
 	}
@@ -224,19 +234,46 @@ func (p Pipeline) Revalidate(ctx context.Context, e EditedArtifact) (Eligible, e
 		return out, err
 	}
 	_ = ss
+	if err = stage("ast_bind"); err != nil {
+		return out, err
+	}
+	if err = bindDDL(e); err != nil {
+		return out, err
+	}
 	rebuilt := e.CandidatePlan
+	if err = stage("rebind"); err != nil {
+		return out, err
+	}
 	if err := rebuilt.Validate(); err != nil {
 		return out, fmt.Errorf("rebuild bindings: %w", ErrInvalid)
+	}
+	if err = stage("simulation"); err != nil {
+		return out, err
 	}
 	fp, err := p.Simulator.Simulate(ctx, rebuilt)
 	if err != nil {
 		return out, fmt.Errorf("isolated simulation: %w", err)
 	}
+	if err = stage("fingerprint"); err != nil {
+		return out, err
+	}
 	if fp != rebuilt.ToFingerprint {
 		return out, fmt.Errorf("final fingerprint: %w", ErrInvalid)
 	}
+	if err = stage("safety"); err != nil {
+		return out, err
+	}
 	if err = p.Safety.Analyze(ctx, rebuilt); err != nil {
 		return out, fmt.Errorf("safety: %w", err)
+	}
+	if err = stage("policy"); err != nil {
+		return out, err
+	}
+	if err = stage("precheck"); err != nil {
+		return out, err
+	}
+	if err = stage("guardrail"); err != nil {
+		return out, err
 	}
 	checks, bundle, err := p.Binder.Bind(ctx, rebuilt)
 	if err != nil {

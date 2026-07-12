@@ -35,6 +35,14 @@ type productionEditService struct {
 	created, expires                                                                                 time.Time
 	audit                                                                                            *executor.FileAudit
 	schemas                                                                                          []string
+	stage                                                                                            func(string) error
+}
+
+func (s *productionEditService) checkpoint(name string) error {
+	if s.stage != nil {
+		return s.stage(name)
+	}
+	return nil
 }
 
 func (s *productionEditService) TrustedEditor() string { return s.editor }
@@ -169,7 +177,7 @@ func (s *productionEditService) revalidateCore(ctx context.Context, e planedit.E
 		chainDigest = e.Provenance[len(e.Provenance)-1].Digest
 		editor = e.Provenance[len(e.Provenance)-1].EditorIdentity
 	}
-	eligible, err := (planedit.Pipeline{Simulator: editSimulator{url: s.developmentURL, id: s.developmentIdentity, productionID: s.targetIdentity, from: from}, Safety: editSafety{version: s.version}, Binder: editBinder{s: s, original: orig}, ContextDigest: contextDigest, Context: planedit.ValidationContext{TargetIdentity: s.targetIdentity, DevelopmentIdentity: s.developmentIdentity, DatabaseVersion: fmt.Sprint(s.version), EditorIdentity: editor, ReasonDigest: reasonDigest, ChainDigest: chainDigest}}).Revalidate(ctx, e)
+	eligible, err := (planedit.Pipeline{Simulator: editSimulator{url: s.developmentURL, id: s.developmentIdentity, productionID: s.targetIdentity, from: from}, Safety: editSafety{version: s.version}, Binder: editBinder{s: s, original: orig}, ContextDigest: contextDigest, Stage: s.stage, Context: planedit.ValidationContext{TargetIdentity: s.targetIdentity, DevelopmentIdentity: s.developmentIdentity, DatabaseVersion: fmt.Sprint(s.version), EditorIdentity: editor, ReasonDigest: reasonDigest, ChainDigest: chainDigest}}).Revalidate(ctx, e)
 	return eligible, err
 }
 func (s *productionEditService) Publish(ctx context.Context, e planedit.Eligible) (out artifact.Artifact, err error) {
