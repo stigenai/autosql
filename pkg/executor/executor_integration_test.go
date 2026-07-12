@@ -97,6 +97,39 @@ func TestTransactionalDDLAndHistoryRollbackTogether(t *testing.T) {
 	}
 }
 
+func TestAppendOnlyReapplyAttemptExecutesSameSignedArtifactAgain(t *testing.T) {
+	ctx := context.Background()
+	name := fmt.Sprintf("autosql_exec_reapply_%d", time.Now().UnixNano())
+	digest := "reapply-" + name
+	p := plan.Plan{FromFingerprint: "sha256:" + string(make([]byte, 64)), Steps: []plan.Step{{ID: "one", SQL: "create table " + name + "(id int)", Kind: plan.StepExecutable, Transaction: plan.TransactionRequired}}, Phases: []plan.Phase{{ID: "phase", Transaction: plan.TransactionRequired, StepIDs: []string{"one"}}}}
+	first := testExecutor(t, p, digest)
+	if _, e := first.ApplyAuthorized(ctx, precheck.Plan{}); e != nil {
+		t.Fatal(e)
+	}
+	conn, e := pgx.Connect(ctx, liveURL(t))
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer conn.Close(ctx)
+	defer conn.Exec(ctx, "drop table if exists "+name)
+	defer conn.Exec(ctx, "delete from autosql_migration_history where artifact_digest=$1", digest)
+	if _, e = conn.Exec(ctx, "drop table "+name); e != nil {
+		t.Fatal(e)
+	}
+	second := testExecutor(t, p, digest)
+	second.config.Attempt = 2
+	if _, e = second.ApplyAuthorized(ctx, precheck.Plan{}); e != nil {
+		t.Fatal(e)
+	}
+	var attempts, count int
+	if e = conn.QueryRow(ctx, `select count(distinct attempt),count(*) from autosql_migration_history where artifact_digest=$1`, digest).Scan(&attempts, &count); e != nil {
+		t.Fatal(e)
+	}
+	if attempts != 2 || count != 2 {
+		t.Fatalf("attempts=%d rows=%d", attempts, count)
+	}
+}
+
 func TestNontransactionalIntentAndRetryRefusal(t *testing.T) {
 	ctx := context.Background()
 	name := fmt.Sprintf("autosql_exec_nt_%d", time.Now().UnixNano())

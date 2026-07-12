@@ -77,6 +77,8 @@ func RunWithServices(ctx context.Context, args []string, streams Streams, servic
 		err = runMigrateStatus(ctx, args[2:], o, redactor)
 	case len(args) >= 2 && args[0] == "migrate" && args[1] == "apply":
 		err = runMigrateApply(ctx, args[2:], o, services, false, redactor)
+	case len(args) >= 2 && args[0] == "migrate" && args[1] == "down":
+		err = runMigrateDown(ctx, args[2:], o, services.Down)
 	case len(args) >= 2 && args[0] == "migrate" && args[1] == "baseline":
 		err = runMigrateApply(ctx, args[2:], o, services, true, redactor)
 	case len(args) >= 2 && args[0] == "plan" && args[1] == "edit":

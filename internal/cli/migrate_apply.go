@@ -98,6 +98,11 @@ func runMigrateApply(ctx context.Context, args []string, o output, services Serv
 		return &Error{Kind: "config", Message: "trusted migration artifact verifier is not configured", Code: ExitConfig}
 	}
 	engine := migrateapply.Engine{Store: store, Verify: verifier.VerifyArtifact, Apply: verifier.ApplyVersioned, Drain: verifier.DrainLifecycle}
+	if reapply, ok := services.Apply.(interface {
+		ApplyVersionedAttempt(context.Context, artifact.VerifiedArtifact, executor.Session, executor.Tx, int) (executor.ExternalExecution, error)
+	}); ok {
+		engine.ApplyAttempt = reapply.ApplyVersionedAttempt
+	}
 	callCtx, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()
 	result, e := executeVersionedMigration(engine, callCtx, migrateapply.Request{Directory: *dir, Snapshot: snapshot, From: *from, To: *to, Count: max, DryRun: *dry, Baseline: baseline, Transaction: *transaction, Operator: *operator, TargetIdentity: "revision/" + *schema})

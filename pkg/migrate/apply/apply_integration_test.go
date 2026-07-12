@@ -474,6 +474,36 @@ func TestCoordinatorOutboxPartialDrainTwoFileAllInOneIsIdempotent(t *testing.T) 
 	}
 }
 
+func TestSelectTrustedTreatsReversedVersionsAsAppendOnlyReapplyAttempts(t *testing.T) {
+	dev, prod := os.Getenv("AUTOSQL_GENERATE_TEST_DSN"), os.Getenv("AUTOSQL_GENERATE_PROD_TEST_DSN")
+	if dev == "" || prod == "" {
+		t.Skip("live generation databases unset")
+	}
+	dir, verify, appendSecond := liveGenerated(t, dev, prod)
+	appendSecond()
+	snap, e := migrate.LoadSnapshot(dir)
+	if e != nil {
+		t.Fatal(e)
+	}
+	records := []revision.Revision{}
+	for _, m := range snap.Manifest.Entries {
+		records = append(records, revision.Revision{Version: m.Version, Kind: "migration", FileName: m.File, FileDigest: m.SQLDigest, ManifestDigest: snap.Manifest.Digest, ManifestGeneration: snap.Manifest.Generation, ArtifactDigest: m.ArtifactDigest, PlanDigest: m.Directives.PlanDigest, ChecksDigest: m.Directives.CheckDigest, BundleDigest: m.Directives.BundleDigest, State: "applied", Attempt: 1})
+	}
+	records = append(records, revision.Revision{Version: "zz_down_test", Kind: "reversal", State: "applied", FromVersion: "2.0.0", ToVersion: "1.0.0", ReversalOf: "signed-originals", Attempt: 1})
+	selected, e := selectTrusted(snap, records, Request{From: "2", To: "2"}, verify)
+	if e != nil || len(selected) != 1 {
+		t.Fatalf("selected=%+v err=%v", selected, e)
+	}
+	if selected[0].executionAttempt != 2 || selected[0].recordVersion == "" || selected[0].reversalOf != "zz_down_test" {
+		t.Fatalf("not append-only reapply: %+v", selected[0])
+	}
+	records = append(records, revision.Revision{Version: selected[0].recordVersion, Kind: "reapply", FileName: selected[0].entry.File, FileDigest: selected[0].entry.SQLDigest, ArtifactDigest: selected[0].entry.ArtifactDigest, PlanDigest: selected[0].entry.Directives.PlanDigest, ChecksDigest: selected[0].entry.Directives.CheckDigest, BundleDigest: selected[0].entry.Directives.BundleDigest, State: "applied", ToVersion: "2.0.0", ReversalOf: "zz_down_test", Attempt: 2})
+	selected, e = selectTrusted(snap, records, Request{}, verify)
+	if e != nil || len(selected) != 0 {
+		t.Fatalf("reapply not logical head: selected=%d err=%v", len(selected), e)
+	}
+}
+
 func TestCoordinatorManifestReplacementWhileAcquiringCanonicalLock(t *testing.T) {
 	dev, prod := os.Getenv("AUTOSQL_GENERATE_TEST_DSN"), os.Getenv("AUTOSQL_GENERATE_PROD_TEST_DSN")
 	if dev == "" || prod == "" {

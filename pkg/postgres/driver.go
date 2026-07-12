@@ -54,12 +54,27 @@ func InspectURL(ctx context.Context, url string, opts Options) (schema.Document,
 
 // InspectConn inspects through the supplied session, preserving session locks.
 func InspectConn(ctx context.Context, conn *pgx.Conn, opts Options) (schema.Document, error) {
+	request := inspectRequest(opts)
+	return inspectConn(ctx, conn, request)
+}
+
+// InspectTx inspects the schema visible inside an existing transaction. It is
+// used to prove an exact post-mutation fingerprint before DDL and its durable
+// revision evidence are committed together.
+func InspectTx(ctx context.Context, tx pgx.Tx, opts Options) (schema.Document, error) {
+	if tx == nil {
+		return schema.Document{}, errors.New("inspect PostgreSQL transaction: transaction is required")
+	}
+	return inspectSnapshot(ctx, tx, inspectRequest(opts))
+}
+
+func inspectRequest(opts Options) plugin.InspectRequest {
 	request := plugin.InspectRequest{Schemas: append([]string(nil), opts.Schemas...), Options: map[string]string{"include": strings.Join(opts.Include, ","), "exclude": strings.Join(opts.Exclude, ",")}}
 	if opts.Advanced {
 		request.Options["roles"] = "true"
 		request.Options["grants"] = "true"
 	}
-	return inspectConn(ctx, conn, request)
+	return request
 }
 
 func (*Driver) Info() plugin.Info {

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"autosql/pkg/approval"
@@ -36,6 +37,7 @@ type applyConfig struct {
 	ExpectedValidationContextDigests                                                                                                                                          map[string]string
 	ExpectedValidationAttestations                                                                                                                                            map[string]artifact.ValidationAttestation
 	EditorIdentity, EditSigningKeyID, EditSigningKeyReference, DevelopmentURLReference, FreshApprovalIdentity, FreshApprovalProofDigest                                       string
+	DownConfigPath                                                                                                                                                            string
 	FreshApprovalAt, EditReleaseCreatedAt, EditReleaseExpiresAt                                                                                                               time.Time
 	TrustedMigrations                                                                                                                                                         map[string]migrationTrust
 }
@@ -93,7 +95,15 @@ func productionServices(connector executor.Connector) (Services, error) {
 	authority := staticAuthority{actors: map[string]approval.Identity{c.Author: {ID: c.Author}, c.Requester: {ID: c.Requester}}}
 	ap := approval.Policy{Environments: map[string]approval.EnvironmentPolicy{c.Environment: {Allowed: true}}}
 	g := guardrail.Guardrail{Config: guardrail.Config{Environment: c.Environment, FailOn: safety.SeverityError, Risk: guardrail.RiskConfig{Baseline: approval.RiskLow}}, Safety: safety.Runner{Analyzers: safety.Builtins()}, Policy: policy.Evaluator{}, Approval: approval.Gate{Policy: ap, Authority: authority, Audit: &approval.Chain{Sink: &approval.FileSink{Path: c.ApprovalAuditPath}}}}
+	dynamicPolicies := map[string]artifact.VerifyPolicy{}
+	var dynamicPolicyMu sync.RWMutex
 	policyFor := func(a artifact.Artifact) (artifact.VerifyPolicy, error) {
+		dynamicPolicyMu.RLock()
+		dynamic, dynamicOK := dynamicPolicies[a.Digest]
+		dynamicPolicyMu.RUnlock()
+		if dynamicOK {
+			return dynamic, nil
+		}
 		expected := artifact.ExpectedBindings{PlanDigest: c.ExpectedPlanDigest, GeneratedPlanDigest: c.ExpectedPlanDigest, ChecksDigest: c.ExpectedChecksDigest, GuardrailDigest: c.ExpectedGuardrailDigest, SourceRevision: c.SourceRevision, Environment: c.Environment, DatabaseIdentity: c.DatabaseIdentity, ApprovalIdentity: c.ExpectedApprovalIdentity, ApprovalProofDigest: c.ExpectedApprovalProofDigest}
 		contexts, attestations := c.ExpectedValidationContextDigests, c.ExpectedValidationAttestations
 		if len(c.TrustedMigrations) > 0 {
@@ -130,15 +140,25 @@ func productionServices(connector executor.Connector) (Services, error) {
 		return guardrail.Input{Changes: a.Plan.Changes, Safety: si, Policy: doc, PolicyIdentity: "production-config/v1", Precheck: a.Checks, Approval: approval.Request{Plan: approval.Plan{Digest: a.GuardrailDigest, Environment: c.Environment, Author: c.Author, ExpiresAt: a.ExpiresAt}, RequestedBy: c.Requester}, StatementBindings: bindings}, nil
 	}
 	lifecycle := &executor.FileAudit{Path: c.LifecycleAuditPath}
-	mutationFor := func(v artifact.VerifiedArtifact, locked executor.Session, tx executor.Tx) (guardrail.AuthorizedMutation, error) {
+	mutationForAttempt := func(v artifact.VerifiedArtifact, locked executor.Session, tx executor.Tx, attempt int) (guardrail.AuthorizedMutation, error) {
 		a, _ := v.Payload()
 		state := func(ctx context.Context, conn executor.Session) (executor.RuntimeState, error) {
-			doc, err := postgres.InspectConn(ctx, conn.Raw(), postgres.Options{Schemas: c.Schemas})
+			var doc schema.Document
+			var err error
+			if rawTx := executor.RawPGXTx(tx); rawTx != nil {
+				doc, err = postgres.InspectTx(ctx, rawTx, postgres.Options{Schemas: c.Schemas})
+			} else {
+				doc, err = postgres.InspectConn(ctx, conn.Raw(), postgres.Options{Schemas: c.Schemas})
+			}
+			if err != nil {
+				return executor.RuntimeState{}, err
+			}
+			doc, err = postgres.New().Normalize(ctx, doc)
 			if err != nil {
 				return executor.RuntimeState{}, err
 			}
 			fp, err := schema.SemanticFingerprint(doc)
-			return executor.RuntimeState{Fingerprint: fp, SourceRevision: c.SourceRevision, Environment: c.Environment, DatabaseIdentity: c.DatabaseIdentity}, err
+			return executor.RuntimeState{Fingerprint: fp, SourceRevision: a.SourceRevision, Environment: a.TargetEnvironment, DatabaseIdentity: a.DatabaseIdentity}, err
 		}
 		last := ""
 		for _, s := range a.Plan.Steps {
@@ -146,7 +166,7 @@ func productionServices(connector executor.Connector) (Services, error) {
 				last = s.ID
 			}
 		}
-		return executor.NewPostgreSQL(executor.Config{URL: url, Connector: connector, LockedSession: locked, LockAlreadyHeld: locked != nil, Transaction: tx, NoEdits: c.NoEdits, Audit: lifecycle, Reauthorize: func(ctx context.Context, a artifact.Artifact) error {
+		return executor.NewPostgreSQL(executor.Config{URL: url, Connector: connector, LockedSession: locked, LockAlreadyHeld: locked != nil, Transaction: tx, Attempt: attempt, NoEdits: c.NoEdits, Audit: lifecycle, Reauthorize: func(ctx context.Context, a artifact.Artifact) error {
 			fresh, _ := policyFor(a)
 			_, err := a.VerifyTrusted(fresh)
 			return err
@@ -166,10 +186,17 @@ func productionServices(connector executor.Connector) (Services, error) {
 			return nil
 		}}, v)
 	}
+	mutationFor := func(v artifact.VerifiedArtifact, locked executor.Session, tx executor.Tx) (guardrail.AuthorizedMutation, error) {
+		return mutationForAttempt(v, locked, tx, 1)
+	}
 	mutation := func(v artifact.VerifiedArtifact) (guardrail.AuthorizedMutation, error) {
 		return mutationFor(v, nil, nil)
 	}
-	verified := VerifiedArtifactApplyService{PolicyFor: policyFor, Guardrail: g, Input: input, Mutation: mutation, MutationLocked: mutationFor, NoEdits: c.NoEdits, LifecycleAudit: lifecycle}
+	verified := VerifiedArtifactApplyService{PolicyFor: policyFor, InstallPolicy: func(digest string, p artifact.VerifyPolicy) {
+		dynamicPolicyMu.Lock()
+		dynamicPolicies[digest] = p
+		dynamicPolicyMu.Unlock()
+	}, Guardrail: g, Input: input, Mutation: mutation, MutationLocked: mutationFor, MutationLockedAttempt: mutationForAttempt, NoEdits: c.NoEdits, LifecycleAudit: lifecycle}
 	var editService PlanEditService
 	if c.EditorIdentity != "" {
 		if c.EditorIdentity == c.Author || c.EditorIdentity == c.Requester {
@@ -200,7 +227,11 @@ func productionServices(connector executor.Connector) (Services, error) {
 		}
 		editService = &productionEditService{editor: c.EditorIdentity, policyFor: policyFor, g: g, input: input, url: url, targetIdentity: targetID, developmentURL: devURL, developmentIdentity: devID, revision: c.SourceRevision, environment: c.Environment, database: c.DatabaseIdentity, keyID: c.EditSigningKeyID, version: c.PostgresVersion, private: private, approval: artifact.Approval{Identity: c.FreshApprovalIdentity, ApprovedAt: c.FreshApprovalAt.UTC(), ProofDigest: c.FreshApprovalProofDigest}, created: c.EditReleaseCreatedAt.UTC(), expires: c.EditReleaseExpiresAt.UTC(), audit: &executor.FileAudit{Path: c.LifecycleAuditPath}, schemas: append([]string(nil), c.Schemas...)}
 	}
-	return Services{ReadPlan: DefaultReadPlan{}, Apply: resolvingApply{verified: verified, directory: c.ArtifactDirectory}, PlanEdit: editService}, nil
+	downService, err := newProductionDownService(c.DownConfigPath, resolver, verified, url, c)
+	if err != nil {
+		return Services{}, err
+	}
+	return Services{ReadPlan: DefaultReadPlan{}, Apply: resolvingApply{verified: verified, directory: c.ArtifactDirectory}, PlanEdit: editService, Down: downService}, nil
 }
 
 type resolvingApply struct {
@@ -213,6 +244,9 @@ func (s resolvingApply) VerifyArtifact(a artifact.Artifact) (artifact.VerifiedAr
 }
 func (s resolvingApply) ApplyVersioned(ctx context.Context, v artifact.VerifiedArtifact, session executor.Session, tx executor.Tx) (executor.ExternalExecution, error) {
 	return s.verified.ApplyVersioned(ctx, v, session, tx)
+}
+func (s resolvingApply) ApplyVersionedAttempt(ctx context.Context, v artifact.VerifiedArtifact, session executor.Session, tx executor.Tx, attempt int) (executor.ExternalExecution, error) {
+	return s.verified.ApplyVersionedAttempt(ctx, v, session, tx, attempt)
 }
 func (s resolvingApply) DrainLifecycle(ctx context.Context, e executor.LifecycleEvent) error {
 	return s.verified.DrainLifecycle(ctx, e)
