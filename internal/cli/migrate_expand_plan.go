@@ -22,6 +22,8 @@ func runMigrateExpandPlan(parent context.Context, args []string, o output, redac
 	format := fs.String("format", "json", "json or yaml")
 	urlRef := fs.String("url", "", "database URL secret reference")
 	keyRef := fs.String("public-key", "", "Ed25519 public key secret reference")
+	planKeyRef := fs.String("plan-signing-key", "", "Ed25519 private plan signing key secret reference")
+	planKeyID := fs.String("plan-key-id", "", "trusted plan signer key identity")
 	metadata := fs.String("metadata-schema", zdm.DefaultSchema, "reserved metadata schema")
 	target := fs.String("target", "", "stable target identity")
 	environment := fs.String("env", "", "environment identity")
@@ -41,8 +43,8 @@ func runMigrateExpandPlan(parent context.Context, args []string, o output, redac
 	if err := fs.Parse(args); err != nil {
 		return usageError(err)
 	}
-	if fs.NArg() != 0 || *file == "" || *urlRef == "" || *keyRef == "" || *target == "" || *environment == "" || *expected == "" || len(schemas.values) == 0 || *timeout <= 0 {
-		return usageError(errors.New("--file, --url, --public-key, --target, --env, --expected-fingerprint, at least one --schema, and positive --timeout are required"))
+	if fs.NArg() != 0 || *file == "" || *urlRef == "" || *keyRef == "" || *planKeyRef == "" || *planKeyID == "" || *target == "" || *environment == "" || *expected == "" || len(schemas.values) == 0 || *timeout <= 0 {
+		return usageError(errors.New("--file, --url, --public-key, --plan-signing-key, --plan-key-id, --target, --env, --expected-fingerprint, at least one --schema, and positive --timeout are required"))
 	}
 	if strings.Contains(*target, "://") {
 		return usageError(errors.New("--target is an identity, not a URL"))
@@ -79,13 +81,28 @@ func runMigrateExpandPlan(parent context.Context, args []string, o output, redac
 	if err != nil || len(kb) != ed25519.PublicKeySize {
 		return &Error{Kind: "secret", Message: "public key must be raw-base64 Ed25519 public key", Code: ExitSecret}
 	}
-	snap, err := expandplan.InspectLive(ctx, expandplan.InspectRequest{URL: url, MetadataSchema: *metadata, Target: *target, Environment: *environment, Schemas: schemas.value()})
+	if err = m.Verify(ed25519.PublicKey(kb)); err != nil {
+		return &Error{Kind: "validation", Message: "artifact signature verification failed", Code: ExitValidation, Cause: err}
+	}
+	rawPlanKey, err := resolver.Resolve(ctx, secret.Reference(*planKeyRef))
+	if err != nil {
+		return &Error{Kind: "secret", Message: "resolve plan signing key failed", Code: ExitSecret, Cause: err}
+	}
+	planKey, err := base64.RawStdEncoding.Strict().DecodeString(strings.TrimSpace(rawPlanKey))
+	if err != nil || len(planKey) != ed25519.PrivateKeySize {
+		return &Error{Kind: "secret", Message: "plan signing key must be raw-base64 Ed25519 private key", Code: ExitSecret}
+	}
+	snap, err := expandplan.InspectLive(ctx, expandplan.InspectRequest{URL: url, MetadataSchema: *metadata, Target: *target, Environment: *environment, ArtifactDigest: m.Digest, Schemas: schemas.value()})
 	if err != nil {
 		return &Error{Kind: "validation", Message: redactor.String(err.Error()), Code: ExitValidation, Cause: err}
 	}
-	p, err := expandplan.Build(expandplan.Request{Migration: m, Snapshot: snap, ExpectedFingerprint: *expected, Target: *target, Environment: *environment, Policy: expandplan.Policy{MaxLockMS: *maxLock, MaxStatementMS: *maxStatement, MaxTransactionMS: *maxTx, AllowRewrite: *allowRewrite, AllowTableScan: *allowScan, AllowValidationScan: *allowValidation, AllowNonTransactional: *allowNonTx, AllowMaintenanceRequired: *allowMaintenance}, Verify: func(x zerodowntime.Migration) error { return x.Verify(ed25519.PublicKey(kb)) }})
+	req := expandplan.Request{Migration: m, Snapshot: snap, ExpectedFingerprint: *expected, Target: *target, Environment: *environment, Policy: expandplan.Policy{MaxLockMS: *maxLock, MaxStatementMS: *maxStatement, MaxTransactionMS: *maxTx, AllowRewrite: *allowRewrite, AllowTableScan: *allowScan, AllowValidationScan: *allowValidation, AllowNonTransactional: *allowNonTx, AllowMaintenanceRequired: *allowMaintenance}, Verify: func(x zerodowntime.Migration) error { return x.Verify(ed25519.PublicKey(kb)) }, PlanKeyID: *planKeyID, PlanSigner: ed25519.PrivateKey(planKey)}
+	p, err := expandplan.Build(req)
 	if err != nil {
 		return &Error{Kind: "validation", Message: redactor.String(err.Error()), Code: ExitValidation, Cause: err}
+	}
+	if err = p.VerifyTrusted(req, ed25519.PrivateKey(planKey).Public().(ed25519.PublicKey)); err != nil {
+		return &Error{Kind: "validation", Message: "generated plan attestation verification failed", Code: ExitValidation, Cause: err}
 	}
 	return o.success(p, fmt.Sprintf("expand plan %s: %d read-only planned steps for %s/%s", p.Digest, len(p.Steps), p.Target, p.Environment))
 }

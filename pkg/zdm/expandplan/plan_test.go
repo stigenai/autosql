@@ -1,6 +1,7 @@
 package expandplan
 
 import (
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -26,7 +27,7 @@ func addNoneEffects() zerodowntime.PhaseEffect {
 	return e
 }
 func base(m zerodowntime.Migration) Request {
-	return Request{Migration: m, ExpectedFingerprint: "sha256:live", Target: "primary", Environment: "prod", Snapshot: Snapshot{Fingerprint: "sha256:live", Target: "primary", Environment: "prod", PostgresMajor: 16, Tables: map[string]Table{"users": {Schema: "public", Name: "users", Owner: "app", Columns: map[string]Column{"id": {Name: "id", Type: "bigint"}, "name": {Name: "name", Type: "text", Nullable: true}}}}, Indexes: map[string]Index{}, Mappings: map[string]Mapping{}, Schemas: []string{"public"}}, Policy: Policy{MaxLockMS: 100, MaxStatementMS: 10000, MaxTransactionMS: 10000, AllowTableScan: true, AllowValidationScan: true, AllowNonTransactional: true}, Verify: func(zerodowntime.Migration) error { return nil }}
+	return Request{Migration: m, ExpectedFingerprint: "sha256:live", Target: "primary", Environment: "prod", Snapshot: Snapshot{Fingerprint: "sha256:live", Target: "primary", Environment: "prod", PostgresMajor: 16, Tables: map[string]Table{"users": {Schema: "public", Name: "users", Owner: "app", CanAlter: true, Columns: map[string]Column{"id": {Name: "id", Type: "bigint"}, "name": {Name: "name", Type: "text", Nullable: true}}}}, Indexes: map[string]Index{}, Mappings: map[string]Mapping{}, Schemas: []string{"public"}, SchemaCreate: map[string]bool{"public": true}, ExistingObjects: map[string]string{}, UniqueEvidence: map[string]UniqueEvidence{"users_pkey": {Name: "users_pkey", Table: "users", Columns: []string{"id"}, Constraint: true, Valid: true, Ready: true}}}, Policy: Policy{MaxLockMS: 100, MaxStatementMS: 10000, MaxTransactionMS: 10000, AllowTableScan: true, AllowValidationScan: true, AllowNonTransactional: true}, Verify: func(zerodowntime.Migration) error { return nil }}
 }
 
 func TestBuildAdditiveAndBreakingPlans(t *testing.T) {
@@ -92,7 +93,8 @@ func TestMappingTamperAndCollisionRefused(t *testing.T) {
 	op := zerodowntime.Operation{ID: "01", Kind: zerodowntime.RenameColumn, Table: "users", Column: "name", NewName: "display_name", Expression: "name", Ordering: &zerodowntime.Ordering{Columns: []string{"id"}, Unique: zerodowntime.UniqueEvidence{Kind: "constraint", Name: "users_pkey", Columns: []string{"id"}}}, BatchSize: 10, Effects: effects(zerodowntime.RenameColumn), Reversal: zerodowntime.Reversal{Mode: "automatic"}}
 	r := base(migration(t, []zerodowntime.Operation{op}))
 	want := physicalName(r.Target, r.Migration.Name, op.ID, "column", "display_name")
-	r.Snapshot.Mappings["01/column:display_name"] = Mapping{OperationID: "01", LogicalID: "column:display_name", Schema: "public", Name: "evil", Kind: "column"}
+	scope := mappingScope(r.Target, r.Environment, r.Migration.Digest)
+	r.Snapshot.Mappings[scope+"/01/column:display_name"] = Mapping{OperationID: "01", LogicalID: "column:display_name", Schema: "public", Name: "evil", Kind: "column", Scope: scope}
 	if _, err := Build(r); !errors.Is(err, ErrRefused) {
 		t.Fatal(err)
 	}
@@ -100,6 +102,24 @@ func TestMappingTamperAndCollisionRefused(t *testing.T) {
 	r.Snapshot.Mappings["other"] = Mapping{OperationID: "other", LogicalID: "x", Schema: "public", Name: want, Kind: "column"}
 	if _, err := Build(r); !errors.Is(err, ErrRefused) {
 		t.Fatal(err)
+	}
+	r = base(r.Migration)
+	p, err := Build(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Mappings) != 1 || !strings.HasPrefix(p.Mappings[0].StorageLogicalID(), mappingScope(r.Target, r.Environment, r.Migration.Digest)+"/") {
+		t.Fatal("mapping is not target/environment/artifact scoped")
+	}
+	other := r
+	other.Target = "secondary"
+	other.Snapshot.Target = "secondary"
+	p2, err := Build(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p2.Mappings[0].Scope == p.Mappings[0].Scope || p2.Mappings[0].Name == p.Mappings[0].Name {
+		t.Fatal("target mapping isolation failed")
 	}
 }
 
@@ -124,5 +144,66 @@ func TestEverySupportedOperationTranslatesWithoutDestructiveExpandSQL(t *testing
 		if strings.Contains(strings.ToUpper(p.Steps[0].SQL), "DROP") || strings.Contains(strings.ToUpper(p.Steps[0].SQL), "RENAME") {
 			t.Fatalf("destructive expand: %q", p.Steps[0].SQL)
 		}
+	}
+}
+
+func TestTrustedPlanRejectsEveryMaterialTamper(t *testing.T) {
+	op := zerodowntime.Operation{ID: "01", Kind: zerodowntime.AddColumn, Table: "users", Column: "email", DataType: "text", SynchronizationMode: "none", Effects: addNoneEffects(), Reversal: zerodowntime.Reversal{Mode: "automatic"}}
+	r := base(migration(t, []zerodowntime.Operation{op}))
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	r.PlanKeyID = "planner"
+	r.PlanSigner = priv
+	p, err := Build(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = p.VerifyTrusted(r, pub); err != nil {
+		t.Fatal(err)
+	}
+	mutations := []func(*Plan){func(x *Plan) { x.Target = "evil" }, func(x *Plan) { x.Steps[0].SQL = "DROP TABLE users" }, func(x *Plan) { x.Steps[0].LockMode = "NONE" }, func(x *Plan) { x.Steps[0].TableScan = true }, func(x *Plan) { x.Steps[0].LockBudgetMS++ }, func(x *Plan) { x.Steps[0].Preconditions[0].Expected = "stale" }, func(x *Plan) { x.Mappings = append(x.Mappings, Mapping{OperationID: "x"}) }, func(x *Plan) { x.Attestation.Signature = "AAAA" }}
+	for i, mut := range mutations {
+		x := p
+		x.Steps = append([]Step(nil), p.Steps...)
+		x.Steps[0].Preconditions = append([]Condition(nil), p.Steps[0].Preconditions...)
+		x.Mappings = append([]Mapping(nil), p.Mappings...)
+		a := *p.Attestation
+		x.Attestation = &a
+		mut(&x)
+		if err = x.VerifyTrusted(r, pub); !errors.Is(err, ErrRefused) {
+			t.Fatalf("tamper %d accepted: %v", i, err)
+		}
+	}
+	x := p
+	x.Attestation = nil
+	x.Steps = append([]Step(nil), p.Steps...)
+	x.Steps[0].SQL = "DROP TABLE users"
+	x.Digest = ""
+	x.Digest = digest(x)
+	if err = x.Validate(); !errors.Is(err, ErrRefused) {
+		t.Fatal("structural DROP accepted")
+	}
+}
+
+func TestBudgetAndEvidenceBoundaries(t *testing.T) {
+	op := zerodowntime.Operation{ID: "01", Kind: zerodowntime.RenameColumn, Table: "users", Column: "name", NewName: "display_name", Expression: "name", Ordering: &zerodowntime.Ordering{Columns: []string{"id"}, Unique: zerodowntime.UniqueEvidence{Kind: "constraint", Name: "users_pkey", Columns: []string{"id"}}}, BatchSize: 10, Effects: effects(zerodowntime.RenameColumn), Reversal: zerodowntime.Reversal{Mode: "automatic"}}
+	r := base(migration(t, []zerodowntime.Operation{op}))
+	if _, err := Build(r); err != nil {
+		t.Fatal(err)
+	}
+	r.Policy.MaxTransactionMS = r.Migration.Requirements.StatementTimeoutMS - 1
+	if _, err := Build(r); !errors.Is(err, ErrRefused) {
+		t.Fatal("transaction boundary accepted")
+	}
+	r = base(r.Migration)
+	r.Policy.AllowTableScan = false
+	if _, err := Build(r); !errors.Is(err, ErrRefused) {
+		t.Fatal("scan policy bypassed")
+	}
+	r = base(r.Migration)
+	e := r.Snapshot.UniqueEvidence["users_pkey"]
+	e.Ready = false
+	r.Snapshot.UniqueEvidence["users_pkey"] = e
+	if _, err := Build(r); !errors.Is(err, ErrRefused) {
+		t.Fatal("unready uniqueness evidence accepted")
 	}
 }

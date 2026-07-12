@@ -60,7 +60,7 @@ func TestLivePlanningIsReadOnlyAndFencedToBaseline(t *testing.T) {
 	if err := c.QueryRow(ctx, `select count(*) from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid=c.relnamespace where n.nspname=any($1)`, []string{meta, app}).Scan(&before); err != nil {
 		t.Fatal(err)
 	}
-	snap, err := expandplan.InspectLive(ctx, expandplan.InspectRequest{URL: url, MetadataSchema: meta, Target: "primary", Environment: "test", Schemas: []string{app}})
+	snap, err := expandplan.InspectLive(ctx, expandplan.InspectRequest{URL: url, MetadataSchema: meta, Target: "primary", Environment: "test", ArtifactDigest: "pending", Schemas: []string{app}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,6 +77,7 @@ func TestLivePlanningIsReadOnlyAndFencedToBaseline(t *testing.T) {
 	if err = m.Sign("release", priv); err != nil {
 		t.Fatal(err)
 	}
+	snap.ArtifactDigest = m.Digest
 	p, err := expandplan.Build(expandplan.Request{Migration: m, Snapshot: snap, ExpectedFingerprint: snap.Fingerprint, Target: "primary", Environment: "test", Policy: expandplan.Policy{MaxLockMS: 100, MaxStatementMS: 1000, MaxTransactionMS: 2000}, Verify: func(m zerodowntime.Migration) error { return m.Verify(pub) }})
 	if err != nil || len(p.Steps) != 1 {
 		t.Fatalf("plan=%+v err=%v", p, err)
@@ -88,7 +89,50 @@ func TestLivePlanningIsReadOnlyAndFencedToBaseline(t *testing.T) {
 	if _, err = c.Exec(ctx, "alter table "+pgx.Identifier{app, "accounts"}.Sanitize()+" add column drifted boolean"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = expandplan.InspectLive(ctx, expandplan.InspectRequest{URL: url, MetadataSchema: meta, Target: "primary", Environment: "test", Schemas: []string{app}}); err == nil {
+	if _, err = expandplan.InspectLive(ctx, expandplan.InspectRequest{URL: url, MetadataSchema: meta, Target: "primary", Environment: "test", ArtifactDigest: m.Digest, Schemas: []string{app}}); err == nil {
 		t.Fatal("expected baseline drift refusal")
+	}
+}
+
+func TestLiveConcurrentDDLWaitsAndPlanRefusesFreshSnapshot(t *testing.T) {
+	ctx, c, meta, app, _ := live(t)
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	other, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close(ctx)
+	var pid int
+	if err = other.QueryRow(ctx, "select pg_backend_pid()").Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	hook := func() error {
+		go func() {
+			_, e := other.Exec(context.Background(), "alter table "+pgx.Identifier{app, "accounts"}.Sanitize()+" add column concurrent_ddl text")
+			done <- e
+		}()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			var waiting bool
+			e := c.QueryRow(ctx, `select coalesce(wait_event_type='Lock',false) from pg_catalog.pg_stat_activity where pid=$1`, pid).Scan(&waiting)
+			if e == nil && waiting {
+				return nil
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		return fmt.Errorf("concurrent DDL did not wait on planning relation lock")
+	}
+	_, err = expandplan.InspectLive(ctx, expandplan.InspectRequest{URL: url, MetadataSchema: meta, Target: "primary", Environment: "test", ArtifactDigest: "sha256:artifact", Schemas: []string{app}, BeforeFinalInspection: hook})
+	if err == nil {
+		t.Fatal("concurrent DDL produced a stale plan")
+	}
+	// Refusal is the safety outcome. Close the competing session whether its DDL
+	// won immediately after the fence or remains queued behind another reader.
+	_ = other.Close(ctx)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("concurrent DDL goroutine did not terminate")
 	}
 }
