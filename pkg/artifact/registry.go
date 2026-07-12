@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"golang.org/x/sys/unix"
-	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -237,13 +236,25 @@ func trustedFD(fd int, mode uint32) error {
 	return nil
 }
 func readFD(fd int) ([]byte, error) {
-	f := os.NewFile(uintptr(fd), "")
-	if f == nil {
-		return nil, fail("registry_io", ErrInvalid)
+	const limit = 4 << 20
+	result := make([]byte, 0, 4096)
+	buffer := make([]byte, 32<<10)
+	for {
+		n, err := unix.Read(fd, buffer)
+		if n > 0 {
+			if len(result)+n > limit {
+				return nil, fail("registry_io", ErrInvalid)
+			}
+			result = append(result, buffer[:n]...)
+		}
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return nil, fail("registry_io", ErrInvalid)
+		}
+		if n == 0 {
+			return result, nil
+		}
 	}
-	b, e := io.ReadAll(io.LimitReader(f, 4<<20+1))
-	if e != nil || len(b) > 4<<20 {
-		return nil, fail("registry_io", ErrInvalid)
-	}
-	return b, nil
 }

@@ -13,10 +13,13 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func fixture(t *testing.T) (Artifact, ed25519.PublicKey, ed25519.PrivateKey) {
@@ -263,6 +266,37 @@ func TestRegistriesImmutableAndConcurrent(t *testing.T) {
 			t.Fatalf("temporary files: %v", matches)
 		}
 	})
+}
+
+func TestReadFDRetainsSingleDescriptorOwner(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry-data")
+	if err := os.WriteFile(path, []byte("artifact"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 20; i++ {
+		fd, err := unix.Open(path, unix.O_RDONLY, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := readFD(fd)
+		if closeErr := unix.Close(fd); err != nil || closeErr != nil || string(got) != "artifact" {
+			t.Fatalf("read=%q err=%v close=%v", got, err, closeErr)
+		}
+		// Encourage descriptor-number reuse before finalizers run. readFD must
+		// not leave behind a second owner capable of closing this new handle.
+		sentinel, err := unix.Open(path, unix.O_RDONLY, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		runtime.GC()
+		var stat unix.Stat_t
+		if err = unix.Fstat(sentinel, &stat); err != nil {
+			t.Fatalf("reused descriptor was closed by stale owner: %v", err)
+		}
+		if err = unix.Close(sentinel); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 func TestVerifiedTokenAndMemoryReadRevalidateIntegrity(t *testing.T) {
 	a, pub, _ := fixture(t)
