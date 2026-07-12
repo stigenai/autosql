@@ -27,7 +27,7 @@ func testExecutor(t *testing.T, p plan.Plan, digest string) *PostgreSQL {
 	t.Helper()
 	now := time.Now().UTC()
 	a := artifact.Artifact{Digest: digest, DatabaseIdentity: "executor-test", TargetEnvironment: "test", SourceRevision: "test-revision", CreatedAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour), Plan: p}
-	return &PostgreSQL{config: Config{URL: liveURL(t), Now: func() time.Time { return now }, State: func(context.Context, *pgx.Conn) (RuntimeState, error) {
+	return &PostgreSQL{config: Config{URL: liveURL(t), Connector: PGXConnector{}, Now: func() time.Time { return now }, State: func(context.Context, Session) (RuntimeState, error) {
 		return RuntimeState{Fingerprint: p.FromFingerprint, SourceRevision: "test-revision", Environment: "test", DatabaseIdentity: "executor-test"}, nil
 	}}, artifact: a}
 }

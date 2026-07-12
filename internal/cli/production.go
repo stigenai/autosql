@@ -22,7 +22,6 @@ import (
 	"autosql/pkg/safety"
 	"autosql/pkg/schema"
 	"autosql/pkg/secret"
-	"github.com/jackc/pgx/v5"
 )
 
 type applyConfig struct {
@@ -47,6 +46,10 @@ func (staticAuthority) VerifyApproval(context.Context, approval.Approval) (appro
 
 // ProductionServices loads the shipped binary apply boundary from AUTOSQL_APPLY_CONFIG.
 func ProductionServices() (Services, error) {
+	return productionServices(executor.PGXConnector{})
+}
+
+func productionServices(connector executor.Connector) (Services, error) {
 	path := os.Getenv("AUTOSQL_APPLY_CONFIG")
 	if path == "" {
 		return Services{ReadPlan: DefaultReadPlan{}, Apply: refusingApply{}}, nil
@@ -94,8 +97,8 @@ func ProductionServices() (Services, error) {
 	}
 	mutation := func(v artifact.VerifiedArtifact) (guardrail.AuthorizedMutation, error) {
 		a, _ := v.Payload()
-		state := func(ctx context.Context, conn *pgx.Conn) (executor.RuntimeState, error) {
-			doc, err := postgres.InspectConn(ctx, conn, postgres.Options{Schemas: c.Schemas})
+		state := func(ctx context.Context, conn executor.Session) (executor.RuntimeState, error) {
+			doc, err := postgres.InspectConn(ctx, conn.Raw(), postgres.Options{Schemas: c.Schemas})
 			if err != nil {
 				return executor.RuntimeState{}, err
 			}
@@ -108,11 +111,13 @@ func ProductionServices() (Services, error) {
 				last = s.ID
 			}
 		}
-		return executor.NewPostgreSQL(executor.Config{URL: url, Audit: &executor.FileAudit{Path: c.LifecycleAuditPath}, Reauthorize: func(ctx context.Context, a artifact.Artifact) error {
+		return executor.NewPostgreSQL(executor.Config{URL: url, Connector: connector, Audit: &executor.FileAudit{Path: c.LifecycleAuditPath}, Reauthorize: func(ctx context.Context, a artifact.Artifact) error {
 			fresh, _ := policyFor(a)
 			_, err := a.VerifyTrusted(fresh)
 			return err
-		}, State: func(ctx context.Context, conn *pgx.Conn) (executor.RuntimeState, error) { return state(ctx, conn) }, Confirm: func(ctx context.Context, conn *pgx.Conn, s plan.Step) error {
+		}, State: func(ctx context.Context, conn executor.Session) (executor.RuntimeState, error) {
+			return state(ctx, conn)
+		}, Confirm: func(ctx context.Context, conn executor.Session, s plan.Step) error {
 			if s.ID != last {
 				return nil
 			}

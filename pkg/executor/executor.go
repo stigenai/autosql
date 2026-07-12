@@ -13,8 +13,6 @@ import (
 	"autosql/pkg/artifact"
 	"autosql/pkg/plan"
 	"autosql/pkg/precheck"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 )
 
 var (
@@ -26,7 +24,7 @@ var (
 )
 
 type RuntimeState struct{ Fingerprint, SourceRevision, Environment, DatabaseIdentity string }
-type StateReader func(context.Context, *pgx.Conn) (RuntimeState, error)
+type StateReader func(context.Context, Session) (RuntimeState, error)
 type Clock func() time.Time
 type LifecycleEvent struct {
 	Type, ExecutionID, Target, ArtifactDigest, PlanDigest, BundleDigest, StepID, Guidance string
@@ -35,7 +33,7 @@ type LifecycleEvent struct {
 type LifecycleAudit interface {
 	AppendDurable(context.Context, LifecycleEvent) error
 }
-type StepConfirmer func(context.Context, *pgx.Conn, plan.Step) error
+type StepConfirmer func(context.Context, Session, plan.Step) error
 
 type Config struct {
 	URL         string
@@ -44,6 +42,7 @@ type Config struct {
 	Reauthorize func(context.Context, artifact.Artifact) error
 	Confirm     StepConfirmer
 	Audit       LifecycleAudit
+	Connector   Connector
 }
 
 type Result struct {
@@ -72,6 +71,9 @@ func NewPostgreSQL(config Config, verified artifact.VerifiedArtifact) (*PostgreS
 	if config.Now == nil {
 		config.Now = time.Now
 	}
+	if config.Connector == nil {
+		config.Connector = PGXConnector{}
+	}
 	return &PostgreSQL{config: config, artifact: payload}, nil
 }
 
@@ -88,7 +90,7 @@ func (e *PostgreSQL) ApplyAuthorized(ctx context.Context, checks precheck.Plan) 
 	if err := e.audit(ctx, "requested", "", ""); err != nil {
 		return nil, errors.New("durable lifecycle audit failed")
 	}
-	conn, err := pgx.Connect(ctx, e.config.URL)
+	conn, err := e.config.Connector.Connect(ctx, e.config.URL)
 	if err != nil {
 		return nil, errors.New("connect executor database")
 	}
@@ -195,7 +197,7 @@ func (e *PostgreSQL) ApplyAuthorized(ctx context.Context, checks precheck.Plan) 
 	return results, nil
 }
 
-func confirmedSteps(ctx context.Context, conn *pgx.Conn, a artifact.Artifact) (map[string]bool, error) {
+func confirmedSteps(ctx context.Context, conn Session, a artifact.Artifact) (map[string]bool, error) {
 	rows, err := conn.Query(ctx, `select step_id,step_hash,phase_id,phase_mode,execution_id,target_identity,plan_digest,bundle_digest from autosql_migration_history where artifact_digest=$1 and state='confirmed'`, a.Digest)
 	if err != nil {
 		return nil, errors.New("read confirmed migration history")
@@ -235,7 +237,7 @@ const historyDDL = `create table if not exists autosql_migration_history (
  last_confirmed_step text not null default '', recovery_guidance text not null default '',
  primary key (artifact_digest, step_id, attempt))`
 
-func ensureHistory(ctx context.Context, conn *pgx.Conn) error {
+func ensureHistory(ctx context.Context, conn Session) error {
 	_, err := conn.Exec(ctx, historyDDL)
 	if err != nil {
 		return errors.New("initialize migration history")
@@ -247,7 +249,7 @@ func ensureHistory(ctx context.Context, conn *pgx.Conn) error {
 	return nil
 }
 
-func refuseUncertain(ctx context.Context, conn *pgx.Conn, digest string) error {
+func refuseUncertain(ctx context.Context, conn Session, digest string) error {
 	var exists bool
 	err := conn.QueryRow(ctx, `select exists(select 1 from autosql_migration_history where artifact_digest=$1 and state='intended')`, digest).Scan(&exists)
 	if err != nil {
@@ -260,7 +262,7 @@ func refuseUncertain(ctx context.Context, conn *pgx.Conn, digest string) error {
 }
 
 func runChecks(ctx context.Context, conn interface {
-	QueryRow(context.Context, string, ...any) pgx.Row
+	QueryRow(context.Context, string, ...any) Row
 }, p precheck.Plan) ([]precheck.Result, error) {
 	var out []precheck.Result
 	for _, a := range p.Assertions {
@@ -283,14 +285,22 @@ func runChecks(ctx context.Context, conn interface {
 	return out, nil
 }
 
-func (e *PostgreSQL) transactionalPhase(ctx context.Context, conn *pgx.Conn, phase plan.Phase, steps map[string]plan.Step, confirmed map[string]bool, checks precheck.Plan, runPrechecks bool) (results []precheck.Result, err error) {
+func (e *PostgreSQL) transactionalPhase(ctx context.Context, conn Session, phase plan.Phase, steps map[string]plan.Step, confirmed map[string]bool, checks precheck.Plan, runPrechecks bool) (results []precheck.Result, err error) {
+	if auditErr := e.audit(ctx, "transaction_started", "", ""); auditErr != nil {
+		return nil, errors.New("durable lifecycle audit failed")
+	}
 	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return nil, errors.New("begin migration phase")
 	}
+	committed := false
 	defer func() {
-		if err != nil {
-			_ = tx.Rollback(context.WithoutCancel(ctx))
+		if err != nil && !committed {
+			rollbackErr := tx.Rollback(context.WithoutCancel(ctx))
+			auditErr := e.audit(context.WithoutCancel(ctx), "transaction_rollback", "", "")
+			if rollbackErr != nil || auditErr != nil {
+				err = errors.Join(err, errors.New("transaction rollback or audit failed"))
+			}
 		}
 	}()
 	if runPrechecks {
@@ -311,10 +321,16 @@ func (e *PostgreSQL) transactionalPhase(ctx context.Context, conn *pgx.Conn, pha
 		}
 		if step.Kind == plan.StepExecutable {
 			if _, err = tx.Exec(ctx, step.SQL); err != nil {
+				if auditErr := e.audit(ctx, "transaction_failed", step.ID, ""); auditErr != nil {
+					return results, errors.Join(errors.New("execute transactional migration step"), errors.New("durable lifecycle audit failed"))
+				}
 				return results, errors.New("execute transactional migration step")
 			}
 		}
 		if err = insertHistory(ctx, tx, e.artifact, step, phase, "confirmed", last, ""); err != nil {
+			if auditErr := e.audit(ctx, "transaction_failed", step.ID, ""); auditErr != nil {
+				return results, errors.Join(err, errors.New("durable lifecycle audit failed"))
+			}
 			return results, err
 		}
 		pendingCount++
@@ -325,10 +341,20 @@ func (e *PostgreSQL) transactionalPhase(ctx context.Context, conn *pgx.Conn, pha
 		e.result.PendingStep = last
 		e.result.ExecutionID = e.artifact.Digest
 		e.result.RecoveryGuidance = "reconcile transaction outcome before retry"
+		if auditErr := e.audit(ctx, "uncertain", last, e.result.RecoveryGuidance); auditErr != nil {
+			return results, errors.Join(ErrReconcile, errors.New("durable lifecycle audit failed"))
+		}
 		return results, ErrReconcile
 	}
+	committed = true
 	e.result.AppliedSteps += pendingCount
 	e.result.LastConfirmed = last
+	if auditErr := e.audit(ctx, "transaction_committed", last, ""); auditErr != nil {
+		e.result.Partial = true
+		e.result.ExecutionID = e.artifact.Digest
+		e.result.RecoveryGuidance = "repair transaction commit audit before retry"
+		return results, ErrPartial
+	}
 	for _, id := range phase.StepIDs {
 		if s := steps[id]; s.Kind == plan.StepExecutable && !confirmed[id] {
 			if auditErr := e.audit(ctx, "confirmed", id, ""); auditErr != nil {
@@ -342,7 +368,7 @@ func (e *PostgreSQL) transactionalPhase(ctx context.Context, conn *pgx.Conn, pha
 	return results, nil
 }
 
-func (e *PostgreSQL) nontransactionalPhase(ctx context.Context, conn *pgx.Conn, phase plan.Phase, steps map[string]plan.Step, confirmed map[string]bool) error {
+func (e *PostgreSQL) nontransactionalPhase(ctx context.Context, conn Session, phase plan.Phase, steps map[string]plan.Step, confirmed map[string]bool) error {
 	for _, id := range phase.StepIDs {
 		if confirmed[id] {
 			continue
@@ -416,7 +442,7 @@ func (e *PostgreSQL) nontransactionalPhase(ctx context.Context, conn *pgx.Conn, 
 }
 
 func insertHistory(ctx context.Context, x interface {
-	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	Exec(context.Context, string, ...any) (Tag, error)
 }, a artifact.Artifact, step plan.Step, phase plan.Phase, state, last, guidance string) error {
 	target := a.DatabaseIdentity + "/" + a.TargetEnvironment
 	_, err := x.Exec(ctx, `insert into autosql_migration_history(artifact_digest,step_id,step_hash,attempt,phase_id,phase_mode,state,intended_at,confirmed_at,last_confirmed_step,recovery_guidance,execution_id,target_identity,plan_digest,bundle_digest) values($1,$2,$3,1,$4,$5,$6,clock_timestamp(),case when $6='confirmed' then clock_timestamp() end,$7,$8,$1,$9,$10,$11)`, a.Digest, step.ID, stepHash(step), phase.ID, phase.Transaction, state, last, guidance, target, a.Plan.Digest, a.GuardrailDigest)
