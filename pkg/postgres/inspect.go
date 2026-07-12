@@ -17,9 +17,7 @@ import (
 )
 
 type inspector struct {
-	conn interface {
-		Query(context.Context, string, ...any) (pgx.Rows, error)
-	}
+	conn      catalogQueryer
 	resources []schema.Resource
 	byOID     map[uint32]string
 	schemas   map[string]string
@@ -41,18 +39,46 @@ func inspectConn(ctx context.Context, conn *pgx.Conn, req plugin.InspectRequest)
 	if conn.PgConn().TxStatus() != 'I' {
 		return schema.Document{}, errors.New("inspect PostgreSQL database: connection must be idle")
 	}
+	begin := func(ctx context.Context) (catalogQueryer, func(context.Context) error, error) {
+		tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+		if err != nil {
+			return nil, nil, err
+		}
+		return tx, tx.Rollback, nil
+	}
+	return inspectTransactions(ctx, req, begin, inspectSnapshot)
+}
+
+type catalogQueryer interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+}
+type snapshotBegin func(context.Context) (catalogQueryer, func(context.Context) error, error)
+type snapshotInspect func(context.Context, catalogQueryer, plugin.InspectRequest) (schema.Document, error)
+
+type snapshotRollbackError struct{ cause error }
+
+func (e *snapshotRollbackError) Error() string {
+	return "inspect PostgreSQL database: rollback catalog snapshot"
+}
+func (e *snapshotRollbackError) Unwrap() error { return e.cause }
+
+func inspectTransactions(ctx context.Context, req plugin.InspectRequest, begin snapshotBegin, run snapshotInspect) (schema.Document, error) {
 	var last error
 	for attempt := 0; attempt < 5; attempt++ {
-		tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+		queryer, rollback, err := begin(ctx)
 		if err != nil {
 			return schema.Document{}, err
 		}
-		doc, inspectErr := inspectSnapshot(ctx, tx, req)
-		rollbackErr := tx.Rollback(context.WithoutCancel(ctx))
-		if inspectErr == nil {
-			if rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
-				return schema.Document{}, rollbackErr
+		doc, inspectErr := run(ctx, queryer, req)
+		rollbackErr := rollback(context.WithoutCancel(ctx))
+		if rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
+			typed := &snapshotRollbackError{cause: rollbackErr}
+			if inspectErr != nil {
+				return schema.Document{}, errors.Join(inspectErr, typed)
 			}
+			return schema.Document{}, typed
+		}
+		if inspectErr == nil {
 			return doc, nil
 		}
 		last = inspectErr
@@ -75,9 +101,7 @@ func transientCatalogOID(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "XX000" && (strings.Contains(pgErr.Message, "could not open relation with OID") || strings.Contains(pgErr.Message, "cache lookup failed for"))
 }
 
-func inspectSnapshot(ctx context.Context, conn interface {
-	Query(context.Context, string, ...any) (pgx.Rows, error)
-}, req plugin.InspectRequest) (schema.Document, error) {
+func inspectSnapshot(ctx context.Context, conn catalogQueryer, req plugin.InspectRequest) (schema.Document, error) {
 	i := &inspector{conn: conn, byOID: map[uint32]string{}, schemas: map[string]string{}}
 	steps := []struct {
 		resource, privilege string
