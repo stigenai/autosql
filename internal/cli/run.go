@@ -81,6 +81,10 @@ func RunWithServices(ctx context.Context, args []string, streams Streams, servic
 		err = runMigrateDown(ctx, args[2:], o, services.Down)
 	case len(args) >= 2 && args[0] == "migrate" && args[1] == "baseline":
 		err = runMigrateApply(ctx, args[2:], o, services, true, redactor)
+	case len(args) >= 2 && args[0] == "migrate" && args[1] == "diagnose":
+		err = runMigrateDiagnose(ctx, args[2:], o, services, redactor)
+	case len(args) >= 3 && args[0] == "migrate" && args[1] == "repair" && (args[2] == "mark" || args[2] == "remove" || args[2] == "reconcile"):
+		err = runMigrateRepair(ctx, args[2], args[3:], o, services, redactor)
 	case len(args) >= 2 && args[0] == "plan" && args[1] == "edit":
 		err = runPlanEdit(ctx, args[2:], o, services.PlanEdit)
 	case len(args) >= 2 && args[0] == "plan" && args[1] == "review":
@@ -308,7 +312,7 @@ func usageError(err error) *Error {
 	return &Error{Kind: "usage", Message: err.Error(), Code: ExitUsage, Cause: err}
 }
 func usage() string {
-	return "usage: autosql <command>\n\ncommands:\n  version [--json]\n  config validate [--config path] [--env name] [--preflight] [--json]\n  migrate generate --dir path --from source --to source --version semver --label name [--rename-hints value] [--json]\n  migrate status [--config path --env name | --url env://NAME --migration-dir path] [--revision-schema name] [--json]\n  migrate apply|baseline [--config path | --url env://NAME --migration-dir path] [--from version] [--to version] [--count n] [--dry-run] [--json]\n  schema load --source sql:path|json:path [--source ...] [--json]\n  schema inspect --url env://NAME|file://path [--format native|sql|json]\n  schema diff --from source --to source [--max-changes n] [--json]\n  plan --from source --to source [--max-changes n] [--json]\n  plan edit --artifact file --sql file --editor id --reason text --output file\n  plan review --artifact file [--json]\n  plan revalidate --draft file --output file [--json]\n  plan publish --attested file --output file [--json]\n  apply --from source --to source [--dry-run|--approve-digest digest|--artifact path] [--no-edits] [--json]"
+	return "usage: autosql <command>\n\ncommands:\n  version [--json]\n  config validate [--config path] [--env name] [--preflight] [--json]\n  migrate generate --dir path --from source --to source --version semver --label name [--rename-hints value] [--json]\n  migrate status [--config path --env name | --url env://NAME --migration-dir path] [--revision-schema name] [--json]\n  migrate apply|baseline [--config path | --url env://NAME --migration-dir path] [--from version] [--to version] [--count n] [--dry-run] [--json]\n  migrate diagnose --url env://NAME --migration-dir path [--json]\n  migrate repair mark|remove|reconcile --url env://NAME --proposal file --operator-public-key env://NAME --audit path [--json]\n  schema load --source sql:path|json:path [--source ...] [--json]\n  schema inspect --url env://NAME|file://path [--format native|sql|json]\n  schema diff --from source --to source [--max-changes n] [--json]\n  plan --from source --to source [--max-changes n] [--json]\n  plan edit --artifact file --sql file --editor id --reason text --output file\n  plan review --artifact file [--json]\n  plan revalidate --draft file --output file [--json]\n  plan publish --attested file --output file [--json]\n  apply --from source --to source [--dry-run|--approve-digest digest|--artifact path] [--no-edits] [--json]"
 }
 func contains(args []string, want string) bool {
 	for _, a := range args {

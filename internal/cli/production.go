@@ -17,6 +17,8 @@ import (
 	"autosql/pkg/artifact"
 	"autosql/pkg/executor"
 	"autosql/pkg/guardrail"
+	"autosql/pkg/migrate/repair"
+	"autosql/pkg/migrate/revision"
 	"autosql/pkg/plan"
 	"autosql/pkg/policy"
 	"autosql/pkg/postgres"
@@ -40,6 +42,7 @@ type applyConfig struct {
 	DownConfigPath                                                                                                                                                            string
 	FreshApprovalAt, EditReleaseCreatedAt, EditReleaseExpiresAt                                                                                                               time.Time
 	TrustedMigrations                                                                                                                                                         map[string]migrationTrust
+	RepairPolicyDigest, RepairApprovalDigest, RepairDestructiveApprovalDigest                                                                                                 string
 }
 type migrationTrust struct {
 	Expected                 artifact.ExpectedBindings
@@ -192,11 +195,24 @@ func productionServices(connector executor.Connector) (Services, error) {
 	mutation := func(v artifact.VerifiedArtifact) (guardrail.AuthorizedMutation, error) {
 		return mutationFor(v, nil, nil)
 	}
+	repairAuthorization := func(_ context.Context, p repair.Proposal, r revision.Revision) error {
+		if p.DatabaseIdentity != c.DatabaseIdentity || p.Environment != c.Environment || p.GuardrailDigest != r.BundleDigest || c.RepairPolicyDigest == "" || p.PolicyDigest != c.RepairPolicyDigest {
+			return errors.New("repair target or guardrail policy denied")
+		}
+		want := c.RepairApprovalDigest
+		if p.Action == "remove" {
+			want = c.RepairDestructiveApprovalDigest
+		}
+		if want == "" || p.ApprovalDigest != want {
+			return errors.New("repair approval policy denied")
+		}
+		return nil
+	}
 	verified := VerifiedArtifactApplyService{PolicyFor: policyFor, InstallPolicy: func(digest string, p artifact.VerifyPolicy) {
 		dynamicPolicyMu.Lock()
 		dynamicPolicies[digest] = p
 		dynamicPolicyMu.Unlock()
-	}, Guardrail: g, Input: input, Mutation: mutation, MutationLocked: mutationFor, MutationLockedAttempt: mutationForAttempt, NoEdits: c.NoEdits, LifecycleAudit: lifecycle}
+	}, Guardrail: g, Input: input, Mutation: mutation, MutationLocked: mutationFor, MutationLockedAttempt: mutationForAttempt, NoEdits: c.NoEdits, LifecycleAudit: lifecycle, RepairAuthorization: repairAuthorization}
 	var editService PlanEditService
 	if c.EditorIdentity != "" {
 		if c.EditorIdentity == c.Author || c.EditorIdentity == c.Requester {

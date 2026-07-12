@@ -9,6 +9,8 @@ import (
 	"autosql/pkg/artifact"
 	"autosql/pkg/executor"
 	"autosql/pkg/guardrail"
+	"autosql/pkg/migrate/repair"
+	"autosql/pkg/migrate/revision"
 )
 
 // VerifiedArtifactApplyService is the only CLI bridge to mutation. Callers must
@@ -25,6 +27,14 @@ type VerifiedArtifactApplyService struct {
 	MutationLockedAttempt func(artifact.VerifiedArtifact, executor.Session, executor.Tx, int) (guardrail.AuthorizedMutation, error)
 	NoEdits               bool
 	LifecycleAudit        executor.LifecycleAudit
+	RepairAuthorization   func(context.Context, repair.Proposal, revision.Revision) error
+}
+
+func (s VerifiedArtifactApplyService) AuthorizeRepair(ctx context.Context, p repair.Proposal, r revision.Revision) error {
+	if s.RepairAuthorization == nil {
+		return errors.New("production repair authorization is not configured")
+	}
+	return s.RepairAuthorization(ctx, p, r)
 }
 
 func (s VerifiedArtifactApplyService) DrainLifecycle(ctx context.Context, e executor.LifecycleEvent) error {

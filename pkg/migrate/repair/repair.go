@@ -1,0 +1,427 @@
+// Package repair provides signed, compare-and-swap repair of migration evidence.
+package repair
+
+import (
+	"autosql/pkg/artifact"
+	"autosql/pkg/executor"
+	"autosql/pkg/migrate"
+	"autosql/pkg/migrate/revision"
+	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+)
+
+var ErrRefused = errors.New("migration repair refused")
+
+type Proposal struct {
+	Version, Action, TargetVersion, Reason, Operator, DatabaseIdentity, Environment, ExpectedBeforeDigest, ExpectedBeforeState, ExpectedAfterState, ManifestDigest, GuardrailDigest, PolicyDigest, ApprovalDigest, ApprovalLevel, Digest string
+	CreatedAt, ExpiresAt                                                                                                                                                                                                                 time.Time
+	Signature                                                                                                                                                                                                                            artifact.Signature
+}
+
+func (p Proposal) canonical() ([]byte, error) {
+	x := p
+	x.Digest = ""
+	x.Signature = artifact.Signature{}
+	return json.Marshal(x)
+}
+func (p *Proposal) Sign(keyID string, key ed25519.PrivateKey) error {
+	if err := p.validate(); err != nil {
+		return err
+	}
+	raw, _ := p.canonical()
+	sum := sha256.Sum256(append([]byte("autosql.repair.proposal/v1\x00"), raw...))
+	p.Digest = "sha256:" + hex.EncodeToString(sum[:])
+	p.Signature = artifact.Signature{KeyID: keyID, Algorithm: "Ed25519", Value: base64.RawStdEncoding.EncodeToString(ed25519.Sign(key, []byte(p.Digest)))}
+	return nil
+}
+func (p Proposal) Verify(keys map[string]ed25519.PublicKey, now time.Time) error {
+	if err := p.validate(); err != nil {
+		return err
+	}
+	raw, _ := p.canonical()
+	sum := sha256.Sum256(append([]byte("autosql.repair.proposal/v1\x00"), raw...))
+	want := "sha256:" + hex.EncodeToString(sum[:])
+	key, ok := keys[p.Signature.KeyID]
+	sig, e := base64.RawStdEncoding.Strict().DecodeString(p.Signature.Value)
+	if !ok || p.Digest != want || p.Signature.Algorithm != "Ed25519" || e != nil || !ed25519.Verify(key, []byte(p.Digest), sig) || now.Before(p.CreatedAt) || !now.Before(p.ExpiresAt) {
+		return ErrRefused
+	}
+	return nil
+}
+func (p Proposal) validate() error {
+	if p.Version != "autosql.repair-proposal/v1" || p.TargetVersion == "" || p.Operator == "" || p.DatabaseIdentity == "" || p.Environment == "" || len(p.Reason) < 8 || len(p.Reason) > 500 || p.ExpectedBeforeDigest == "" || p.ExpectedBeforeState == "" || p.ExpectedAfterState == "" || p.ManifestDigest == "" || p.GuardrailDigest == "" || p.PolicyDigest == "" || p.ApprovalDigest == "" || p.CreatedAt.IsZero() || !p.ExpiresAt.After(p.CreatedAt) {
+		return ErrRefused
+	}
+	lowerReason := strings.ToLower(p.Reason)
+	if strings.Contains(lowerReason, "password=") || strings.Contains(lowerReason, "postgres://") || strings.Contains(lowerReason, "postgresql://") {
+		return ErrRefused
+	}
+	switch p.Action {
+	case "mark", "remove", "reconcile":
+	default:
+		return ErrRefused
+	}
+	return nil
+}
+
+type AuditRecord struct {
+	EventID, Type, ProposalDigest, Action, TargetVersion, Reason, Operator, PolicyDigest, ApprovalDigest, BeforeDigest, BeforeState, AfterState string
+	At                                                                                                                                          time.Time
+}
+type Audit interface {
+	AppendDurable(context.Context, AuditRecord) error
+}
+type VerifyArtifact func(artifact.Artifact) (artifact.VerifiedArtifact, error)
+type Fingerprint func(context.Context) (string, error)
+type Service struct {
+	Store           *revision.Store
+	Verify          VerifyArtifact
+	LiveFingerprint Fingerprint
+	Audit           Audit
+	Keys            map[string]ed25519.PublicKey
+	Now             func() time.Time
+	LockIdentity    string
+	Authorize       func(context.Context, Proposal, revision.Revision) error
+	Hooks           Hooks
+}
+type Hooks struct{ AfterRequested, BeforeCommit, AfterCommit, AfterApplied func() error }
+
+type Divergence struct {
+	Version, Kind, Expected, Actual, RootCause, SuggestedCommand string `json:",omitempty"`
+}
+type Diagnosis struct {
+	Status, ManifestDigest, LiveFingerprint, ExpectedFingerprint string
+	First                                                        *Divergence `json:",omitempty"`
+	Revisions                                                    int
+	History                                                      int
+}
+
+func (s Service) Diagnose(ctx context.Context, dir string) (Diagnosis, error) {
+	var out Diagnosis
+	if s.Store == nil || s.Verify == nil || s.LiveFingerprint == nil {
+		return out, ErrRefused
+	}
+	snap, e := migrate.LoadSnapshot(dir)
+	if e != nil {
+		return out, ErrRefused
+	}
+	if len(snap.Manifest.Entries) == 0 {
+		return out, ErrRefused
+	}
+	first := snap.Manifest.Entries[0]
+	a, e := artifact.Parse(snap.Files[first.ArtifactFile])
+	if e != nil {
+		return out, ErrRefused
+	}
+	verified, e := s.Verify(a)
+	if e != nil {
+		return out, ErrRefused
+	}
+	payload, e := verified.Payload()
+	if e != nil {
+		return out, ErrRefused
+	}
+	lockIdentity, e := executor.LockKey(payload.DatabaseIdentity, payload.TargetEnvironment)
+	if e != nil {
+		return out, ErrRefused
+	}
+	session, e := s.Store.OpenSession(ctx)
+	if e != nil {
+		return out, e
+	}
+	defer session.Close(context.Background())
+	if ok, e := session.Lock(ctx, lockIdentity); e != nil || !ok {
+		return out, ErrRefused
+	}
+	defer session.Unlock(context.Background(), lockIdentity)
+	rows, e := session.Revisions(ctx)
+	if e != nil {
+		return out, e
+	}
+	out.ManifestDigest = snap.Manifest.Digest
+	out.Revisions = len(rows)
+	history, e := session.ExecutorRecords(ctx, payload.DatabaseIdentity+"/"+payload.TargetEnvironment)
+	if e != nil {
+		return out, e
+	}
+	out.History = len(history)
+	by := map[string]revision.Revision{}
+	var dirtyCandidate *Divergence
+	for _, r := range rows {
+		by[r.Version] = r
+	}
+	for _, r := range rows {
+		found := false
+		for _, m := range snap.Manifest.Entries {
+			if m.Version == r.Version {
+				found = true
+				if r.State == "pending" || r.State == "partial" || r.State == "failed" {
+					dirtyCandidate = &Divergence{Version: r.Version, Kind: "dirty", Expected: "applied", Actual: r.State, RootCause: "incomplete revision evidence", SuggestedCommand: safeCommand("reconcile", r.Version)}
+				}
+				if r.FileDigest != m.SQLDigest || r.ArtifactDigest != m.ArtifactDigest {
+					out.First = &Divergence{Version: r.Version, Kind: "checksum", Expected: m.SQLDigest, Actual: r.FileDigest, RootCause: "recorded revision differs from verified manifest", SuggestedCommand: safeCommand("remove", r.Version)}
+					break
+				}
+			}
+		}
+		if out.First != nil {
+			break
+		}
+		if !found {
+			if dirtyCandidate != nil {
+				out.First = dirtyCandidate
+				break
+			}
+			out.First = &Divergence{Version: r.Version, Kind: "unknown", Actual: r.FileName, RootCause: "revision is absent from verified manifest", SuggestedCommand: safeCommand("remove", r.Version)}
+			break
+		}
+	}
+	artifacts := map[string]artifact.Artifact{}
+	versions := map[string]string{}
+	for _, m := range snap.Manifest.Entries {
+		raw := snap.Files[m.ArtifactFile]
+		a, er := artifact.Parse(raw)
+		if er != nil {
+			return out, ErrRefused
+		}
+		v, er := s.Verify(a)
+		if er != nil {
+			return out, ErrRefused
+		}
+		p, er := v.Payload()
+		if er != nil {
+			return out, ErrRefused
+		}
+		artifacts[p.Digest] = p
+		versions[p.Digest] = m.Version
+	}
+	seenHistory := map[string]bool{}
+	if out.First == nil {
+		for _, h := range history {
+			key := fmt.Sprintf("%s\x00%s\x00%d", h.ArtifactDigest, h.StepID, h.Attempt)
+			if seenHistory[key] {
+				out.First = &Divergence{Version: versions[h.ArtifactDigest], Kind: "executor_duplicate", Actual: h.StepID, RootCause: "duplicate executor step evidence", SuggestedCommand: safeCommand("reconcile", versions[h.ArtifactDigest])}
+				break
+			}
+			seenHistory[key] = true
+			a, ok := artifacts[h.ArtifactDigest]
+			if !ok {
+				if dirtyCandidate != nil {
+					out.First = dirtyCandidate
+					break
+				}
+				out.First = &Divergence{Kind: "executor_unknown", Actual: h.ArtifactDigest, RootCause: "executor history references an untrusted artifact", SuggestedCommand: "autosql migrate diagnose --config <trusted-config> --env <environment>"}
+				break
+			}
+			expectedStep := false
+			for _, st := range a.Plan.Steps {
+				if st.ID == h.StepID {
+					expectedStep = true
+					break
+				}
+			}
+			r := by[versions[h.ArtifactDigest]]
+			if !expectedStep || h.ExecutionID != a.Digest || h.PlanDigest != a.Plan.Digest || h.BundleDigest != a.GuardrailDigest || h.Attempt != r.Attempt {
+				out.First = &Divergence{Version: r.Version, Kind: "executor_linkage", Expected: a.Digest, Actual: h.ExecutionID, RootCause: "executor attempt or artifact linkage is inconsistent", SuggestedCommand: safeCommand("reconcile", r.Version)}
+				break
+			}
+			if r.State == "applied" && h.State != "confirmed" {
+				out.First = &Divergence{Version: r.Version, Kind: "executor_partial", Expected: "confirmed", Actual: h.State, RootCause: "applied revision has an unconfirmed executor step", SuggestedCommand: safeCommand("reconcile", r.Version)}
+				break
+			}
+			if (r.State == "partial" || r.State == "pending") && h.State == "intended" {
+				out.First = &Divergence{Version: r.Version, Kind: "executor_uncertain", Expected: "confirmed or failed", Actual: "intended", RootCause: "statement outcome is uncertain at the first intended step", SuggestedCommand: safeCommand("reconcile", r.Version)}
+				break
+			}
+		}
+	}
+	if out.First == nil && dirtyCandidate != nil {
+		out.First = dirtyCandidate
+	}
+	if out.First == nil {
+		for _, m := range snap.Manifest.Entries {
+			if _, ok := by[m.Version]; !ok {
+				break
+			}
+			raw := snap.Files[m.ArtifactFile]
+			a, e := artifact.Parse(raw)
+			if e != nil {
+				return out, ErrRefused
+			}
+			v, e := s.Verify(a)
+			if e != nil {
+				return out, ErrRefused
+			}
+			p, _ := v.Payload()
+			out.ExpectedFingerprint = p.Plan.ToFingerprint
+		}
+	}
+	live, e := s.LiveFingerprint(ctx)
+	if e != nil {
+		return out, e
+	}
+	out.LiveFingerprint = live
+	if out.First == nil && out.ExpectedFingerprint != "" && live != out.ExpectedFingerprint {
+		out.First = &Divergence{Kind: "manual_drift", Expected: out.ExpectedFingerprint, Actual: live, RootCause: "live canonical schema differs from applied head", SuggestedCommand: "autosql migrate diagnose --config <trusted-config> --env <environment>"}
+	}
+	if out.First == nil {
+		out.Status = "consistent"
+	} else {
+		out.Status = "diverged"
+	}
+	return out, nil
+}
+func safeCommand(action, version string) string {
+	return fmt.Sprintf("autosql migrate repair %s --proposal <signed-proposal.json> --config <trusted-config> --target-version %s", action, version)
+}
+
+func (s Service) Apply(ctx context.Context, p Proposal) error {
+	if s.Store == nil || s.Audit == nil || s.Now == nil || s.Authorize == nil || p.Verify(s.Keys, s.Now()) != nil {
+		return ErrRefused
+	}
+	if p.Action == "remove" && p.ApprovalLevel != "destructive" {
+		return s.refuse(ctx, p)
+	}
+	session, e := s.Store.OpenSession(ctx)
+	if e != nil {
+		return e
+	}
+	defer session.Close(context.Background())
+	lockIdentity, e := executor.LockKey(p.DatabaseIdentity, p.Environment)
+	if e != nil {
+		return s.refuse(ctx, p)
+	}
+	ok, e := session.Lock(ctx, lockIdentity)
+	if e != nil || !ok {
+		return s.refuse(ctx, p)
+	}
+	defer session.Unlock(context.Background(), lockIdentity)
+	writers, e := session.LockWriters(ctx)
+	if e != nil || !writers {
+		return s.refuse(ctx, p)
+	}
+	defer session.UnlockWriters(context.Background())
+	recovered := false
+	pending, e := session.PendingOutbox(ctx)
+	if e != nil {
+		return e
+	}
+	for _, item := range pending {
+		var record AuditRecord
+		if json.Unmarshal(item.Payload, &record) != nil || record.EventID != item.ID {
+			continue
+		}
+		if e = s.Audit.AppendDurable(ctx, record); e != nil {
+			return e
+		}
+		if e = session.FinalizeOutbox(ctx, item.ID); e != nil {
+			return e
+		}
+		if record.ProposalDigest == p.Digest {
+			recovered = true
+		}
+	}
+	if recovered {
+		return nil
+	}
+	rows, e := session.Revisions(ctx)
+	if e != nil {
+		return e
+	}
+	alreadyApplied, checkErr := session.HasRepairProposal(ctx, p.Digest)
+	if checkErr != nil {
+		return checkErr
+	}
+	if alreadyApplied {
+		return nil
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Version < rows[j].Version })
+	var before *revision.Revision
+	for i := range rows {
+		if rows[i].Version == p.TargetVersion {
+			before = &rows[i]
+			break
+		}
+	}
+	if before == nil || before.State != p.ExpectedBeforeState || revisionDigest(*before) != p.ExpectedBeforeDigest || before.ManifestDigest != p.ManifestDigest || before.BundleDigest != p.GuardrailDigest {
+		already, checkErr := session.HasRepairProposal(ctx, p.Digest)
+		if checkErr != nil {
+			return checkErr
+		}
+		if recovered || already {
+			return nil
+		}
+		return s.refuse(ctx, p)
+	}
+	if e = s.Authorize(ctx, p, *before); e != nil {
+		return s.refuse(ctx, p)
+	}
+	requested := s.auditRecord("repair_requested", p)
+	if e = s.Audit.AppendDurable(ctx, requested); e != nil {
+		return e
+	}
+	if s.Hooks.AfterRequested != nil {
+		if e = s.Hooks.AfterRequested(); e != nil {
+			return e
+		}
+	}
+	tx, e := session.Begin(ctx)
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback(context.Background())
+	evidenceRaw, _ := json.Marshal(s.auditRecord("repair_applied", p))
+	if e = session.Repair(ctx, tx, p.TargetVersion, p.Action, p.ExpectedBeforeState, p.ExpectedAfterState, p.ExpectedBeforeDigest, p.Digest, p.Operator, string(evidenceRaw), s.Now()); e != nil {
+		return s.refuse(ctx, p)
+	}
+	applied := s.auditRecord("repair_applied", p)
+	raw, _ := json.Marshal(applied)
+	if e = session.EnqueueOutbox(ctx, tx, applied.EventID, raw); e != nil {
+		return e
+	}
+	if s.Hooks.BeforeCommit != nil {
+		if e = s.Hooks.BeforeCommit(); e != nil {
+			return e
+		}
+	}
+	if e = tx.Commit(ctx); e != nil {
+		return e
+	}
+	if s.Hooks.AfterCommit != nil {
+		if e = s.Hooks.AfterCommit(); e != nil {
+			return e
+		}
+	}
+	if e = s.Audit.AppendDurable(ctx, applied); e != nil {
+		return e
+	}
+	if e = session.FinalizeOutbox(ctx, applied.EventID); e != nil {
+		return e
+	}
+	if s.Hooks.AfterApplied != nil {
+		return s.Hooks.AfterApplied()
+	}
+	return nil
+}
+func (s Service) refuse(ctx context.Context, p Proposal) error {
+	if s.Audit != nil && s.Now != nil {
+		_ = s.Audit.AppendDurable(ctx, s.auditRecord("repair_refused", p))
+	}
+	return ErrRefused
+}
+func (s Service) auditRecord(kind string, p Proposal) AuditRecord {
+	return AuditRecord{EventID: strings.ReplaceAll(kind, "_", "-") + "/" + p.Digest, Type: kind, ProposalDigest: p.Digest, Action: p.Action, TargetVersion: p.TargetVersion, Reason: p.Reason, Operator: p.Operator, PolicyDigest: p.PolicyDigest, ApprovalDigest: p.ApprovalDigest, BeforeDigest: p.ExpectedBeforeDigest, BeforeState: p.ExpectedBeforeState, AfterState: p.ExpectedAfterState, At: s.Now()}
+}
+func revisionDigest(r revision.Revision) string {
+	return revision.Digest(r)
+}
+func RevisionDigest(r revision.Revision) string { return revisionDigest(r) }
