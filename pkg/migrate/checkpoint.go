@@ -1,6 +1,7 @@
 package migrate
 
 import (
+	"autosql/pkg/approval"
 	"autosql/pkg/artifact"
 	"autosql/pkg/plan"
 	"autosql/pkg/plugin"
@@ -111,7 +112,15 @@ func (s GenerateService) CreateCheckpoint(ctx context.Context, r CheckpointReque
 		return out, generationFailure("replay", ErrGenerateStage)
 	}
 	defer workspace.Close()
-	doc, err := postgres.New().Normalize(ctx, workspace.Document)
+	schemas, err := checkpointSchemas(ctx, workspace.URL)
+	if err != nil || len(schemas) == 0 {
+		return out, generationFailure("inspect", ErrGenerateStage)
+	}
+	inspected, err := postgres.InspectURL(ctx, workspace.URL, postgres.Options{Schemas: schemas})
+	if err != nil {
+		return out, generationFailure("inspect", ErrGenerateStage)
+	}
+	doc, err := postgres.New().Normalize(ctx, inspected)
 	if err != nil {
 		return out, generationFailure("inspect", ErrGenerateStage)
 	}
@@ -133,7 +142,7 @@ func (s GenerateService) CreateCheckpoint(ctx context.Context, r CheckpointReque
 	if err != nil || simulated != fingerprint {
 		return out, generationFailure("simulate", ErrGenerateStage)
 	}
-	empty := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{}}}
+	empty := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{}, Extra: doc.Graph.Extra}, Annotations: doc.Annotations, Extra: doc.Extra}
 	p, err := plan.Build(ctx, postgres.New(), empty, doc, plan.Options{})
 	if err != nil || p.ToFingerprint != fingerprint {
 		return out, generationFailure("plan", ErrGenerateStage)
@@ -155,7 +164,11 @@ func (s GenerateService) CreateCheckpoint(ctx context.Context, r CheckpointReque
 	metadata["autosql.migration.manifest"] = snap.Manifest.Digest
 	metadata["autosql.migration.from"] = p.FromFingerprint
 	metadata["autosql.migration.to"] = p.ToFingerprint
-	approved, err := trustedArtifactApproval(ctx, r.Authority, r.Approvals, p.Digest, r.Environment)
+	approvals := append([]approval.Approval(nil), r.Approvals...)
+	for i := range approvals {
+		approvals[i].PlanDigest, approvals[i].Environment = p.Digest, r.Environment
+	}
+	approved, err := trustedArtifactApproval(ctx, r.Authority, approvals, p.Digest, r.Environment)
 	if err != nil {
 		return out, generationFailure("approval_evidence", ErrGenerateStage)
 	}
@@ -185,6 +198,28 @@ func (s GenerateService) CreateCheckpoint(ctx context.Context, r CheckpointReque
 		return out, generationFailure("publish", ErrGenerateConflict)
 	}
 	return CheckpointResult{Status: "created", File: name, ArtifactFile: name + ".artifact.json", ManifestDigest: man.Digest, CoveredFrom: coveredFrom, CoveredTo: coveredTo, SchemaFingerprint: fingerprint, DataPolicy: r.DataPolicy, Statements: len(statements)}, nil
+}
+
+func checkpointSchemas(ctx context.Context, databaseURL string) ([]string, error) {
+	c, err := pgx.Connect(ctx, databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close(context.Background())
+	rows, err := c.Query(ctx, `select n.nspname from pg_namespace n where n.nspname <> 'information_schema' and n.nspname !~ '^pg_' and exists(select 1 from pg_class c where c.relnamespace=n.oid and c.relkind in ('r','p','v','m','S','f')) order by n.nspname`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var n string
+		if err = rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
 }
 
 func validateCheckpointData(s Snapshot, r CheckpointRequest) error {
