@@ -36,7 +36,7 @@ func (a liveAuthority) VerifyApproval(_ context.Context, v approval.Approval) (a
 	return approval.VerifiedApproval{Identity: approval.Identity{ID: "reviewer", Roles: []string{"reviewer"}}, PlanDigest: v.PlanDigest, Environment: v.Environment, ApprovedAt: a.at, ExpiresAt: a.expires}, nil
 }
 
-func liveGenerated(t *testing.T, dev, prod string) (string, VerifyArtifact) {
+func liveGenerated(t *testing.T, dev, prod string) (string, VerifyArtifact, func()) {
 	t.Helper()
 	dir := t.TempDir()
 	if _, e := migrate.Update(dir, migrate.UpdateRequest{ManifestVersion: migrate.ManifestVersion}); e != nil {
@@ -64,39 +64,50 @@ func liveGenerated(t *testing.T, dev, prod string) (string, VerifyArtifact) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	doc2, e := source.LoadContext(context.Background(), source.Input{URI: "desired2.sql", Format: source.FormatSQL, Data: []byte("CREATE SCHEMA app; CREATE TABLE app.widgets (id bigint); CREATE TABLE app.gadgets (id bigint);")})
-	if e != nil {
-		t.Fatal(e)
-	}
-	r.Version, r.Label, r.Desired = "2", "gadgets", doc2
-	if _, e = (migrate.GenerateService{}).Generate(context.Background(), r); e != nil {
-		t.Fatal(e)
-	}
 	snap, e := migrate.LoadSnapshot(dir)
 	if e != nil {
 		t.Fatal(e)
 	}
 	policies := map[string]artifact.VerifyPolicy{}
-	for _, me := range snap.Manifest.Entries {
-		a, pe := artifact.Parse(snap.Files[me.ArtifactFile])
-		if pe != nil {
-			t.Fatal(pe)
+	addPolicies := func(snap migrate.Snapshot) {
+		for _, me := range snap.Manifest.Entries {
+			a, pe := artifact.Parse(snap.Files[me.ArtifactFile])
+			if pe != nil {
+				t.Fatal(pe)
+			}
+			contexts := map[string]string{}
+			atts := map[string]artifact.ValidationAttestation{}
+			for _, x := range a.ValidationAttestations {
+				contexts[x.Stage] = x.ConfigDigest
+				atts[x.Stage] = x
+			}
+			policies[a.Digest] = artifact.VerifyPolicy{Now: time.Now, NoEdits: true, Expected: artifact.ExpectedBindings{PlanDigest: a.Plan.Digest, GeneratedPlanDigest: a.Plan.Digest, ChecksDigest: a.Checks.Digest, GuardrailDigest: a.GuardrailDigest, SourceRevision: a.SourceRevision, Environment: a.TargetEnvironment, DatabaseIdentity: a.DatabaseIdentity, ApprovalIdentity: a.Approval.Identity, ApprovalProofDigest: a.Approval.ProofDigest}, Keys: map[string]artifact.KeyRecord{"release": {PublicKey: sign.Public().(ed25519.PublicKey), Issuer: "issuer", Identity: "signer", Environment: "test", Purpose: "release", Status: "active", NotBefore: now.Add(-time.Hour), NotAfter: expires.Add(time.Hour)}}, Issuer: "issuer", Identity: "signer", Purpose: "release", GeneratorKeys: map[string]artifact.KeyRecord{"gen": {PublicKey: gen.Public().(ed25519.PublicKey), Purpose: "migration-generator"}}, GeneratorPurpose: "migration-generator", ExpectedValidationContextDigests: contexts, ExpectedValidationAttestations: atts}
 		}
-		contexts := map[string]string{}
-		atts := map[string]artifact.ValidationAttestation{}
-		for _, x := range a.ValidationAttestations {
-			contexts[x.Stage] = x.ConfigDigest
-			atts[x.Stage] = x
-		}
-		policies[a.Digest] = artifact.VerifyPolicy{Now: time.Now, NoEdits: true, Expected: artifact.ExpectedBindings{PlanDigest: a.Plan.Digest, GeneratedPlanDigest: a.Plan.Digest, ChecksDigest: a.Checks.Digest, GuardrailDigest: a.GuardrailDigest, SourceRevision: a.SourceRevision, Environment: a.TargetEnvironment, DatabaseIdentity: a.DatabaseIdentity, ApprovalIdentity: a.Approval.Identity, ApprovalProofDigest: a.Approval.ProofDigest}, Keys: map[string]artifact.KeyRecord{"release": {PublicKey: sign.Public().(ed25519.PublicKey), Issuer: "issuer", Identity: "signer", Environment: "test", Purpose: "release", Status: "active", NotBefore: now.Add(-time.Hour), NotAfter: expires.Add(time.Hour)}}, Issuer: "issuer", Identity: "signer", Purpose: "release", GeneratorKeys: map[string]artifact.KeyRecord{"gen": {PublicKey: gen.Public().(ed25519.PublicKey), Purpose: "migration-generator"}}, GeneratorPurpose: "migration-generator", ExpectedValidationContextDigests: contexts, ExpectedValidationAttestations: atts}
 	}
-	return dir, func(x artifact.Artifact) (artifact.VerifiedArtifact, error) {
+	addPolicies(snap)
+	verify := func(x artifact.Artifact) (artifact.VerifiedArtifact, error) {
 		p, ok := policies[x.Digest]
 		if !ok {
 			return artifact.VerifiedArtifact{}, errors.New("untrusted test artifact")
 		}
 		return x.VerifyTrusted(p)
 	}
+	appendSecond := func() {
+		doc2, e := source.LoadContext(context.Background(), source.Input{URI: "desired2.sql", Format: source.FormatSQL, Data: []byte("CREATE SCHEMA app; CREATE TABLE app.widgets (id bigint); CREATE TABLE app.gadgets (id bigint);")})
+		if e != nil {
+			t.Fatal(e)
+		}
+		r.Version, r.Label, r.Desired = "2", "gadgets", doc2
+		if _, e = (migrate.GenerateService{}).Generate(context.Background(), r); e != nil {
+			t.Fatal(e)
+		}
+		next, e := migrate.LoadSnapshot(dir)
+		if e != nil {
+			t.Fatal(e)
+		}
+		addPolicies(next)
+	}
+	return dir, verify, appendSecond
 }
 
 func TestLiveGenerationApplyRetryBaselineAndAtomicEvidence(t *testing.T) {
@@ -104,7 +115,7 @@ func TestLiveGenerationApplyRetryBaselineAndAtomicEvidence(t *testing.T) {
 	if dev == "" || prod == "" {
 		t.Skip("live generation databases unset")
 	}
-	dir, verify := liveGenerated(t, dev, prod)
+	dir, verify, appendSecond := liveGenerated(t, dev, prod)
 	clean, e := pgx.Connect(context.Background(), prod)
 	if e != nil {
 		t.Fatal(e)
@@ -120,16 +131,19 @@ func TestLiveGenerationApplyRetryBaselineAndAtomicEvidence(t *testing.T) {
 		t.Fatal(e)
 	}
 	engine := Engine{Store: store, Verify: verify}
-	guarded := func(ctx context.Context, v artifact.VerifiedArtifact, s executor.Session, tx executor.Tx) (executor.Result, error) {
+	guarded := func(ctx context.Context, v artifact.VerifiedArtifact, s executor.Session, tx executor.Tx) (executor.ExternalExecution, error) {
 		a, _ := v.Payload()
 		x, e := executor.NewPostgreSQL(executor.Config{LockedSession: s, LockAlreadyHeld: true, Transaction: tx, Now: time.Now, Reauthorize: func(context.Context, artifact.Artifact) error { _, z := verify(a); return z }, State: func(context.Context, executor.Session) (executor.RuntimeState, error) {
 			return executor.RuntimeState{Fingerprint: a.Plan.FromFingerprint, SourceRevision: a.SourceRevision, Environment: a.TargetEnvironment, DatabaseIdentity: a.DatabaseIdentity}, nil
 		}}, v)
 		if e != nil {
-			return executor.Result{}, e
+			return executor.ExternalExecution{}, e
 		}
 		_, e = x.ApplyAuthorized(ctx, a.Checks)
-		return x.Result(), e
+		if tx != nil {
+			return x.ExternalExecution(), e
+		}
+		return executor.ExternalExecution{Result: x.Result()}, e
 	}
 	engine.Apply = guarded
 	one := 1
@@ -142,6 +156,7 @@ func TestLiveGenerationApplyRetryBaselineAndAtomicEvidence(t *testing.T) {
 	if e != nil || got.Status != "applied" || got.Statements == 0 || got.FileResults[0].Duration < 0 {
 		t.Fatalf("got=%+v err=%v", got, e)
 	}
+	appendSecond()
 	retryReq := req
 	retryReq.From = ""
 	retryReq.To = ""
@@ -219,6 +234,12 @@ func TestLiveGenerationApplyRetryBaselineAndAtomicEvidence(t *testing.T) {
 	if e != nil || len(rows) != 0 {
 		t.Fatalf("rolled-back rows=%+v err=%v", rows, e)
 	}
+	bc, e := pgx.Connect(context.Background(), prod)
+	if e != nil {
+		t.Fatal(e)
+	}
+	_, _ = bc.Exec(context.Background(), `drop schema if exists app cascade; drop table if exists autosql_migration_history`)
+	_ = bc.Close(context.Background())
 	baseSchema := schema + "b"
 	base, e := revision.Open(revision.Config{URL: prod, Schema: baseSchema})
 	if e != nil {
@@ -230,5 +251,18 @@ func TestLiveGenerationApplyRetryBaselineAndAtomicEvidence(t *testing.T) {
 	b, e := (Engine{Store: base, Verify: verify}).Run(context.Background(), Request{Directory: dir, Operator: "operator", TargetIdentity: baseSchema, Transaction: "file", Baseline: true})
 	if e != nil || b.Status != "baselined" || b.Statements != 0 {
 		t.Fatalf("baseline=%+v err=%v", b, e)
+	}
+	check, e := pgx.Connect(context.Background(), prod)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer check.Close(context.Background())
+	var exists bool
+	if e = check.QueryRow(context.Background(), `select exists(select 1 from pg_namespace where nspname='app')`).Scan(&exists); e != nil || exists {
+		t.Fatalf("baseline executed SQL exists=%v err=%v", exists, e)
+	}
+	var history *string
+	if e = check.QueryRow(context.Background(), `select to_regclass('public.autosql_migration_history')::text`).Scan(&history); e != nil || history != nil {
+		t.Fatalf("baseline created executor history=%v err=%v", history, e)
 	}
 }

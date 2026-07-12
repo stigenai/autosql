@@ -65,6 +65,36 @@ type Result struct {
 	Uncertain                                  bool
 	PendingStep, ExecutionID, RecoveryGuidance string
 }
+type ExternalExecution struct {
+	Result   Result
+	Finalize func(context.Context, bool) error
+}
+
+func (e *PostgreSQL) ExternalExecution() ExternalExecution {
+	return ExternalExecution{Result: e.result, Finalize: func(ctx context.Context, committed bool) error {
+		if !committed {
+			e.result.Uncertain = true
+			e.result.RecoveryGuidance = "reconcile outer transaction outcome"
+			_ = e.audit(ctx, "uncertain", e.result.LastConfirmed, e.result.RecoveryGuidance)
+			return ErrReconcile
+		}
+		if err := e.audit(ctx, "transaction_committed", e.result.LastConfirmed, ""); err != nil {
+			return ErrPartial
+		}
+		for _, p := range e.artifact.Plan.Phases {
+			for _, id := range p.StepIDs {
+				for _, s := range e.artifact.Plan.Steps {
+					if s.ID == id && s.Kind == plan.StepExecutable {
+						if err := e.audit(ctx, "confirmed", id, ""); err != nil {
+							return ErrPartial
+						}
+					}
+				}
+			}
+		}
+		return e.finish(ctx)
+	}}
+}
 
 // PostgreSQL can be constructed only with a cryptographically verified artifact.
 type PostgreSQL struct {
@@ -220,7 +250,9 @@ func (e *PostgreSQL) ApplyAuthorized(ctx context.Context, checks precheck.Plan) 
 			}
 		}
 	}
-	if e.config.Transaction!=nil{return results,nil}
+	if e.config.Transaction != nil {
+		return results, nil
+	}
 	return results, e.finish(ctx)
 }
 func (e *PostgreSQL) finish(ctx context.Context) error {
@@ -408,15 +440,20 @@ func (e *PostgreSQL) transactionalPhase(ctx context.Context, conn Session, phase
 	committed = true
 	e.result.AppliedSteps += pendingCount
 	e.result.LastConfirmed = last
-	if e.config.Transaction==nil { if auditErr := e.audit(ctx, "transaction_committed", last, ""); auditErr != nil {
-		e.result.Partial = true
-		e.result.ExecutionID = e.artifact.Digest
-		e.result.RecoveryGuidance = "repair transaction commit audit before retry"
-		return results, ErrPartial
-	} }
+	if e.config.Transaction == nil {
+		if auditErr := e.audit(ctx, "transaction_committed", last, ""); auditErr != nil {
+			e.result.Partial = true
+			e.result.ExecutionID = e.artifact.Digest
+			e.result.RecoveryGuidance = "repair transaction commit audit before retry"
+			return results, ErrPartial
+		}
+	}
 	for _, id := range phase.StepIDs {
 		if s := steps[id]; s.Kind == plan.StepExecutable && !confirmed[id] {
-			if e.config.Transaction!=nil{continue};if auditErr := e.audit(ctx, "confirmed", id, ""); auditErr != nil {
+			if e.config.Transaction != nil {
+				continue
+			}
+			if auditErr := e.audit(ctx, "confirmed", id, ""); auditErr != nil {
 				e.result.Partial = true
 				e.result.ExecutionID = e.artifact.Digest
 				e.result.RecoveryGuidance = "repair lifecycle audit before retry"
@@ -515,3 +552,4 @@ func stepHash(step plan.Step) string {
 	s := sha256.Sum256([]byte(step.ID + "\x00" + step.SQL + "\x00" + string(step.Transaction)))
 	return "sha256:" + hex.EncodeToString(s[:])
 }
+func StepHash(step plan.Step) string { return stepHash(step) }

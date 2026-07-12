@@ -90,6 +90,42 @@ func TestCompletedAuditFailureAppliedOutcome(t *testing.T) {
 	}
 }
 
+func TestExternalTransactionAuditFinalizesOnlyAfterOwnerOutcome(t *testing.T) {
+	a := &failingAudit{}
+	e := stateExecutor(a)
+	e.artifact.Plan.Steps = []plan.Step{{ID: "one", Kind: plan.StepExecutable}}
+	e.artifact.Plan.Phases = []plan.Phase{{ID: "p", Transaction: plan.TransactionRequired, StepIDs: []string{"one"}}}
+	e.result = Result{AppliedSteps: 1, LastConfirmed: "one"}
+	x := e.ExternalExecution()
+	if len(a.events) != 0 {
+		t.Fatal("external transaction audited before owner outcome")
+	}
+	if err := x.Finalize(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"transaction_committed", "confirmed", "completed"}
+	if len(a.events) != len(want) {
+		t.Fatalf("events=%v", a.events)
+	}
+	for i := range want {
+		if a.events[i] != want[i] {
+			t.Fatalf("events=%v", a.events)
+		}
+	}
+	b := &failingAudit{fail: "confirmed"}
+	e.config.Audit = b
+	x = e.ExternalExecution()
+	if err := x.Finalize(context.Background(), true); !errors.Is(err, ErrPartial) {
+		t.Fatalf("audit failure=%v", err)
+	}
+	c := &failingAudit{}
+	e.config.Audit = c
+	x = e.ExternalExecution()
+	if err := x.Finalize(context.Background(), false); !errors.Is(err, ErrReconcile) || c.events[0] != "uncertain" {
+		t.Fatalf("rollback err=%v events=%v", err, c.events)
+	}
+}
+
 func TestTwoStepConfirmationUncertaintyStopsSubsequentExecution(t *testing.T) {
 	one := plan.Step{ID: "one", SQL: "ddl1", Kind: plan.StepExecutable, Transaction: plan.TransactionProhibited}
 	two := plan.Step{ID: "two", SQL: "ddl2", Kind: plan.StepExecutable, Transaction: plan.TransactionProhibited}

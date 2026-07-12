@@ -951,6 +951,12 @@ func LoadSnapshot(dir string) (Snapshot, error) {
 // canonical artifact payload rather than the exact directory bytes.
 func ArtifactDigest(raw []byte) string  { return digest("artifact", raw) }
 func StatementDigest(sql string) string { return digest("statement", []byte(sql)) }
+func ManifestHead(m Manifest) (int, string) {
+	if len(m.Entries) == 0 {
+		return 0, ""
+	}
+	return len(m.Entries), m.Entries[len(m.Entries)-1].ChainDigest
+}
 func Verify(dir string) (Manifest, error) {
 	s, e := LoadSnapshot(dir)
 	if e != nil {

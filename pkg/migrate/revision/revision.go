@@ -186,16 +186,31 @@ check (kind in ('migration','baseline','checkpoint','reversal')), check (state i
 		_, err := tx.Exec(ctx, `alter table `+r+` add column duration_ns bigint not null default 0 check(duration_ns>=0), add column manifest_generation text not null default ''`)
 		return err
 	case 4:
-		_, err := tx.Exec(ctx, `create table `+q(c.Schema, c.ManifestTable)+` (generation text primary key,digest text not null unique,parent_generation text not null,recorded_at timestamptz not null)`)
+		var existing *string
+		if err := tx.QueryRow(ctx, `select to_regclass($1)::text`, c.Schema+"."+c.ManifestTable).Scan(&existing); err != nil {
+			return err
+		}
+		if existing != nil {
+			return fmt.Errorf("%w: unexpected manifest ancestry table at schema version 3", ErrConfig)
+		}
+		_, err := tx.Exec(ctx, `create table `+q(c.Schema, c.ManifestTable)+` (generation text primary key,digest text not null unique,parent_generation text not null,entry_count integer not null check(entry_count>=0),head_chain_digest text not null,recorded_at timestamptz not null)`)
 		return err
 	default:
 		return ErrConfig
 	}
 }
 func (s *Session) RecordManifest(ctx context.Context, tx pgx.Tx, m migrate.Manifest, parent string, at time.Time) error {
-	_, err := tx.Exec(ctx, `insert into `+q(s.config.Schema, s.config.ManifestTable)+`(generation,digest,parent_generation,recorded_at) values($1,$2,$3,$4) on conflict(generation) do update set digest=excluded.digest where `+q(s.config.Schema, s.config.ManifestTable)+`.digest=excluded.digest`, m.Generation, m.Digest, parent, at.UTC())
+	count, head := migrate.ManifestHead(m)
+	tag, err := tx.Exec(ctx, `insert into `+q(s.config.Schema, s.config.ManifestTable)+`(generation,digest,parent_generation,entry_count,head_chain_digest,recorded_at) values($1,$2,$3,$4,$5,$6) on conflict(generation) do nothing`, m.Generation, m.Digest, parent, count, head, at.UTC())
 	if err != nil {
 		return errors.New("record manifest ancestry")
+	}
+	if tag.RowsAffected() == 0 {
+		var d, p, h string
+		var n int
+		if err = tx.QueryRow(ctx, `select digest,parent_generation,entry_count,head_chain_digest from `+q(s.config.Schema, s.config.ManifestTable)+` where generation=$1`, m.Generation).Scan(&d, &p, &n, &h); err != nil || d != m.Digest || n != count || h != head {
+			return errors.New("manifest ancestry binding conflict")
+		}
 	}
 	return nil
 }
@@ -203,9 +218,22 @@ func (s *Session) ManifestDescendsFrom(ctx context.Context, current migrate.Mani
 	if current.Generation == ancestorGeneration && current.Digest == ancestorDigest {
 		return true, nil
 	}
-	var ok bool
-	err := s.conn.QueryRow(ctx, `with recursive chain as (select generation,digest,parent_generation from `+q(s.config.Schema, s.config.ManifestTable)+` where generation=$1 union all select m.generation,m.digest,m.parent_generation from `+q(s.config.Schema, s.config.ManifestTable)+` m join chain c on m.generation=c.parent_generation) select exists(select 1 from chain where generation=$2 and digest=$3)`, current.Generation, ancestorGeneration, ancestorDigest).Scan(&ok)
-	return ok, err
+	var count int
+	var head string
+	err := s.conn.QueryRow(ctx, `select entry_count,head_chain_digest from `+q(s.config.Schema, s.config.ManifestTable)+` where generation=$1 and digest=$2`, ancestorGeneration, ancestorDigest).Scan(&count, &head)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if count < 0 || count > len(current.Entries) {
+		return false, nil
+	}
+	if count == 0 {
+		return true, nil
+	}
+	return current.Entries[count-1].ChainDigest == head, nil
 }
 
 type Revision struct {
@@ -395,6 +423,35 @@ func (s *Store) UpdateState(ctx context.Context, version string, attempt int, st
 }
 
 type ExecutorHistory struct{ ArtifactDigest, State string }
+type ExecutorRecord struct {
+	ArtifactDigest, StepID, StepHash, PhaseID, PhaseMode, State, ExecutionID, TargetIdentity, PlanDigest, BundleDigest string
+	Attempt                                                                                                            int
+}
+
+func (s *Session) ExecutorRecords(ctx context.Context) ([]ExecutorRecord, error) {
+	var reg *string
+	if err := s.conn.QueryRow(ctx, `select to_regclass($1)::text`, s.config.ExecutorHistorySchema+"."+s.config.ExecutorHistoryTable).Scan(&reg); err != nil {
+		return nil, err
+	}
+	if reg == nil {
+		return nil, nil
+	}
+	rows, err := s.conn.Query(ctx, `select artifact_digest,step_id,step_hash,phase_id,phase_mode,state,execution_id,target_identity,plan_digest,bundle_digest,attempt from `+q(s.config.ExecutorHistorySchema, s.config.ExecutorHistoryTable))
+	if err != nil {
+		return nil, errors.New("read executor reconciliation history")
+	}
+	defer rows.Close()
+	var out []ExecutorRecord
+	for rows.Next() {
+		var x ExecutorRecord
+		if err = rows.Scan(&x.ArtifactDigest, &x.StepID, &x.StepHash, &x.PhaseID, &x.PhaseMode, &x.State, &x.ExecutionID, &x.TargetIdentity, &x.PlanDigest, &x.BundleDigest, &x.Attempt); err != nil {
+			return nil, errors.New("scan executor reconciliation history")
+		}
+		out = append(out, x)
+	}
+	return out, rows.Err()
+}
+
 type StatusEntry struct {
 	Version          string `json:"version"`
 	File             string `json:"file,omitempty"`

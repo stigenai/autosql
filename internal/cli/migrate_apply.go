@@ -87,7 +87,7 @@ func runMigrateApply(ctx context.Context, args []string, o output, services Serv
 	}
 	verifier, ok := services.Apply.(interface {
 		VerifyArtifact(artifact.Artifact) (artifact.VerifiedArtifact, error)
-		ApplyVersioned(context.Context, artifact.VerifiedArtifact, executor.Session, executor.Tx) (executor.Result, error)
+		ApplyVersioned(context.Context, artifact.VerifiedArtifact, executor.Session, executor.Tx) (executor.ExternalExecution, error)
 	})
 	if !ok {
 		return &Error{Kind: "config", Message: "trusted migration artifact verifier is not configured", Code: ExitConfig}

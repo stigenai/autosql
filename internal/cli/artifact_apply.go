@@ -24,8 +24,8 @@ type VerifiedArtifactApplyService struct {
 	NoEdits        bool
 }
 
-func (s VerifiedArtifactApplyService) ApplyVersioned(ctx context.Context, v artifact.VerifiedArtifact, session executor.Session, tx executor.Tx) (executor.Result, error) {
-	var out executor.Result
+func (s VerifiedArtifactApplyService) ApplyVersioned(ctx context.Context, v artifact.VerifiedArtifact, session executor.Session, tx executor.Tx) (executor.ExternalExecution, error) {
+	var out executor.ExternalExecution
 	p, err := v.Payload()
 	if err != nil || s.Input == nil || s.MutationLocked == nil {
 		return out, errors.New("versioned guarded apply is not configured")
@@ -41,12 +41,20 @@ func (s VerifiedArtifactApplyService) ApplyVersioned(ctx context.Context, v arti
 	in.Mutation = mutation
 	if _, err = s.Guardrail.Apply(ctx, in); err != nil {
 		if x, ok := mutation.(*executor.PostgreSQL); ok {
-			out = x.Result()
+			if tx != nil {
+				out = x.ExternalExecution()
+			} else {
+				out.Result = x.Result()
+			}
 		}
 		return out, err
 	}
 	if x, ok := mutation.(*executor.PostgreSQL); ok {
-		out = x.Result()
+		if tx != nil {
+			out = x.ExternalExecution()
+		} else {
+			out.Result = x.Result()
+		}
 	}
 	return out, nil
 }

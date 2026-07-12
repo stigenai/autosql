@@ -26,7 +26,7 @@ type SessionStore interface {
 	OpenSession(context.Context) (*revision.Session, error)
 }
 type VerifyArtifact func(artifact.Artifact) (artifact.VerifiedArtifact, error)
-type GuardedApply func(context.Context, artifact.VerifiedArtifact, executor.Session, executor.Tx) (executor.Result, error)
+type GuardedApply func(context.Context, artifact.VerifiedArtifact, executor.Session, executor.Tx) (executor.ExternalExecution, error)
 type Request struct {
 	Directory                string
 	Snapshot                 migrate.Snapshot // tests/offline callers; production should use Directory
@@ -41,6 +41,7 @@ type FileResult struct {
 	Version, File, Status string
 	Statements            int
 	Duration              time.Duration
+	finalize              func(context.Context, bool) error
 }
 type Failure struct {
 	Version, File                                 string `json:",omitempty"`
@@ -121,6 +122,14 @@ func (e Engine) Run(ctx context.Context, r Request) (out Result, err error) {
 	if snap.Manifest.Digest == "" || snap.Manifest.Generation == "" {
 		return out, ErrRefused
 	}
+	lockedDB, lockedEnv, targetErr := trustedTarget(snap, e.Verify)
+	if targetErr != nil {
+		return out, targetErr
+	}
+	lockedKey, keyErr := executor.LockKey(lockedDB, lockedEnv)
+	if keyErr != nil || lockedKey != lockKey {
+		return out, fmt.Errorf("%w: signed target changed while acquiring lock", ErrRefused)
+	}
 	records, err := s.Revisions(ctx)
 	if err != nil {
 		return out, err
@@ -135,6 +144,13 @@ func (e Engine) Run(ctx context.Context, r Request) (out Result, err error) {
 	candidates, err := selectTrusted(snap, records, r, e.Verify)
 	if err != nil {
 		return out, err
+	}
+	history, he := s.ExecutorRecords(ctx)
+	if he != nil {
+		return out, he
+	}
+	if he = reconcileHistory(snap, records, history, e.Verify); he != nil {
+		return out, he
 	}
 	for _, c := range candidates {
 		out.Files = append(out.Files, c.entry.File)
@@ -176,6 +192,82 @@ func (e Engine) Run(ctx context.Context, r Request) (out Result, err error) {
 	out.Status = "applied"
 	out.Duration = r.Now().Sub(started)
 	return out, nil
+}
+func reconcileHistory(snap migrate.Snapshot, revs []revision.Revision, rows []revision.ExecutorRecord, verify VerifyArtifact) error {
+	arts := map[string]artifact.Artifact{}
+	for _, m := range snap.Manifest.Entries {
+		raw := snap.Files[m.ArtifactFile]
+		a, e := artifact.Parse(raw)
+		if e != nil {
+			return ErrRefused
+		}
+		v, e := verify(a)
+		if e != nil {
+			return ErrRefused
+		}
+		p, e := v.Payload()
+		if e != nil {
+			return ErrRefused
+		}
+		arts[m.ArtifactDigest] = p
+	}
+	by := map[string][]revision.ExecutorRecord{}
+	seen := map[string]bool{}
+	for _, x := range rows {
+		k := fmt.Sprintf("%s\x00%s\x00%d", x.ArtifactDigest, x.StepID, x.Attempt)
+		if seen[k] {
+			return fmt.Errorf("%w: duplicate executor history", ErrRefused)
+		}
+		seen[k] = true
+		by[x.ArtifactDigest] = append(by[x.ArtifactDigest], x)
+	}
+	known := map[string]bool{}
+	for _, r := range revs {
+		a, ok := arts[r.ArtifactDigest]
+		if !ok {
+			return fmt.Errorf("%w: revision artifact absent", ErrRefused)
+		}
+		known[a.Digest] = true
+		if r.State == "baseline" || r.State == "checkpoint" {
+			if len(by[a.Digest]) != 0 {
+				return fmt.Errorf("%w: baseline has executor history", ErrRefused)
+			}
+			continue
+		}
+		expected := map[string]plan.Phase{}
+		for _, p := range a.Plan.Phases {
+			for _, id := range p.StepIDs {
+				st := stepByID(a, id)
+				if st.Kind == plan.StepExecutable || p.Transaction == plan.TransactionRequired {
+					expected[id] = p
+				}
+			}
+		}
+		if len(by[a.Digest]) != len(expected) {
+			return fmt.Errorf("%w: incomplete executor history", ErrRefused)
+		}
+		for _, x := range by[a.Digest] {
+			p, ok := expected[x.StepID]
+			st := stepByID(a, x.StepID)
+			if !ok || x.Attempt != 1 || x.State != "confirmed" || x.StepHash != executor.StepHash(st) || x.PhaseID != p.ID || x.PhaseMode != string(p.Transaction) || x.ExecutionID != a.Digest || x.TargetIdentity != a.DatabaseIdentity+"/"+a.TargetEnvironment || x.PlanDigest != a.Plan.Digest || x.BundleDigest != a.GuardrailDigest {
+				return fmt.Errorf("%w: executor history binding conflict", ErrRefused)
+			}
+		}
+	}
+	for d := range by {
+		if !known[d] {
+			return fmt.Errorf("%w: executor history without revision", ErrRefused)
+		}
+	}
+	return nil
+}
+func stepByID(a artifact.Artifact, id string) plan.Step {
+	for _, s := range a.Plan.Steps {
+		if s.ID == id {
+			return s
+		}
+	}
+	return plan.Step{}
 }
 func trustedTarget(s migrate.Snapshot, verify VerifyArtifact) (string, string, error) {
 	var db, env string
@@ -235,6 +327,23 @@ func selectTrusted(snap migrate.Snapshot, records []revision.Revision, r Request
 			return nil, fmt.Errorf("%w: duplicate revision", ErrRefused)
 		}
 		by[x.Version] = x
+	}
+	applied := map[string]bool{}
+	for _, m := range snap.Manifest.Entries {
+		_, isApplied := by[m.Version]
+		for _, p := range m.Parents {
+			if !applied[p] {
+				return nil, fmt.Errorf("%w: migration parent closure is incomplete", ErrRefused)
+			}
+		}
+		if isApplied {
+			applied[m.Version] = true
+			continue
+		}
+		if m.NonLinear || len(m.Parents) > 1 {
+			return nil, fmt.Errorf("%w: branching pending migrations require an explicit merge workflow", ErrRefused)
+		}
+		applied[m.Version] = true
 	}
 	manifestVersions := map[string]bool{}
 	for _, m := range snap.Manifest.Entries {
@@ -391,9 +500,23 @@ func applyAtomic(ctx context.Context, s *revision.Session, cs []candidate, m mig
 		}
 	}
 	if e = tx.Commit(ctx); e != nil {
+		for _, fr := range out.FileResults {
+			if fr.finalize != nil {
+				_ = fr.finalize(context.WithoutCancel(ctx), false)
+			}
+		}
 		out.Status = "uncertain"
 		out.Failure = &Failure{Recovery: "reconcile all-in-one transaction outcome before retry"}
 		return ErrUncertain
+	}
+	for _, fr := range out.FileResults {
+		if fr.finalize != nil {
+			if fe := fr.finalize(context.WithoutCancel(ctx), true); fe != nil {
+				out.Status = "partial_failure"
+				out.Failure = &Failure{Recovery: "database committed; repair durable lifecycle audit without rerunning SQL"}
+				return fe
+			}
+		}
 	}
 	return nil
 }
@@ -419,11 +542,23 @@ func applyPerFile(ctx context.Context, s *revision.Session, cs []candidate, m mi
 			if e != nil && !errors.Is(e, ErrUncertain) {
 				_ = tx.Rollback(context.WithoutCancel(ctx))
 			}
+			if fr.finalize != nil {
+				if e == nil {
+					if fe := fr.finalize(context.WithoutCancel(ctx), true); fe != nil {
+						e = fe
+						out.Status = "partial_failure"
+					}
+				} else {
+					_ = fr.finalize(context.WithoutCancel(ctx), false)
+				}
+			}
 		}
 		out.FileResults = append(out.FileResults, fr)
 		out.Statements += fr.Statements
 		if e != nil {
-			out.Status = "failed"
+			if out.Status == "" {
+				out.Status = "failed"
+			}
 			if errors.Is(e, ErrUncertain) {
 				out.Status = "uncertain"
 			}
@@ -457,7 +592,8 @@ func executeGuarded(ctx context.Context, s *revision.Session, tx pgx.Tx, c candi
 			return fr, e
 		}
 		eres, e := apply(ctx, c.verified, executor.WrapPGX(s.Raw()), nil)
-		fr.Statements = eres.AppliedSteps
+		fr.Statements = eres.Result.AppliedSteps
+		fr.finalize = eres.Finalize
 		done := r.Now().UTC()
 		final, be := s.Begin(context.WithoutCancel(ctx))
 		if be != nil {
@@ -504,7 +640,8 @@ func executeGuarded(ctx context.Context, s *revision.Session, tx pgx.Tx, c candi
 		return fr, err
 	}
 	eres, err := apply(ctx, c.verified, executor.WrapPGX(s.Raw()), executor.WrapPGXTx(tx))
-	fr.Statements = eres.AppliedSteps
+	fr.Statements = eres.Result.AppliedSteps
+	fr.finalize = eres.Finalize
 	if err != nil {
 		return fr, err
 	}

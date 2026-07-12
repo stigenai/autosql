@@ -210,7 +210,7 @@ type resolvingApply struct {
 func (s resolvingApply) VerifyArtifact(a artifact.Artifact) (artifact.VerifiedArtifact, error) {
 	return s.verified.VerifyArtifact(a)
 }
-func (s resolvingApply) ApplyVersioned(ctx context.Context, v artifact.VerifiedArtifact, session executor.Session, tx executor.Tx) (executor.Result, error) {
+func (s resolvingApply) ApplyVersioned(ctx context.Context, v artifact.VerifiedArtifact, session executor.Session, tx executor.Tx) (executor.ExternalExecution, error) {
 	return s.verified.ApplyVersioned(ctx, v, session, tx)
 }
 
