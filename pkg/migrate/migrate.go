@@ -164,19 +164,24 @@ type Statement struct {
 	Digest  string `json:"digest"`
 }
 type Migration struct {
-	File            string      `json:"file"`
-	Version         string      `json:"version"`
-	Name            string      `json:"name"`
-	SQLDigest       string      `json:"sql_digest"`
-	ArtifactFile    string      `json:"artifact_file,omitempty"`
-	ArtifactDigest  string      `json:"artifact_digest,omitempty"`
-	Directives      Directives  `json:"directives"`
-	DirectiveDigest string      `json:"directive_digest"`
-	Statements      []Statement `json:"statements"`
-	BoundaryDigest  string      `json:"boundary_digest"`
-	Parents         []string    `json:"parents"`
-	NonLinear       bool        `json:"nonlinear,omitempty"`
-	ChainDigest     string      `json:"chain_digest"`
+	File              string      `json:"file"`
+	Version           string      `json:"version"`
+	Name              string      `json:"name"`
+	SQLDigest         string      `json:"sql_digest"`
+	ArtifactFile      string      `json:"artifact_file,omitempty"`
+	ArtifactDigest    string      `json:"artifact_digest,omitempty"`
+	Directives        Directives  `json:"directives"`
+	DirectiveDigest   string      `json:"directive_digest"`
+	Statements        []Statement `json:"statements"`
+	BoundaryDigest    string      `json:"boundary_digest"`
+	Parents           []string    `json:"parents"`
+	NonLinear         bool        `json:"nonlinear,omitempty"`
+	ChainDigest       string      `json:"chain_digest"`
+	Kind              string      `json:"kind,omitempty"`
+	CoveredFrom       string      `json:"covered_from,omitempty"`
+	CoveredTo         string      `json:"covered_to,omitempty"`
+	SchemaFingerprint string      `json:"schema_fingerprint,omitempty"`
+	DataPolicy        string      `json:"data_policy,omitempty"`
 }
 type Manifest struct {
 	Version    string      `json:"version"`
@@ -185,12 +190,13 @@ type Manifest struct {
 	Digest     string      `json:"digest"`
 }
 type File struct {
-	Name         string
-	SQL          []byte
-	ArtifactName string
-	Artifact     []byte
-	Parents      []string
-	NonLinear    bool
+	Name                                                        string
+	SQL                                                         []byte
+	ArtifactName                                                string
+	Artifact                                                    []byte
+	Parents                                                     []string
+	NonLinear                                                   bool
+	Kind, CoveredFrom, CoveredTo, SchemaFingerprint, DataPolicy string
 }
 type UpdateRequest struct {
 	Files                  []File
@@ -318,10 +324,11 @@ var digestRE = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 var generationRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 type chainMaterial struct {
-	Version, File, SQL, Directives, Boundaries string
-	Artifact                                   string `json:",omitempty"`
-	Parents, ParentChains                      []string
-	NonLinear                                  bool
+	Version, File, SQL, Directives, Boundaries                  string
+	Artifact                                                    string `json:",omitempty"`
+	Kind, CoveredFrom, CoveredTo, SchemaFingerprint, DataPolicy string `json:",omitempty"`
+	Parents, ParentChains                                       []string
+	NonLinear                                                   bool
 }
 
 func digest(domain string, b []byte) string {
@@ -416,7 +423,7 @@ func parseFile(f File) (Migration, error) {
 	bd := digest("boundaries", canonical(stmts))
 	parents := append([]string(nil), f.Parents...)
 	sort.Strings(parents)
-	entry := Migration{File: name, Version: v.String(), Name: m[2], SQLDigest: digest("sql", sql), Directives: dirs, DirectiveDigest: dd, Statements: stmts, BoundaryDigest: bd, Parents: parents, NonLinear: f.NonLinear}
+	entry := Migration{File: name, Version: v.String(), Name: m[2], SQLDigest: digest("sql", sql), Directives: dirs, DirectiveDigest: dd, Statements: stmts, BoundaryDigest: bd, Parents: parents, NonLinear: f.NonLinear, Kind: f.Kind, CoveredFrom: f.CoveredFrom, CoveredTo: f.CoveredTo, SchemaFingerprint: f.SchemaFingerprint, DataPolicy: f.DataPolicy}
 	if len(f.Artifact) > 0 || f.ArtifactName != "" {
 		if f.ArtifactName != name+".artifact.json" || len(f.Artifact) == 0 || len(f.Artifact) > maxFile || !utf8.Valid(f.Artifact) || bytes.IndexByte(f.Artifact, 0) >= 0 {
 			return Migration{}, fmt.Errorf("%w: artifact", ErrInvalid)
@@ -432,7 +439,7 @@ func canonicalExecutableSQL(v string) string {
 	lines := strings.Split(v, "\n")
 	for len(lines) > 0 {
 		t := strings.TrimSpace(lines[0])
-		if strings.HasPrefix(t, "-- autosql:") || strings.HasPrefix(t, "-- autosql-rename-hints-") {
+		if strings.HasPrefix(t, "-- autosql:") || strings.HasPrefix(t, "-- autosql-rename-hints-") || strings.HasPrefix(t, "-- autosql-checkpoint-") {
 			lines = lines[1:]
 			continue
 		}
@@ -475,6 +482,13 @@ func build(files []File) (Manifest, error) {
 	}
 	for i := range entries {
 		e := &entries[i]
+		if e.Kind == "checkpoint" {
+			from, fok := byVersion[e.CoveredFrom]
+			to, tok := byVersion[e.CoveredTo]
+			if !fok || !tok || from > to || to >= i || !digestRE.MatchString(e.SchemaFingerprint) || (e.DataPolicy != "schema_only" && e.DataPolicy != "declared_replay") {
+				return Manifest{}, conflict("checkpoint_range", e.File, "bind a checkpoint to an earlier contiguous covered range")
+			}
+		}
 		if i == 0 {
 			if len(e.Parents) > 0 {
 				return Manifest{}, conflict("root_parent", e.File, "remove root parents")
@@ -509,7 +523,7 @@ func build(files []File) (Manifest, error) {
 			parentChains[j] = entries[byVersion[p]].ChainDigest
 		}
 		sort.Strings(parentChains)
-		material := chainMaterial{Version: e.Version, File: e.File, SQL: e.SQLDigest, Directives: e.DirectiveDigest, Boundaries: e.BoundaryDigest, Artifact: e.ArtifactDigest, Parents: append([]string(nil), e.Parents...), ParentChains: parentChains, NonLinear: e.NonLinear}
+		material := chainMaterial{Version: e.Version, File: e.File, SQL: e.SQLDigest, Directives: e.DirectiveDigest, Boundaries: e.BoundaryDigest, Artifact: e.ArtifactDigest, Kind: e.Kind, CoveredFrom: e.CoveredFrom, CoveredTo: e.CoveredTo, SchemaFingerprint: e.SchemaFingerprint, DataPolicy: e.DataPolicy, Parents: append([]string(nil), e.Parents...), ParentChains: parentChains, NonLinear: e.NonLinear}
 		e.ChainDigest = digest("chain", canonical(material))
 	}
 	// The generation is derived from all semantic and byte digests, not wall time.
@@ -614,6 +628,13 @@ func validateManifestStructure(m Manifest) error {
 	byVersion := map[string]int{}
 	for i := range m.Entries {
 		e := &m.Entries[i]
+		if e.Kind == "checkpoint" {
+			from, fok := byVersion[e.CoveredFrom]
+			to, tok := byVersion[e.CoveredTo]
+			if !fok || !tok || from > to || to >= i {
+				return ErrInvalid
+			}
+		}
 		if filepath.Base(e.File) != e.File || strings.Contains(e.File, "..") || strings.ContainsAny(e.File, "/\\") {
 			return ErrInvalid
 		}
@@ -642,6 +663,9 @@ func validateManifestStructure(m Manifest) error {
 			return ErrInvalid
 		}
 		if (e.ArtifactFile == "") != (e.ArtifactDigest == "") || e.ArtifactFile != "" && (e.ArtifactFile != e.File+".artifact.json" || !digestRE.MatchString(e.ArtifactDigest)) {
+			return ErrInvalid
+		}
+		if e.Kind != "" && e.Kind != "checkpoint" || e.Kind == "checkpoint" && (e.CoveredFrom == "" || e.CoveredTo == "" || !digestRE.MatchString(e.SchemaFingerprint) || (e.DataPolicy != "schema_only" && e.DataPolicy != "declared_replay")) {
 			return ErrInvalid
 		}
 		if e.Directives.Transaction != TransactionAuto && e.Directives.Transaction != TransactionRequired && e.Directives.Transaction != TransactionForbidden {
@@ -690,7 +714,7 @@ func validateManifestStructure(m Manifest) error {
 		if linear == e.NonLinear {
 			return ErrInvalid
 		}
-		material := chainMaterial{Version: e.Version, File: e.File, SQL: e.SQLDigest, Directives: e.DirectiveDigest, Boundaries: e.BoundaryDigest, Artifact: e.ArtifactDigest, Parents: append([]string(nil), e.Parents...), ParentChains: parentChains, NonLinear: e.NonLinear}
+		material := chainMaterial{Version: e.Version, File: e.File, SQL: e.SQLDigest, Directives: e.DirectiveDigest, Boundaries: e.BoundaryDigest, Artifact: e.ArtifactDigest, Kind: e.Kind, CoveredFrom: e.CoveredFrom, CoveredTo: e.CoveredTo, SchemaFingerprint: e.SchemaFingerprint, DataPolicy: e.DataPolicy, Parents: append([]string(nil), e.Parents...), ParentChains: parentChains, NonLinear: e.NonLinear}
 		if digest("chain", canonical(material)) != e.ChainDigest {
 			return conflict("chain_digest", e.File, "restore the canonical ancestry chain")
 		}
@@ -877,7 +901,7 @@ func verifyGenerationAt(root int, m Manifest) (map[string][]byte, error) {
 			return nil, e
 		}
 		out[entry.File] = b
-		f := File{Name: entry.File, SQL: b, Parents: append([]string(nil), entry.Parents...), NonLinear: entry.NonLinear}
+		f := File{Name: entry.File, SQL: b, Parents: append([]string(nil), entry.Parents...), NonLinear: entry.NonLinear, Kind: entry.Kind, CoveredFrom: entry.CoveredFrom, CoveredTo: entry.CoveredTo, SchemaFingerprint: entry.SchemaFingerprint, DataPolicy: entry.DataPolicy}
 		if entry.ArtifactFile != "" {
 			ab, re := readAt(g, entry.ArtifactFile, maxFile)
 			if re != nil {

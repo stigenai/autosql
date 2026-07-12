@@ -2,6 +2,7 @@ package cli
 
 import (
 	"autosql/pkg/approval"
+	"autosql/pkg/artifact"
 	"autosql/pkg/migrate"
 	"autosql/pkg/policy"
 	"autosql/pkg/precheck"
@@ -53,6 +54,13 @@ type generationConfig struct {
 	Lifetime                                                                                                 string
 	GeneratorKeyID, GeneratorPurpose, GeneratorPrivateKeyReference, SigningKeyID, SigningPrivateKeyReference string
 	Metadata                                                                                                 map[string]string
+	CheckpointDataPolicy                                                                                     string
+	CheckpointDeclaredReplay                                                                                 []string
+	CheckpointPolicyApproved                                                                                 bool
+	CheckpointExpectedValidationContextDigests                                                               map[string]string
+	CheckpointExpectedValidationAttestations                                                                 map[string]artifact.ValidationAttestation
+	CheckpointExpectedApprovalIdentity, CheckpointExpectedApprovalProofDigest                                string
+	CheckpointReleaseIssuer, CheckpointReleaseIdentity, CheckpointReleasePurpose                             string
 }
 type configuredGenerationAuthority struct {
 	actors   map[string]approval.Identity

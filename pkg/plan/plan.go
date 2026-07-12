@@ -78,6 +78,7 @@ type Plan struct {
 	FromFingerprint string           `json:"from_fingerprint"`
 	ToFingerprint   string           `json:"to_fingerprint"`
 	Changes         schema.ChangeSet `json:"changes"`
+	Replay          []string         `json:"replay,omitempty"`
 	Steps           []Step           `json:"steps"`
 	Phases          []Phase          `json:"phases"`
 	Digest          string           `json:"digest"`
@@ -116,7 +117,7 @@ func Build(ctx context.Context, driver plugin.Driver, current, desired schema.Do
 	if err != nil {
 		return Plan{}, fmt.Errorf("%w: %w", ErrUnsupportedTransition, err)
 	}
-	steps, err := bindSteps(changes, statements)
+	steps, err := bindSteps(changes, statements, nil)
 	if err != nil {
 		return Plan{}, err
 	}
@@ -143,6 +144,14 @@ func (p Plan) Validate() error {
 	for _, c := range p.Changes.Changes {
 		changeIDs[c.ID] = true
 	}
+	if len(p.Replay) > 0 {
+		changeIDs[ReplayChangeID] = true
+		for _, q := range p.Replay {
+			if strings.TrimSpace(q) == "" {
+				return fmt.Errorf("%w: empty replay", ErrInvalidPlan)
+			}
+		}
+	}
 	stepIDs := map[string]bool{}
 	for _, s := range p.Steps {
 		if s.ID == "" || !changeIDs[s.ChangeID] || stepIDs[s.ID] || s.Kind == StepExecutable && strings.TrimSpace(s.SQL) == "" || s.Kind == StepTopology && s.SQL != "" {
@@ -159,7 +168,7 @@ func (p Plan) Validate() error {
 		}
 		stepIDs[s.ID] = true
 	}
-	rebuilt, err := bindSteps(p.Changes, p.renderedStatements())
+	rebuilt, err := bindSteps(p.Changes, p.renderedStatements(), p.Replay)
 	gotSteps, _ := json.Marshal(rebuilt)
 	wantSteps, _ := json.Marshal(p.Steps)
 	if err != nil || string(gotSteps) != string(wantSteps) {
@@ -175,11 +184,43 @@ func (p Plan) Validate() error {
 			}
 		}
 	}
-	want, err := digestPlan(Plan{Version: p.Version, PlannerVersion: p.PlannerVersion, Driver: p.Driver, FromFingerprint: p.FromFingerprint, ToFingerprint: p.ToFingerprint, Changes: p.Changes, Steps: p.Steps, Phases: p.Phases})
+	want, err := digestPlan(Plan{Version: p.Version, PlannerVersion: p.PlannerVersion, Driver: p.Driver, FromFingerprint: p.FromFingerprint, ToFingerprint: p.ToFingerprint, Changes: p.Changes, Replay: p.Replay, Steps: p.Steps, Phases: p.Phases})
 	if err != nil || want != p.Digest {
 		return fmt.Errorf("%w: digest mismatch", ErrInvalidPlan)
 	}
 	return nil
+}
+
+// AppendReplay binds policy-approved canonical replay statements to the final
+// schema change and recomputes all step, phase, and digest evidence. This is
+// used by signed schema checkpoints; callers must classify and authorize the
+// statements before invoking it.
+func AppendReplay(p Plan, sql []string) (Plan, error) {
+	if err := p.Validate(); err != nil {
+		return Plan{}, err
+	}
+	if len(sql) == 0 {
+		return p, nil
+	}
+	statements := p.renderedStatements()
+	p.Replay = append([]string(nil), sql...)
+	for _, q := range sql {
+		if strings.TrimSpace(q) == "" {
+			return Plan{}, fmt.Errorf("%w: empty replay", ErrInvalidPlan)
+		}
+		statements = append(statements, plugin.Statement{SQL: q, ChangeID: ReplayChangeID, Transactional: true, Kind: plugin.StatementExecutable})
+	}
+	steps, err := bindSteps(p.Changes, statements, p.Replay)
+	if err != nil {
+		return Plan{}, err
+	}
+	p.Steps = steps
+	p.Phases = phases(steps)
+	p.Digest, err = digestPlan(Plan{Version: p.Version, PlannerVersion: p.PlannerVersion, Driver: p.Driver, FromFingerprint: p.FromFingerprint, ToFingerprint: p.ToFingerprint, Changes: p.Changes, Replay: p.Replay, Steps: p.Steps, Phases: p.Phases})
+	if err != nil {
+		return Plan{}, err
+	}
+	return p, p.Validate()
 }
 func jsonEqual(a, b any) bool {
 	x, _ := json.Marshal(a)
@@ -290,7 +331,7 @@ func EditSQL(p Plan, sql []string) (Plan, error) {
 		rendered = append(rendered, plugin.Statement{SQL: sql[idx], ChangeID: s.ChangeID, Transactional: transactional, Kind: plugin.StatementExecutable})
 		idx++
 	}
-	p.Steps, err = bindSteps(p.Changes, rendered)
+	p.Steps, err = bindSteps(p.Changes, rendered, p.Replay)
 	if err != nil {
 		return Plan{}, err
 	}
@@ -307,10 +348,15 @@ func EditSQL(p Plan, sql []string) (Plan, error) {
 	return p, nil
 }
 
-func bindSteps(changes schema.ChangeSet, statements []plugin.Statement) ([]Step, error) {
+const ReplayChangeID = "autosql:approved-replay"
+
+func bindSteps(changes schema.ChangeSet, statements []plugin.Statement, replay []string) ([]Step, error) {
 	byChange := map[string]schema.Change{}
 	for _, c := range changes.Changes {
 		byChange[c.ID] = c
+	}
+	if len(replay) > 0 {
+		byChange[ReplayChangeID] = schema.Change{ID: ReplayChangeID, ResourceID: ReplayChangeID, Operation: schema.OperationAlter}
 	}
 	if len(changes.Changes) > 0 && len(statements) == 0 {
 		return nil, fmt.Errorf("%w: renderer returned zero statements", ErrUnsupportedTransition)
@@ -326,6 +372,12 @@ func bindSteps(changes schema.ChangeSet, statements []plugin.Statement) ([]Step,
 		}
 		if !ok || kind == StepExecutable && strings.TrimSpace(statement.SQL) == "" || kind == StepTopology && statement.SQL != "" {
 			return nil, fmt.Errorf("%w: unbound renderer statement", ErrInvalidPlan)
+		}
+		if statement.ChangeID == ReplayChangeID {
+			replayIndex := idx - (len(statements) - len(replay))
+			if kind != StepExecutable || replayIndex < 0 || replayIndex >= len(replay) || statement.SQL != replay[replayIndex] || !statement.Transactional {
+				return nil, fmt.Errorf("%w: invalid replay binding", ErrInvalidPlan)
+			}
 		}
 		mode := TransactionRequired
 		if !statement.Transactional {

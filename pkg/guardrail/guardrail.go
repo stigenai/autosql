@@ -104,6 +104,7 @@ type Input struct {
 	Approval           approval.Request
 	Database           precheck.DB
 	StatementBindings  []StatementBinding
+	ApprovedReplay     map[string][]string
 	// Mutation is invoked only inside the approval gate's authorized callback.
 	// When set it owns phase-aware prechecks, mutation, and durable history.
 	Mutation AuthorizedMutation
@@ -276,6 +277,12 @@ func validateProduction(g Guardrail, in Input) error {
 
 // BuildStatementBindings canonically attributes every safety statement.
 func BuildStatementBindings(changes schema.ChangeSet, statements []safety.Statement) ([]StatementBinding, error) {
+	return BuildStatementBindingsWithReplay(changes, statements, nil)
+}
+
+// BuildStatementBindingsWithReplay binds explicit, policy-approved replay SQL
+// that has no schema change. The exact subject, order, and SQL are hashed.
+func BuildStatementBindingsWithReplay(changes schema.ChangeSet, statements []safety.Statement, replay map[string][]string) ([]StatementBinding, error) {
 	if err := changes.Validate(); err != nil {
 		return nil, fmt.Errorf("%w: invalid changes", ErrBinding)
 	}
@@ -283,17 +290,36 @@ func BuildStatementBindings(changes schema.ChangeSet, statements []safety.Statem
 	for _, change := range changes.Changes {
 		byID[change.ID] = change
 	}
+	replayIndex := map[string]int{}
 	out := make([]StatementBinding, len(statements))
 	for i, statement := range statements {
 		change, ok := byID[statement.ChangeID]
 		if !ok {
-			return nil, &BindingError{Field: fmt.Sprintf("statement %d change", i+1)}
+			sql, approved := replay[statement.ChangeID]
+			idx := replayIndex[statement.ChangeID]
+			if !approved || idx >= len(sql) || statement.SQL != sql[idx] || strings.TrimSpace(statement.SQL) == "" {
+				return nil, &BindingError{Field: fmt.Sprintf("statement %d change", i+1)}
+			}
+			replayIndex[statement.ChangeID]++
+			h := sha256.New()
+			writeField(h, "autosql.guardrail.approved-replay/v1")
+			writeField(h, statement.ChangeID)
+			for _, q := range sql {
+				writeField(h, q)
+			}
+			out[i] = StatementBinding{SQL: statement.SQL, ChangeID: statement.ChangeID, ChangeHash: "sha256:" + hex.EncodeToString(h.Sum(nil))}
+			continue
 		}
 		hash, err := changeHash(change)
 		if err != nil {
 			return nil, err
 		}
 		out[i] = StatementBinding{SQL: statement.SQL, ChangeID: statement.ChangeID, ChangeHash: hash}
+	}
+	for id, sql := range replay {
+		if len(sql) == 0 || replayIndex[id] != len(sql) {
+			return nil, &BindingError{Field: "approved replay coverage"}
+		}
 	}
 	return out, nil
 }
@@ -347,7 +373,7 @@ func (g Guardrail) Apply(ctx context.Context, in Input) (Result, error) {
 			return result, &BindingError{Field: fmt.Sprintf("assertion %d plan digest", i+1)}
 		}
 	}
-	if err := validateSafetyStatements(in.StatementBindings, in.Safety.Statements, in.Precheck.Statements, in.Changes); err != nil {
+	if err := validateSafetyStatements(in.StatementBindings, in.Safety.Statements, in.Precheck.Statements, in.Changes, in.ApprovedReplay); err != nil {
 		return result, err
 	}
 	wantApproval, err := g.BundleDigest(in)
@@ -416,11 +442,11 @@ func (g Guardrail) Apply(ctx context.Context, in Input) (Result, error) {
 	return result, nil
 }
 
-func validateSafetyStatements(bindings []StatementBinding, got []safety.Statement, statements []string, changes schema.ChangeSet) error {
+func validateSafetyStatements(bindings []StatementBinding, got []safety.Statement, statements []string, changes schema.ChangeSet, replay map[string][]string) error {
 	if len(got) != len(statements) {
 		return &BindingError{Field: "safety statement count"}
 	}
-	expected, err := BuildStatementBindings(changes, got)
+	expected, err := BuildStatementBindingsWithReplay(changes, got, replay)
 	if err != nil {
 		return err
 	}

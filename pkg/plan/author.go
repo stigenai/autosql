@@ -40,7 +40,7 @@ func AppendAuthorSQL(p Plan, input []AuthorSQL) (Plan, error) {
 		depends = []string{change.ID}
 		_ = i
 	}
-	steps, e := bindSteps(changes, rendered)
+	steps, e := bindSteps(changes, rendered, p.Replay)
 	if e != nil {
 		return Plan{}, e
 	}

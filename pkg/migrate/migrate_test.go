@@ -3,6 +3,7 @@ package migrate
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -138,6 +139,45 @@ func TestDeterminismAndInputOrder(t *testing.T) {
 		m, _ := build(a)
 		if m.Digest != ma.Digest || m.Generation != ma.Generation {
 			t.Fatal("unstable output")
+		}
+	}
+}
+
+func TestCheckpointMetadataDeterministicAfterLongHistory(t *testing.T) {
+	files := make([]File, 0, 102)
+	for i := 1; i <= 101; i++ {
+		files = append(files, File{Name: fmt.Sprintf("V%d__revision.sql", i), SQL: []byte(fmt.Sprintf("SELECT %d;", i))})
+	}
+	fp := "sha256:" + strings.Repeat("a", 64)
+	files = append(files, File{Name: "V102__checkpoint.sql", SQL: []byte("SELECT 102;"), Kind: "checkpoint", CoveredFrom: "1.0.0", CoveredTo: "101.0.0", SchemaFingerprint: fp, DataPolicy: "schema_only"})
+	want, err := build(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 120; i++ {
+		got, e := build(append([]File(nil), files...))
+		if e != nil || got.Digest != want.Digest || got.Generation != want.Generation {
+			t.Fatalf("iteration %d is not deterministic: %v", i, e)
+		}
+	}
+	e := want.Entries[len(want.Entries)-1]
+	if e.Kind != "checkpoint" || e.CoveredFrom != "1.0.0" || e.CoveredTo != "101.0.0" || e.SchemaFingerprint != fp || e.DataPolicy != "schema_only" {
+		t.Fatalf("checkpoint binding lost: %+v", e)
+	}
+}
+
+func TestCheckpointASTSideEffectClassification(t *testing.T) {
+	mutating := []string{"-- hidden\n INSERT INTO t VALUES(1)", "WITH changed AS (DELETE FROM t RETURNING *) SELECT * FROM changed", "MERGE INTO t USING s ON false WHEN NOT MATCHED THEN INSERT VALUES(1)", "TRUNCATE t", "SELECT setval('s', 4)", "DO $$ BEGIN PERFORM 1; END $$", "CREATE FUNCTION f() RETURNS void LANGUAGE sql AS $$ SELECT 1 $$"}
+	for _, q := range mutating {
+		got, err := checkpointSideEffects("x.sql", []byte(q))
+		if err != nil || !got {
+			t.Fatalf("side effect not classified %q: %v", q, err)
+		}
+	}
+	for _, q := range []string{"  -- comment\nCREATE TABLE t(id bigint)", "ALTER TABLE t ADD COLUMN n text", "CREATE SCHEMA empty"} {
+		got, err := checkpointSideEffects("x.sql", []byte(q))
+		if err != nil || got {
+			t.Fatalf("schema statement classified as data %q: %v", q, err)
 		}
 	}
 }
