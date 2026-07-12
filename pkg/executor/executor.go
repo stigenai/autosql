@@ -43,6 +43,7 @@ type Config struct {
 	Confirm     StepConfirmer
 	Audit       LifecycleAudit
 	Connector   Connector
+	NoEdits     bool
 }
 
 type Result struct {
@@ -64,6 +65,9 @@ func NewPostgreSQL(config Config, verified artifact.VerifiedArtifact) (*PostgreS
 	payload, err := verified.Payload()
 	if err != nil {
 		return nil, err
+	}
+	if config.NoEdits && payload.Metadata["autosql.edited"] == "true" {
+		return nil, errors.New("edited artifacts are forbidden")
 	}
 	if config.URL == "" || config.State == nil {
 		return nil, errors.New("executor configuration invalid")

@@ -76,6 +76,7 @@ type VerifyPolicy struct {
 	Expected                  ExpectedBindings
 	Keys                      map[string]KeyRecord
 	Issuer, Identity, Purpose string
+	NoEdits                   bool
 }
 type VerifiedArtifact struct {
 	artifact Artifact
@@ -126,6 +127,9 @@ func (a Artifact) VerifyTrusted(policy VerifyPolicy) (VerifiedArtifact, error) {
 		return VerifiedArtifact{}, fail("policy", ErrInvalid)
 	}
 	now := policy.Now().UTC()
+	if policy.NoEdits && a.Metadata["autosql.edited"] == "true" {
+		return VerifiedArtifact{}, fail("edits_forbidden", ErrInvalid)
+	}
 	if err := a.validateUnsigned(); err != nil {
 		return VerifiedArtifact{}, fail("structure", ErrInvalid)
 	}

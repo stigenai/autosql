@@ -20,6 +20,7 @@ type VerifiedArtifactApplyService struct {
 	Guardrail guardrail.Guardrail
 	Input     func(artifact.Artifact) (guardrail.Input, error)
 	Mutation  func(artifact.VerifiedArtifact) (guardrail.AuthorizedMutation, error)
+	NoEdits   bool
 }
 
 func (s VerifiedArtifactApplyService) Apply(ctx context.Context, request ApplyRequest) (ApplyResult, error) {
@@ -33,6 +34,9 @@ func (s VerifiedArtifactApplyService) Apply(ctx context.Context, request ApplyRe
 	a, err := artifact.Parse(raw)
 	if err != nil {
 		return ApplyResult{Status: "refused"}, err
+	}
+	if (s.NoEdits || request.NoEdits) && a.Metadata["autosql.edited"] == "true" {
+		return ApplyResult{Status: "refused"}, errors.New("edited artifacts are forbidden")
 	}
 	verifyPolicy := s.Policy
 	if s.PolicyFor != nil {

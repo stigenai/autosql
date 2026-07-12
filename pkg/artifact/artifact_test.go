@@ -393,3 +393,20 @@ func TestZeroVerifiedArtifactCannotAuthorizeStaleCheck(t *testing.T) {
 func trustedPolicy(a Artifact, pub ed25519.PublicKey, now time.Time) VerifyPolicy {
 	return VerifyPolicy{Now: func() time.Time { return now }, Expected: ExpectedBindings{PlanDigest: a.Plan.Digest, ChecksDigest: a.Checks.Digest, GuardrailDigest: a.GuardrailDigest, SourceRevision: a.SourceRevision, Environment: a.TargetEnvironment, DatabaseIdentity: "db-1", ApprovalIdentity: a.Approval.Identity}, Keys: map[string]KeyRecord{"key-1": {PublicKey: pub, Issuer: "issuer", Identity: "signer", Environment: a.TargetEnvironment, Purpose: "plan-artifact", Status: "active", NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour)}}, Issuer: "issuer", Identity: "signer", Purpose: "plan-artifact"}
 }
+
+func TestNoEditsPolicyRejectsValidlyResignedEditedArtifact(t *testing.T) {
+	a, pub, priv := fixture(t)
+	a.Metadata["autosql.edited"] = "true"
+	a.Metadata["autosql.edit_digest"] = "sha256:" + strings.Repeat("b", 64)
+	if err := a.Sign("key-1", priv); err != nil {
+		t.Fatal(err)
+	}
+	policy := trustedPolicy(a, pub, a.CreatedAt)
+	if _, err := a.VerifyTrusted(policy); err != nil {
+		t.Fatalf("ordinary policy=%v", err)
+	}
+	policy.NoEdits = true
+	if _, err := a.VerifyTrusted(policy); err == nil {
+		t.Fatal("no-edits accepted edited artifact")
+	}
+}

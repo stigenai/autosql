@@ -30,6 +30,7 @@ type applyConfig struct {
 	Schemas                                                                                                                                                                   []string
 	ExpectedPlanDigest, ExpectedChecksDigest, ExpectedGuardrailDigest, ExpectedApprovalIdentity, KeyStatus, KeyPurpose                                                        string
 	KeyNotBefore, KeyNotAfter                                                                                                                                                 time.Time
+	NoEdits                                                                                                                                                                   bool
 }
 type staticAuthority struct{ actors map[string]approval.Identity }
 
@@ -84,7 +85,7 @@ func productionServices(connector executor.Connector) (Services, error) {
 		if c.ExpectedPlanDigest == "" || c.ExpectedChecksDigest == "" || c.ExpectedGuardrailDigest == "" || c.ExpectedApprovalIdentity == "" || c.KeyStatus == "" || c.KeyPurpose == "" || c.KeyNotBefore.IsZero() || c.KeyNotAfter.IsZero() {
 			return artifact.VerifyPolicy{}, errors.New("trusted release manifest bindings required")
 		}
-		return artifact.VerifyPolicy{Now: time.Now, Expected: artifact.ExpectedBindings{PlanDigest: c.ExpectedPlanDigest, ChecksDigest: c.ExpectedChecksDigest, GuardrailDigest: c.ExpectedGuardrailDigest, SourceRevision: c.SourceRevision, Environment: c.Environment, DatabaseIdentity: c.DatabaseIdentity, ApprovalIdentity: c.ExpectedApprovalIdentity}, Keys: map[string]artifact.KeyRecord{c.KeyID: {PublicKey: ed25519.PublicKey(pub), Issuer: c.Issuer, Identity: c.Signer, Environment: c.Environment, Purpose: c.KeyPurpose, Status: c.KeyStatus, NotBefore: c.KeyNotBefore.UTC(), NotAfter: c.KeyNotAfter.UTC()}}, Issuer: c.Issuer, Identity: c.Signer, Purpose: c.KeyPurpose}, nil
+		return artifact.VerifyPolicy{Now: time.Now, NoEdits: c.NoEdits, Expected: artifact.ExpectedBindings{PlanDigest: c.ExpectedPlanDigest, ChecksDigest: c.ExpectedChecksDigest, GuardrailDigest: c.ExpectedGuardrailDigest, SourceRevision: c.SourceRevision, Environment: c.Environment, DatabaseIdentity: c.DatabaseIdentity, ApprovalIdentity: c.ExpectedApprovalIdentity}, Keys: map[string]artifact.KeyRecord{c.KeyID: {PublicKey: ed25519.PublicKey(pub), Issuer: c.Issuer, Identity: c.Signer, Environment: c.Environment, Purpose: c.KeyPurpose, Status: c.KeyStatus, NotBefore: c.KeyNotBefore.UTC(), NotAfter: c.KeyNotAfter.UTC()}}, Issuer: c.Issuer, Identity: c.Signer, Purpose: c.KeyPurpose}, nil
 	}
 	input := func(a artifact.Artifact) (guardrail.Input, error) {
 		doc := policy.Document{Version: policy.LanguageVersion, Rules: []policy.Rule{{Name: "configured apply", Target: "all", Assert: policy.Expression{Eq: []any{true, true}}, Message: "apply allowed"}}}
@@ -111,7 +112,7 @@ func productionServices(connector executor.Connector) (Services, error) {
 				last = s.ID
 			}
 		}
-		return executor.NewPostgreSQL(executor.Config{URL: url, Connector: connector, Audit: &executor.FileAudit{Path: c.LifecycleAuditPath}, Reauthorize: func(ctx context.Context, a artifact.Artifact) error {
+		return executor.NewPostgreSQL(executor.Config{URL: url, Connector: connector, NoEdits: c.NoEdits, Audit: &executor.FileAudit{Path: c.LifecycleAuditPath}, Reauthorize: func(ctx context.Context, a artifact.Artifact) error {
 			fresh, _ := policyFor(a)
 			_, err := a.VerifyTrusted(fresh)
 			return err
@@ -131,7 +132,7 @@ func productionServices(connector executor.Connector) (Services, error) {
 			return nil
 		}}, v)
 	}
-	verified := VerifiedArtifactApplyService{PolicyFor: policyFor, Guardrail: g, Input: input, Mutation: mutation}
+	verified := VerifiedArtifactApplyService{PolicyFor: policyFor, Guardrail: g, Input: input, Mutation: mutation, NoEdits: c.NoEdits}
 	return Services{ReadPlan: DefaultReadPlan{}, Apply: resolvingApply{verified: verified, directory: c.ArtifactDirectory}}, nil
 }
 

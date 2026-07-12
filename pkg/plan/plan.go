@@ -129,6 +129,13 @@ func Build(ctx context.Context, driver plugin.Driver, current, desired schema.Do
 	if err := p.Validate(); err != nil {
 		return Plan{}, err
 	}
+	raw, err := json.Marshal(p)
+	if err != nil {
+		return Plan{}, err
+	}
+	if err = json.Unmarshal(raw, &p); err != nil {
+		return Plan{}, err
+	}
 	return p, nil
 }
 
@@ -244,6 +251,59 @@ func (p Plan) SafetyStatements() []safety.Statement {
 		out = append(out, safety.Statement{SQL: step.SQL, ChangeID: step.ChangeID})
 	}
 	return out
+}
+
+// EditSQL replaces executable SQL in order, rebuilds step/phase identities and
+// returns a new unsigned plan digest. It cannot add, remove, or reorder the
+// renderer's exact statement/change bindings.
+func EditSQL(p Plan, sql []string) (Plan, error) {
+	if err := p.Validate(); err != nil {
+		return Plan{}, err
+	}
+	count := 0
+	for _, s := range p.Steps {
+		if s.Kind == StepExecutable {
+			count++
+		}
+	}
+	if len(sql) != count {
+		return Plan{}, fmt.Errorf("%w: edited statement count", ErrInvalidPlan)
+	}
+	oldToNew := map[string]string{}
+	idx := 0
+	for i := range p.Steps {
+		old := p.Steps[i].ID
+		if p.Steps[i].Kind == StepExecutable {
+			if strings.TrimSpace(sql[idx]) == "" {
+				return Plan{}, fmt.Errorf("%w: empty edited SQL", ErrInvalidPlan)
+			}
+			p.Steps[i].SQL = sql[idx]
+			idx++
+		}
+		p.Steps[i].ID = stableID("step", p.Steps[i].ChangeID, fmt.Sprint(i), string(p.Steps[i].Kind), p.Steps[i].SQL, string(p.Steps[i].Transaction))
+		oldToNew[old] = p.Steps[i].ID
+	}
+	for i := range p.Steps {
+		for j, d := range p.Steps[i].DependsOn {
+			n := oldToNew[d]
+			if n == "" {
+				return Plan{}, fmt.Errorf("%w: edited dependency", ErrInvalidPlan)
+			}
+			p.Steps[i].DependsOn[j] = n
+		}
+		sort.Strings(p.Steps[i].DependsOn)
+	}
+	p.Phases = phases(p.Steps)
+	p.Digest = ""
+	d, err := digestPlan(p)
+	if err != nil {
+		return Plan{}, err
+	}
+	p.Digest = d
+	if err = p.Validate(); err != nil {
+		return Plan{}, err
+	}
+	return p, nil
 }
 
 func bindSteps(changes schema.ChangeSet, statements []plugin.Statement) ([]Step, error) {
