@@ -8,7 +8,9 @@
     "schema_version": { "const": "autosql.output/v1" },
     "command": { "type": "string" },
     "ok": { "type": "boolean" },
-    "data": {},
+    "data": {
+      "description": "Command result. migrate status returns manifest_digest, ordered entries, counts, and optional dirty/drift flags. Entry classifications are pending, applied, failed, partial, baseline, checkpoint, drift, or unknown."
+    },
     "error": {
       "type": "object",
       "required": ["kind", "message", "exit_code"],

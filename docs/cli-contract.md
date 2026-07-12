@@ -25,11 +25,23 @@ Future commands must use these categories rather than inventing command-specific
 
 ## Configuration
 
-`autosql.json` has version `1`, an `environment` name, and an `environments` object. Each named environment defines a `target` secret reference, optional `dev_database` secret reference, `schema_sources`, `migration_dir`, include/exclude filters, variables, and an optional Go-style duration such as `30s`.
+`autosql.json` has version `1`, an `environment` name, and an `environments` object. Each named environment defines a `target` secret reference, optional `dev_database` secret reference, `schema_sources`, `migration_dir`, optional lowercase PostgreSQL `revision_schema` (default `autosql_revision`), include/exclude filters, variables, and an optional Go-style duration such as `30s`.
 
 Secret references are `env://VARIABLE` or `file:///path`. Secret values are resolved only by `config validate --preflight` and later runtime commands; the values are never included in config or JSON output. The normal validation command parses and validates references without resolving secrets or connecting to any database. `--preflight` additionally resolves secrets and verifies local schema and migration paths, but still never opens a production connection.
 
-Precedence is deterministic: configuration file, then `AUTOSQL_*` environment variables, then explicit command flags. Environment overrides are `AUTOSQL_ENV`, `AUTOSQL_TARGET`, `AUTOSQL_DEV_DATABASE`, `AUTOSQL_SCHEMA_SOURCES`, `AUTOSQL_MIGRATION_DIR`, `AUTOSQL_INCLUDE`, `AUTOSQL_EXCLUDE`, and `AUTOSQL_TIMEOUT`.
+Precedence is deterministic: configuration file, then `AUTOSQL_*` environment variables, then explicit command flags. Environment overrides are `AUTOSQL_ENV`, `AUTOSQL_TARGET`, `AUTOSQL_DEV_DATABASE`, `AUTOSQL_SCHEMA_SOURCES`, `AUTOSQL_MIGRATION_DIR`, `AUTOSQL_REVISION_SCHEMA`, `AUTOSQL_INCLUDE`, `AUTOSQL_EXCLUDE`, and `AUTOSQL_TIMEOUT`.
+
+## Migration revision status
+
+`migrate status --config autosql.json [--env NAME]` or
+`migrate status --url env://DATABASE --migration-dir PATH [--revision-schema NAME]`
+first verifies the canonical migration manifest, then performs read-only queries
+against the versioned PostgreSQL revision store. It never initializes, upgrades,
+repairs, or reinterprets incomplete records. Output distinguishes pending,
+applied, failed, partial, baseline, checkpoint, unknown, dirty, and drifted
+entries. Executor rows in an incomplete state add reconciliation guidance but
+never promote a revision to applied. JSON uses the standard output envelope and
+contains `manifest_digest`, ordered `entries`, `counts`, `dirty`, and `drift`.
 
 ## Schema commands
 
