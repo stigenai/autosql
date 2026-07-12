@@ -2,30 +2,23 @@ package cli
 
 import (
 	"autosql/pkg/approval"
-	"autosql/pkg/artifact"
 	"autosql/pkg/migrate"
-	"autosql/pkg/plan"
 	"autosql/pkg/policy"
+	"autosql/pkg/precheck"
 	"autosql/pkg/secret"
 	"autosql/pkg/simulate"
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"strings"
 	"time"
 )
 
-type generateResult struct {
-	Status, Version, File, ManifestDigest, PlanDigest string
-	Changes                                           int
-}
-
 func runMigrateGenerate(ctx context.Context, args []string, o output, reader ReadPlanService) error {
 	fs := newFlags("migrate generate", o.streams.Err)
 	dir := fs.String("dir", "", "migration directory")
-	from := fs.String("from", "", "current source")
+	_ = fs.String("from", "", "deprecated untrusted current source")
 	to := fs.String("to", "", "desired source")
 	version := fs.String("version", "", "version")
 	label := fs.String("label", "", "label")
@@ -39,56 +32,7 @@ func runMigrateGenerate(ctx context.Context, args []string, o output, reader Rea
 	if *trustedConfig != "" {
 		return runTrustedMigrateGenerate(ctx, trustedGenerateArgs{dir: *dir, to: *to, version: *version, label: *label, format: *format, hints: *hints, json: *jf, config: *trustedConfig}, o, reader)
 	}
-	if reader == nil || *dir == "" || *from == "" || *to == "" || *version == "" || *label == "" || *format != "sql" || fs.NArg() != 0 {
-		return usageError(errors.New("--dir, --from, --to, --version, --label and --format=sql required"))
-	}
-	if strings.ToLower(*label) != *label || strings.IndexFunc(*label, func(r rune) bool { return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '_') }) >= 0 {
-		return usageError(errors.New("label must be canonical lowercase ASCII"))
-	}
-	if _, e := migrate.ParseVersion(*version); e != nil {
-		return &Error{Kind: "validation", Message: "invalid migration version", Code: ExitValidation}
-	}
-	snap, e := migrate.LoadSnapshot(*dir)
-	if e != nil {
-		return &Error{Kind: "validation", Message: "verify migration directory failed", Code: ExitValidation, Cause: e}
-	}
-	if len(snap.Manifest.Entries) > 0 && snap.Manifest.Entries[len(snap.Manifest.Entries)-1].NonLinear {
-		return &Error{Kind: "validation", Message: "generation requires a linear manifest head", Code: ExitValidation}
-	}
-	current, e := reader.Load(ctx, LoadRequest{Spec: *from})
-	if e != nil {
-		return &Error{Kind: "validation", Message: "load replayed schema failed", Code: ExitValidation}
-	}
-	desired, e := reader.Load(ctx, LoadRequest{Spec: *to})
-	if e != nil {
-		return &Error{Kind: "validation", Message: "load desired schema failed", Code: ExitValidation}
-	}
-	p, e := reader.Plan(ctx, current, desired)
-	if e != nil {
-		return &Error{Kind: "validation", Message: "plan migration failed", Code: ExitValidation}
-	}
-	o.json = *jf
-	if len(p.Changes.Changes) == 0 {
-		return o.success(generateResult{Status: "no_op", ManifestDigest: snap.Manifest.Digest, PlanDigest: p.Digest}, "no migration generated")
-	}
-	var ss []string
-	for _, s := range p.Steps {
-		if s.Kind == plan.StepExecutable {
-			ss = append(ss, strings.TrimSpace(s.SQL))
-		}
-	}
-	sql := fmt.Sprintf("-- autosql:transaction=auto\n-- autosql:plan-digest=%s\n-- autosql:check-digest=%s\n-- autosql:bundle-digest=%s\n-- autosql:check-bundle-digest=%s\n-- rename-hints: %s\n%s\n", p.Digest, p.Digest, p.Digest, p.Digest, *hints, strings.Join(ss, ";\n"))
-	name := fmt.Sprintf("V%s__%s.sql", *version, *label)
-	files := make([]migrate.File, 0, len(snap.Manifest.Entries)+1)
-	for _, x := range snap.Manifest.Entries {
-		files = append(files, migrate.File{Name: x.File, SQL: append([]byte(nil), snap.Files[x.File]...), Parents: append([]string(nil), x.Parents...), NonLinear: x.NonLinear})
-	}
-	files = append(files, migrate.File{Name: name, SQL: []byte(sql)})
-	man, e := migrate.Update(*dir, migrate.UpdateRequest{Files: files, ManifestVersion: migrate.ManifestVersion, ExpectedManifestDigest: snap.Manifest.Digest})
-	if e != nil {
-		return &Error{Kind: "validation", Message: "publish migration generation failed", Code: ExitValidation, Cause: e}
-	}
-	return o.success(generateResult{Status: "generated", Version: *version, File: name, ManifestDigest: man.Digest, PlanDigest: p.Digest, Changes: len(p.Changes.Changes)}, name)
+	return &Error{Kind: "config", Message: "trusted --generation-config is required; untrusted generation cannot publish", Code: ExitConfig}
 }
 
 type trustedGenerateArgs struct {
@@ -101,10 +45,33 @@ type generationConfig struct {
 	PostgresVersion                                                                                          int
 	PolicyFile, PolicyIdentity                                                                               string
 	ApprovalPolicy                                                                                           approval.Policy
-	Approval                                                                                                 artifact.Approval
+	Actors                                                                                                   map[string]approval.Identity
+	VerifiedApprovals                                                                                        map[string]approval.VerifiedApproval
+	Approvals                                                                                                []approval.Approval
+	ApprovalAuditPath                                                                                        string
+	Prechecks                                                                                                []precheck.Assertion
 	Lifetime                                                                                                 string
 	GeneratorKeyID, GeneratorPurpose, GeneratorPrivateKeyReference, SigningKeyID, SigningPrivateKeyReference string
 	Metadata                                                                                                 map[string]string
+}
+type configuredGenerationAuthority struct {
+	actors   map[string]approval.Identity
+	verified map[string]approval.VerifiedApproval
+}
+
+func (a configuredGenerationAuthority) ResolveActor(_ context.Context, id string) (approval.Identity, error) {
+	v, ok := a.actors[id]
+	if !ok {
+		return v, errors.New("untrusted actor")
+	}
+	return v, nil
+}
+func (a configuredGenerationAuthority) VerifyApproval(_ context.Context, p approval.Approval) (approval.VerifiedApproval, error) {
+	v, ok := a.verified[p.Proof]
+	if !ok {
+		return v, errors.New("untrusted approval proof")
+	}
+	return v, nil
 }
 
 func runTrustedMigrateGenerate(ctx context.Context, a trustedGenerateArgs, o output, reader ReadPlanService) error {
@@ -171,7 +138,7 @@ func runTrustedMigrateGenerate(ctx context.Context, a trustedGenerateArgs, o out
 		return &Error{Kind: "config", Message: "positive generation lifetime required", Code: ExitConfig}
 	}
 	now := time.Now().UTC()
-	result, err := (migrate.GenerateService{}).Generate(ctx, migrate.GenerateRequest{Directory: a.dir, Version: a.version, Label: a.label, Format: a.format, RenameHints: a.hints, Desired: desired, DevelopmentURL: dev, DevelopmentIdentity: devID, ProductionIdentity: prodID, Environment: c.Environment, DatabaseIdentity: c.DatabaseIdentity, SourceRevision: c.SourceRevision, Author: c.Author, Requester: c.Requester, PostgresVersion: c.PostgresVersion, Policy: *doc, PolicyIdentity: c.PolicyIdentity, ApprovalPolicy: c.ApprovalPolicy, CreatedAt: now, ExpiresAt: now.Add(lifetime), Approval: c.Approval, GeneratorKeyID: c.GeneratorKeyID, GeneratorPurpose: c.GeneratorPurpose, SigningKeyID: c.SigningKeyID, GeneratorPrivateKey: genKey, SigningPrivateKey: signKey, Metadata: c.Metadata})
+	result, err := (migrate.GenerateService{}).Generate(ctx, migrate.GenerateRequest{Directory: a.dir, Version: a.version, Label: a.label, Format: a.format, RenameHints: a.hints, Desired: desired, DevelopmentURL: dev, DevelopmentIdentity: devID, ProductionIdentity: prodID, Environment: c.Environment, DatabaseIdentity: c.DatabaseIdentity, SourceRevision: c.SourceRevision, Author: c.Author, Requester: c.Requester, PostgresVersion: c.PostgresVersion, Policy: *doc, PolicyIdentity: c.PolicyIdentity, ApprovalPolicy: c.ApprovalPolicy, Authority: configuredGenerationAuthority{actors: c.Actors, verified: c.VerifiedApprovals}, ApprovalAudit: &approval.Chain{Sink: &approval.FileSink{Path: c.ApprovalAuditPath}}, Approvals: c.Approvals, PrecheckAssertions: c.Prechecks, CreatedAt: now, ExpiresAt: now.Add(lifetime), GeneratorKeyID: c.GeneratorKeyID, GeneratorPurpose: c.GeneratorPurpose, SigningKeyID: c.SigningKeyID, GeneratorPrivateKey: genKey, SigningPrivateKey: signKey, Metadata: c.Metadata})
 	if err != nil {
 		code := ExitMigration
 		kind := "migration"

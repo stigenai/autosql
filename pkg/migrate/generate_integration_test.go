@@ -4,12 +4,16 @@ import (
 	"autosql/pkg/approval"
 	"autosql/pkg/artifact"
 	"autosql/pkg/policy"
+	"autosql/pkg/precheck"
+	"autosql/pkg/schema"
 	"autosql/pkg/simulate"
 	"autosql/pkg/source"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"fmt"
+	"golang.org/x/sys/unix"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +21,21 @@ import (
 	"testing"
 	"time"
 )
+
+type generationTestAuthority struct{ at, expires time.Time }
+
+func (a generationTestAuthority) ResolveActor(_ context.Context, id string) (approval.Identity, error) {
+	if id == "author" || id == "requester" {
+		return approval.Identity{ID: id}, nil
+	}
+	return approval.Identity{}, errors.New("untrusted actor")
+}
+func (a generationTestAuthority) VerifyApproval(_ context.Context, v approval.Approval) (approval.VerifiedApproval, error) {
+	if v.Proof != "trusted-proof" || v.Approver != "reviewer" {
+		return approval.VerifiedApproval{}, errors.New("bad proof")
+	}
+	return approval.VerifiedApproval{Identity: approval.Identity{ID: "reviewer", Roles: []string{"reviewer"}}, PlanDigest: v.PlanDigest, Environment: v.Environment, ApprovedAt: a.at, ExpiresAt: a.expires}, nil
+}
 
 func generationFixture(t *testing.T, dir, dev, prod string) GenerateRequest {
 	t.Helper()
@@ -35,7 +54,8 @@ func generationFixture(t *testing.T, dir, dev, prod string) GenerateRequest {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC().Add(-time.Minute)
-	return GenerateRequest{Directory: dir, Version: "1", Label: "create_widgets", Format: "sql", RenameHints: "{}", Desired: doc, DevelopmentURL: dev, DevelopmentIdentity: devID, ProductionIdentity: prodID, Environment: "test", DatabaseIdentity: prodID, SourceRevision: "test-revision", Author: "author", Requester: "requester", PostgresVersion: 16, Policy: policy.Document{Version: policy.LanguageVersion, Rules: []policy.Rule{{Name: "allow", Target: "all", Assert: policy.Expression{Eq: []any{true, true}}, Message: "allowed"}}}, PolicyIdentity: "test-policy/v1", ApprovalPolicy: approval.Policy{Environments: map[string]approval.EnvironmentPolicy{"test": {Allowed: true}}}, CreatedAt: now, ExpiresAt: now.Add(time.Hour), Approval: artifact.Approval{Identity: "generator-approval", ApprovedAt: now, ProofDigest: "sha256:" + strings.Repeat("a", 64)}, GeneratorKeyID: "generator", GeneratorPurpose: "migration-generator", SigningKeyID: "release", GeneratorPrivateKey: generator, SigningPrivateKey: signer}
+	expires := now.Add(time.Hour)
+	return GenerateRequest{Directory: dir, Version: "1", Label: "create_widgets", Format: "sql", RenameHints: "{}", Desired: doc, DevelopmentURL: dev, DevelopmentIdentity: devID, ProductionIdentity: prodID, Environment: "test", DatabaseIdentity: prodID, SourceRevision: "test-revision", Author: "author", Requester: "requester", PostgresVersion: 16, Policy: policy.Document{Version: policy.LanguageVersion, Rules: []policy.Rule{{Name: "allow", Target: "all", Assert: policy.Expression{Eq: []any{true, true}}, Message: "allowed"}}}, PolicyIdentity: "test-policy/v1", ApprovalPolicy: approval.Policy{Environments: map[string]approval.EnvironmentPolicy{"test": {Allowed: true, Requirements: []approval.Requirement{{MinimumRisk: approval.RiskLow, ApproverCount: 1, Roles: []string{"reviewer"}}}}}}, Authority: generationTestAuthority{at: now, expires: expires}, ApprovalAudit: &approval.Chain{Sink: &approval.FileSink{Path: dir + "-approval.audit"}}, Approvals: []approval.Approval{{Approver: "reviewer", ApprovedAt: now, ExpiresAt: expires, Proof: "trusted-proof"}}, CreatedAt: now, ExpiresAt: expires, GeneratorKeyID: "generator", GeneratorPurpose: "migration-generator", SigningKeyID: "release", GeneratorPrivateKey: generator, SigningPrivateKey: signer}
 }
 
 func TestGenerateServiceLiveReplaySimulationPublicationAndNoop(t *testing.T) {
@@ -68,6 +88,32 @@ func TestGenerateServiceLiveReplaySimulationPublicationAndNoop(t *testing.T) {
 	}
 	if a.Plan.Digest != got.PlanDigest || a.Checks.Digest != got.ChecksDigest || a.GuardrailDigest != got.BundleDigest || a.Origin.Kind != "generated" {
 		t.Fatal("artifact bindings mismatch")
+	}
+	genPub := r.GeneratorPrivateKey.Public().(ed25519.PublicKey)
+	signPub := r.SigningPrivateKey.Public().(ed25519.PublicKey)
+	expectedAtt := map[string]artifact.ValidationAttestation{}
+	contexts := map[string]string{}
+	for _, v := range a.ValidationAttestations {
+		expectedAtt[v.Stage] = v
+		contexts[v.Stage] = v.ConfigDigest
+	}
+	verify := artifact.VerifyPolicy{Now: func() time.Time { return r.CreatedAt.Add(time.Second) }, NoEdits: true, Expected: artifact.ExpectedBindings{PlanDigest: got.PlanDigest, GeneratedPlanDigest: got.PlanDigest, ChecksDigest: got.ChecksDigest, GuardrailDigest: got.BundleDigest, SourceRevision: r.SourceRevision, Environment: r.Environment, DatabaseIdentity: r.DatabaseIdentity, ApprovalIdentity: "reviewer", ApprovalProofDigest: sha("trusted-proof")}, Keys: map[string]artifact.KeyRecord{r.SigningKeyID: {PublicKey: signPub, Issuer: "test-issuer", Identity: "release-signer", Environment: r.Environment, Purpose: "release", Status: "active", NotBefore: r.CreatedAt.Add(-time.Hour), NotAfter: r.ExpiresAt.Add(time.Hour)}}, Issuer: "test-issuer", Identity: "release-signer", Purpose: "release", GeneratorKeys: map[string]artifact.KeyRecord{r.GeneratorKeyID: {PublicKey: genPub, Purpose: r.GeneratorPurpose}}, GeneratorPurpose: r.GeneratorPurpose, ExpectedValidationContextDigests: contexts, ExpectedValidationAttestations: expectedAtt}
+	if _, err := a.VerifyTrusted(verify); err != nil {
+		t.Fatalf("generated artifact did not verify trusted: %v", err)
+	}
+	mutations := map[string]func(*artifact.Artifact){"plan": func(x *artifact.Artifact) { x.Plan.Digest = sha("wrong") }, "checks": func(x *artifact.Artifact) { x.Checks.Digest = strings.Repeat("0", 64) }, "bundle": func(x *artifact.Artifact) { x.GuardrailDigest = sha("wrong") }, "simulation": func(x *artifact.Artifact) { x.ValidationAttestations[0].Simulation.ToFingerprint = sha("wrong") }, "safety": func(x *artifact.Artifact) { x.ValidationAttestations[1].Safety.DiagnosticsDigest = sha("wrong") }, "policy": func(x *artifact.Artifact) { x.ValidationAttestations[2].Policy.DocumentDigest = sha("wrong") }, "precheck": func(x *artifact.Artifact) {
+		x.ValidationAttestations[2].Precheck.ChecksDigest = strings.Repeat("1", 64)
+	}}
+	for name, mutate := range mutations {
+		t.Run("reject_"+name, func(t *testing.T) {
+			x := a
+			raw, _ := x.MarshalCanonical()
+			x, _ = artifact.Parse(raw)
+			mutate(&x)
+			if _, err := x.VerifyTrusted(verify); err == nil {
+				t.Fatal("mutated generated artifact verified")
+			}
+		})
 	}
 	before := treeState(t, d)
 	r.Version = "2"
@@ -137,6 +183,41 @@ func TestGenerateServiceConcurrentCASHasOneWinner(t *testing.T) {
 	snap, err := LoadSnapshot(d)
 	if err != nil || len(snap.Manifest.Entries) != 1 {
 		t.Fatalf("snapshot entries=%d err=%v", len(snap.Manifest.Entries), err)
+	}
+}
+
+func TestGenerateServiceLiveRenameHint(t *testing.T) {
+	dev, prod := os.Getenv("AUTOSQL_GENERATE_TEST_DSN"), os.Getenv("AUTOSQL_GENERATE_PROD_TEST_DSN")
+	if dev == "" || prod == "" {
+		t.Skip("generation PostgreSQL URLs not configured")
+	}
+	d := t.TempDir()
+	_ = os.Chmod(d, 0700)
+	base := File{Name: "V1__old.sql", SQL: []byte("CREATE SCHEMA app; CREATE TABLE app.old_widgets (id bigint);\n")}
+	if _, err := Update(d, UpdateRequest{Files: []File{base}}); err != nil {
+		t.Fatal(err)
+	}
+	r := generationFixture(t, d, dev, prod)
+	doc, err := source.LoadContext(context.Background(), source.Input{URI: "rename.sql", Format: source.FormatSQL, Data: []byte("CREATE SCHEMA app; CREATE TABLE app.new_widgets (id bigint);")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Desired = doc
+	r.Version = "2"
+	r.Label = "rename_widgets"
+	schemaID := schema.StableID(schema.KindSchema, schema.Name{Name: "app"})
+	oldID := schema.StableID(schema.KindTable, schema.Name{Schema: "app", Name: "old_widgets", Parent: schemaID})
+	r.RenameHints = `{"` + oldID + `":"app.new_widgets"}`
+	got, err := (GenerateService{}).Generate(context.Background(), r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, err := LoadSnapshot(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(snap.Files[got.File]), "RENAME") {
+		t.Fatalf("rename SQL missing: %s", snap.Files[got.File])
 	}
 }
 
@@ -217,6 +298,114 @@ func TestGenerateServiceStageFailuresPublishNothing(t *testing.T) {
 			}
 			if after := treeState(t, d); before != after {
 				t.Fatalf("%s failure published partial state", stage)
+			}
+		})
+	}
+}
+
+func TestGenerateControlFailuresPublishNothing(t *testing.T) {
+	dev, prod := os.Getenv("AUTOSQL_GENERATE_TEST_DSN"), os.Getenv("AUTOSQL_GENERATE_PROD_TEST_DSN")
+	if dev == "" || prod == "" {
+		t.Skip("generation PostgreSQL URLs not configured")
+	}
+	cases := map[string]func(*GenerateRequest){
+		"environment": func(r *GenerateRequest) { r.Environment = "forbidden" },
+		"proof":       func(r *GenerateRequest) { r.Approvals[0].Proof = "forged" },
+		"precheck": func(r *GenerateRequest) {
+			r.PrecheckAssertions = []precheck.Assertion{{Name: "must_be_empty", Query: "SELECT count(*) FROM pg_class", MaxAllowed: 0, Timeout: time.Second, Source: precheck.Source{File: "checks.sql", Line: 1, Column: 1}}}
+		},
+		"policy":             func(r *GenerateRequest) { r.Policy.Rules[0].Assert = policy.Expression{Eq: []any{true, false}} },
+		"guardrail_identity": func(r *GenerateRequest) { r.PolicyIdentity = "" },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			d := t.TempDir()
+			_ = os.Chmod(d, 0700)
+			if _, err := Update(d, UpdateRequest{ManifestVersion: ManifestVersion}); err != nil {
+				t.Fatal(err)
+			}
+			before := treeState(t, d)
+			r := generationFixture(t, d, dev, prod)
+			mutate(&r)
+			if _, err := (GenerateService{}).Generate(context.Background(), r); err == nil {
+				t.Fatal("control failure accepted")
+			}
+			if after := treeState(t, d); after != before {
+				t.Fatal("control failure published migration output")
+			}
+		})
+	}
+}
+
+func TestGenerateArtifactPublicationFaultMatrix(t *testing.T) {
+	dev, prod := os.Getenv("AUTOSQL_GENERATE_TEST_DSN"), os.Getenv("AUTOSQL_GENERATE_PROD_TEST_DSN")
+	if dev == "" || prod == "" {
+		t.Skip("generation PostgreSQL URLs not configured")
+	}
+	makeDir := func(t *testing.T) string {
+		d := t.TempDir()
+		_ = os.Chmod(d, 0700)
+		if _, err := Update(d, UpdateRequest{ManifestVersion: ManifestVersion}); err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	count := 0
+	counter := Ops{Write: func(fd int, p []byte) (int, error) { count++; return unix.Write(fd, p) }, Fsync: func(fd int) error { count++; return unix.Fsync(fd) }, Renameat: func(a int, ap string, b int, bp string) error { count++; return unix.Renameat(a, ap, b, bp) }}
+	d := makeDir(t)
+	r := generationFixture(t, d, dev, prod)
+	if _, err := (GenerateService{Ops: counter}).Generate(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	if count < 8 {
+		t.Fatalf("unexpected publication boundaries %d", count)
+	}
+	for fail := 1; fail <= count; fail++ {
+		t.Run(fmt.Sprint(fail), func(t *testing.T) {
+			d := makeDir(t)
+			r := generationFixture(t, d, dev, prod)
+			calls, hit := 0, false
+			boom := errors.New("injected")
+			ops := Ops{Write: func(fd int, p []byte) (int, error) {
+				calls++
+				if calls == fail {
+					hit = true
+					return 0, boom
+				}
+				return unix.Write(fd, p)
+			}, Fsync: func(fd int) error {
+				calls++
+				if calls == fail {
+					hit = true
+					return boom
+				}
+				return unix.Fsync(fd)
+			}, Renameat: func(a int, ap string, b int, bp string) error {
+				calls++
+				if calls == fail {
+					hit = true
+					return boom
+				}
+				return unix.Renameat(a, ap, b, bp)
+			}}
+			_, _ = (GenerateService{Ops: ops}).Generate(context.Background(), r)
+			if !hit {
+				t.Fatal("fault boundary not reached")
+			}
+			snap, err := LoadSnapshot(d)
+			if err != nil {
+				t.Fatalf("partial snapshot: %v", err)
+			}
+			if len(snap.Manifest.Entries) > 1 {
+				t.Fatal("mixed snapshot")
+			}
+			r.ApprovalAudit = &approval.Chain{Sink: &approval.FileSink{Path: d + "-retry.audit"}}
+			if _, err = (GenerateService{}).Generate(context.Background(), r); err != nil {
+				t.Fatalf("recovery/retry: %v", err)
+			}
+			snap, err = LoadSnapshot(d)
+			if err != nil || len(snap.Manifest.Entries) != 1 || snap.Manifest.Entries[0].ArtifactFile == "" {
+				t.Fatalf("new snapshot incomplete: %+v %v", snap.Manifest, err)
 			}
 		})
 	}
