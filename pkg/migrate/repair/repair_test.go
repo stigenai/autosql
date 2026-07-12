@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -13,6 +14,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 type auditLog struct {
@@ -89,6 +92,24 @@ func TestLiveMarkRemoveStaleAuditAtomicity(t *testing.T) {
 	if len(audit.records) != 2 || audit.records[0].Type != "repair_requested" || audit.records[1].Type != "repair_applied" {
 		t.Fatalf("audit=%+v", audit.records)
 	}
+	for _, record := range audit.records {
+		if record.Reason != mark.Reason || record.BeforeDigest != mark.ExpectedBeforeDigest || record.BeforeState != "partial" || record.AfterState != "applied" {
+			t.Fatalf("audit lacks independent repair evidence: %+v", record)
+		}
+	}
+	evidenceConn, e := pgx.Connect(ctx, url)
+	if e != nil {
+		t.Fatal(e)
+	}
+	var eventEvidenceRaw string
+	if e = evidenceConn.QueryRow(ctx, `select redacted_detail from `+schema+`.events where event_type='repair_applied' and version=$1`, base.Version).Scan(&eventEvidenceRaw); e != nil {
+		t.Fatal(e)
+	}
+	evidenceConn.Close(ctx)
+	var eventEvidence AuditRecord
+	if json.Unmarshal([]byte(eventEvidenceRaw), &eventEvidence) != nil || eventEvidence.Reason != mark.Reason || eventEvidence.BeforeDigest != mark.ExpectedBeforeDigest || eventEvidence.BeforeState != "partial" || eventEvidence.AfterState != "applied" {
+		t.Fatalf("revision event lacks independent repair evidence: %s", eventEvidenceRaw)
+	}
 	if e = svc.Apply(ctx, mark); e != nil {
 		t.Fatalf("idempotent retry=%v", e)
 	}
@@ -156,6 +177,62 @@ func TestLiveMarkRemoveStaleAuditAtomicity(t *testing.T) {
 	}
 	if e = svc.Apply(ctx, stale); !errors.Is(e, ErrRefused) {
 		t.Fatalf("distinct stale proposal=%v", e)
+	}
+	// A writer that bypasses the advisory barrier but changes a non-state field
+	// between authorization and mutation must still lose the full-row CAS.
+	fourth := base
+	fourth.Version = "4.0.0"
+	if e = store.Insert(ctx, fourth); e != nil {
+		t.Fatal(e)
+	}
+	direct := proposal(t, fourth, "mark", "applied", key, now)
+	mutated := svc
+	mutated.Hooks.AfterRequested = func() error {
+		conn, er := pgx.Connect(ctx, url)
+		if er != nil {
+			return er
+		}
+		defer conn.Close(ctx)
+		_, er = conn.Exec(ctx, `update `+schema+`.revisions set statement_ordinal=statement_ordinal+1 where version=$1`, fourth.Version)
+		return er
+	}
+	if e = mutated.Apply(ctx, direct); !errors.Is(e, ErrRefused) {
+		t.Fatalf("full-row transactional CAS accepted concurrent mutation: %v", e)
+	}
+	if got := audit.records[len(audit.records)-1]; got.Type != "repair_refused" || got.Reason != direct.Reason || got.BeforeDigest != direct.ExpectedBeforeDigest || got.BeforeState != direct.ExpectedBeforeState || got.AfterState != direct.ExpectedAfterState {
+		t.Fatalf("refusal audit lacks evidence: %+v", got)
+	}
+	// Ordinary revision writers participate in the same barrier as apply and
+	// cannot cross the repair authorization/mutation window.
+	fifth := base
+	fifth.Version = "5.0.0"
+	if e = store.Insert(ctx, fifth); e != nil {
+		t.Fatal(e)
+	}
+	barrierProposal := proposal(t, fifth, "mark", "applied", key, now)
+	writerDone := make(chan error, 1)
+	barrier := svc
+	barrier.Hooks.AfterRequested = func() error {
+		go func() {
+			writerDone <- store.UpdateState(ctx, fifth.Version, fifth.Attempt, "partial", 9, "", 0, "writer_race", "executor")
+		}()
+		select {
+		case er := <-writerDone:
+			return fmt.Errorf("ordinary writer escaped repair barrier: %v", er)
+		case <-time.After(100 * time.Millisecond):
+			return nil
+		}
+	}
+	if e = barrier.Apply(ctx, barrierProposal); e != nil {
+		t.Fatalf("repair under writer race: %v", e)
+	}
+	select {
+	case e = <-writerDone:
+		if e != nil {
+			t.Fatalf("ordinary writer after barrier: %v", e)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ordinary writer remained blocked after repair")
 	}
 	denied := svc
 	denied.Authorize = func(context.Context, Proposal, revision.Revision) error { return errors.New("policy denied") }

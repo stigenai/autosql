@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -60,6 +61,10 @@ func (p Proposal) validate() error {
 	if p.Version != "autosql.repair-proposal/v1" || p.TargetVersion == "" || p.Operator == "" || p.DatabaseIdentity == "" || p.Environment == "" || len(p.Reason) < 8 || len(p.Reason) > 500 || p.ExpectedBeforeDigest == "" || p.ExpectedBeforeState == "" || p.ExpectedAfterState == "" || p.ManifestDigest == "" || p.GuardrailDigest == "" || p.PolicyDigest == "" || p.ApprovalDigest == "" || p.CreatedAt.IsZero() || !p.ExpiresAt.After(p.CreatedAt) {
 		return ErrRefused
 	}
+	lowerReason := strings.ToLower(p.Reason)
+	if strings.Contains(lowerReason, "password=") || strings.Contains(lowerReason, "postgres://") || strings.Contains(lowerReason, "postgresql://") {
+		return ErrRefused
+	}
 	switch p.Action {
 	case "mark", "remove", "reconcile":
 	default:
@@ -69,8 +74,8 @@ func (p Proposal) validate() error {
 }
 
 type AuditRecord struct {
-	EventID, Type, ProposalDigest, Action, TargetVersion, Operator, PolicyDigest, ApprovalDigest string
-	At                                                                                           time.Time
+	EventID, Type, ProposalDigest, Action, TargetVersion, Reason, Operator, PolicyDigest, ApprovalDigest, BeforeDigest, BeforeState, AfterState string
+	At                                                                                                                                          time.Time
 }
 type Audit interface {
 	AppendDurable(context.Context, AuditRecord) error
@@ -300,6 +305,11 @@ func (s Service) Apply(ctx context.Context, p Proposal) error {
 		return s.refuse(ctx, p)
 	}
 	defer session.Unlock(context.Background(), lockIdentity)
+	writers, e := session.LockWriters(ctx)
+	if e != nil || !writers {
+		return s.refuse(ctx, p)
+	}
+	defer session.UnlockWriters(context.Background())
 	recovered := false
 	pending, e := session.PendingOutbox(ctx)
 	if e != nil {
@@ -355,7 +365,7 @@ func (s Service) Apply(ctx context.Context, p Proposal) error {
 	if e = s.Authorize(ctx, p, *before); e != nil {
 		return s.refuse(ctx, p)
 	}
-	requested := AuditRecord{EventID: "repair-requested/" + p.Digest, Type: "repair_requested", ProposalDigest: p.Digest, Action: p.Action, TargetVersion: p.TargetVersion, Operator: p.Operator, PolicyDigest: p.PolicyDigest, ApprovalDigest: p.ApprovalDigest, At: s.Now()}
+	requested := s.auditRecord("repair_requested", p)
 	if e = s.Audit.AppendDurable(ctx, requested); e != nil {
 		return e
 	}
@@ -369,10 +379,11 @@ func (s Service) Apply(ctx context.Context, p Proposal) error {
 		return e
 	}
 	defer tx.Rollback(context.Background())
-	if e = session.Repair(ctx, tx, p.TargetVersion, p.Action, p.ExpectedBeforeState, p.ExpectedAfterState, p.Digest, p.Operator, s.Now()); e != nil {
-		return e
+	evidenceRaw, _ := json.Marshal(s.auditRecord("repair_applied", p))
+	if e = session.Repair(ctx, tx, p.TargetVersion, p.Action, p.ExpectedBeforeState, p.ExpectedAfterState, p.ExpectedBeforeDigest, p.Digest, p.Operator, string(evidenceRaw), s.Now()); e != nil {
+		return s.refuse(ctx, p)
 	}
-	applied := AuditRecord{EventID: "repair-applied/" + p.Digest, Type: "repair_applied", ProposalDigest: p.Digest, Action: p.Action, TargetVersion: p.TargetVersion, Operator: p.Operator, PolicyDigest: p.PolicyDigest, ApprovalDigest: p.ApprovalDigest, At: s.Now()}
+	applied := s.auditRecord("repair_applied", p)
 	raw, _ := json.Marshal(applied)
 	if e = session.EnqueueOutbox(ctx, tx, applied.EventID, raw); e != nil {
 		return e
@@ -403,13 +414,14 @@ func (s Service) Apply(ctx context.Context, p Proposal) error {
 }
 func (s Service) refuse(ctx context.Context, p Proposal) error {
 	if s.Audit != nil && s.Now != nil {
-		_ = s.Audit.AppendDurable(ctx, AuditRecord{EventID: "repair-refused/" + p.Digest, Type: "repair_refused", ProposalDigest: p.Digest, Action: p.Action, TargetVersion: p.TargetVersion, Operator: p.Operator, PolicyDigest: p.PolicyDigest, ApprovalDigest: p.ApprovalDigest, At: s.Now()})
+		_ = s.Audit.AppendDurable(ctx, s.auditRecord("repair_refused", p))
 	}
 	return ErrRefused
 }
+func (s Service) auditRecord(kind string, p Proposal) AuditRecord {
+	return AuditRecord{EventID: strings.ReplaceAll(kind, "_", "-") + "/" + p.Digest, Type: kind, ProposalDigest: p.Digest, Action: p.Action, TargetVersion: p.TargetVersion, Reason: p.Reason, Operator: p.Operator, PolicyDigest: p.PolicyDigest, ApprovalDigest: p.ApprovalDigest, BeforeDigest: p.ExpectedBeforeDigest, BeforeState: p.ExpectedBeforeState, AfterState: p.ExpectedAfterState, At: s.Now()}
+}
 func revisionDigest(r revision.Revision) string {
-	raw, _ := json.Marshal(struct{ Version, State, FileDigest, ArtifactDigest, ManifestDigest string }{r.Version, r.State, r.FileDigest, r.ArtifactDigest, r.ManifestDigest})
-	sum := sha256.Sum256(append([]byte("autosql.repair.revision/v1\x00"), raw...))
-	return "sha256:" + hex.EncodeToString(sum[:])
+	return revision.Digest(r)
 }
 func RevisionDigest(r revision.Revision) string { return revisionDigest(r) }
