@@ -2,6 +2,8 @@ package postgres
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"os"
 	"strings"
 	"testing"
@@ -11,6 +13,65 @@ import (
 
 	"github.com/jackc/pgx/v5"
 )
+
+func TestInspectURLConcurrentIndexChurn(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	nonce := make([]byte, 6)
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatal(err)
+	}
+	name := "autosql_churn_" + hex.EncodeToString(nonce)
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	if _, err = conn.Exec(ctx, "create schema "+pgx.Identifier{name}.Sanitize()+"; create table "+pgx.Identifier{name, "items"}.Sanitize()+" (id bigint primary key, value text)"); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Exec(context.Background(), "drop schema if exists "+pgx.Identifier{name}.Sanitize()+" cascade")
+
+	churnDone := make(chan error, 1)
+	go func() {
+		churn, connectErr := pgx.Connect(ctx, url)
+		if connectErr != nil {
+			churnDone <- connectErr
+			return
+		}
+		defer churn.Close(context.Background())
+		index := pgx.Identifier{"items_value_idx"}.Sanitize()
+		qualifiedIndex := pgx.Identifier{name, "items_value_idx"}.Sanitize()
+		table := pgx.Identifier{name, "items"}.Sanitize()
+		for i := 0; i < 100; i++ {
+			if _, execErr := churn.Exec(ctx, "create index "+index+" on "+table+" (value)"); execErr != nil {
+				churnDone <- execErr
+				return
+			}
+			if _, execErr := churn.Exec(ctx, "drop index "+qualifiedIndex); execErr != nil {
+				churnDone <- execErr
+				return
+			}
+		}
+		churnDone <- nil
+	}()
+	for i := 0; i < 40; i++ {
+		doc, inspectErr := InspectURL(ctx, url, Options{Schemas: []string{name}})
+		if inspectErr != nil {
+			t.Fatalf("inspection under index churn %d: %v", i, inspectErr)
+		}
+		if inspectErr = doc.Validate(); inspectErr != nil {
+			t.Fatalf("invalid inspection under index churn %d: %v", i, inspectErr)
+		}
+	}
+	if err = <-churnDone; err != nil {
+		t.Fatalf("index churn: %v", err)
+	}
+}
 
 func TestInspectURLIntegration(t *testing.T) {
 	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")

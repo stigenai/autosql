@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"autosql/pkg/plugin"
@@ -98,5 +99,26 @@ func TestInspectTransactionsSuccessfulInspectionStillRequiresRollback(t *testing
 	var typed *snapshotRollbackError
 	if !errors.Is(err, rollbackFailure) || !errors.As(err, &typed) {
 		t.Fatalf("rollback failure was masked: %v", err)
+	}
+}
+
+func TestInspectTransactionsPersistentCatalogDisappearanceExhaustsRetries(t *testing.T) {
+	disappeared := &catalogDisappearanceError{resource: "index definition", oid: 42}
+	begins, inspections := 0, 0
+	begin := func(context.Context) (catalogQueryer, func(context.Context) error, error) {
+		begins++
+		return unusedCatalogQueryer{}, func(context.Context) error { return nil }, nil
+	}
+	run := func(context.Context, catalogQueryer, plugin.InspectRequest) (schema.Document, error) {
+		inspections++
+		return schema.Document{}, classify("indexes", "catalog metadata", "postgres://user:secret@db/app", disappeared)
+	}
+	_, err := inspectTransactions(context.Background(), plugin.InspectRequest{}, begin, run)
+	var got *catalogDisappearanceError
+	if !errors.As(err, &got) || !transientCatalogOID(err) || begins != 5 || inspections != 5 {
+		t.Fatalf("persistent disappearance err=%v begins=%d inspections=%d", err, begins, inspections)
+	}
+	if strings.Contains(err.Error(), "secret") || !strings.Contains(err.Error(), "OID 42") {
+		t.Fatalf("persistent disappearance was masked or leaked DSN: %v", err)
 	}
 }

@@ -97,8 +97,21 @@ func inspectTransactions(ctx context.Context, req plugin.InspectRequest, begin s
 }
 
 func transientCatalogOID(err error) bool {
+	var disappeared *catalogDisappearanceError
+	if errors.As(err, &disappeared) {
+		return true
+	}
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "XX000" && (strings.Contains(pgErr.Message, "could not open relation with OID") || strings.Contains(pgErr.Message, "cache lookup failed for"))
+}
+
+type catalogDisappearanceError struct {
+	resource string
+	oid      uint32
+}
+
+func (e *catalogDisappearanceError) Error() string {
+	return fmt.Sprintf("PostgreSQL catalog %s disappeared during inspection (OID %d)", e.resource, e.oid)
 }
 
 func inspectSnapshot(ctx context.Context, conn catalogQueryer, req plugin.InspectRequest) (schema.Document, error) {
@@ -216,7 +229,7 @@ func classify(resource, privilege, dsn string, err error) error {
 		return &PermissionError{Resource: resource, Privilege: privilege, Cause: pe}
 	}
 	if transientCatalogOID(err) {
-		return &catalogOIDError{message: safeError("inspect "+resource, dsn, err).Error(), cause: pe}
+		return &catalogOIDError{message: safeError("inspect "+resource, dsn, err).Error(), cause: err}
 	}
 	return safeError("inspect "+resource, dsn, err)
 }
@@ -567,17 +580,21 @@ func (i *inspector) inspectIndexes(ctx context.Context) error {
 	defer rows.Close()
 	for rows.Next() {
 		var oid, rel uint32
-		var ns, table, name, method, definition string
+		var ns, table, name, method string
+		var definition *string
 		var unique, valid, ready bool
 		var comment *string
 		if err := rows.Scan(&oid, &rel, &ns, &table, &name, &method, &unique, &valid, &ready, &definition, &comment); err != nil {
 			return err
 		}
+		if definition == nil {
+			return &catalogDisappearanceError{resource: "index definition", oid: oid}
+		}
 		p := i.byOID[rel]
 		if p == "" {
 			continue
 		}
-		id := i.add(schema.KindIndex, i.name(ns, name, p), map[string]any{"method": method, "unique": unique, "valid": valid, "ready": ready, "definition": definition}, dep(p, schema.DependencyContains), comment)
+		id := i.add(schema.KindIndex, i.name(ns, name, p), map[string]any{"method": method, "unique": unique, "valid": valid, "ready": ready, "definition": *definition}, dep(p, schema.DependencyContains), comment)
 		i.byOID[oid] = id
 	}
 	return rows.Err()
