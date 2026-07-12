@@ -225,3 +225,15 @@ func TestPostgreSQLParserRejectsUnsafeEditedStatements(t *testing.T) {
 		})
 	}
 }
+
+func TestCommentCannotChangeTransactionMetadata(t *testing.T) {
+	a, raw, _ := fixture(t)
+	sql := "-- CONCURRENTLY\n" + a.Plan.Steps[0].SQL
+	e, err := New(raw, a, sql, "edit.sql", Editor{Identity: "editor", At: time.Now().UTC(), Reason: "format only"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.CandidatePlan.Steps[0].Transaction != a.Plan.Steps[0].Transaction || e.CandidatePlan.Steps[0].Lock != a.Plan.Steps[0].Lock || e.CandidatePlan.Steps[0].Impact != a.Plan.Steps[0].Impact {
+		t.Fatal("comment changed derived execution metadata")
+	}
+}

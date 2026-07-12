@@ -69,7 +69,7 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 	}
 	pub := priv.Public().(ed25519.PublicKey)
 	_, editPriv, _ := ed25519.GenerateKey(rand.Reader)
-	releaseAt := time.Now().UTC().Add(5 * time.Minute)
+	releaseAt := time.Now().UTC().Add(5 * time.Second)
 	dir := t.TempDir()
 	name := "autosql_prod_" + strings.ToLower(time.Now().Format("150405000000"))
 	cfg := applyConfig{DatabaseURL: "env://AUTOSQL_PROD_TEST_URL", Environment: "test", DatabaseIdentity: "prod-test", SourceRevision: "test-rev", KeyID: "test-key", PublicKey: base64.RawStdEncoding.EncodeToString(pub), Issuer: "test-issuer", Signer: "test-signer", Author: "author", Requester: "requester", ApprovalAuditPath: filepath.Join(dir, "approval.jsonl"), LifecycleAuditPath: filepath.Join(dir, "lifecycle.jsonl"), ArtifactDirectory: dir, PostgresVersion: 15, Schemas: []string{name}, ExpectedPlanDigest: "pending", ExpectedChecksDigest: "pending", ExpectedGuardrailDigest: "pending", ExpectedApprovalIdentity: "release", KeyStatus: "active", KeyPurpose: "plan-artifact", KeyNotBefore: time.Now().UTC().Add(-time.Hour), KeyNotAfter: time.Now().UTC().Add(2 * time.Hour), EditorIdentity: "editor", EditSigningKeyID: "edit-key", EditSigningKeyReference: "env://AUTOSQL_EDIT_TEST_KEY", DevelopmentURLReference: "env://AUTOSQL_DEV_TEST_URL", FreshApprovalIdentity: "fresh-approver", FreshApprovalAt: releaseAt, EditReleaseCreatedAt: releaseAt, EditReleaseExpiresAt: releaseAt.Add(time.Hour)}
@@ -273,5 +273,53 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 	}
 	if !strings.Contains(auditText, a.Digest) || !strings.Contains(auditText, p.Digest) || !strings.Contains(auditText, bundle) {
 		t.Fatal("lifecycle audit bindings missing")
+	}
+	// Install the edited release manifest and prove both artifact and digest
+	// apply paths consume the freshly published artifact.
+	cfg.ExpectedPlanDigest, cfg.ExpectedChecksDigest, cfg.ExpectedGuardrailDigest = published.Plan.Digest, published.Checks.Digest, published.GuardrailDigest
+	cfg.ExpectedApprovalIdentity, cfg.KeyID, cfg.PublicKey = published.Approval.Identity, "edit-key", base64.RawStdEncoding.EncodeToString(editPriv.Public().(ed25519.PublicKey))
+	cfg.ExpectedValidationContextDigests = map[string]string{}
+	for _, att := range published.EditProvenance.Attestations {
+		cfg.ExpectedValidationContextDigests[att.Stage] = att.ConfigDigest
+	}
+	raw, _ = json.Marshal(cfg)
+	if err = os.WriteFile(configPath, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	editedServices, err := ProductionServices()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wait := time.Until(releaseAt); wait > 0 {
+		time.Sleep(wait + 10*time.Millisecond)
+	}
+	code, out, _ = invoke(t, []string{"apply", "--artifact", publishedPath, "--json"}, "", false, editedServices)
+	if code != 0 || !strings.Contains(out, "no_op") {
+		t.Fatalf("edited artifact apply code=%d out=%s", code, out)
+	}
+	if err = os.WriteFile(filepath.Join(dir, published.Plan.Digest+".json"), publishedRaw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	editedServices.ReadPlan = &fakeRead{from: current, to: desired, p: published.Plan}
+	code, out, _ = invoke(t, []string{"apply", "--from", "from", "--to", "to", "--approve-digest", published.Plan.Digest, "--json"}, "", false, editedServices)
+	if code != 0 || !strings.Contains(out, "no_op") {
+		t.Fatalf("edited digest apply code=%d out=%s", code, out)
+	}
+	code, _, _ = invoke(t, []string{"apply", "--artifact", publishedPath, "--no-edits", "--json"}, "", false, editedServices)
+	if code == 0 {
+		t.Fatal("request no-edits accepted edited artifact")
+	}
+	cfg.NoEdits = true
+	raw, _ = json.Marshal(cfg)
+	if err = os.WriteFile(configPath, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	noEditServices, err := ProductionServices()
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, _, _ = invoke(t, []string{"apply", "--artifact", publishedPath, "--json"}, "", false, noEditServices)
+	if code == 0 {
+		t.Fatal("configured no-edits accepted edited artifact")
 	}
 }

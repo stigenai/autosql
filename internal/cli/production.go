@@ -92,7 +92,7 @@ func productionServices(connector executor.Connector) (Services, error) {
 		}
 		vp := artifact.VerifyPolicy{Now: time.Now, NoEdits: c.NoEdits, Expected: artifact.ExpectedBindings{PlanDigest: c.ExpectedPlanDigest, GeneratedPlanDigest: c.ExpectedPlanDigest, ChecksDigest: c.ExpectedChecksDigest, GuardrailDigest: c.ExpectedGuardrailDigest, SourceRevision: c.SourceRevision, Environment: c.Environment, DatabaseIdentity: c.DatabaseIdentity, ApprovalIdentity: c.ExpectedApprovalIdentity}, Keys: map[string]artifact.KeyRecord{c.KeyID: {PublicKey: ed25519.PublicKey(pub), Issuer: c.Issuer, Identity: c.Signer, Environment: c.Environment, Purpose: c.KeyPurpose, Status: c.KeyStatus, NotBefore: c.KeyNotBefore.UTC(), NotAfter: c.KeyNotAfter.UTC()}}, Issuer: c.Issuer, Identity: c.Signer, Purpose: c.KeyPurpose}
 		vp.ExpectedValidationContextDigests = c.ExpectedValidationContextDigests
-		if c.NoEdits {
+		if c.GeneratorKeyID != "" || c.GeneratorPublicKey != "" || c.GeneratorPurpose != "" {
 			generatorPub, decodeErr := base64.RawStdEncoding.Strict().DecodeString(c.GeneratorPublicKey)
 			if decodeErr != nil || len(generatorPub) != ed25519.PublicKeySize || c.GeneratorKeyID == "" || c.GeneratorPurpose == "" {
 				return artifact.VerifyPolicy{}, errors.New("trusted generator manifest required")

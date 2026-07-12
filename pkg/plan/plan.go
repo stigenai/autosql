@@ -14,6 +14,7 @@ import (
 	"autosql/pkg/plugin"
 	"autosql/pkg/safety"
 	"autosql/pkg/schema"
+	pg_query "github.com/pganalyze/pg_query_go/v6"
 )
 
 const Version = "autosql.plan/v1"
@@ -285,7 +286,7 @@ func EditSQL(p Plan, sql []string) (Plan, error) {
 		if strings.TrimSpace(sql[idx]) == "" {
 			return Plan{}, fmt.Errorf("%w: empty edited SQL", ErrInvalidPlan)
 		}
-		transactional := !strings.Contains(strings.ToUpper(sql[idx]), "CONCURRENTLY")
+		transactional := s.Transaction == TransactionRequired
 		rendered = append(rendered, plugin.Statement{SQL: sql[idx], ChangeID: s.ChangeID, Transactional: transactional, Kind: plugin.StatementExecutable})
 		idx++
 	}
@@ -378,13 +379,21 @@ func lockFor(c schema.Change, sql string) LockLevel {
 	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(sql)), "-- AUTOSQL TOPOLOGY:") {
 		return LockNone
 	}
-	if strings.Contains(strings.ToUpper(sql), "CONCURRENTLY") {
+	if sqlIndexConcurrent(sql) {
 		return LockShare
 	}
 	if c.Operation == schema.OperationCreate && c.After != nil && c.After.Kind == schema.KindSchema {
 		return LockNone
 	}
 	return LockExclusive
+}
+func sqlIndexConcurrent(sql string) bool {
+	tree, err := pg_query.Parse(sql)
+	if err != nil || len(tree.Stmts) != 1 {
+		return false
+	}
+	idx := tree.Stmts[0].Stmt.GetIndexStmt()
+	return idx != nil && idx.Concurrent
 }
 func impactFor(c schema.Change, sql string) Impact {
 	u := strings.ToUpper(sql)

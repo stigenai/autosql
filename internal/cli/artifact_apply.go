@@ -35,15 +35,15 @@ func (s VerifiedArtifactApplyService) Apply(ctx context.Context, request ApplyRe
 	if err != nil {
 		return ApplyResult{Status: "refused"}, err
 	}
-	if (s.NoEdits || request.NoEdits) && a.EditProvenance != nil {
-		return ApplyResult{Status: "refused"}, errors.New("edited artifacts are forbidden")
-	}
 	verifyPolicy := s.Policy
 	if s.PolicyFor != nil {
 		verifyPolicy, err = s.PolicyFor(a)
 		if err != nil {
 			return ApplyResult{Status: "refused"}, err
 		}
+	}
+	if s.NoEdits || request.NoEdits {
+		verifyPolicy.NoEdits = true
 	}
 	v, err := a.VerifyTrusted(verifyPolicy)
 	if err != nil {
