@@ -21,9 +21,6 @@ func (*Driver) Render(ctx context.Context, request plugin.RenderRequest) ([]plug
 	if err := request.Changes.Validate(); err != nil {
 		return nil, fmt.Errorf("render PostgreSQL changes: %w", err)
 	}
-	if enabled(request.Options, "concurrent_indexes", false) {
-		return nil, fmt.Errorf("render PostgreSQL changes: %w: nontransactional execution is unavailable until phase-aware guarded apply", plugin.ErrUnsupported)
-	}
 	if err := validateManagedDocuments(request); err != nil {
 		return nil, fmt.Errorf("render PostgreSQL changes: %w", err)
 	}

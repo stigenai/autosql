@@ -56,9 +56,12 @@ func validateSelectors(from, to string, r LoadRequest) error {
 }
 
 type ApplyResult struct {
-	Status       string `json:"status"`
-	AppliedSteps int    `json:"applied_steps,omitempty"`
-	Message      string `json:"message,omitempty"`
+	Status           string `json:"status"`
+	AppliedSteps     int    `json:"applied_steps"`
+	Message          string `json:"message,omitempty"`
+	PendingStep      string `json:"pending_step,omitempty"`
+	ExecutionID      string `json:"execution_id,omitempty"`
+	RecoveryGuidance string `json:"recovery_guidance,omitempty"`
 }
 type ApplyService interface {
 	Apply(context.Context, ApplyRequest) (ApplyResult, error)
@@ -267,7 +270,17 @@ func runApply(ctx context.Context, args []string, o output, s Services, tty bool
 		return usageError(errors.New("selectors require --from and --to live sources"))
 	}
 	if *artifact != "" {
-		return &Error{Kind: "migration", Message: "artifact verification is not available until cs5.7", Code: ExitMigration, Status: "refused"}
+		if s.Apply == nil {
+			return &Error{Kind: "migration", Message: "verified artifact apply service is not wired", Code: ExitMigration, Status: "refused"}
+		}
+		result, err := s.Apply.Apply(ctx, ApplyRequest{ArtifactPath: *artifact, ApprovalMode: "artifact"})
+		if err != nil {
+			return applyFailure(result, err)
+		}
+		if result.Status == "" {
+			result.Status = "success"
+		}
+		return o.success(result, result.Status)
 	}
 	if *from == "" || *to == "" {
 		return usageError(errors.New("--from and --to required unless --artifact is used"))
@@ -333,10 +346,10 @@ func runApply(ctx context.Context, args []string, o output, s Services, tty bool
 
 func applyFailure(result ApplyResult, cause error) error {
 	status := ""
-	if result.Status == "partial_failure" {
+	if result.Status == "partial_failure" || result.Status == "uncertain" {
 		status = result.Status
 	}
-	return &Error{Kind: "migration", Message: "apply failed", Code: ExitMigration, Status: status, Cause: cause}
+	return &Error{Kind: "migration", Message: "apply failed", Code: ExitMigration, Status: status, Cause: cause, PendingStep: result.PendingStep, ExecutionID: result.ExecutionID, RecoveryGuidance: result.RecoveryGuidance, AppliedSteps: result.AppliedSteps}
 }
 func schemaSQL(doc schema.Document) (string, error) {
 	statements, e := postgres.RenderDocument(context.Background(), doc, nil)

@@ -83,6 +83,9 @@ type VerifiedArtifact struct {
 }
 
 func (v VerifiedArtifact) Digest() string { return v.artifact.Digest }
+
+// Payload returns a defensive copy only for a valid verified token.
+func (v VerifiedArtifact) Payload() (Artifact, error) { return v.forRegistry() }
 func (v VerifiedArtifact) forRegistry() (Artifact, error) {
 	if v.marker != verifiedMarker(v.artifact) || v.artifact.Digest == "" {
 		return Artifact{}, fail("verified_token", ErrInvalid)

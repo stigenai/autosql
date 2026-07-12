@@ -14,6 +14,20 @@ import (
 	"time"
 )
 
+func countSimulationDatabases(t *testing.T, url string) int {
+	t.Helper()
+	c, e := pgx.Connect(context.Background(), url)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer c.Close(context.Background())
+	var n int
+	if e = c.QueryRow(context.Background(), `select count(*) from pg_database where datname like 'autosql_sim_%'`).Scan(&n); e != nil {
+		t.Fatal(e)
+	}
+	return n
+}
+
 func liveFixture(t *testing.T) (schema.Document, plan.Plan) {
 	t.Helper()
 	ctx := context.Background()
@@ -44,6 +58,7 @@ func TestPostgresSimulationConcurrentIsolationAndCleanup(t *testing.T) {
 	if url == "" {
 		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
 	}
+	baseline := countSimulationDatabases(t, url)
 	from, p := liveFixture(t)
 	devIdentity, e := ResolvePostgresIdentity(context.Background(), url)
 	if e != nil {
@@ -85,7 +100,7 @@ func TestPostgresSimulationConcurrentIsolationAndCleanup(t *testing.T) {
 	}
 	defer conn.Close(context.Background())
 	var remaining int
-	if e = conn.QueryRow(ctx, `select count(*) from pg_database where datname like 'autosql_sim_%'`).Scan(&remaining); e != nil || remaining != 0 {
+	if e = conn.QueryRow(ctx, `select count(*) from pg_database where datname like 'autosql_sim_%'`).Scan(&remaining); e != nil || remaining != baseline {
 		t.Fatalf("remaining=%d err=%v", remaining, e)
 	}
 }
@@ -116,6 +131,7 @@ func TestAmbiguousCreateAlwaysCleansGeneratedDatabase(t *testing.T) {
 	if url == "" {
 		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
 	}
+	baseline := countSimulationDatabases(t, url)
 	id, e := ResolvePostgresIdentity(context.Background(), url)
 	if e != nil {
 		t.Fatal(e)
@@ -130,7 +146,7 @@ func TestAmbiguousCreateAlwaysCleansGeneratedDatabase(t *testing.T) {
 	}
 	defer conn.Close(context.Background())
 	var remaining int
-	if e = conn.QueryRow(context.Background(), `select count(*) from pg_database where datname like 'autosql_sim_%'`).Scan(&remaining); e != nil || remaining != 0 {
+	if e = conn.QueryRow(context.Background(), `select count(*) from pg_database where datname like 'autosql_sim_%'`).Scan(&remaining); e != nil || remaining != baseline {
 		t.Fatalf("remaining=%d err=%v", remaining, e)
 	}
 }
@@ -171,6 +187,7 @@ func TestPostgresCleanupAfterLiveFailureCancelAndMismatch(t *testing.T) {
 	if url == "" {
 		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
 	}
+	baseline := countSimulationDatabases(t, url)
 	from, p := liveFixture(t)
 	devIdentity, e := ResolvePostgresIdentity(context.Background(), url)
 	if e != nil {
@@ -195,7 +212,7 @@ func TestPostgresCleanupAfterLiveFailureCancelAndMismatch(t *testing.T) {
 			}
 			defer conn.Close(context.Background())
 			var remaining int
-			if ce = conn.QueryRow(checkCtx, `select count(*) from pg_database where datname like 'autosql_sim_%'`).Scan(&remaining); ce != nil || remaining != 0 {
+			if ce = conn.QueryRow(checkCtx, `select count(*) from pg_database where datname like 'autosql_sim_%'`).Scan(&remaining); ce != nil || remaining != baseline {
 				t.Fatalf("remaining=%d err=%v", remaining, ce)
 			}
 		})
