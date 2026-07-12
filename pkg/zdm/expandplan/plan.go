@@ -24,6 +24,7 @@ var ErrRefused = errors.New("expand planning refused")
 
 type Policy struct {
 	MaxLockMS                int  `json:"max_lock_ms"`
+	MaxLockHoldMS            int  `json:"max_lock_hold_ms"`
 	MaxStatementMS           int  `json:"max_statement_ms"`
 	MaxTransactionMS         int  `json:"max_transaction_ms"`
 	AllowRewrite             bool `json:"allow_rewrite"`
@@ -82,40 +83,52 @@ type Condition struct {
 	Expected string `json:"expected"`
 }
 type Step struct {
-	Ordinal             int         `json:"ordinal"`
-	OperationID         string      `json:"operation_id"`
-	Kind                string      `json:"kind"`
-	SQL                 string      `json:"sql"`
-	TransactionGroup    string      `json:"transaction_group"`
-	LockMode            string      `json:"lock_mode"`
-	Recovery            string      `json:"recovery"`
-	LockBudgetMS        int         `json:"lock_budget_ms"`
-	StatementBudgetMS   int         `json:"statement_budget_ms"`
-	TransactionBudgetMS int         `json:"transaction_budget_ms"`
-	EstimatedDurationMS int         `json:"estimated_duration_ms"`
-	Rewrite             bool        `json:"rewrite"`
-	ValidationScan      bool        `json:"validation_scan"`
-	TableScan           bool        `json:"table_scan"`
-	NonTransactional    bool        `json:"nontransactional"`
-	Reversible          bool        `json:"reversible"`
-	Preconditions       []Condition `json:"preconditions"`
-	Postconditions      []Condition `json:"postconditions"`
-	Handoff             []string    `json:"handoff,omitempty"`
+	Ordinal             int            `json:"ordinal"`
+	OperationID         string         `json:"operation_id"`
+	Kind                string         `json:"kind"`
+	SQL                 string         `json:"sql"`
+	TransactionGroup    string         `json:"transaction_group"`
+	Recovery            string         `json:"recovery"`
+	StatementBudgetMS   int            `json:"statement_budget_ms"`
+	TransactionBudgetMS int            `json:"transaction_budget_ms"`
+	EstimatedDurationMS int            `json:"estimated_duration_ms"`
+	Rewrite             bool           `json:"rewrite"`
+	ValidationScan      bool           `json:"validation_scan"`
+	TableScan           bool           `json:"table_scan"`
+	NonTransactional    bool           `json:"nontransactional"`
+	Reversible          bool           `json:"reversible"`
+	Preconditions       []Condition    `json:"preconditions"`
+	Postconditions      []Condition    `json:"postconditions"`
+	Handoff             []string       `json:"handoff,omitempty"`
+	SessionSetup        []string       `json:"session_setup"`
+	Locks               []LockEvidence `json:"locks"`
+}
+type LockEvidence struct {
+	Schema               string `json:"schema,omitempty"`
+	Object               string `json:"object"`
+	Kind                 string `json:"kind"`
+	Mode                 string `json:"mode"`
+	AcquisitionTimeoutMS int    `json:"acquisition_timeout_ms"`
+	Phase                string `json:"phase"`
+	EstimatedHoldMS      int    `json:"estimated_hold_ms"`
+	MaximumHoldMS        int    `json:"maximum_hold_ms"`
+	TransactionBoundary  string `json:"transaction_boundary"`
 }
 type Plan struct {
-	Version          string       `json:"version"`
-	ArtifactDigest   string       `json:"artifact_digest"`
-	FromFingerprint  string       `json:"from_fingerprint"`
-	Target           string       `json:"target"`
-	Environment      string       `json:"environment"`
-	PostgresMajor    int          `json:"postgres_major"`
-	CapabilityDigest string       `json:"capability_digest"`
-	BindingsDigest   string       `json:"bindings_digest"`
-	PolicyDigest     string       `json:"policy_digest"`
-	Steps            []Step       `json:"steps"`
-	Mappings         []Mapping    `json:"mappings"`
-	Digest           string       `json:"digest"`
-	Attestation      *Attestation `json:"attestation,omitempty"`
+	Version          string         `json:"version"`
+	ArtifactDigest   string         `json:"artifact_digest"`
+	FromFingerprint  string         `json:"from_fingerprint"`
+	Target           string         `json:"target"`
+	Environment      string         `json:"environment"`
+	PostgresMajor    int            `json:"postgres_major"`
+	CapabilityDigest string         `json:"capability_digest"`
+	BindingsDigest   string         `json:"bindings_digest"`
+	PolicyDigest     string         `json:"policy_digest"`
+	Steps            []Step         `json:"steps"`
+	Mappings         []Mapping      `json:"mappings"`
+	Digest           string         `json:"digest"`
+	Attestation      *Attestation   `json:"attestation,omitempty"`
+	PlanningLocks    []LockEvidence `json:"planning_locks"`
 }
 type Attestation struct {
 	KeyID     string `json:"key_id"`
@@ -160,7 +173,7 @@ func Build(r Request) (Plan, error) {
 	if r.Target == "" || r.Environment == "" || r.Target != r.Snapshot.Target || r.Environment != r.Snapshot.Environment {
 		return Plan{}, refuse("target or environment identity mismatch")
 	}
-	if r.Policy.MaxLockMS <= 0 || r.Policy.MaxStatementMS <= 0 || r.Policy.MaxTransactionMS <= 0 {
+	if r.Policy.MaxLockMS <= 0 || r.Policy.MaxLockHoldMS <= 0 || r.Policy.MaxStatementMS <= 0 || r.Policy.MaxTransactionMS <= 0 {
 		return Plan{}, refuse("positive availability budgets are required")
 	}
 	if r.Migration.Requirements.LockTimeoutMS > r.Policy.MaxLockMS || r.Migration.Requirements.StatementTimeoutMS > r.Policy.MaxStatementMS {
@@ -176,6 +189,13 @@ func Build(r Request) (Plan, error) {
 		PostgresMajor int `json:"postgres_major"`
 	}{r.Snapshot.PostgresMajor}), PolicyDigest: digest(r.Policy)}
 	p.BindingsDigest = digest(bindings{p.ArtifactDigest, p.FromFingerprint, p.Target, p.Environment, p.CapabilityDigest, p.PolicyDigest})
+	p.PlanningLocks = append(p.PlanningLocks, LockEvidence{Object: "autosql.zdm.expand-plan/v1/" + r.Target + "/" + r.Environment, Kind: "advisory", Mode: "SHARED", AcquisitionTimeoutMS: r.Policy.MaxLockMS, Phase: "planning", EstimatedHoldMS: min(100, r.Policy.MaxLockHoldMS), MaximumHoldMS: r.Policy.MaxLockHoldMS, TransactionBoundary: "read-only-repeatable-read"})
+	for _, t := range r.Snapshot.Tables {
+		p.PlanningLocks = append(p.PlanningLocks, LockEvidence{Schema: t.Schema, Object: t.Name, Kind: "relation", Mode: "ACCESS SHARE", AcquisitionTimeoutMS: r.Policy.MaxLockMS, Phase: "planning", EstimatedHoldMS: min(100, r.Policy.MaxLockHoldMS), MaximumHoldMS: r.Policy.MaxLockHoldMS, TransactionBoundary: "read-only-repeatable-read"})
+	}
+	sort.Slice(p.PlanningLocks, func(i, j int) bool {
+		return p.PlanningLocks[i].Schema+"/"+p.PlanningLocks[i].Object < p.PlanningLocks[j].Schema+"/"+p.PlanningLocks[j].Object
+	})
 	used := map[string]string{}
 	for _, m := range r.Snapshot.Mappings {
 		key := m.Schema + "." + m.Name
@@ -204,7 +224,8 @@ func Build(r Request) (Plan, error) {
 		if len(r.PlanSigner) != ed25519.PrivateKeySize || r.PlanKeyID == "" {
 			return Plan{}, refuse("invalid plan signer")
 		}
-		p.Attestation = &Attestation{KeyID: r.PlanKeyID, Algorithm: "Ed25519", Signature: base64.RawStdEncoding.EncodeToString(ed25519.Sign(r.PlanSigner, []byte("autosql.zero-downtime-expand-plan.attestation/v1\x00"+p.Digest)))}
+		p.Attestation = &Attestation{KeyID: r.PlanKeyID, Algorithm: "Ed25519"}
+		p.Attestation.Signature = base64.RawStdEncoding.EncodeToString(ed25519.Sign(r.PlanSigner, attestationPayload(*p.Attestation, p.Digest)))
 	}
 	return p, nil
 }
@@ -227,8 +248,13 @@ func (p Plan) Validate() error {
 	}
 	p.Attestation = att
 	for i, s := range p.Steps {
-		if s.Ordinal != i+1 || s.OperationID == "" || s.Kind == "" || s.LockMode == "" || s.LockBudgetMS <= 0 || s.StatementBudgetMS <= 0 {
+		if s.Ordinal != i+1 || s.OperationID == "" || s.Kind == "" || s.StatementBudgetMS <= 0 || len(s.SessionSetup) != 1 || (s.SessionSetup[0] != "SET LOCAL search_path=pg_catalog" && s.SessionSetup[0] != "SET search_path=pg_catalog") {
 			return refuse("invalid step %d", i+1)
+		}
+		for _, l := range s.Locks {
+			if l.Object == "" || l.Kind == "" || l.Mode == "" || l.AcquisitionTimeoutMS <= 0 || l.EstimatedHoldMS < 0 || l.MaximumHoldMS <= 0 || l.EstimatedHoldMS > l.MaximumHoldMS || l.Phase != "expand" || l.TransactionBoundary != s.TransactionGroup {
+				return refuse("invalid structured lock evidence")
+			}
 		}
 		if err := validateExpandSQL(s); err != nil {
 			return err
@@ -300,11 +326,11 @@ func (p Plan) VerifyTrusted(r Request, public ed25519.PublicKey) error {
 	if err != nil {
 		return err
 	}
-	if p.Attestation == nil || p.Attestation.Algorithm != "Ed25519" || len(public) != ed25519.PublicKeySize {
+	if p.Attestation == nil || p.Attestation.Algorithm != "Ed25519" || p.Attestation.KeyID == "" || p.Attestation.KeyID != r.PlanKeyID || len(public) != ed25519.PublicKeySize {
 		return refuse("trusted plan attestation is required")
 	}
 	sig, e := base64.RawStdEncoding.Strict().DecodeString(p.Attestation.Signature)
-	if e != nil || !ed25519.Verify(public, []byte("autosql.zero-downtime-expand-plan.attestation/v1\x00"+p.Digest), sig) {
+	if e != nil || !ed25519.Verify(public, attestationPayload(*p.Attestation, p.Digest), sig) {
 		return refuse("plan attestation verification failed")
 	}
 	p.Attestation = nil
@@ -313,10 +339,13 @@ func (p Plan) VerifyTrusted(r Request, public ed25519.PublicKey) error {
 	}
 	return p.Validate()
 }
+func attestationPayload(a Attestation, digest string) []byte {
+	return []byte("autosql.zero-downtime-expand-plan.attestation/v1\x00" + a.Algorithm + "\x00" + a.KeyID + "\x00" + digest)
+}
 
 func translate(r Request, op zerodowntime.Operation, used map[string]string) ([]Step, []Mapping, error) {
 	table, exists := r.Snapshot.Tables[op.Table]
-	base := Step{OperationID: op.ID, TransactionGroup: "expand-" + op.ID, LockBudgetMS: r.Migration.Requirements.LockTimeoutMS, StatementBudgetMS: r.Migration.Requirements.StatementTimeoutMS, TransactionBudgetMS: r.Policy.MaxTransactionMS, EstimatedDurationMS: r.Migration.Requirements.LockTimeoutMS, Reversible: true, Recovery: "drop the additive physical object before synchronization", Preconditions: []Condition{{Kind: "fingerprint", Expected: r.Snapshot.Fingerprint}}}
+	base := Step{OperationID: op.ID, TransactionGroup: "expand-" + op.ID, StatementBudgetMS: r.Migration.Requirements.StatementTimeoutMS, TransactionBudgetMS: r.Policy.MaxTransactionMS, EstimatedDurationMS: min(100, r.Policy.MaxLockHoldMS), Reversible: true, Recovery: "drop the additive physical object before synchronization", Preconditions: []Condition{{Kind: "fingerprint", Expected: r.Snapshot.Fingerprint}, {Kind: "session_setting", Object: "search_path", Expected: "pg_catalog"}}, SessionSetup: []string{"SET LOCAL search_path=pg_catalog"}}
 	if op.Kind != zerodowntime.AddTable && !exists {
 		return nil, nil, refuse("operation %s references missing or ambiguous table %s", op.ID, op.Table)
 	}
@@ -337,6 +366,9 @@ func translate(r Request, op zerodowntime.Operation, used map[string]string) ([]
 		}
 	}
 	qtable := qi(table.Schema, table.Name)
+	if exists {
+		base.Locks = []LockEvidence{{Schema: table.Schema, Object: table.Name, Kind: "relation", Mode: "ACCESS EXCLUSIVE", AcquisitionTimeoutMS: r.Migration.Requirements.LockTimeoutMS, Phase: "expand", EstimatedHoldMS: min(100, r.Policy.MaxLockHoldMS), MaximumHoldMS: r.Policy.MaxLockHoldMS, TransactionBoundary: base.TransactionGroup}}
+	}
 	switch op.Kind {
 	case zerodowntime.AddTable:
 		if exists {
@@ -353,7 +385,7 @@ func translate(r Request, op zerodowntime.Operation, used map[string]string) ([]
 			return nil, nil, err
 		}
 		base.Kind = "create_shadow_table"
-		base.LockMode = "ACCESS EXCLUSIVE"
+		base.Locks = []LockEvidence{{Schema: m.Schema, Object: m.Schema, Kind: "namespace", Mode: "CREATE", AcquisitionTimeoutMS: r.Migration.Requirements.LockTimeoutMS, Phase: "expand", EstimatedHoldMS: min(100, r.Policy.MaxLockHoldMS), MaximumHoldMS: r.Policy.MaxLockHoldMS, TransactionBoundary: base.TransactionGroup}}
 		base.SQL = "CREATE TABLE " + qi(m.Schema, name) + " ()"
 		base.Postconditions = []Condition{{Kind: "relation_exists", Object: m.Schema + "." + name, Expected: "table"}}
 		return []Step{base}, []Mapping{m}, nil
@@ -362,7 +394,6 @@ func translate(r Request, op zerodowntime.Operation, used map[string]string) ([]
 			return nil, nil, refuse("column %s.%s already exists", op.Table, op.Column)
 		}
 		base.Kind = "add_column"
-		base.LockMode = "ACCESS EXCLUSIVE"
 		base.SQL = "ALTER TABLE " + qtable + " ADD COLUMN " + qi(op.Column) + " " + op.DataType
 		base.Postconditions = []Condition{{Kind: "column_exists", Object: table.Schema + "." + table.Name + "." + op.Column, Expected: op.DataType}}
 		if op.SynchronizationMode == "backfill" {
@@ -380,16 +411,20 @@ func translate(r Request, op zerodowntime.Operation, used map[string]string) ([]
 		if op.IndexMode == nil || !op.IndexMode.Concurrent || op.IndexMode.Partitioned || op.IndexMode.BacksConstraint || table.Partitioned {
 			return nil, nil, refuse("concurrent index capability is unavailable for partitioned or constraint-backed objects")
 		}
+		if !r.Snapshot.SchemaCreate[table.Schema] {
+			return nil, nil, refuse("CREATE privilege is required on index schema")
+		}
 		name, m, err := physical(r, op, table.Schema, "index", op.Index, used)
 		if err != nil {
 			return nil, nil, err
 		}
 		base.Kind = "create_index_concurrently"
-		base.LockMode = "SHARE UPDATE EXCLUSIVE"
+		base.Locks = []LockEvidence{{Schema: table.Schema, Object: table.Name, Kind: "relation", Mode: "SHARE UPDATE EXCLUSIVE", AcquisitionTimeoutMS: r.Migration.Requirements.LockTimeoutMS, Phase: "expand", EstimatedHoldMS: min(1000, r.Policy.MaxLockHoldMS), MaximumHoldMS: r.Policy.MaxLockHoldMS, TransactionBoundary: "none"}, {Schema: table.Schema, Object: table.Schema, Kind: "namespace", Mode: "CREATE", AcquisitionTimeoutMS: r.Migration.Requirements.LockTimeoutMS, Phase: "expand", EstimatedHoldMS: min(100, r.Policy.MaxLockHoldMS), MaximumHoldMS: r.Policy.MaxLockHoldMS, TransactionBoundary: "none"}}
 		base.NonTransactional = true
 		base.TableScan = true
 		base.TransactionGroup = "none"
 		base.TransactionBudgetMS = 0
+		base.SessionSetup = []string{"SET search_path=pg_catalog"}
 		base.SQL = "CREATE " + map[bool]string{true: "UNIQUE ", false: ""}[op.Unique] + "INDEX CONCURRENTLY " + qi(table.Schema, name) + " ON " + qtable + " (" + op.Expression + ")"
 		base.Postconditions = []Condition{{Kind: "valid_index", Object: table.Schema + "." + name, Expected: "true"}}
 		if !r.Policy.AllowNonTransactional || !r.Policy.AllowTableScan {
@@ -399,7 +434,7 @@ func translate(r Request, op zerodowntime.Operation, used map[string]string) ([]
 	case zerodowntime.DropColumn, zerodowntime.DropTable, zerodowntime.DropIndex:
 		// Destruction is deliberately deferred to contract; expand records no SQL.
 		base.Kind = "defer_contract"
-		base.LockMode = "NONE"
+		base.Locks = nil
 		base.SQL = ""
 		base.Recovery = "no expand mutation"
 		base.Reversible = op.Kind == zerodowntime.DropIndex
@@ -424,7 +459,6 @@ func translate(r Request, op zerodowntime.Operation, used map[string]string) ([]
 		if !r.Policy.AllowTableScan || !r.Policy.AllowValidationScan {
 			return nil, nil, refuse("not-null backfill or validation scan exceeds policy")
 		}
-		base.LockMode = "ACCESS EXCLUSIVE"
 		base.SQL = "ALTER TABLE " + qtable + " ADD CONSTRAINT " + qi(name) + " CHECK (" + qi(op.Column) + " IS NOT NULL) NOT VALID"
 		base.Handoff = []string{"backfill:" + op.Expression, "ordering:" + strings.Join(op.Ordering.Columns, ","), fmt.Sprintf("batch_size:%d", op.BatchSize), "validate_constraint:" + name}
 		base.Postconditions = []Condition{{Kind: "constraint_exists_not_valid", Object: table.Schema + "." + table.Name + "." + name, Expected: "true"}}
@@ -454,7 +488,6 @@ func translate(r Request, op zerodowntime.Operation, used map[string]string) ([]
 		if !r.Policy.AllowTableScan {
 			return nil, nil, refuse("shadow backfill table scan exceeds policy")
 		}
-		base.LockMode = "ACCESS EXCLUSIVE"
 		base.SQL = "ALTER TABLE " + qtable + " ADD COLUMN " + qi(name) + " " + typ
 		base.Handoff = []string{"source:" + op.Column, "transform:" + op.Expression, "ordering:" + strings.Join(op.Ordering.Columns, ","), fmt.Sprintf("batch_size:%d", op.BatchSize)}
 		base.Postconditions = []Condition{{Kind: "column_exists", Object: table.Schema + "." + table.Name + "." + name, Expected: typ}}

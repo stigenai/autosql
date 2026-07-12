@@ -27,7 +27,7 @@ func addNoneEffects() zerodowntime.PhaseEffect {
 	return e
 }
 func base(m zerodowntime.Migration) Request {
-	return Request{Migration: m, ExpectedFingerprint: "sha256:live", Target: "primary", Environment: "prod", Snapshot: Snapshot{Fingerprint: "sha256:live", Target: "primary", Environment: "prod", PostgresMajor: 16, Tables: map[string]Table{"users": {Schema: "public", Name: "users", Owner: "app", CanAlter: true, Columns: map[string]Column{"id": {Name: "id", Type: "bigint"}, "name": {Name: "name", Type: "text", Nullable: true}}}}, Indexes: map[string]Index{}, Mappings: map[string]Mapping{}, Schemas: []string{"public"}, SchemaCreate: map[string]bool{"public": true}, ExistingObjects: map[string]string{}, UniqueEvidence: map[string]UniqueEvidence{"users_pkey": {Name: "users_pkey", Table: "users", Columns: []string{"id"}, Constraint: true, Valid: true, Ready: true}}}, Policy: Policy{MaxLockMS: 100, MaxStatementMS: 10000, MaxTransactionMS: 10000, AllowTableScan: true, AllowValidationScan: true, AllowNonTransactional: true}, Verify: func(zerodowntime.Migration) error { return nil }}
+	return Request{Migration: m, ExpectedFingerprint: "sha256:live", Target: "primary", Environment: "prod", Snapshot: Snapshot{Fingerprint: "sha256:live", Target: "primary", Environment: "prod", PostgresMajor: 16, Tables: map[string]Table{"users": {Schema: "public", Name: "users", Owner: "app", CanAlter: true, Columns: map[string]Column{"id": {Name: "id", Type: "bigint"}, "name": {Name: "name", Type: "text", Nullable: true}}}}, Indexes: map[string]Index{}, Mappings: map[string]Mapping{}, Schemas: []string{"public"}, SchemaCreate: map[string]bool{"public": true}, ExistingObjects: map[string]string{}, UniqueEvidence: map[string]UniqueEvidence{"users_pkey": {Name: "users_pkey", Table: "users", Columns: []string{"id"}, Constraint: true, Valid: true, Ready: true}}}, Policy: Policy{MaxLockMS: 100, MaxLockHoldMS: 1000, MaxStatementMS: 10000, MaxTransactionMS: 10000, AllowTableScan: true, AllowValidationScan: true, AllowNonTransactional: true}, Verify: func(zerodowntime.Migration) error { return nil }}
 }
 
 func TestBuildAdditiveAndBreakingPlans(t *testing.T) {
@@ -78,6 +78,7 @@ func TestBuildRefusesBeforeProducingPartialPlan(t *testing.T) {
 			x.Partitioned = true
 			r.Snapshot.Tables["users"] = x
 		},
+		func(r *Request) { r.Snapshot.SchemaCreate["public"] = false },
 	}
 	for i, mut := range cases {
 		x := r
@@ -160,11 +161,13 @@ func TestTrustedPlanRejectsEveryMaterialTamper(t *testing.T) {
 	if err = p.VerifyTrusted(r, pub); err != nil {
 		t.Fatal(err)
 	}
-	mutations := []func(*Plan){func(x *Plan) { x.Target = "evil" }, func(x *Plan) { x.Steps[0].SQL = "DROP TABLE users" }, func(x *Plan) { x.Steps[0].LockMode = "NONE" }, func(x *Plan) { x.Steps[0].TableScan = true }, func(x *Plan) { x.Steps[0].LockBudgetMS++ }, func(x *Plan) { x.Steps[0].Preconditions[0].Expected = "stale" }, func(x *Plan) { x.Mappings = append(x.Mappings, Mapping{OperationID: "x"}) }, func(x *Plan) { x.Attestation.Signature = "AAAA" }}
+	mutations := []func(*Plan){func(x *Plan) { x.Target = "evil" }, func(x *Plan) { x.Steps[0].SQL = "DROP TABLE users" }, func(x *Plan) { x.Steps[0].Locks[0].Mode = "NONE" }, func(x *Plan) { x.Steps[0].TableScan = true }, func(x *Plan) { x.Steps[0].Locks[0].AcquisitionTimeoutMS++ }, func(x *Plan) { x.Steps[0].Locks[0].MaximumHoldMS++ }, func(x *Plan) { x.Steps[0].SessionSetup[0] = "SET search_path=attacker,pg_catalog" }, func(x *Plan) { x.Steps[0].Preconditions[0].Expected = "stale" }, func(x *Plan) { x.Mappings = append(x.Mappings, Mapping{OperationID: "x"}) }, func(x *Plan) { x.Attestation.Signature = "AAAA" }, func(x *Plan) { x.Attestation.KeyID = "other" }, func(x *Plan) { x.Attestation.Algorithm = "evil" }}
 	for i, mut := range mutations {
 		x := p
 		x.Steps = append([]Step(nil), p.Steps...)
 		x.Steps[0].Preconditions = append([]Condition(nil), p.Steps[0].Preconditions...)
+		x.Steps[0].Locks = append([]LockEvidence(nil), p.Steps[0].Locks...)
+		x.Steps[0].SessionSetup = append([]string(nil), p.Steps[0].SessionSetup...)
 		x.Mappings = append([]Mapping(nil), p.Mappings...)
 		a := *p.Attestation
 		x.Attestation = &a
@@ -181,6 +184,24 @@ func TestTrustedPlanRejectsEveryMaterialTamper(t *testing.T) {
 	x.Digest = digest(x)
 	if err = x.Validate(); !errors.Is(err, ErrRefused) {
 		t.Fatal("structural DROP accepted")
+	}
+}
+
+func TestStructuredLockEvidenceSeparatesAcquisitionAndHold(t *testing.T) {
+	op := zerodowntime.Operation{ID: "01", Kind: zerodowntime.AddColumn, Table: "users", Column: "email", DataType: "text", SynchronizationMode: "none", Effects: addNoneEffects(), Reversal: zerodowntime.Reversal{Mode: "automatic"}}
+	r := base(migration(t, []zerodowntime.Operation{op}))
+	r.Policy.MaxLockMS = 50
+	r.Policy.MaxLockHoldMS = 700
+	p, err := Build(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := p.Steps[0].Locks[0]
+	if l.AcquisitionTimeoutMS != 50 || l.MaximumHoldMS != 700 || l.EstimatedHoldMS > l.MaximumHoldMS || l.TransactionBoundary != p.Steps[0].TransactionGroup {
+		t.Fatalf("lock=%+v", l)
+	}
+	if len(p.PlanningLocks) < 2 || p.PlanningLocks[0].Phase != "planning" {
+		t.Fatalf("planning locks=%+v", p.PlanningLocks)
 	}
 }
 

@@ -29,6 +29,7 @@ func runMigrateExpandPlan(parent context.Context, args []string, o output, redac
 	environment := fs.String("env", "", "environment identity")
 	expected := fs.String("expected-fingerprint", "", "required live fingerprint")
 	maxLock := fs.Int("max-lock-ms", 5000, "maximum lock duration")
+	maxLockHold := fs.Int("max-lock-hold-ms", 5000, "maximum lock hold duration")
 	maxStatement := fs.Int("max-statement-ms", 300000, "maximum statement duration")
 	maxTx := fs.Int("max-transaction-ms", 300000, "maximum transaction duration")
 	allowScan := fs.Bool("allow-table-scan", false, "allow table scans")
@@ -96,7 +97,7 @@ func runMigrateExpandPlan(parent context.Context, args []string, o output, redac
 	if err != nil {
 		return &Error{Kind: "validation", Message: redactor.String(err.Error()), Code: ExitValidation, Cause: err}
 	}
-	req := expandplan.Request{Migration: m, Snapshot: snap, ExpectedFingerprint: *expected, Target: *target, Environment: *environment, Policy: expandplan.Policy{MaxLockMS: *maxLock, MaxStatementMS: *maxStatement, MaxTransactionMS: *maxTx, AllowRewrite: *allowRewrite, AllowTableScan: *allowScan, AllowValidationScan: *allowValidation, AllowNonTransactional: *allowNonTx, AllowMaintenanceRequired: *allowMaintenance}, Verify: func(x zerodowntime.Migration) error { return x.Verify(ed25519.PublicKey(kb)) }, PlanKeyID: *planKeyID, PlanSigner: ed25519.PrivateKey(planKey)}
+	req := expandplan.Request{Migration: m, Snapshot: snap, ExpectedFingerprint: *expected, Target: *target, Environment: *environment, Policy: expandplan.Policy{MaxLockMS: *maxLock, MaxLockHoldMS: *maxLockHold, MaxStatementMS: *maxStatement, MaxTransactionMS: *maxTx, AllowRewrite: *allowRewrite, AllowTableScan: *allowScan, AllowValidationScan: *allowValidation, AllowNonTransactional: *allowNonTx, AllowMaintenanceRequired: *allowMaintenance}, Verify: func(x zerodowntime.Migration) error { return x.Verify(ed25519.PublicKey(kb)) }, PlanKeyID: *planKeyID, PlanSigner: ed25519.PrivateKey(planKey)}
 	p, err := expandplan.Build(req)
 	if err != nil {
 		return &Error{Kind: "validation", Message: redactor.String(err.Error()), Code: ExitValidation, Cause: err}
@@ -104,5 +105,15 @@ func runMigrateExpandPlan(parent context.Context, args []string, o output, redac
 	if err = p.VerifyTrusted(req, ed25519.PrivateKey(planKey).Public().(ed25519.PublicKey)); err != nil {
 		return &Error{Kind: "validation", Message: "generated plan attestation verification failed", Code: ExitValidation, Cause: err}
 	}
-	return o.success(p, fmt.Sprintf("expand plan %s: %d read-only planned steps for %s/%s", p.Digest, len(p.Steps), p.Target, p.Environment))
+	var human strings.Builder
+	fmt.Fprintf(&human, "expand plan %s: %d read-only planned steps for %s/%s", p.Digest, len(p.Steps), p.Target, p.Environment)
+	for _, l := range p.PlanningLocks {
+		fmt.Fprintf(&human, "\nplanning lock %s.%s %s acquire<=%dms hold~%dms<=%dms tx=%s", l.Schema, l.Object, l.Mode, l.AcquisitionTimeoutMS, l.EstimatedHoldMS, l.MaximumHoldMS, l.TransactionBoundary)
+	}
+	for _, s := range p.Steps {
+		for _, l := range s.Locks {
+			fmt.Fprintf(&human, "\nstep %d %s lock %s.%s %s acquire<=%dms hold~%dms<=%dms tx=%s", s.Ordinal, s.OperationID, l.Schema, l.Object, l.Mode, l.AcquisitionTimeoutMS, l.EstimatedHoldMS, l.MaximumHoldMS, l.TransactionBoundary)
+		}
+	}
+	return o.success(p, human.String())
 }
