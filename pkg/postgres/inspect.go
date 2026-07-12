@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path"
 	"strings"
+	"time"
 
 	"autosql/pkg/plugin"
 	"autosql/pkg/schema"
@@ -16,7 +17,9 @@ import (
 )
 
 type inspector struct {
-	conn      *pgx.Conn
+	conn interface {
+		Query(context.Context, string, ...any) (pgx.Rows, error)
+	}
 	resources []schema.Resource
 	byOID     map[uint32]string
 	schemas   map[string]string
@@ -35,6 +38,46 @@ func inspect(ctx context.Context, req plugin.InspectRequest) (schema.Document, e
 }
 
 func inspectConn(ctx context.Context, conn *pgx.Conn, req plugin.InspectRequest) (schema.Document, error) {
+	if conn.PgConn().TxStatus() != 'I' {
+		return schema.Document{}, errors.New("inspect PostgreSQL database: connection must be idle")
+	}
+	var last error
+	for attempt := 0; attempt < 5; attempt++ {
+		tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+		if err != nil {
+			return schema.Document{}, err
+		}
+		doc, inspectErr := inspectSnapshot(ctx, tx, req)
+		rollbackErr := tx.Rollback(context.WithoutCancel(ctx))
+		if inspectErr == nil {
+			if rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
+				return schema.Document{}, rollbackErr
+			}
+			return doc, nil
+		}
+		last = inspectErr
+		if !transientCatalogOID(inspectErr) || attempt == 4 {
+			return schema.Document{}, inspectErr
+		}
+		timer := time.NewTimer(time.Duration(attempt+1) * 5 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return schema.Document{}, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return schema.Document{}, last
+}
+
+func transientCatalogOID(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "XX000" && (strings.Contains(pgErr.Message, "could not open relation with OID") || strings.Contains(pgErr.Message, "cache lookup failed for"))
+}
+
+func inspectSnapshot(ctx context.Context, conn interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+}, req plugin.InspectRequest) (schema.Document, error) {
 	i := &inspector{conn: conn, byOID: map[uint32]string{}, schemas: map[string]string{}}
 	steps := []struct {
 		resource, privilege string
@@ -148,8 +191,19 @@ func classify(resource, privilege, dsn string, err error) error {
 	if errors.As(err, &pe) && pe.Code == "42501" {
 		return &PermissionError{Resource: resource, Privilege: privilege, Cause: pe}
 	}
+	if transientCatalogOID(err) {
+		return &catalogOIDError{message: safeError("inspect "+resource, dsn, err).Error(), cause: pe}
+	}
 	return safeError("inspect "+resource, dsn, err)
 }
+
+type catalogOIDError struct {
+	message string
+	cause   error
+}
+
+func (e *catalogOIDError) Error() string { return e.message }
+func (e *catalogOIDError) Unwrap() error { return e.cause }
 
 func (i *inspector) add(kind schema.Kind, name schema.Name, spec any, deps []schema.Dependency, comment *string) string {
 	b, _ := json.Marshal(spec)
