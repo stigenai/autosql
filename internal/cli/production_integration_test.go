@@ -17,6 +17,7 @@ import (
 	"autosql/pkg/executor"
 	"autosql/pkg/guardrail"
 	"autosql/pkg/plan"
+	"autosql/pkg/planedit"
 	"autosql/pkg/postgres"
 	"autosql/pkg/precheck"
 	"autosql/pkg/schema"
@@ -57,6 +58,10 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 	if url == "" {
 		t.Skip("AUTOSQL_TEST_POSTGRES_URL unset")
 	}
+	devURL := os.Getenv("AUTOSQL_DEV_TEST_URL")
+	if devURL == "" {
+		t.Skip("AUTOSQL_DEV_TEST_URL unset")
+	}
 	ctx := context.Background()
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -67,7 +72,7 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 	releaseAt := time.Now().UTC().Add(5 * time.Minute)
 	dir := t.TempDir()
 	name := "autosql_prod_" + strings.ToLower(time.Now().Format("150405000000"))
-	cfg := applyConfig{DatabaseURL: "env://AUTOSQL_PROD_TEST_URL", Environment: "test", DatabaseIdentity: "prod-test", SourceRevision: "test-rev", KeyID: "test-key", PublicKey: base64.RawStdEncoding.EncodeToString(pub), Issuer: "test-issuer", Signer: "test-signer", Author: "author", Requester: "requester", ApprovalAuditPath: filepath.Join(dir, "approval.jsonl"), LifecycleAuditPath: filepath.Join(dir, "lifecycle.jsonl"), ArtifactDirectory: dir, PostgresVersion: 15, Schemas: []string{name}, ExpectedPlanDigest: "pending", ExpectedChecksDigest: "pending", ExpectedGuardrailDigest: "pending", ExpectedApprovalIdentity: "release", KeyStatus: "active", KeyPurpose: "plan-artifact", KeyNotBefore: time.Now().UTC().Add(-time.Hour), KeyNotAfter: time.Now().UTC().Add(2 * time.Hour), EditorIdentity: "editor", EditSigningKeyID: "edit-key", EditSigningKeyReference: "env://AUTOSQL_EDIT_TEST_KEY", DevelopmentURLReference: "env://AUTOSQL_PROD_TEST_URL", FreshApprovalIdentity: "fresh-approver", FreshApprovalAt: releaseAt, EditReleaseCreatedAt: releaseAt, EditReleaseExpiresAt: releaseAt.Add(time.Hour)}
+	cfg := applyConfig{DatabaseURL: "env://AUTOSQL_PROD_TEST_URL", Environment: "test", DatabaseIdentity: "prod-test", SourceRevision: "test-rev", KeyID: "test-key", PublicKey: base64.RawStdEncoding.EncodeToString(pub), Issuer: "test-issuer", Signer: "test-signer", Author: "author", Requester: "requester", ApprovalAuditPath: filepath.Join(dir, "approval.jsonl"), LifecycleAuditPath: filepath.Join(dir, "lifecycle.jsonl"), ArtifactDirectory: dir, PostgresVersion: 15, Schemas: []string{name}, ExpectedPlanDigest: "pending", ExpectedChecksDigest: "pending", ExpectedGuardrailDigest: "pending", ExpectedApprovalIdentity: "release", KeyStatus: "active", KeyPurpose: "plan-artifact", KeyNotBefore: time.Now().UTC().Add(-time.Hour), KeyNotAfter: time.Now().UTC().Add(2 * time.Hour), EditorIdentity: "editor", EditSigningKeyID: "edit-key", EditSigningKeyReference: "env://AUTOSQL_EDIT_TEST_KEY", DevelopmentURLReference: "env://AUTOSQL_DEV_TEST_URL", FreshApprovalIdentity: "fresh-approver", FreshApprovalAt: releaseAt, EditReleaseCreatedAt: releaseAt, EditReleaseExpiresAt: releaseAt.Add(time.Hour)}
 	raw, _ := json.Marshal(cfg)
 	configPath := filepath.Join(dir, "apply.json")
 	if err = os.WriteFile(configPath, raw, 0600); err != nil {
@@ -75,6 +80,7 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 	}
 	t.Setenv("AUTOSQL_APPLY_CONFIG", configPath)
 	t.Setenv("AUTOSQL_PROD_TEST_URL", url)
+	t.Setenv("AUTOSQL_DEV_TEST_URL", devURL)
 	t.Setenv("AUTOSQL_EDIT_TEST_KEY", base64.RawStdEncoding.EncodeToString(editPriv))
 	services, err := ProductionServices()
 	if err != nil {
@@ -160,6 +166,28 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 	code, out, _ = invoke(t, []string{"plan", "revalidate", "--draft", draftPath, "--output", attestedPath, "--json"}, "", false, services)
 	if code != 0 {
 		t.Fatalf("revalidate code=%d out=%s", code, out)
+	}
+	attestedRaw, err := os.ReadFile(attestedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tampered planedit.Eligible
+	if err = json.Unmarshal(attestedRaw, &tampered); err != nil {
+		t.Fatal(err)
+	}
+	tampered.GuardrailDigest = "sha256:" + strings.Repeat("f", 64)
+	tamperedRaw, _ := json.Marshal(tampered)
+	tamperedPath := filepath.Join(dir, "tampered-attested.json")
+	if err = os.WriteFile(tamperedPath, tamperedRaw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	tamperedOutput := filepath.Join(dir, "must-not-publish.json")
+	code, _, _ = invoke(t, []string{"plan", "publish", "--attested", tamperedPath, "--output", tamperedOutput, "--json"}, "", false, services)
+	if code == 0 {
+		t.Fatal("tampered eligibility published")
+	}
+	if _, err = os.Stat(tamperedOutput); !os.IsNotExist(err) {
+		t.Fatalf("tampered publish created output: %v", err)
 	}
 	publishedPath := filepath.Join(dir, "published.json")
 	code, out, _ = invoke(t, []string{"plan", "publish", "--attested", attestedPath, "--output", publishedPath, "--json"}, "", false, services)

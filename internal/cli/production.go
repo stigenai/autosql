@@ -22,6 +22,7 @@ import (
 	"autosql/pkg/safety"
 	"autosql/pkg/schema"
 	"autosql/pkg/secret"
+	"autosql/pkg/simulate"
 )
 
 type applyConfig struct {
@@ -152,7 +153,18 @@ func productionServices(connector executor.Connector) (Services, error) {
 		if resolveErr != nil {
 			return Services{}, errors.New("resolve edit development URL")
 		}
-		editService = &productionEditService{editor: c.EditorIdentity, policyFor: policyFor, g: g, input: input, url: url, developmentURL: devURL, revision: c.SourceRevision, environment: c.Environment, database: c.DatabaseIdentity, keyID: c.EditSigningKeyID, version: c.PostgresVersion, private: private, approval: artifact.Approval{Identity: c.FreshApprovalIdentity, ApprovedAt: c.FreshApprovalAt.UTC()}, created: c.EditReleaseCreatedAt.UTC(), expires: c.EditReleaseExpiresAt.UTC(), audit: &executor.FileAudit{Path: c.LifecycleAuditPath}, schemas: append([]string(nil), c.Schemas...)}
+		targetID, identityErr := simulate.ResolvePostgresIdentity(context.Background(), url)
+		if identityErr != nil {
+			return Services{}, errors.New("resolve edit target identity")
+		}
+		devID, identityErr := simulate.ResolvePostgresIdentity(context.Background(), devURL)
+		if identityErr != nil {
+			return Services{}, errors.New("resolve edit development identity")
+		}
+		if targetID == devID {
+			return Services{}, errors.New("edit development database must be distinct from target")
+		}
+		editService = &productionEditService{editor: c.EditorIdentity, policyFor: policyFor, g: g, input: input, url: url, targetIdentity: targetID, developmentURL: devURL, developmentIdentity: devID, revision: c.SourceRevision, environment: c.Environment, database: c.DatabaseIdentity, keyID: c.EditSigningKeyID, version: c.PostgresVersion, private: private, approval: artifact.Approval{Identity: c.FreshApprovalIdentity, ApprovedAt: c.FreshApprovalAt.UTC()}, created: c.EditReleaseCreatedAt.UTC(), expires: c.EditReleaseExpiresAt.UTC(), audit: &executor.FileAudit{Path: c.LifecycleAuditPath}, schemas: append([]string(nil), c.Schemas...)}
 	}
 	return Services{ReadPlan: DefaultReadPlan{}, Apply: resolvingApply{verified: verified, directory: c.ArtifactDirectory}, PlanEdit: editService}, nil
 }

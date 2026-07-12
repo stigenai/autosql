@@ -4,6 +4,7 @@ import (
 	"autosql/pkg/artifact"
 	"autosql/pkg/plan"
 	"autosql/pkg/precheck"
+	"autosql/pkg/schema"
 	"autosql/pkg/source"
 	"context"
 	"crypto/sha256"
@@ -13,6 +14,7 @@ import (
 	"fmt"
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 	"google.golang.org/protobuf/encoding/protojson"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -59,6 +61,9 @@ func parse(file, sql string) ([]source.Statement, error) {
 		if n.GetTransactionStmt() != nil || n.GetVariableSetStmt() != nil || n.GetCopyStmt() != nil || n.GetCreateRoleStmt() != nil || n.GetAlterRoleStmt() != nil || n.GetAlterRoleSetStmt() != nil || n.GetDropRoleStmt() != nil || n.GetGrantRoleStmt() != nil || n.GetLockStmt() != nil || n.GetListenStmt() != nil || n.GetNotifyStmt() != nil {
 			return nil, fmt.Errorf("%w: session, transaction, role, lock, or COPY statement", ErrInvalid)
 		}
+		if n.GetCreateStmt() == nil && n.GetAlterTableStmt() == nil && n.GetIndexStmt() == nil && n.GetDropStmt() == nil && n.GetRenameStmt() == nil && n.GetViewStmt() == nil && n.GetCreateSchemaStmt() == nil {
+			return nil, fmt.Errorf("%w: only supported declarative DDL is editable", ErrInvalid)
+		}
 		pb, _ := protojson.Marshal(n)
 		lower := strings.ToLower(string(pb) + " " + ss[i].SQL)
 		for _, bad := range []string{"pg_advisory", "autosql_migration_history", "search_path", "session_authorization", "autosql_audit"} {
@@ -68,6 +73,51 @@ func parse(file, sql string) ([]source.Statement, error) {
 		}
 	}
 	return ss, nil
+}
+
+func bindDDL(e EditedArtifact) error {
+	steps := make([]plan.Step, 0)
+	for _, s := range e.CandidatePlan.Steps {
+		if s.Kind == plan.StepExecutable {
+			steps = append(steps, s)
+		}
+	}
+	ss, err := source.SplitSQL("edited.sql", e.EditedSQL)
+	if err != nil || len(ss) != len(steps) {
+		return fmt.Errorf("%w: statement/change cardinality", ErrInvalid)
+	}
+	changes := map[string]schema.Change{}
+	for _, c := range e.CandidatePlan.Changes.Changes {
+		changes[c.ID] = c
+	}
+	for i, st := range ss {
+		c, ok := changes[steps[i].ChangeID]
+		if !ok {
+			return ErrInvalid
+		}
+		r := c.After
+		if r == nil {
+			r = c.Before
+		}
+		if r == nil {
+			return ErrInvalid
+		}
+		lower := strings.ToLower(st.SQL)
+		keyword := map[schema.Operation]string{schema.OperationCreate: "create", schema.OperationAlter: "alter", schema.OperationDrop: "drop", schema.OperationRename: "rename"}[c.Operation]
+		if keyword == "" || !strings.Contains(lower, keyword) {
+			return fmt.Errorf("%w: DDL operation mismatch", ErrInvalid)
+		}
+		// Require every qualified object component to be present in the parsed
+		// statement. This prevents rebinding an approved change to another object.
+		for _, part := range strings.Split(strings.ToLower(r.Name.String()), ".") {
+			part = strings.Trim(part, `"`)
+			matched, _ := regexp.MatchString(`(^|[^a-z0-9_])`+regexp.QuoteMeta(part)+`([^a-z0-9_]|$)`, lower)
+			if part != "" && !matched {
+				return fmt.Errorf("%w: DDL object mismatch", ErrInvalid)
+			}
+		}
+	}
+	return nil
 }
 func New(raw []byte, a artifact.Artifact, sql, file string, editor Editor) (EditedArtifact, error) {
 	if len(raw) == 0 {
@@ -109,6 +159,9 @@ func edit(e EditedArtifact, sql, file string, editor Editor) (EditedArtifact, er
 	r.Digest = provHash("record", js(r))
 	e.CandidatePlan = candidate
 	e.EditedSQL = sql
+	if err := bindDDL(e); err != nil {
+		return EditedArtifact{}, err
+	}
 	e.Provenance = append(append([]artifact.EditRecord(nil), e.Provenance...), r)
 	e.Digest = hash("draft", js(struct {
 		Original []byte
@@ -146,7 +199,10 @@ func (e EditedArtifact) Validate() error {
 		return ErrInvalid
 	}
 	_, err = parse("edited.sql", e.EditedSQL)
-	return err
+	if err != nil {
+		return err
+	}
+	return bindDDL(e)
 }
 
 type Simulator interface {
@@ -159,9 +215,10 @@ type Binder interface {
 	Bind(context.Context, plan.Plan) (precheck.Plan, string, error)
 }
 type Pipeline struct {
-	Simulator Simulator
-	Safety    Safety
-	Binder    Binder
+	Simulator     Simulator
+	Safety        Safety
+	Binder        Binder
+	ContextDigest string
 }
 type Eligible struct {
 	Edit                              EditedArtifact
@@ -200,7 +257,7 @@ func (p Pipeline) Revalidate(ctx context.Context, e EditedArtifact) (Eligible, e
 	}
 	now := time.Now().UTC()
 	mk := func(stage, impl, result string) artifact.ValidationAttestation {
-		return artifact.ValidationAttestation{Stage: stage, Implementation: impl, Version: "1", ConfigDigest: hash("config", []byte(impl)), ResultDigest: result, At: now}
+		return artifact.ValidationAttestation{Stage: stage, Implementation: impl, Version: "1", ConfigDigest: hash("config", []byte(impl+"\x00"+p.ContextDigest)), ResultDigest: result, At: now, ExpiresAt: now.Add(time.Hour)}
 	}
 	return Eligible{Edit: e, Checks: checks, GuardrailDigest: bundle, FinalFingerprint: fp, Attestations: []artifact.ValidationAttestation{mk("parse_rebind", "pg_query_go/v6+autosql/plan", rebuilt.Digest), mk("simulation", fmt.Sprintf("%T", p.Simulator), fp), mk("safety", fmt.Sprintf("%T", p.Safety), hash("safety", []byte(rebuilt.Digest))), mk("policy_precheck_guardrail", fmt.Sprintf("%T", p.Binder), bundle)}}, nil
 }
@@ -216,6 +273,7 @@ func (e Eligible) FreshArtifact(created, expires time.Time, revision, environmen
 	sig, _ := json.Marshal(orig.Signature)
 	candidate, _ := e.Edit.CandidatePlan.MarshalCanonical()
 	a.EditProvenance = &artifact.EditProvenance{Version: "autosql.edit-provenance/v1", OriginalArtifact: append([]byte(nil), e.Edit.OriginalGeneratedArtifact...), OriginalLength: len(e.Edit.OriginalGeneratedArtifact), OriginalBytesDigest: provHash("original-bytes", e.Edit.OriginalGeneratedArtifact), OriginalArtifactDigest: orig.Digest, OriginalPlanDigest: orig.Plan.Digest, OriginalSignatureDigest: provHash("signature", sig), CandidatePlanDigest: a.Plan.Digest, CandidateBytesDigest: provHash("candidate", candidate), ChainDigest: e.Edit.Provenance[len(e.Edit.Provenance)-1].Digest, Records: append([]artifact.EditRecord(nil), e.Edit.Provenance...), Attestations: append([]artifact.ValidationAttestation(nil), e.Attestations...)}
+	a.MarkEditedOrigin("autosql/controlled-plan-editor/v1")
 	if err = a.ResetAuthorization(); err != nil {
 		return a, err
 	}

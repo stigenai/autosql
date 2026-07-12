@@ -66,6 +66,7 @@ type ValidationAttestation struct {
 	ConfigDigest   string    `json:"config_digest"`
 	ResultDigest   string    `json:"result_digest"`
 	At             time.Time `json:"at"`
+	ExpiresAt      time.Time `json:"expires_at"`
 }
 type EditProvenance struct {
 	Version                 string                  `json:"version"`
@@ -80,6 +81,12 @@ type EditProvenance struct {
 	ChainDigest             string                  `json:"chain_digest"`
 	Records                 []EditRecord            `json:"records"`
 	Attestations            []ValidationAttestation `json:"attestations"`
+}
+type ArtifactOrigin struct {
+	Kind          string `json:"kind"`
+	PlanDigest    string `json:"plan_digest"`
+	Generator     string `json:"generator"`
+	GeneratorHash string `json:"generator_hash"`
 }
 type Artifact struct {
 	Version           string            `json:"version"`
@@ -96,8 +103,9 @@ type Artifact struct {
 	Digest            string            `json:"digest"`
 	Signature         Signature         `json:"signature"`
 	EditProvenance    *EditProvenance   `json:"edit_provenance,omitempty"`
+	Origin            ArtifactOrigin    `json:"origin"`
 }
-type ExpectedBindings struct{ PlanDigest, ChecksDigest, GuardrailDigest, SourceRevision, Environment, DatabaseIdentity, ApprovalIdentity string }
+type ExpectedBindings struct{ PlanDigest, ChecksDigest, GuardrailDigest, SourceRevision, Environment, DatabaseIdentity, ApprovalIdentity, GeneratedPlanDigest string }
 type KeyRecord struct {
 	PublicKey                                      ed25519.PublicKey
 	Issuer, Identity, Environment, Purpose, Status string
@@ -130,7 +138,8 @@ func (v VerifiedArtifact) forRegistry() (Artifact, error) {
 }
 
 func New(p plan.Plan, checks precheck.Plan, created, expires time.Time, revision, environment, databaseIdentity, guardrailDigest string, approval Approval, metadata map[string]string) (Artifact, error) {
-	a := Artifact{Version: Version, Plan: p, Checks: checks, CreatedAt: created.UTC(), ExpiresAt: expires.UTC(), SourceRevision: revision, TargetEnvironment: environment, DatabaseIdentity: databaseIdentity, Approval: approval, GuardrailDigest: guardrailDigest, Metadata: clone(metadata)}
+	a := Artifact{Version: Version, Plan: p, Checks: checks, CreatedAt: created.UTC(), ExpiresAt: expires.UTC(), SourceRevision: revision, TargetEnvironment: environment, DatabaseIdentity: databaseIdentity, Approval: approval, GuardrailDigest: guardrailDigest, Metadata: clone(metadata), Origin: ArtifactOrigin{Kind: "generated", PlanDigest: p.Digest, Generator: "autosql/" + plan.PlannerVersion}}
+	a.Origin.GeneratorHash = originHash(a.Origin)
 	d, err := digest(a)
 	a.Digest = d
 	return a, err
@@ -159,6 +168,10 @@ func (a *Artifact) ResetAuthorization() error {
 	a.Digest = d
 	return err
 }
+func (a *Artifact) MarkEditedOrigin(generator string) {
+	a.Origin = ArtifactOrigin{Kind: "edited", PlanDigest: a.Plan.Digest, Generator: generator}
+	a.Origin.GeneratorHash = originHash(a.Origin)
+}
 func (a Artifact) Verify(keys map[string]ed25519.PublicKey, now time.Time) error {
 	return fail("trusted_policy_required", ErrInvalid)
 }
@@ -167,7 +180,11 @@ func (a Artifact) VerifyTrusted(policy VerifyPolicy) (VerifiedArtifact, error) {
 		return VerifiedArtifact{}, fail("policy", ErrInvalid)
 	}
 	now := policy.Now().UTC()
-	if policy.NoEdits && a.EditProvenance != nil {
+	generated := policy.Expected.GeneratedPlanDigest
+	if generated == "" {
+		generated = policy.Expected.PlanDigest
+	}
+	if policy.NoEdits && (a.EditProvenance != nil || a.Origin.Kind != "generated" || generated == "" || a.Origin.PlanDigest != generated || a.Plan.Digest != generated) {
 		return VerifiedArtifact{}, fail("edits_forbidden", ErrInvalid)
 	}
 	if err := a.validateUnsigned(); err != nil {
@@ -232,7 +249,7 @@ func (a Artifact) VerifyTrusted(policy VerifyPolicy) (VerifiedArtifact, error) {
 	return v, nil
 }
 func (a Artifact) validateUnsigned() error {
-	if a.Version != Version || a.SourceRevision == "" || a.TargetEnvironment == "" || a.DatabaseIdentity == "" || a.GuardrailDigest == "" || a.Approval.Identity == "" || a.Metadata == nil || a.CreatedAt.IsZero() || !a.ExpiresAt.After(a.CreatedAt) || a.Approval.ApprovedAt.IsZero() || a.Approval.ApprovedAt.After(a.CreatedAt) || a.CreatedAt.Location() != time.UTC || a.ExpiresAt.Location() != time.UTC || a.Approval.ApprovedAt.Location() != time.UTC {
+	if a.Version != Version || a.SourceRevision == "" || a.TargetEnvironment == "" || a.DatabaseIdentity == "" || a.GuardrailDigest == "" || a.Approval.Identity == "" || a.Metadata == nil || a.CreatedAt.IsZero() || !a.ExpiresAt.After(a.CreatedAt) || a.Approval.ApprovedAt.IsZero() || a.Approval.ApprovedAt.After(a.CreatedAt) || a.CreatedAt.Location() != time.UTC || a.ExpiresAt.Location() != time.UTC || a.Approval.ApprovedAt.Location() != time.UTC || (a.Origin.Kind != "generated" && a.Origin.Kind != "edited") || a.Origin.PlanDigest != a.Plan.Digest || a.Origin.Generator == "" || a.Origin.GeneratorHash != originHash(a.Origin) {
 		return fmt.Errorf("%w: required metadata", ErrInvalid)
 	}
 	if err := a.Plan.Validate(); err != nil {
@@ -251,6 +268,13 @@ func (a Artifact) validateUnsigned() error {
 		return fail("digest_format", ErrInvalid)
 	}
 	return nil
+}
+
+func originHash(o ArtifactOrigin) string {
+	o.GeneratorHash = ""
+	b, _ := json.Marshal(o)
+	s := sha256.Sum256(append([]byte("autosql.artifact.origin/v1\x00"), b...))
+	return "sha256:" + hex.EncodeToString(s[:])
 }
 func editHash(domain string, b []byte) string {
 	s := sha256.Sum256(append([]byte("autosql.edit-provenance."+domain+"/v1\x00"), b...))
@@ -287,7 +311,7 @@ func validateEditProvenance(a Artifact) error {
 		return fail("edit_chain", ErrInvalid)
 	}
 	for _, v := range p.Attestations {
-		if v.Stage == "" || v.Implementation == "" || v.Version == "" || !digestPattern.MatchString(v.ConfigDigest) || !digestPattern.MatchString(v.ResultDigest) || v.At.IsZero() || v.At.Location() != time.UTC {
+		if v.Stage == "" || v.Implementation == "" || v.Version == "" || !digestPattern.MatchString(v.ConfigDigest) || !digestPattern.MatchString(v.ResultDigest) || v.At.IsZero() || v.At.Location() != time.UTC || !v.ExpiresAt.After(v.At) || v.ExpiresAt.Location() != time.UTC {
 			return fail("edit_attestation", ErrInvalid)
 		}
 	}

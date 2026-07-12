@@ -410,3 +410,23 @@ func TestNoEditsPolicyDoesNotTrustForgedMetadataMarker(t *testing.T) {
 		t.Fatalf("metadata marker became edit authority: %v", err)
 	}
 }
+
+func TestNoEditsRequiresSignedGeneratedOrigin(t *testing.T) {
+	a, pub, priv := fixture(t)
+	policy := trustedPolicy(a, pub, a.CreatedAt)
+	policy.NoEdits = true
+	if _, err := a.VerifyTrusted(policy); err != nil {
+		t.Fatalf("generated artifact rejected: %v", err)
+	}
+	a.MarkEditedOrigin("forged-generator")
+	if err := a.Sign("key-1", priv); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.VerifyTrusted(policy); err == nil {
+		t.Fatal("signed edited origin accepted in no-edits mode")
+	}
+	a.Origin = ArtifactOrigin{}
+	if err := a.Sign("key-1", priv); err == nil {
+		t.Fatal("artifact without typed origin signed")
+	}
+}
