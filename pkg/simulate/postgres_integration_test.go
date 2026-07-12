@@ -247,3 +247,39 @@ func TestPostgresCleanupAfterLiveFailureCancelAndMismatch(t *testing.T) {
 		})
 	}
 }
+
+func TestPostgresCancelStressConfirmsOwnedNamespaceAbsent(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	prefix := uniqueSimulationPrefix(t)
+	from, p := liveFixture(t)
+	devIdentity, err := ResolvePostgresIdentity(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const runs = 8
+	errs := make(chan error, runs)
+	var wg sync.WaitGroup
+	for i := 0; i < runs; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+			defer cancel()
+			_, runErr := Run(ctx, liveWrapperFactory{mode: "cancel", prefix: prefix}, Request{Config: Config{DevelopmentURL: url, DevelopmentIdentity: devIdentity, ProductionIdentity: "production.example:5432/prod", CleanupTimeout: 15 * time.Second}, From: from, Plan: p})
+			errs <- runErr
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for runErr := range errs {
+		if runErr == nil {
+			t.Fatal("canceled simulation succeeded")
+		}
+	}
+	if remaining := countSimulationDatabases(t, url, prefix); remaining != 0 {
+		t.Fatalf("prefix=%s remaining=%d", prefix, remaining)
+	}
+}

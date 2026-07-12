@@ -72,7 +72,7 @@ func Run(ctx context.Context, f Factory, req Request) (result Result, err error)
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 		defer cancel()
 		if ce := iso.Cleanup(cleanupCtx); ce != nil {
-			err = errors.Join(err, fail("cleanup", ErrLifecycle))
+			err = errors.Join(err, fail("cleanup", ErrLifecycle), ce)
 		}
 	}()
 	if e = iso.Materialize(ctx, req.From); e != nil {

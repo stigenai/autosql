@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"net"
 	"net/url"
 	"regexp"
@@ -252,16 +253,114 @@ func (p *postgresIsolation) Cleanup(ctx context.Context) error {
 	return cleanupDatabase(ctx, p.adminURL, p.name)
 }
 func cleanupDatabase(ctx context.Context, adminURL, name string) error {
-	conn, e := pgx.Connect(ctx, adminURL)
-	if e != nil {
-		return fail("cleanup_connect", ErrLifecycle)
+	cycle := func(attemptCtx context.Context) (bool, error) {
+		conn, err := pgx.Connect(attemptCtx, adminURL)
+		if err != nil {
+			return false, err
+		}
+		closed := false
+		defer func() {
+			if !closed {
+				_ = conn.Close(attemptCtx)
+			}
+		}()
+		absent, attemptErr := cleanupDatabaseAttempt(attemptCtx,
+			func(ctx context.Context) error {
+				_, execErr := conn.Exec(ctx, "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1 AND pid<>pg_backend_pid()", name)
+				return execErr
+			},
+			func(ctx context.Context) error {
+				_, execErr := conn.Exec(ctx, "DROP DATABASE IF EXISTS "+quote(name))
+				return execErr
+			},
+			func(ctx context.Context) (bool, error) {
+				var exists bool
+				scanErr := conn.QueryRow(ctx, `select exists(select 1 from pg_database where datname=$1)`, name).Scan(&exists)
+				return !exists, scanErr
+			})
+		closeErr := conn.Close(attemptCtx)
+		closed = true
+		if closeErr != nil {
+			attemptErr = errors.Join(attemptErr, closeErr)
+		}
+		if attemptErr != nil {
+			return false, attemptErr
+		}
+		return absent, nil
 	}
-	defer conn.Close(context.Background())
-	_, _ = conn.Exec(ctx, "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1 AND pid<>pg_backend_pid()", name)
-	_, e = conn.Exec(ctx, "DROP DATABASE IF EXISTS "+quote(name))
-	if e != nil {
-		return fail("cleanup_database", ErrLifecycle)
+	if err := cleanupDatabaseCycles(ctx, cycle, sleepCleanupRetry); err != nil {
+		return errors.Join(fail("cleanup_database", ErrLifecycle), err)
 	}
 	return nil
+}
+
+func cleanupDatabaseAttempt(ctx context.Context, terminate func(context.Context) error, drop func(context.Context) error, absent func(context.Context) (bool, error)) (bool, error) {
+	if err := terminate(ctx); err != nil {
+		return false, err
+	}
+	if err := drop(ctx); err != nil {
+		return false, err
+	}
+	return absent(ctx)
+}
+
+type databaseStillPresentError struct{ attempts int }
+
+func (e *databaseStillPresentError) Error() string {
+	return fmt.Sprintf("temporary database still present after cleanup attempt %d", e.attempts)
+}
+
+func transientCleanup(err error) bool {
+	var present *databaseStillPresentError
+	if errors.As(err, &present) {
+		return true
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	switch pgErr.Code {
+	case "55006", "57P03", "53300", "55P03", "40001", "40P01":
+		return true
+	default:
+		return false
+	}
+}
+
+func sleepCleanupRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func cleanupDatabaseCycles(ctx context.Context, cycle func(context.Context) (bool, error), sleep func(context.Context, time.Duration) error) error {
+	const maxAttempts = 12
+	var last error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		absent, err := cycle(ctx)
+		if err == nil && absent {
+			return nil
+		}
+		if err == nil {
+			err = &databaseStillPresentError{attempts: attempt}
+		}
+		last = err
+		if !transientCleanup(err) {
+			return err
+		}
+		if attempt == maxAttempts {
+			break
+		}
+		delay := min(5*time.Millisecond*time.Duration(1<<min(attempt-1, 6)), 250*time.Millisecond)
+		if err = sleep(ctx, delay); err != nil {
+			return errors.Join(last, err)
+		}
+	}
+	return errors.Join(last, &databaseStillPresentError{attempts: maxAttempts})
 }
 func quote(s string) string { return `"` + strings.ReplaceAll(s, `"`, `""`) + `"` }
