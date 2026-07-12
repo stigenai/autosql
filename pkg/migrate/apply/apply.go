@@ -5,6 +5,9 @@ package apply
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -42,6 +45,8 @@ type FileResult struct {
 	Statements            int
 	Duration              time.Duration
 	finalize              func(context.Context, bool) error
+	events                []executor.LifecycleEvent
+	eventIDs              []string
 }
 type Failure struct {
 	Version, File                                 string `json:",omitempty"`
@@ -68,6 +73,7 @@ type Engine struct {
 	Store  SessionStore
 	Verify VerifyArtifact
 	Apply  GuardedApply
+	Drain  func(context.Context, executor.LifecycleEvent) error
 }
 
 func (e Engine) Run(ctx context.Context, r Request) (out Result, err error) {
@@ -103,6 +109,34 @@ func (e Engine) Run(ctx context.Context, r Request) (out Result, err error) {
 	}
 	if !locked {
 		return out, ErrBusy
+	}
+	writers, writerErr := s.LockWriters(ctx)
+	if writerErr != nil || !writers {
+		return out, errors.New("acquire revision writer barrier")
+	}
+	defer func() {
+		if u := s.UnlockWriters(context.WithoutCancel(ctx)); u != nil && err == nil {
+			err = errors.Join(ErrUncertain, u)
+		}
+	}()
+	pending, drainErr := s.PendingOutbox(ctx)
+	if drainErr != nil {
+		return out, drainErr
+	}
+	for _, p := range pending {
+		if e.Drain == nil {
+			return out, fmt.Errorf("%w: lifecycle audit outbox requires configured drain", ErrRefused)
+		}
+		var event executor.LifecycleEvent
+		if json.Unmarshal(p.Payload, &event) != nil {
+			return out, fmt.Errorf("%w: malformed lifecycle outbox", ErrRefused)
+		}
+		if drainErr = e.Drain(ctx, event); drainErr != nil {
+			return out, errors.New("durable lifecycle audit drain failed")
+		}
+		if drainErr = s.FinalizeOutbox(ctx, p.ID); drainErr != nil {
+			return out, drainErr
+		}
 	}
 	defer func() {
 		if u := s.Unlock(context.WithoutCancel(ctx), lockKey); u != nil && err == nil {
@@ -168,7 +202,7 @@ func (e Engine) Run(ctx context.Context, r Request) (out Result, err error) {
 	}
 	started := r.Now()
 	if r.Baseline {
-		err = baseline(ctx, s, candidates, snap.Manifest, r, r.Now, parentGeneration(records))
+		err = baseline(ctx, s, candidates, snap, r, r.Now, parentGeneration(records), e.Verify)
 		if err != nil {
 			return failed(out, nil, err)
 		}
@@ -182,9 +216,9 @@ func (e Engine) Run(ctx context.Context, r Request) (out Result, err error) {
 				return out, fmt.Errorf("%w: all transaction requires transaction=required", ErrRefused)
 			}
 		}
-		err = applyAtomic(ctx, s, candidates, snap.Manifest, r, &out, e.Apply, parentGeneration(records))
+		err = applyAtomic(ctx, s, candidates, snap, r, &out, e.Apply, parentGeneration(records), e.Verify)
 	} else {
-		err = applyPerFile(ctx, s, candidates, snap.Manifest, r, &out, e.Apply, parentGeneration(records))
+		err = applyPerFile(ctx, s, candidates, snap, r, &out, e.Apply, parentGeneration(records), e.Verify)
 	}
 	if err != nil {
 		return out, err
@@ -268,6 +302,27 @@ func stepByID(a artifact.Artifact, id string) plan.Step {
 		}
 	}
 	return plan.Step{}
+}
+func revalidateLocked(ctx context.Context, s *revision.Session, snap migrate.Snapshot, verify VerifyArtifact) error {
+	records, e := s.Revisions(ctx)
+	if e != nil {
+		return e
+	}
+	if len(records) > 0 {
+		h := records[len(records)-1]
+		ok, ae := s.ManifestDescendsFrom(ctx, snap.Manifest, h.ManifestGeneration, h.ManifestDigest)
+		if ae != nil || !ok {
+			return fmt.Errorf("%w: revision state changed before mutation", ErrRefused)
+		}
+	}
+	if _, e = selectTrusted(snap, records, Request{Transaction: "file", Operator: "reconcile"}, verify); e != nil {
+		return e
+	}
+	history, e := s.ExecutorRecords(ctx)
+	if e != nil {
+		return e
+	}
+	return reconcileHistory(snap, records, history, verify)
 }
 func trustedTarget(s migrate.Snapshot, verify VerifyArtifact) (string, string, error) {
 	var db, env string
@@ -459,12 +514,19 @@ func parentGeneration(rs []revision.Revision) string {
 func baseRevision(c candidate, m migrate.Manifest, r Request, at time.Time, state, kind string) revision.Revision {
 	return revision.Revision{Version: c.entry.Version, Description: c.entry.Name, Kind: kind, FileName: c.entry.File, FileDigest: c.entry.SQLDigest, ManifestDigest: m.Digest, ManifestGeneration: m.Generation, ArtifactDigest: c.entry.ArtifactDigest, PlanDigest: c.entry.Directives.PlanDigest, ChecksDigest: c.entry.Directives.CheckDigest, BundleDigest: c.entry.Directives.BundleDigest, State: state, Attempt: 1, Operator: r.Operator, StartedAt: at, UpdatedAt: at, FromVersion: c.payload.Metadata["autosql.migration.from"], ToVersion: c.entry.Version}
 }
-func baseline(ctx context.Context, s *revision.Session, cs []candidate, m migrate.Manifest, r Request, now func() time.Time, parent string) error {
+func baseline(ctx context.Context, s *revision.Session, cs []candidate, snap migrate.Snapshot, r Request, now func() time.Time, parent string, verify VerifyArtifact) error {
+	m := snap.Manifest
 	tx, e := s.Begin(ctx)
 	if e != nil {
 		return e
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
+	if e = s.LockMutationTables(ctx, tx); e != nil {
+		return e
+	}
+	if e = revalidateLocked(ctx, s, snap, verify); e != nil {
+		return e
+	}
 	if e = s.RecordManifest(ctx, tx, m, parent, now()); e != nil {
 		return e
 	}
@@ -483,12 +545,19 @@ func baseline(ctx context.Context, s *revision.Session, cs []candidate, m migrat
 	return tx.Commit(ctx)
 }
 
-func applyAtomic(ctx context.Context, s *revision.Session, cs []candidate, m migrate.Manifest, r Request, out *Result, apply GuardedApply, parent string) error {
+func applyAtomic(ctx context.Context, s *revision.Session, cs []candidate, snap migrate.Snapshot, r Request, out *Result, apply GuardedApply, parent string, verify VerifyArtifact) error {
+	m := snap.Manifest
 	tx, e := s.Begin(ctx)
 	if e != nil {
 		return e
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
+	if e = s.LockMutationTables(ctx, tx); e != nil {
+		return e
+	}
+	if e = revalidateLocked(ctx, s, snap, verify); e != nil {
+		return e
+	}
 	for i, c := range cs {
 		fr, fe := executeGuarded(ctx, s, tx, c, m, r, apply, parent)
 		out.FileResults = append(out.FileResults, fr)
@@ -516,11 +585,17 @@ func applyAtomic(ctx context.Context, s *revision.Session, cs []candidate, m mig
 				out.Failure = &Failure{Recovery: "database committed; repair durable lifecycle audit without rerunning SQL"}
 				return fe
 			}
+			for _, id := range fr.eventIDs {
+				if fe := s.FinalizeOutbox(context.WithoutCancel(ctx), id); fe != nil {
+					return fe
+				}
+			}
 		}
 	}
 	return nil
 }
-func applyPerFile(ctx context.Context, s *revision.Session, cs []candidate, m migrate.Manifest, r Request, out *Result, apply GuardedApply, parent string) error {
+func applyPerFile(ctx context.Context, s *revision.Session, cs []candidate, snap migrate.Snapshot, r Request, out *Result, apply GuardedApply, parent string, verify VerifyArtifact) error {
+	m := snap.Manifest
 	for i, c := range cs {
 		var fr FileResult
 		var e error
@@ -529,6 +604,14 @@ func applyPerFile(ctx context.Context, s *revision.Session, cs []candidate, m mi
 		} else {
 			tx, be := s.Begin(ctx)
 			if be != nil {
+				return be
+			}
+			if be = s.LockMutationTables(ctx, tx); be != nil {
+				_ = tx.Rollback(context.WithoutCancel(ctx))
+				return be
+			}
+			if be = revalidateLocked(ctx, s, snap, verify); be != nil {
+				_ = tx.Rollback(context.WithoutCancel(ctx))
 				return be
 			}
 			fr, e = executeGuarded(ctx, s, tx, c, m, r, apply, parent)
@@ -550,6 +633,14 @@ func applyPerFile(ctx context.Context, s *revision.Session, cs []candidate, m mi
 					}
 				} else {
 					_ = fr.finalize(context.WithoutCancel(ctx), false)
+				}
+				if e == nil {
+					for _, id := range fr.eventIDs {
+						if fe := s.FinalizeOutbox(context.WithoutCancel(ctx), id); fe != nil {
+							e = fe
+							break
+						}
+					}
 				}
 			}
 		}
@@ -642,8 +733,16 @@ func executeGuarded(ctx context.Context, s *revision.Session, tx pgx.Tx, c candi
 	eres, err := apply(ctx, c.verified, executor.WrapPGX(s.Raw()), executor.WrapPGXTx(tx))
 	fr.Statements = eres.Result.AppliedSteps
 	fr.finalize = eres.Finalize
+	fr.events = eres.Events
 	if err != nil {
 		return fr, err
+	}
+	for _, event := range fr.events {
+		id, payload := outboxEvent(event)
+		if err = s.EnqueueOutbox(ctx, tx, id, payload); err != nil {
+			return fr, err
+		}
+		fr.eventIDs = append(fr.eventIDs, id)
 	}
 	done := r.Now().UTC()
 	fr.Duration = done.Sub(start)
@@ -676,4 +775,9 @@ func failed(out Result, f *Failure, e error) (Result, error) {
 	out.Status = "failed"
 	out.Failure = f
 	return out, e
+}
+func outboxEvent(e executor.LifecycleEvent) (string, []byte) {
+	payload, _ := json.Marshal(e)
+	sum := sha256.Sum256(append([]byte("autosql.lifecycle-outbox/v1\x00"), payload...))
+	return "sha256:" + hex.EncodeToString(sum[:]), payload
 }

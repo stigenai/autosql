@@ -130,13 +130,13 @@ func TestInitConcurrentUpgradeRollbackAndReadOnlyStatus(t *testing.T) {
 	if e = conn.QueryRow(ctx, "select schema_version from "+q(v2, "meta")+" where singleton").Scan(&version); e != nil || version != 3 {
 		t.Fatalf("failed v4 changed version=%d err=%v", version, e)
 	}
-	if _, e = conn.Exec(ctx, "drop table "+q(v2, "manifest_ancestry")); e != nil {
+	if _, e = conn.Exec(ctx, "drop table "+q(v2, "manifest_ancestry")+"; drop table "+q(v2, "lifecycle_outbox")); e != nil {
 		t.Fatal(e)
 	}
 	if e = v2s.Init(ctx); e != nil {
 		t.Fatal(e)
 	}
-	if _, e = conn.Exec(ctx, "drop table "+q(v2, "manifest_ancestry")+"; alter table "+q(v2, "revisions")+" drop column duration_ns, drop column manifest_generation; update "+q(v2, "meta")+" set schema_version=2"); e != nil {
+	if _, e = conn.Exec(ctx, "drop table "+q(v2, "lifecycle_outbox")+"; drop table "+q(v2, "manifest_ancestry")+"; alter table "+q(v2, "revisions")+" drop column duration_ns, drop column manifest_generation; update "+q(v2, "meta")+" set schema_version=2"); e != nil {
 		t.Fatal(e)
 	}
 	injectedV3 := errors.New("v3 placement failure")

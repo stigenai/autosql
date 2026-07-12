@@ -22,6 +22,22 @@ import (
 )
 
 type liveAuthority struct{ at, expires time.Time }
+type replayAudit struct {
+	fail bool
+	seen map[string]int
+}
+
+func (a *replayAudit) AppendDurable(_ context.Context, e executor.LifecycleEvent) error {
+	if a.fail && e.Type == "transaction_committed" {
+		a.fail = false
+		return errors.New("injected audit failure")
+	}
+	if a.seen == nil {
+		a.seen = map[string]int{}
+	}
+	a.seen[e.EventID]++
+	return nil
+}
 
 func (a liveAuthority) ResolveActor(_ context.Context, id string) (approval.Identity, error) {
 	if id == "author" || id == "requester" {
@@ -131,9 +147,10 @@ func TestLiveGenerationApplyRetryBaselineAndAtomicEvidence(t *testing.T) {
 		t.Fatal(e)
 	}
 	engine := Engine{Store: store, Verify: verify}
+	var lifecycle executor.LifecycleAudit
 	guarded := func(ctx context.Context, v artifact.VerifiedArtifact, s executor.Session, tx executor.Tx) (executor.ExternalExecution, error) {
 		a, _ := v.Payload()
-		x, e := executor.NewPostgreSQL(executor.Config{LockedSession: s, LockAlreadyHeld: true, Transaction: tx, Now: time.Now, Reauthorize: func(context.Context, artifact.Artifact) error { _, z := verify(a); return z }, State: func(context.Context, executor.Session) (executor.RuntimeState, error) {
+		x, e := executor.NewPostgreSQL(executor.Config{LockedSession: s, LockAlreadyHeld: true, Transaction: tx, Now: time.Now, Audit: lifecycle, Reauthorize: func(context.Context, artifact.Artifact) error { _, z := verify(a); return z }, State: func(context.Context, executor.Session) (executor.RuntimeState, error) {
 			return executor.RuntimeState{Fingerprint: a.Plan.FromFingerprint, SourceRevision: a.SourceRevision, Environment: a.TargetEnvironment, DatabaseIdentity: a.DatabaseIdentity}, nil
 		}}, v)
 		if e != nil {
@@ -202,10 +219,22 @@ func TestLiveGenerationApplyRetryBaselineAndAtomicEvidence(t *testing.T) {
 	if e = all.Init(context.Background()); e != nil {
 		t.Fatal(e)
 	}
+	ra := &replayAudit{fail: true}
+	lifecycle = ra
 	atomic, e := (Engine{Store: all, Verify: verify, Apply: guarded}).Run(context.Background(), Request{Directory: dir, Operator: "operator", TargetIdentity: allSchema, Transaction: "all"})
-	if e != nil || atomic.Status != "applied" {
+	if e == nil || atomic.Status != "partial_failure" {
 		t.Fatalf("atomic=%+v err=%v", atomic, e)
 	}
+	repaired, e := (Engine{Store: all, Verify: verify, Apply: guarded, Drain: ra.AppendDurable}).Run(context.Background(), Request{Directory: dir, Operator: "operator", TargetIdentity: allSchema, Transaction: "all"})
+	if e != nil || repaired.Status != "no_op" {
+		t.Fatalf("outbox repair=%+v err=%v", repaired, e)
+	}
+	for id, n := range ra.seen {
+		if id == "" || n != 1 {
+			t.Fatalf("non-idempotent audit id=%q count=%d", id, n)
+		}
+	}
+	lifecycle = nil
 	clear, _ := pgx.Connect(context.Background(), prod)
 	if clear != nil {
 		_, _ = clear.Exec(context.Background(), `delete from autosql_migration_history`)

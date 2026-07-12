@@ -46,15 +46,27 @@ func (a *FileAudit) AppendDurable(ctx context.Context, event LifecycleEvent) err
 	}
 	scan := bufio.NewScanner(f)
 	var tail lifecycleRecord
+	duplicate := false
 	for scan.Scan() {
 		var r lifecycleRecord
 		if json.Unmarshal(scan.Bytes(), &r) != nil || r.Sequence != tail.Sequence+1 || r.PreviousHash != tail.Hash || r.Hash != recordHash(r) {
 			return errors.New("tampered lifecycle audit")
 		}
 		tail = r
+		if event.EventID != "" && r.Event.EventID == event.EventID {
+			a, _ := json.Marshal(r.Event)
+			b, _ := json.Marshal(event)
+			if string(a) != string(b) {
+				return errors.New("lifecycle audit event identity conflict")
+			}
+			duplicate = true
+		}
 	}
 	if err = scan.Err(); err != nil {
 		return err
+	}
+	if duplicate {
+		return nil
 	}
 	r := lifecycleRecord{Sequence: tail.Sequence + 1, PreviousHash: tail.Hash, Event: event}
 	r.Hash = recordHash(r)

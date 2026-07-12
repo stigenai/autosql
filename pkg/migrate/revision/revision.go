@@ -16,7 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-const SchemaVersion = 4
+const SchemaVersion = 5
 
 var (
 	ErrConfig = errors.New("invalid revision store configuration")
@@ -25,14 +25,14 @@ var (
 )
 
 type Config struct {
-	URL, Schema, MetaTable, RevisionsTable, StatementsTable, EventsTable, ManifestTable, ExecutorHistorySchema, ExecutorHistoryTable string
+	URL, Schema, MetaTable, RevisionsTable, StatementsTable, EventsTable, ManifestTable, OutboxTable, ExecutorHistorySchema, ExecutorHistoryTable string
 }
 
 func (c Config) normalized() (Config, error) {
 	if c.URL == "" {
 		return c, ErrConfig
 	}
-	defaults := map[*string]string{&c.Schema: "autosql_revision", &c.MetaTable: "meta", &c.RevisionsTable: "revisions", &c.StatementsTable: "statement_attempts", &c.EventsTable: "events", &c.ManifestTable: "manifest_ancestry", &c.ExecutorHistorySchema: "public", &c.ExecutorHistoryTable: "autosql_migration_history"}
+	defaults := map[*string]string{&c.Schema: "autosql_revision", &c.MetaTable: "meta", &c.RevisionsTable: "revisions", &c.StatementsTable: "statement_attempts", &c.EventsTable: "events", &c.ManifestTable: "manifest_ancestry", &c.OutboxTable: "lifecycle_outbox", &c.ExecutorHistorySchema: "public", &c.ExecutorHistoryTable: "autosql_migration_history"}
 	for field, value := range defaults {
 		if *field == "" {
 			*field = value
@@ -85,12 +85,82 @@ func (s *Session) Unlock(ctx context.Context, identity string) error {
 	}
 	return nil
 }
+func writerKey(c Config) string { return "autosql.revision-writers/v1/" + c.Schema }
+func (s *Session) LockWriters(ctx context.Context) (bool, error) {
+	return s.Lock(ctx, writerKey(s.config))
+}
+func (s *Session) UnlockWriters(ctx context.Context) error { return s.Unlock(ctx, writerKey(s.config)) }
+func lockWriter(ctx context.Context, c *pgx.Conn, cfg Config) error {
+	var ok bool
+	return c.QueryRow(ctx, `select pg_advisory_lock(hashtextextended($1,0::bigint)) is null`, writerKey(cfg)).Scan(&ok)
+}
+func unlockWriter(ctx context.Context, c *pgx.Conn, cfg Config) {
+	_, _ = c.Exec(ctx, `select pg_advisory_unlock(hashtextextended($1,0::bigint))`, writerKey(cfg))
+}
 func (s *Session) BackendPID(ctx context.Context) (int32, error) {
 	var pid int32
 	err := s.conn.QueryRow(ctx, `select pg_backend_pid()`).Scan(&pid)
 	return pid, err
 }
 func (s *Session) Begin(ctx context.Context) (pgx.Tx, error) { return s.conn.Begin(ctx) }
+
+// LockMutationTables fences legacy/direct writers that do not participate in
+// the canonical target advisory lock. The locks live until tx completion.
+func (s *Session) LockMutationTables(ctx context.Context, tx pgx.Tx) error {
+	for _, table := range []string{q(s.config.Schema, s.config.RevisionsTable), q(s.config.Schema, s.config.StatementsTable), q(s.config.Schema, s.config.EventsTable)} {
+		if _, err := tx.Exec(ctx, `lock table `+table+` in share row exclusive mode`); err != nil {
+			return errors.New("lock revision reconciliation tables")
+		}
+	}
+	var reg *string
+	if err := tx.QueryRow(ctx, `select to_regclass($1)::text`, s.config.ExecutorHistorySchema+"."+s.config.ExecutorHistoryTable).Scan(&reg); err != nil {
+		return err
+	}
+	if reg != nil {
+		if _, err := tx.Exec(ctx, `lock table `+q(s.config.ExecutorHistorySchema, s.config.ExecutorHistoryTable)+` in share row exclusive mode`); err != nil {
+			return errors.New("lock executor reconciliation table")
+		}
+	}
+	return nil
+}
+
+type OutboxRecord struct {
+	ID      string
+	Payload []byte
+}
+
+func (s *Session) EnqueueOutbox(ctx context.Context, tx pgx.Tx, id string, payload []byte) error {
+	if id == "" || len(payload) == 0 {
+		return ErrConfig
+	}
+	_, err := tx.Exec(ctx, `insert into `+q(s.config.Schema, s.config.OutboxTable)+`(event_id,payload) values($1,$2::jsonb) on conflict(event_id) do nothing`, id, payload)
+	return err
+}
+func (s *Session) PendingOutbox(ctx context.Context) ([]OutboxRecord, error) {
+	rows, err := s.conn.Query(ctx, `select event_id,payload::text from `+q(s.config.Schema, s.config.OutboxTable)+` where finalized_at is null order by event_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []OutboxRecord
+	for rows.Next() {
+		var x OutboxRecord
+		var p string
+		if err = rows.Scan(&x.ID, &p); err != nil {
+			return nil, err
+		}
+		x.Payload = []byte(p)
+		out = append(out, x)
+	}
+	return out, rows.Err()
+}
+func (s *Session) FinalizeOutbox(ctx context.Context, id string) error {
+	tag, err := s.conn.Exec(ctx, `update `+q(s.config.Schema, s.config.OutboxTable)+` set finalized_at=clock_timestamp() where event_id=$1 and finalized_at is null`, id)
+	if err != nil || tag.RowsAffected() != 1 {
+		return errors.New("finalize lifecycle outbox")
+	}
+	return nil
+}
 func (s *Session) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	return s.conn.Exec(ctx, sql, args...)
 }
@@ -194,6 +264,9 @@ check (kind in ('migration','baseline','checkpoint','reversal')), check (state i
 			return fmt.Errorf("%w: unexpected manifest ancestry table at schema version 3", ErrConfig)
 		}
 		_, err := tx.Exec(ctx, `create table `+q(c.Schema, c.ManifestTable)+` (generation text primary key,digest text not null unique,parent_generation text not null,entry_count integer not null check(entry_count>=0),head_chain_digest text not null,recorded_at timestamptz not null)`)
+		return err
+	case 5:
+		_, err := tx.Exec(ctx, `create table `+q(c.Schema, c.OutboxTable)+` (event_id text primary key,payload jsonb not null,finalized_at timestamptz)`)
 		return err
 	default:
 		return ErrConfig
@@ -324,6 +397,10 @@ func (s *Store) Insert(ctx context.Context, r Revision) error {
 		return err
 	}
 	defer conn.Close(context.WithoutCancel(ctx))
+	if err = lockWriter(ctx, conn, c); err != nil {
+		return err
+	}
+	defer unlockWriter(context.WithoutCancel(ctx), conn, c)
 	_, err = conn.Exec(ctx, `insert into `+q(c.Schema, c.RevisionsTable)+`(version,description,kind,file_name,file_digest,manifest_digest,manifest_generation,artifact_digest,plan_digest,checks_digest,bundle_digest,state,statement_ordinal,attempt,redacted_error,operator_identity,started_at,updated_at,completed_at,from_version,to_version,supersedes,reversal_of,duration_ns) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`, r.Version, r.Description, r.Kind, r.FileName, r.FileDigest, r.ManifestDigest, r.ManifestGeneration, r.ArtifactDigest, r.PlanDigest, r.ChecksDigest, r.BundleDigest, r.State, r.StatementOrdinal, r.Attempt, r.RedactedError, r.Operator, r.StartedAt.UTC(), r.UpdatedAt.UTC(), r.CompletedAt, r.FromVersion, r.ToVersion, r.Supersedes, r.ReversalOf, r.Duration.Nanoseconds())
 	if err != nil {
 		return errors.New("insert revision")
@@ -345,6 +422,10 @@ func (s *Store) InsertStatement(ctx context.Context, a StatementAttempt) error {
 		return e
 	}
 	defer conn.Close(context.WithoutCancel(ctx))
+	if e = lockWriter(ctx, conn, c); e != nil {
+		return e
+	}
+	defer unlockWriter(context.WithoutCancel(ctx), conn, c)
 	_, e = conn.Exec(ctx, `insert into `+q(c.Schema, c.StatementsTable)+`(version,statement_ordinal,attempt,state,statement_digest,redacted_error,operator_identity,started_at,completed_at) values($1,$2,$3,$4,$5,$6,$7,$8,$9)`, a.Version, a.Ordinal, a.Attempt, a.State, a.Digest, a.RedactedError, a.Operator, a.StartedAt.UTC(), a.CompletedAt)
 	return e
 }
@@ -362,6 +443,10 @@ func (s *Store) AppendEvent(ctx context.Context, e Event) error {
 		return x
 	}
 	defer conn.Close(context.WithoutCancel(ctx))
+	if x = lockWriter(ctx, conn, c); x != nil {
+		return x
+	}
+	defer unlockWriter(context.WithoutCancel(ctx), conn, c)
 	_, x = conn.Exec(ctx, `insert into `+q(c.Schema, c.EventsTable)+`(version,attempt,event_type,statement_ordinal,redacted_detail,operator_identity,at) values($1,$2,$3,$4,$5,$6,$7)`, e.Version, e.Attempt, e.Type, e.Ordinal, e.Detail, e.Operator, e.At.UTC())
 	return x
 }
@@ -374,6 +459,10 @@ func (s *Store) InsertBatch(ctx context.Context, revisions []Revision, events []
 		return e
 	}
 	defer conn.Close(context.WithoutCancel(ctx))
+	if e = lockWriter(ctx, conn, c); e != nil {
+		return e
+	}
+	defer unlockWriter(context.WithoutCancel(ctx), conn, c)
 	tx, e := conn.Begin(ctx)
 	if e != nil {
 		return e
@@ -407,6 +496,10 @@ func (s *Store) UpdateState(ctx context.Context, version string, attempt int, st
 		return e
 	}
 	defer conn.Close(context.WithoutCancel(ctx))
+	if e = lockWriter(ctx, conn, c); e != nil {
+		return e
+	}
+	defer unlockWriter(context.WithoutCancel(ctx), conn, c)
 	tx, e := conn.Begin(ctx)
 	if e != nil {
 		return e

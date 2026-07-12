@@ -27,9 +27,15 @@ type RuntimeState struct{ Fingerprint, SourceRevision, Environment, DatabaseIden
 type StateReader func(context.Context, Session) (RuntimeState, error)
 type Clock func() time.Time
 type LifecycleEvent struct {
-	Type, ExecutionID, Target, ArtifactDigest, PlanDigest, BundleDigest, StepID, Guidance string
-	At                                                                                    time.Time
+	EventID, Type, ExecutionID, Target, ArtifactDigest, PlanDigest, BundleDigest, StepID, Guidance string
+	At                                                                                             time.Time
 }
+
+func lifecycleEventID(e LifecycleEvent) string {
+	s := sha256.Sum256([]byte(e.ExecutionID + "\x00" + e.Type + "\x00" + e.StepID))
+	return "sha256:" + hex.EncodeToString(s[:])
+}
+
 type LifecycleAudit interface {
 	AppendDurable(context.Context, LifecycleEvent) error
 }
@@ -67,32 +73,44 @@ type Result struct {
 }
 type ExternalExecution struct {
 	Result   Result
+	Events   []LifecycleEvent
 	Finalize func(context.Context, bool) error
 }
 
 func (e *PostgreSQL) ExternalExecution() ExternalExecution {
-	return ExternalExecution{Result: e.result, Finalize: func(ctx context.Context, committed bool) error {
+	var events []LifecycleEvent
+	add := func(typ, step, guidance string) {
+		event := LifecycleEvent{Type: typ, ExecutionID: e.artifact.Digest, Target: e.artifact.DatabaseIdentity + "/" + e.artifact.TargetEnvironment, ArtifactDigest: e.artifact.Digest, PlanDigest: e.artifact.Plan.Digest, BundleDigest: e.artifact.GuardrailDigest, StepID: step, Guidance: guidance, At: e.config.Now().UTC()}
+		event.EventID = lifecycleEventID(event)
+		events = append(events, event)
+	}
+	add("transaction_committed", e.result.LastConfirmed, "")
+	for _, p := range e.artifact.Plan.Phases {
+		for _, id := range p.StepIDs {
+			for _, s := range e.artifact.Plan.Steps {
+				if s.ID == id && s.Kind == plan.StepExecutable {
+					add("confirmed", id, "")
+				}
+			}
+		}
+	}
+	add("completed", e.result.LastConfirmed, "")
+	return ExternalExecution{Result: e.result, Events: events, Finalize: func(ctx context.Context, committed bool) error {
 		if !committed {
 			e.result.Uncertain = true
 			e.result.RecoveryGuidance = "reconcile outer transaction outcome"
 			_ = e.audit(ctx, "uncertain", e.result.LastConfirmed, e.result.RecoveryGuidance)
 			return ErrReconcile
 		}
-		if err := e.audit(ctx, "transaction_committed", e.result.LastConfirmed, ""); err != nil {
-			return ErrPartial
+		if e.config.Audit == nil {
+			return nil
 		}
-		for _, p := range e.artifact.Plan.Phases {
-			for _, id := range p.StepIDs {
-				for _, s := range e.artifact.Plan.Steps {
-					if s.ID == id && s.Kind == plan.StepExecutable {
-						if err := e.audit(ctx, "confirmed", id, ""); err != nil {
-							return ErrPartial
-						}
-					}
-				}
+		for _, event := range events {
+			if err := e.config.Audit.AppendDurable(ctx, event); err != nil {
+				return ErrPartial
 			}
 		}
-		return e.finish(ctx)
+		return nil
 	}}
 }
 
@@ -128,7 +146,9 @@ func (e *PostgreSQL) audit(ctx context.Context, typ, step, guidance string) erro
 	if e.config.Audit == nil {
 		return nil
 	}
-	return e.config.Audit.AppendDurable(ctx, LifecycleEvent{Type: typ, ExecutionID: e.artifact.Digest, Target: e.artifact.DatabaseIdentity + "/" + e.artifact.TargetEnvironment, ArtifactDigest: e.artifact.Digest, PlanDigest: e.artifact.Plan.Digest, BundleDigest: e.artifact.GuardrailDigest, StepID: step, Guidance: guidance, At: e.config.Now().UTC()})
+	event := LifecycleEvent{Type: typ, ExecutionID: e.artifact.Digest, Target: e.artifact.DatabaseIdentity + "/" + e.artifact.TargetEnvironment, ArtifactDigest: e.artifact.Digest, PlanDigest: e.artifact.Plan.Digest, BundleDigest: e.artifact.GuardrailDigest, StepID: step, Guidance: guidance, At: e.config.Now().UTC()}
+	event.EventID = lifecycleEventID(event)
+	return e.config.Audit.AppendDurable(ctx, event)
 }
 
 func (e *PostgreSQL) ApplyAuthorized(ctx context.Context, checks precheck.Plan) ([]precheck.Result, error) {

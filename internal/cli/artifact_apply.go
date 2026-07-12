@@ -22,6 +22,14 @@ type VerifiedArtifactApplyService struct {
 	Mutation       func(artifact.VerifiedArtifact) (guardrail.AuthorizedMutation, error)
 	MutationLocked func(artifact.VerifiedArtifact, executor.Session, executor.Tx) (guardrail.AuthorizedMutation, error)
 	NoEdits        bool
+	LifecycleAudit executor.LifecycleAudit
+}
+
+func (s VerifiedArtifactApplyService) DrainLifecycle(ctx context.Context, e executor.LifecycleEvent) error {
+	if s.LifecycleAudit == nil {
+		return errors.New("durable lifecycle audit is not configured")
+	}
+	return s.LifecycleAudit.AppendDurable(ctx, e)
 }
 
 func (s VerifiedArtifactApplyService) ApplyVersioned(ctx context.Context, v artifact.VerifiedArtifact, session executor.Session, tx executor.Tx) (executor.ExternalExecution, error) {
