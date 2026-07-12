@@ -58,7 +58,15 @@ func RunWithServices(ctx context.Context, args []string, streams Streams, servic
 	case len(args) >= 2 && args[0] == "config" && args[1] == "validate":
 		err = runConfigValidate(ctx, args[2:], o, redactor)
 	case len(args) >= 2 && args[0] == "migrate" && args[1] == "generate":
-		err = runMigrateGenerate(ctx, args[2:], o, services.ReadPlan)
+		trusted := false
+		for _, arg := range args[2:] {
+			trusted = trusted || arg == "--generation-config" || strings.HasPrefix(arg, "--generation-config=")
+		}
+		if !trusted {
+			err = &Error{Kind: "config", Message: "migrate generate requires --generation-config", Code: ExitConfig}
+		} else {
+			err = runMigrateGenerate(ctx, args[2:], o, services.ReadPlan)
+		}
 	case len(args) >= 2 && args[0] == "schema" && args[1] == "load":
 		err = runSchemaLoad(ctx, args[2:], o)
 	case len(args) >= 2 && args[0] == "schema" && args[1] == "inspect":
