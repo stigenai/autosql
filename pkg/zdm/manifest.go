@@ -24,6 +24,7 @@ var metadataColumns = map[string]map[string]columnContract{
 	"object_mappings": {"operation_id": {"text", false, "", ""}, "logical_id": {"text", false, "", ""}, "physical_schema": {"text", false, "", ""}, "physical_name": {"text", false, "", ""}, "object_kind": {"text", false, "", ""}},
 	"baselines":       {"baseline_id": {"text", false, "", ""}, "target_identity": {"text", false, "", ""}, "environment": {"text", false, "", ""}, "fingerprint": {"text", false, "", ""}, "canonical_schema": {"text", false, "", ""}, "operator_identity": {"text", false, "", ""}, "created_at": {"timestamp with time zone", false, "", ""}},
 	"audit":           {"sequence": {"bigint", false, "", "a"}, "event_type": {"text", false, "", ""}, "subject_id": {"text", false, "", ""}, "target_identity": {"text", false, "", ""}, "environment": {"text", false, "", ""}, "fingerprint": {"text", false, "", ""}, "operator_identity": {"text", false, "", ""}, "detail": {"jsonb", false, "", ""}, "at": {"timestamp with time zone", false, "", ""}}}
+var metadataColumnOrder = map[string][]string{"meta": {"singleton", "schema_version", "active_version", "completed_version", "phase", "progress", "recovery_state", "updated_at"}, "operations": {"operation_id", "version", "phase", "progress", "state", "recovery_state", "created_at", "updated_at"}, "object_mappings": {"operation_id", "logical_id", "physical_schema", "physical_name", "object_kind"}, "baselines": {"baseline_id", "target_identity", "environment", "fingerprint", "canonical_schema", "operator_identity", "created_at"}, "audit": {"sequence", "event_type", "subject_id", "target_identity", "environment", "fingerprint", "operator_identity", "detail", "at"}}
 
 func (s *Store) validateLayout(ctx context.Context, db catalogReader) error {
 	var schemaOwner, current string
@@ -34,28 +35,29 @@ func (s *Store) validateLayout(ctx context.Context, db catalogReader) error {
 	if schemaOwner != current || !schemaACL {
 		return corrupt("reserved namespace ownership or access grants differ from trusted manifest")
 	}
-	rows, err := db.Query(ctx, `select c.relname,c.relkind::text,r.rolname,c.relacl is null,c.relpersistence::text,c.relrowsecurity,c.relforcerowsecurity,c.relispartition,c.relreplident::text from pg_class c join pg_namespace n on n.oid=c.relnamespace join pg_roles r on r.oid=c.relowner where n.nspname=$1 and c.relkind in ('r','p','v','m','f','S') order by c.relname`, s.cfg.Schema)
+	rows, err := db.Query(ctx, `select c.relname,c.relkind::text,r.rolname,c.relacl is null,c.relpersistence::text,c.relrowsecurity,c.relforcerowsecurity,c.relispartition,c.relreplident::text,coalesce(am.amname,''),c.reltablespace,c.reloptions is null from pg_class c join pg_namespace n on n.oid=c.relnamespace join pg_roles r on r.oid=c.relowner left join pg_am am on am.oid=c.relam where n.nspname=$1 and c.relkind in ('r','p','v','m','f','S') order by c.relname`, s.cfg.Schema)
 	if err != nil {
 		return err
 	}
 	tables := map[string]bool{}
 	sequence := false
 	for rows.Next() {
-		var name, kind, owner, persistence, replident string
-		var acl, rls, force, partition bool
-		if err = rows.Scan(&name, &kind, &owner, &acl, &persistence, &rls, &force, &partition, &replident); err != nil {
+		var name, kind, owner, persistence, replident, accessMethod string
+		var tablespace uint32
+		var acl, rls, force, partition, optionsDefault bool
+		if err = rows.Scan(&name, &kind, &owner, &acl, &persistence, &rls, &force, &partition, &replident, &accessMethod, &tablespace, &optionsDefault); err != nil {
 			rows.Close()
 			return err
 		}
 		if kind == "S" {
-			if name != "audit_sequence_seq" || owner != current || !acl || persistence != "p" {
+			if name != "audit_sequence_seq" || owner != current || !acl || persistence != "p" || accessMethod != "" || tablespace != 0 || !optionsDefault {
 				rows.Close()
 				return corrupt("identity sequence relation differs from trusted manifest")
 			}
 			sequence = true
 			continue
 		}
-		if _, ok := metadataColumns[name]; !ok || kind != "r" || owner != current || !acl || persistence != "p" || rls || force || partition || replident != "d" {
+		if _, ok := metadataColumns[name]; !ok || kind != "r" || owner != current || !acl || persistence != "p" || rls || force || partition || replident != "d" || accessMethod != "heap" || tablespace != 0 || !optionsDefault {
 			rows.Close()
 			return corrupt("relation %s security, persistence, relkind, or ownership differs from trusted manifest", name)
 		}
@@ -69,42 +71,66 @@ func (s *Store) validateLayout(ctx context.Context, db catalogReader) error {
 		return corrupt("reserved namespace relation set differs from trusted manifest")
 	}
 	for table, want := range metadataColumns {
-		rows, err = db.Query(ctx, `select a.attname,format_type(a.atttypid,a.atttypmod),not a.attnotnull,coalesce(pg_get_expr(d.adbin,d.adrelid),''),a.attidentity::text from pg_attribute a join pg_class c on c.oid=a.attrelid join pg_namespace n on n.oid=c.relnamespace left join pg_attrdef d on d.adrelid=a.attrelid and d.adnum=a.attnum where n.nspname=$1 and c.relname=$2 and a.attnum>0 and not a.attisdropped order by a.attnum`, s.cfg.Schema, table)
+		rows, err = db.Query(ctx, `select a.attname,format_type(a.atttypid,a.atttypmod),not a.attnotnull,coalesce(pg_get_expr(d.adbin,d.adrelid),''),a.attidentity::text,coalesce(coll.collname,''),a.attstorage::text,a.attcompression::text,a.attgenerated::text,a.attstattarget,a.attoptions is null,a.attfdwoptions is null from pg_attribute a join pg_class c on c.oid=a.attrelid join pg_namespace n on n.oid=c.relnamespace left join pg_attrdef d on d.adrelid=a.attrelid and d.adnum=a.attnum left join pg_collation coll on coll.oid=a.attcollation where n.nspname=$1 and c.relname=$2 and a.attnum>0 and not a.attisdropped order by a.attnum`, s.cfg.Schema, table)
 		if err != nil {
 			return err
 		}
 		got := map[string]columnContract{}
+		var order []string
 		for rows.Next() {
 			var name string
 			var c columnContract
-			if err = rows.Scan(&name, &c.typ, &c.nullable, &c.def, &c.identity); err != nil {
+			var collation, storage, compression, generated string
+			var stattarget int
+			var optionsDefault, fdwDefault bool
+			if err = rows.Scan(&name, &c.typ, &c.nullable, &c.def, &c.identity, &collation, &storage, &compression, &generated, &stattarget, &optionsDefault, &fdwDefault); err != nil {
 				rows.Close()
 				return err
 			}
 			got[name] = c
+			order = append(order, name)
+			wantCollation, wantStorage := "", "p"
+			if c.typ == "text" {
+				wantCollation = "default"
+				wantStorage = "x"
+			}
+			if c.typ == "jsonb" {
+				wantStorage = "x"
+			}
+			if collation != wantCollation || storage != wantStorage || compression != "" || generated != "" || stattarget != -1 || !optionsDefault || !fdwDefault {
+				return corrupt("table %s column %s physical/collation contract differs", table, name)
+			}
 		}
 		rows.Close()
-		if len(got) != len(want) {
+		if len(got) != len(want) || strings.Join(order, "\x00") != strings.Join(metadataColumnOrder[table], "\x00") {
 			return corrupt("table %s column set differs from trusted manifest", table)
+		}
+		var dropped int
+		if err = db.QueryRow(ctx, `select count(*) from pg_attribute where attrelid=$1::regclass and attnum>0 and attisdropped`, s.cfg.Schema+"."+table).Scan(&dropped); err != nil {
+			return err
+		}
+		if dropped != 0 {
+			return corrupt("table %s contains dropped physical columns", table)
 		}
 		for name, w := range want {
 			if g, ok := got[name]; !ok || g != w {
 				return corrupt("table %s column %s contract differs", table, name)
 			}
 		}
-		rows, err = db.Query(ctx, `select conname,contype::text,condeferrable,condeferred,convalidated,pg_get_constraintdef(oid,false) from pg_constraint where conrelid=$1::regclass order by conname`, s.cfg.Schema+"."+table)
+		rows, err = db.Query(ctx, `select conname,contype::text,condeferrable,condeferred,convalidated,conislocal,coninhcount,connoinherit,pg_get_constraintdef(oid,false) from pg_constraint where conrelid=$1::regclass order by conname`, s.cfg.Schema+"."+table)
 		if err != nil {
 			return err
 		}
 		var constraints []string
 		for rows.Next() {
 			var name, typ, def string
-			var a, b, c bool
-			if err = rows.Scan(&name, &typ, &a, &b, &c, &def); err != nil {
+			var a, b, c, local, noinherit bool
+			var inhcount int
+			if err = rows.Scan(&name, &typ, &a, &b, &c, &local, &inhcount, &noinherit, &def); err != nil {
 				rows.Close()
 				return err
 			}
-			constraints = append(constraints, fmt.Sprintf("%s|%s|%t|%t|%t|%s", name, typ, a, b, c, def))
+			constraints = append(constraints, fmt.Sprintf("%s|%s|%t|%t|%t|%t|%d|%t|%s", name, typ, a, b, c, local, inhcount, noinherit, def))
 		}
 		rows.Close()
 		if strings.Join(constraints, "\n") != strings.Join(expectedConstraints(s.cfg.Schema, table), "\n") {
@@ -128,12 +154,12 @@ func (s *Store) validateLayout(ctx context.Context, db catalogReader) error {
 		if strings.Join(indexes, "\n") != strings.Join(expectedIndexes(s.cfg.Schema, table), "\n") {
 			return corrupt("table %s indexes differ from exact trusted definitions", table)
 		}
-		var rules, triggers int
-		if err = db.QueryRow(ctx, `select (select count(*) from pg_rewrite where ev_class=$1::regclass),(select count(*) from pg_trigger where tgrelid=$1::regclass and not tgisinternal)`, s.cfg.Schema+"."+table).Scan(&rules, &triggers); err != nil {
+		var rules, triggers, policies int
+		if err = db.QueryRow(ctx, `select (select count(*) from pg_rewrite where ev_class=$1::regclass),(select count(*) from pg_trigger where tgrelid=$1::regclass and not tgisinternal),(select count(*) from pg_policy where polrelid=$1::regclass)`, s.cfg.Schema+"."+table).Scan(&rules, &triggers, &policies); err != nil {
 			return err
 		}
-		if rules != 0 || triggers != 0 {
-			return corrupt("table %s has unexpected rules or non-internal triggers", table)
+		if rules != 0 || triggers != 0 || policies != 0 {
+			return corrupt("table %s has unexpected rules, policies, or non-internal triggers", table)
 		}
 	}
 	return s.validateSequence(ctx, db, current)
@@ -142,12 +168,13 @@ func corrupt(format string, args ...any) error {
 	return fmt.Errorf("%w: %s; do not edit the reserved namespace—restore audited metadata or run a supported explicit upgrade", ErrCorrupt, fmt.Sprintf(format, args...))
 }
 func expectedConstraints(ns, t string) []string {
-	p := "false|false|true|"
+	p := "false|false|true|true|0|true|"
+	c := "false|false|true|true|0|false|"
 	switch t {
 	case "meta":
-		return []string{"meta_pkey|p|" + p + "PRIMARY KEY (singleton)", "meta_progress_check|c|" + p + "CHECK (((progress >= 0) AND (progress <= 100)))", "meta_singleton_check|c|" + p + "CHECK (singleton)"}
+		return []string{"meta_pkey|p|" + p + "PRIMARY KEY (singleton)", "meta_progress_check|c|" + c + "CHECK (((progress >= 0) AND (progress <= 100)))", "meta_singleton_check|c|" + c + "CHECK (singleton)"}
 	case "operations":
-		return []string{"operations_pkey|p|" + p + "PRIMARY KEY (operation_id)", "operations_progress_check|c|" + p + "CHECK (((progress >= 0) AND (progress <= 100)))"}
+		return []string{"operations_pkey|p|" + p + "PRIMARY KEY (operation_id)", "operations_progress_check|c|" + c + "CHECK (((progress >= 0) AND (progress <= 100)))"}
 	case "object_mappings":
 		return []string{"object_mappings_operation_id_fkey|f|" + p + "FOREIGN KEY (operation_id) REFERENCES " + ns + ".operations(operation_id)", "object_mappings_pkey|p|" + p + "PRIMARY KEY (operation_id, logical_id)"}
 	case "baselines":

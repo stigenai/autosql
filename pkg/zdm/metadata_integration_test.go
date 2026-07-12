@@ -196,6 +196,12 @@ func TestLiveTrustedManifestRejectsEveryMaterialDeviation(t *testing.T) {
 		"expression_index": `create index attacker_expression on %s((lower(active_version)))`,
 		"persistence":      `alter table %s set unlogged`,
 		"rls":              `alter table %s enable row level security`,
+		"force_rls":        `alter table %s enable row level security; alter table %s force row level security`,
+		"reloptions":       `alter table %s set (autovacuum_enabled=false)`,
+		"collation":        `alter table %s alter column active_version type text collate "C"`,
+		"storage":          `alter table %s alter column active_version set storage plain`,
+		"compression":      `alter table %s alter column active_version set compression pglz`,
+		"dropped_physical": `alter table %s add column discarded text; alter table %s drop column discarded`,
 	}
 	for name, format := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -211,7 +217,11 @@ func TestLiveTrustedManifestRejectsEveryMaterialDeviation(t *testing.T) {
 			if name == "omitted_operator" {
 				table = "baselines"
 			}
-			sql := fmt.Sprintf(format, q(n, table))
+			args := []any{q(n, table)}
+			if strings.Count(format, "%s") == 2 {
+				args = append(args, q(n, table))
+			}
+			sql := fmt.Sprintf(format, args...)
 			if _, err := c.Exec(ctx, sql); err != nil {
 				t.Fatal(err)
 			}
@@ -342,6 +352,43 @@ func TestLiveTrustedManifestRejectsEveryMaterialDeviation(t *testing.T) {
 			t.Fatalf("trigger accepted: %v", err)
 		}
 	})
+	t.Run("policy", func(t *testing.T) {
+		s, c, n, _ := liveStore(t)
+		ctx := context.Background()
+		if err := s.Init(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Exec(ctx, `create policy attacker_policy on `+q(n, "meta")+` using(false)`); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Init(ctx); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("policy accepted: %v", err)
+		}
+	})
+	for name, set := range map[string]string{"access_method": "relam=0", "tablespace": "reltablespace=(select oid from pg_tablespace where spcname='pg_default')"} {
+		t.Run(name, func(t *testing.T) {
+			s, c, n, _ := liveStore(t)
+			ctx := context.Background()
+			if err := s.Init(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.Exec(ctx, `set allow_system_table_mods=on`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.Exec(ctx, `update pg_class set `+set+` where oid=$1::regclass`, n+".meta"); err != nil {
+				t.Fatal(err)
+			}
+			err := s.Init(ctx)
+			if name == "access_method" {
+				_, _ = c.Exec(ctx, `update pg_class set relam=(select oid from pg_am where amname='heap') where oid=$1::regclass`, n+".meta")
+			} else {
+				_, _ = c.Exec(ctx, `update pg_class set reltablespace=0 where oid=$1::regclass`, n+".meta")
+			}
+			if !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("physical table mutation accepted: %v", err)
+			}
+		})
+	}
 	for name, alter := range map[string]string{"increment": "increment by 7", "min": "minvalue 0", "max": "maxvalue 1000", "start": "start with 2", "cache": "cache 7", "cycle": "cycle", "type": "as integer"} {
 		t.Run("sequence_"+name, func(t *testing.T) {
 			s, c, n, _ := liveStore(t)
