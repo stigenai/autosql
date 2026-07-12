@@ -294,8 +294,9 @@ func (e *PostgreSQL) transactionalPhase(ctx context.Context, conn Session, phase
 		return nil, errors.New("begin migration phase")
 	}
 	committed := false
+	commitAttempted := false
 	defer func() {
-		if err != nil && !committed {
+		if err != nil && !committed && !commitAttempted {
 			rollbackErr := tx.Rollback(context.WithoutCancel(ctx))
 			auditErr := e.audit(context.WithoutCancel(ctx), "transaction_rollback", "", "")
 			if rollbackErr != nil || auditErr != nil {
@@ -336,6 +337,7 @@ func (e *PostgreSQL) transactionalPhase(ctx context.Context, conn Session, phase
 		pendingCount++
 		last = step.ID
 	}
+	commitAttempted = true
 	if err = tx.Commit(ctx); err != nil {
 		e.result.Uncertain = true
 		e.result.PendingStep = last

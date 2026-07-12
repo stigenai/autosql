@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"github.com/jackc/pgx/v5"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -52,6 +53,8 @@ func (r testRow) Scan(dst ...any) error {
 			*p = v.(string)
 		case *bool:
 			*p = v.(bool)
+		case *int64:
+			*p = v.(int64)
 		}
 	}
 	return nil
@@ -68,6 +71,8 @@ type testTx struct {
 	execAt, execs      int
 	execErr, commitErr error
 	rolled             bool
+	rollbackErr        error
+	row                Row
 }
 
 func (t *testTx) Exec(context.Context, string, ...any) (Tag, error) {
@@ -77,9 +82,14 @@ func (t *testTx) Exec(context.Context, string, ...any) (Tag, error) {
 	}
 	return testTag(1), nil
 }
-func (*testTx) QueryRow(context.Context, string, ...any) Row { return testRow{} }
-func (t *testTx) Commit(context.Context) error               { return t.commitErr }
-func (t *testTx) Rollback(context.Context) error             { t.rolled = true; return nil }
+func (t *testTx) QueryRow(context.Context, string, ...any) Row {
+	if t.row != nil {
+		return t.row
+	}
+	return testRow{}
+}
+func (t *testTx) Commit(context.Context) error   { return t.commitErr }
+func (t *testTx) Rollback(context.Context) error { t.rolled = true; return t.rollbackErr }
 
 type testSession struct {
 	tx       *testTx
@@ -87,6 +97,7 @@ type testSession struct {
 	execErrs []error
 	execs    int
 	row      Row
+	beginErr error
 }
 
 func (s *testSession) Exec(context.Context, string, ...any) (Tag, error) {
@@ -107,7 +118,7 @@ func (s *testSession) QueryRow(context.Context, string, ...any) Row {
 	return testRow{}
 }
 func (*testSession) Query(context.Context, string, ...any) (Rows, error) { return testRows{}, nil }
-func (s *testSession) Begin(context.Context) (Tx, error)                 { return s.tx, nil }
+func (s *testSession) Begin(context.Context) (Tx, error)                 { return s.tx, s.beginErr }
 func (*testSession) Close(context.Context) error                         { return nil }
 func (*testSession) Raw() *pgx.Conn                                      { return nil }
 
@@ -195,5 +206,36 @@ func TestRefusalLifecycleEventsUnderLock(t *testing.T) {
 				t.Fatalf("events=%v want=%s", audit.events, tc.want)
 			}
 		})
+	}
+}
+
+func TestCommitAmbiguityLifecycleHasNoRollback(t *testing.T) {
+	a := &failingAudit{}
+	e := stateExecutor(a)
+	step := plan.Step{ID: "s", SQL: "ddl", Kind: plan.StepExecutable, Transaction: plan.TransactionRequired}
+	tx := &testTx{commitErr: errors.New("session lost")}
+	_, err := e.transactionalPhase(context.Background(), &testSession{tx: tx}, plan.Phase{ID: "p", Transaction: plan.TransactionRequired, StepIDs: []string{"s"}}, map[string]plan.Step{"s": step}, map[string]bool{}, precheck.Plan{}, false)
+	if !errors.Is(err, ErrReconcile) || tx.rolled {
+		t.Fatalf("err=%v rolled=%v", err, tx.rolled)
+	}
+	want := []string{"transaction_started", "uncertain"}
+	if !reflect.DeepEqual(a.events, want) {
+		t.Fatalf("events=%v want=%v", a.events, want)
+	}
+}
+
+func TestBeginPrecheckAndRollbackFailures(t *testing.T) {
+	phase := plan.Phase{ID: "p", Transaction: plan.TransactionRequired}
+	e := stateExecutor(nil)
+	_, err := e.transactionalPhase(context.Background(), &testSession{beginErr: errors.New("begin")}, phase, nil, nil, precheck.Plan{}, false)
+	if err == nil {
+		t.Fatal("begin failure accepted")
+	}
+	tx := &testTx{rollbackErr: errors.New("rollback"), row: testRow{vals: []any{int64(1)}}}
+	e = stateExecutor(nil)
+	check := precheck.Assertion{Name: "blocked", MaxAllowed: 0}
+	_, err = e.transactionalPhase(context.Background(), &testSession{tx: tx}, phase, nil, nil, precheck.Plan{Assertions: []precheck.Assertion{check}}, true)
+	if err == nil || !tx.rolled || e.result.AppliedSteps != 0 {
+		t.Fatalf("err=%v rolled=%v result=%+v", err, tx.rolled, e.result)
 	}
 }
