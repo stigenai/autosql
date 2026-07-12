@@ -364,6 +364,27 @@ func (s *Session) ExecEvent(ctx context.Context, tx pgx.Tx, e Event) error {
 	}
 	return nil
 }
+
+// ExecReversal appends a reversal revision and one link event per original
+// artifact in the caller's canonical executor transaction. It intentionally
+// has no update/delete path for prior revisions.
+func (s *Session) ExecReversal(ctx context.Context, tx pgx.Tx, r Revision, originalArtifacts []string) error {
+	if len(originalArtifacts) == 0 || r.Kind != "reversal" || r.ReversalOf == "" || r.State != "applied" {
+		return ErrConfig
+	}
+	if err := s.ExecRevision(ctx, tx, r); err != nil {
+		return err
+	}
+	for i, digest := range originalArtifacts {
+		if digest == "" {
+			return ErrConfig
+		}
+		if err := s.ExecEvent(ctx, tx, Event{Version: r.Version, Attempt: r.Attempt, Type: "reversal_of", Ordinal: i + 1, Detail: digest, Operator: r.Operator, At: r.UpdatedAt}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 func (s *Session) FinalizeRevision(ctx context.Context, tx pgx.Tx, version, state string, ordinal int, duration time.Duration, redacted string, at time.Time) error {
 	tag, err := tx.Exec(ctx, `update `+q(s.config.Schema, s.config.RevisionsTable)+` set state=$2,statement_ordinal=$3,duration_ns=$4,redacted_error=$5,updated_at=$6::timestamptz,completed_at=case when $2 in ('applied','baseline','checkpoint') then $6::timestamptz else null::timestamptz end where version=$1`, version, state, ordinal, duration.Nanoseconds(), redacted, at.UTC())
 	if err != nil {
