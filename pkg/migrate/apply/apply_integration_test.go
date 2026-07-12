@@ -13,15 +13,57 @@ import (
 	"autosql/pkg/approval"
 	"autosql/pkg/artifact"
 	"autosql/pkg/executor"
+	"autosql/pkg/guardrail"
 	"autosql/pkg/migrate"
 	"autosql/pkg/migrate/revision"
+	"autosql/pkg/plan"
+	"autosql/pkg/plugin"
 	"autosql/pkg/policy"
+	"autosql/pkg/precheck"
+	"autosql/pkg/schema"
 	"autosql/pkg/simulate"
 	"autosql/pkg/source"
 	"github.com/jackc/pgx/v5"
 )
 
 type liveAuthority struct{ at, expires time.Time }
+type mixedDriver struct{}
+type injectedSession struct {
+	executor.Session
+	execMatch, queryMatch string
+}
+
+func (s injectedSession) Exec(ctx context.Context, q string, a ...any) (executor.Tag, error) {
+	if s.execMatch != "" && strings.Contains(q, s.execMatch) {
+		return nil, errors.New("injected disconnect password=seed")
+	}
+	return s.Session.Exec(ctx, q, a...)
+}
+func (s injectedSession) QueryRow(ctx context.Context, q string, a ...any) executor.Row {
+	if s.queryMatch != "" && strings.Contains(q, s.queryMatch) {
+		return injectedRow{}
+	}
+	return s.Session.QueryRow(ctx, q, a...)
+}
+
+type injectedRow struct{}
+
+func (injectedRow) Scan(...any) error { return errors.New("injected readback password=seed") }
+
+func (mixedDriver) Info() plugin.Info {
+	return plugin.Info{Name: "mixed", Version: "1", APIVersion: plugin.HostAPIVersion, Capabilities: []plugin.Capability{{Kind: schema.KindSchema, Mode: plugin.Managed, Operations: []schema.Operation{schema.OperationCreate}}}}
+}
+func (mixedDriver) Inspect(context.Context, plugin.InspectRequest) (schema.Document, error) {
+	return schema.Document{}, errors.New("unused")
+}
+func (mixedDriver) Normalize(_ context.Context, d schema.Document) (schema.Document, error) {
+	return d, nil
+}
+func (mixedDriver) Render(_ context.Context, r plugin.RenderRequest) ([]plugin.Statement, error) {
+	id := r.Changes.Changes[0].ID
+	return []plugin.Statement{{SQL: "create table autosql_mixed_one(id int)", ChangeID: id, Transactional: false, Kind: plugin.StatementExecutable}, {SQL: "create table autosql_mixed_two(id int)", ChangeID: id, Transactional: true, Kind: plugin.StatementExecutable}}, nil
+}
+
 type replayAudit struct {
 	fail bool
 	seen map[string]int
@@ -124,6 +166,114 @@ func liveGenerated(t *testing.T, dev, prod string) (string, VerifyArtifact, func
 		addPolicies(next)
 	}
 	return dir, verify, appendSecond
+}
+
+func mixedSnapshot(t *testing.T) (string, VerifyArtifact) {
+	t.Helper()
+	empty := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{}}}
+	name := schema.Name{Name: "app"}
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{{ID: schema.StableID(schema.KindSchema, name), Kind: schema.KindSchema, Name: name, Spec: []byte(`{}`)}}}}
+	p, e := plan.Build(context.Background(), mixedDriver{}, empty, desired, plan.Options{})
+	if e != nil {
+		t.Fatal(e)
+	}
+	cd, e := guardrail.ChangeDigest(p.Changes)
+	if e != nil {
+		t.Fatal(e)
+	}
+	checks := precheck.Plan{ID: "mixed", ChangeDigest: cd, Statements: []string{"create table autosql_mixed_one(id int)", "create table autosql_mixed_two(id int)"}}
+	checks.Digest, e = precheck.Digest(checks)
+	if e != nil {
+		t.Fatal(e)
+	}
+	now := time.Now().UTC().Add(-time.Minute)
+	bundle := "sha256:" + strings.Repeat("b", 64)
+	a, e := artifact.New(p, checks, now, now.Add(time.Hour), "rev", "test", "mixed-db", bundle, artifact.Approval{Identity: "reviewer", ApprovedAt: now}, map[string]string{})
+	if e != nil {
+		t.Fatal(e)
+	}
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	if e = a.Sign("release", priv); e != nil {
+		t.Fatal(e)
+	}
+	raw, e := a.MarshalCanonical()
+	if e != nil {
+		t.Fatal(e)
+	}
+	sql := []byte("-- autosql:transaction=auto\n-- autosql:plan-digest=" + p.Digest + "\n-- autosql:check-digest=sha256:" + checks.Digest + "\n-- autosql:bundle-digest=" + bundle + "\ncreate table autosql_mixed_one(id int);\ncreate table autosql_mixed_two(id int);\n")
+	dir := t.TempDir()
+	if _, e = migrate.Update(dir, migrate.UpdateRequest{Files: []migrate.File{{Name: "V1__mixed.sql", SQL: sql, ArtifactName: "V1__mixed.sql.artifact.json", Artifact: raw}}}); e != nil {
+		t.Fatal(e)
+	}
+	vp := artifact.VerifyPolicy{Now: time.Now, Expected: artifact.ExpectedBindings{PlanDigest: p.Digest, ChecksDigest: checks.Digest, GuardrailDigest: bundle, SourceRevision: "rev", Environment: "test", DatabaseIdentity: "mixed-db", ApprovalIdentity: "reviewer"}, Keys: map[string]artifact.KeyRecord{"release": {PublicKey: pub, Issuer: "issuer", Identity: "signer", Environment: "test", Purpose: "release", Status: "active", NotBefore: now.Add(-time.Hour), NotAfter: now.Add(2 * time.Hour)}}, Issuer: "issuer", Identity: "signer", Purpose: "release"}
+	return dir, func(x artifact.Artifact) (artifact.VerifiedArtifact, error) { return x.VerifyTrusted(vp) }
+}
+
+func TestCoordinatorGeneratedMixedPhaseFaultsStopAndRequireReconcile(t *testing.T) {
+	url := os.Getenv("AUTOSQL_POSTGRES_TEST_DSN")
+	if url == "" {
+		t.Skip("live database unset")
+	}
+	dir, verify := mixedSnapshot(t)
+	cases := map[string]injectedSession{"disconnect": {execMatch: "create table autosql_mixed_one"}, "confirmation": {execMatch: "update autosql_migration_history set state='confirmed'"}, "readback": {queryMatch: "select state,step_hash"}}
+	for name, fault := range cases {
+		t.Run(name, func(t *testing.T) {
+			conn, e := pgx.Connect(context.Background(), url)
+			if e != nil {
+				t.Fatal(e)
+			}
+			_, _ = conn.Exec(context.Background(), `drop table if exists autosql_mixed_two; drop table if exists autosql_mixed_one; drop table if exists autosql_migration_history`)
+			_ = conn.Close(context.Background())
+			schemaName := "autosql_mixed_" + name + strings.ReplaceAll(time.Now().Format("150405.000000"), ".", "")
+			store, _ := revision.Open(revision.Config{URL: url, Schema: schemaName})
+			if e = store.Init(context.Background()); e != nil {
+				t.Fatal(e)
+			}
+			apply := func(ctx context.Context, v artifact.VerifiedArtifact, s executor.Session, _ executor.Tx) (executor.ExternalExecution, error) {
+				a, _ := v.Payload()
+				fault.Session = s
+				x, e := executor.NewPostgreSQL(executor.Config{LockedSession: fault, LockAlreadyHeld: true, Now: time.Now, State: func(context.Context, executor.Session) (executor.RuntimeState, error) {
+					return executor.RuntimeState{Fingerprint: a.Plan.FromFingerprint, SourceRevision: a.SourceRevision, Environment: a.TargetEnvironment, DatabaseIdentity: a.DatabaseIdentity}, nil
+				}}, v)
+				if e != nil {
+					return executor.ExternalExecution{}, e
+				}
+				_, e = x.ApplyAuthorized(ctx, a.Checks)
+				return executor.ExternalExecution{Result: x.Result()}, e
+			}
+			out, e := (Engine{Store: store, Verify: verify, Apply: apply}).Run(context.Background(), Request{Directory: dir, Operator: "op", Transaction: "file"})
+			if e == nil || out.Failure == nil || out.Failure.FilePosition != 1 || out.Failure.StatementPosition != 1 {
+				t.Fatalf("out=%+v err=%v", out, e)
+			}
+			s, e := store.OpenSession(context.Background())
+			if e != nil {
+				t.Fatal(e)
+			}
+			rows, _ := s.Revisions(context.Background())
+			history, _ := s.ExecutorRecords(context.Background())
+			_ = s.Close(context.Background())
+			if len(rows) != 1 || rows[0].State != "partial" || len(history) != 1 {
+				t.Fatalf("rows=%+v history=%+v", rows, history)
+			}
+			if name != "readback" && history[0].State != "intended" {
+				t.Fatalf("history=%+v", history)
+			}
+			conn, e = pgx.Connect(context.Background(), url)
+			if e != nil {
+				t.Fatal(e)
+			}
+			var later bool
+			_ = conn.QueryRow(context.Background(), `select to_regclass('public.autosql_mixed_two') is not null`).Scan(&later)
+			_ = conn.Close(context.Background())
+			if later {
+				t.Fatal("later mixed-phase step ran")
+			}
+			_, retryErr := (Engine{Store: store, Verify: verify, Apply: apply}).Run(context.Background(), Request{Directory: dir, Operator: "op", Transaction: "file"})
+			if !errors.Is(retryErr, executor.ErrReconcile) {
+				t.Fatalf("retry=%v", retryErr)
+			}
+		})
+	}
 }
 
 func TestCoordinatorOutboxPartialDrainTwoFileAllInOneIsIdempotent(t *testing.T) {

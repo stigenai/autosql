@@ -416,7 +416,7 @@ func selectTrusted(snap migrate.Snapshot, records []revision.Revision, r Request
 			return nil, fmt.Errorf("%w: unknown applied revision", ErrRefused)
 		}
 		if x.State == "failed" || x.State == "partial" || x.State == "pending" {
-			return nil, fmt.Errorf("%w: dirty revision state", ErrRefused)
+			return nil, fmt.Errorf("%w: %w: dirty revision state", ErrRefused, executor.ErrReconcile)
 		}
 	}
 	started := false

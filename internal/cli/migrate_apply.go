@@ -15,6 +15,10 @@ import (
 	"autosql/pkg/secret"
 )
 
+var executeVersionedMigration = func(e migrateapply.Engine, ctx context.Context, r migrateapply.Request) (migrateapply.Result, error) {
+	return e.Run(ctx, r)
+}
+
 func runMigrateApply(ctx context.Context, args []string, o output, services Services, baseline bool, redactor *secret.Redactor) error {
 	fs := newFlags("migrate apply", o.streams.Err)
 	configPath := fs.String("config", "", "configuration")
@@ -96,7 +100,7 @@ func runMigrateApply(ctx context.Context, args []string, o output, services Serv
 	engine := migrateapply.Engine{Store: store, Verify: verifier.VerifyArtifact, Apply: verifier.ApplyVersioned, Drain: verifier.DrainLifecycle}
 	callCtx, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()
-	result, e := engine.Run(callCtx, migrateapply.Request{Directory: *dir, Snapshot: snapshot, From: *from, To: *to, Count: max, DryRun: *dry, Baseline: baseline, Transaction: *transaction, Operator: *operator, TargetIdentity: "revision/" + *schema})
+	result, e := executeVersionedMigration(engine, callCtx, migrateapply.Request{Directory: *dir, Snapshot: snapshot, From: *from, To: *to, Count: max, DryRun: *dry, Baseline: baseline, Transaction: *transaction, Operator: *operator, TargetIdentity: "revision/" + *schema})
 	if e != nil {
 		return &Error{Kind: "migration", Message: "versioned migration operation failed", Code: ExitMigration, Cause: e, Status: result.Status, RecoveryGuidance: func() string {
 			if result.Failure != nil {
