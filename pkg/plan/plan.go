@@ -116,11 +116,6 @@ func Build(ctx context.Context, driver plugin.Driver, current, desired schema.Do
 	if err != nil {
 		return Plan{}, fmt.Errorf("%w: %w", ErrUnsupportedTransition, err)
 	}
-	for _, statement := range statements {
-		if statement.Kind != plugin.StatementTopology && !statement.Transactional {
-			return Plan{}, fmt.Errorf("%w: transaction-prohibited execution requires a phase-aware guarded executor", ErrUnsupportedTransition)
-		}
-	}
 	steps, err := bindSteps(changes, statements)
 	if err != nil {
 		return Plan{}, err
@@ -158,9 +153,6 @@ func (p Plan) Validate() error {
 		}
 		if s.Kind != StepExecutable && s.Kind != StepTopology {
 			return fmt.Errorf("%w: step kind", ErrInvalidPlan)
-		}
-		if s.Transaction == TransactionProhibited {
-			return fmt.Errorf("%w: transaction-prohibited execution is unavailable", ErrInvalidPlan)
 		}
 		if s.Lock != LockNone && s.Lock != LockShare && s.Lock != LockExclusive {
 			return fmt.Errorf("%w: lock level", ErrInvalidPlan)

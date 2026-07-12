@@ -58,8 +58,10 @@ receive no mutation capability.
 Interactive apply prints the exact plan digest and requires it to be typed on a
 TTY. Noninteractive apply requires `--approve-digest DIGEST`, which must exactly
 match the computed plan. `--dry-run`, `--approve-digest`, and `--artifact` are
-mutually exclusive. Artifact execution is fail-closed pending cs5.7 signature
-and payload verification.
+mutually exclusive. Artifact execution is available only through the cs5.7
+verified-artifact service: trusted signature and binding verification, guardrail
+authorization/audit, locked stale-state checks, live prechecks, and the
+phase-aware PostgreSQL executor. Missing configuration remains fail-closed.
 Mutation is delegated only to the injected `ApplyService`; the default binary
 returns `refused` until the guarded executor is wired. Stable statuses are
 `planned`, `dry_run`, `no_op`, `success`, `refused`, and `partial_failure`.

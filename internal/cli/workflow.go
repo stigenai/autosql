@@ -267,7 +267,17 @@ func runApply(ctx context.Context, args []string, o output, s Services, tty bool
 		return usageError(errors.New("selectors require --from and --to live sources"))
 	}
 	if *artifact != "" {
-		return &Error{Kind: "migration", Message: "artifact verification is not available until cs5.7", Code: ExitMigration, Status: "refused"}
+		if s.Apply == nil {
+			return &Error{Kind: "migration", Message: "verified artifact apply service is not wired", Code: ExitMigration, Status: "refused"}
+		}
+		result, err := s.Apply.Apply(ctx, ApplyRequest{ArtifactPath: *artifact, ApprovalMode: "artifact"})
+		if err != nil {
+			return applyFailure(result, err)
+		}
+		if result.Status == "" {
+			result.Status = "success"
+		}
+		return o.success(result, result.Status)
 	}
 	if *from == "" || *to == "" {
 		return usageError(errors.New("--from and --to required unless --artifact is used"))

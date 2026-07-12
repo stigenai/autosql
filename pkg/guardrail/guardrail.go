@@ -104,6 +104,13 @@ type Input struct {
 	Approval           approval.Request
 	Database           precheck.DB
 	StatementBindings  []StatementBinding
+	// Mutation is invoked only inside the approval gate's authorized callback.
+	// When set it owns phase-aware prechecks, mutation, and durable history.
+	Mutation AuthorizedMutation
+}
+
+type AuthorizedMutation interface {
+	ApplyAuthorized(context.Context, precheck.Plan) ([]precheck.Result, error)
 }
 
 // StatementBinding attributes one exact SQL command to one exact change.
@@ -380,7 +387,7 @@ func (g Guardrail) Apply(ctx context.Context, in Input) (Result, error) {
 	if len(violations) > 0 {
 		return result, &PolicyError{Count: len(violations)}
 	}
-	if in.Database == nil {
+	if in.Database == nil && in.Mutation == nil {
 		return result, stageError(ErrConfig, "database", nil)
 	}
 
@@ -390,7 +397,13 @@ func (g Guardrail) Apply(ctx context.Context, in Input) (Result, error) {
 	callbackRan := false
 	gateErr := g.Approval.GuardedApply(ctx, req, func(applyCtx context.Context) error {
 		callbackRan = true
-		checks, checkErr := precheck.GuardedApply(applyCtx, in.Database, in.Precheck)
+		var checks []precheck.Result
+		var checkErr error
+		if in.Mutation != nil {
+			checks, checkErr = in.Mutation.ApplyAuthorized(applyCtx, in.Precheck)
+		} else {
+			checks, checkErr = precheck.GuardedApply(applyCtx, in.Database, in.Precheck)
+		}
 		result.Checks = checks
 		return checkErr
 	})

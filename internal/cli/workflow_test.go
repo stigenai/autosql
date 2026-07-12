@@ -79,7 +79,7 @@ func TestApplyPromptsAndExplicitModes(t *testing.T) {
 		tty             bool
 		flags           []string
 		wantCode, calls int
-	}{"accept": {"DIGEST", true, nil, 0, 1}, "refuse": {"no", true, nil, 7, 0}, "eof": {"", true, nil, 7, 0}, "noninteractive": {"", false, nil, 7, 0}, "digest": {"", false, []string{"--approve-digest", "DIGEST"}, 0, 1}, "mismatch": {"", false, []string{"--approve-digest", "wrong"}, 7, 0}, "artifact": {"", false, []string{"--artifact", "signed.json"}, 7, 0}} {
+	}{"accept": {"DIGEST", true, nil, 0, 1}, "refuse": {"no", true, nil, 7, 0}, "eof": {"", true, nil, 7, 0}, "noninteractive": {"", false, nil, 7, 0}, "digest": {"", false, []string{"--approve-digest", "DIGEST"}, 0, 1}, "mismatch": {"", false, []string{"--approve-digest", "wrong"}, 7, 0}, "artifact": {"", false, []string{"--artifact", "signed.json"}, 0, 1}} {
 		t.Run(name, func(t *testing.T) {
 			r, p := workflowFixture(t)
 			a := &fakeApply{result: ApplyResult{Status: "success"}}
@@ -103,7 +103,11 @@ func TestApplyPromptsAndExplicitModes(t *testing.T) {
 				if name == "accept" {
 					wantMode = "interactive"
 				}
-				if a.request.ApprovalMode != wantMode || a.request.AssertedDigest != p.Digest {
+				wantDigest := p.Digest
+				if name == "artifact" {
+					wantDigest = ""
+				}
+				if a.request.ApprovalMode != wantMode || a.request.AssertedDigest != wantDigest {
 					t.Fatalf("request=%+v", a.request)
 				}
 			}
@@ -181,7 +185,7 @@ func TestNoOpMaxLimitAndArtifactOnly(t *testing.T) {
 	r, _ = workflowFixture(t)
 	a := &fakeApply{result: ApplyResult{Status: "success"}}
 	code, _, _ = invoke(t, []string{"apply", "--artifact", "signed.json"}, "", false, Services{ReadPlan: r, Apply: a})
-	if code != int(ExitMigration) || a.calls != 0 || r.loads != 0 {
+	if code != 0 || a.calls != 1 || r.loads != 0 {
 		t.Fatalf("artifact code=%d calls=%d loads=%d", code, a.calls, r.loads)
 	}
 	a = &fakeApply{}
