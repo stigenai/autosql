@@ -56,7 +56,7 @@ func runPlanEdit(_ context.Context, args []string, o output, service PlanEditSer
 	if err != nil {
 		return err
 	}
-	if err = atomicCreate(*output, encoded); err != nil {
+	if err = createPlanEditOutput(service, *output, encoded); err != nil {
 		return &Error{Kind: "validation", Message: "write edited artifact failed", Code: ExitValidation}
 	}
 	o.json = *jsonFlag
@@ -115,7 +115,7 @@ func runPlanRevalidate(ctx context.Context, args []string, o output, s PlanEditS
 		return &Error{Kind: "validation", Message: "edit revalidation failed", Code: ExitValidation}
 	}
 	encoded, _ := json.Marshal(eligible)
-	if err = atomicCreate(*out, encoded); err != nil {
+	if err = createPlanEditOutput(s, *out, encoded); err != nil {
 		return &Error{Kind: "validation", Message: "write attested edit failed", Code: ExitValidation}
 	}
 	o.json = *jsonFlag
@@ -150,12 +150,35 @@ func runPlanPublish(ctx context.Context, args []string, o output, s PlanEditServ
 	if err != nil {
 		return &Error{Kind: "validation", Message: "published artifact invalid", Code: ExitValidation}
 	}
-	if err = atomicCreate(*out, encoded); err != nil {
+	if err = createPublishedEditOutput(ctx, s, e, a, *out, encoded); err != nil {
 		return &Error{Kind: "validation", Message: "write published artifact failed", Code: ExitValidation}
 	}
 	o.json = *jsonFlag
 	return o.success(map[string]any{"status": "published", "artifact_digest": a.Digest, "output": *out}, a.Digest)
 }
+
+type planEditOutputCreator interface {
+	AtomicCreate(string, []byte) error
+}
+
+type publishedEditOutputCreator interface {
+	PublishOutput(context.Context, planedit.Eligible, artifact.Artifact, string, []byte) error
+}
+
+func createPlanEditOutput(service PlanEditService, path string, data []byte) error {
+	if creator, ok := service.(planEditOutputCreator); ok {
+		return creator.AtomicCreate(path, data)
+	}
+	return atomicCreate(path, data)
+}
+
+func createPublishedEditOutput(ctx context.Context, service PlanEditService, eligible planedit.Eligible, a artifact.Artifact, path string, data []byte) error {
+	if creator, ok := service.(publishedEditOutputCreator); ok {
+		return creator.PublishOutput(ctx, eligible, a, path, data)
+	}
+	return createPlanEditOutput(service, path, data)
+}
+
 func atomicCreate(path string, data []byte) error {
 	fd, err := unix.Open(path, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW, 0600)
 	if err != nil {

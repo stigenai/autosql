@@ -289,6 +289,104 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 	if err = json.Unmarshal(attestedRaw, &tampered); err != nil {
 		t.Fatal(err)
 	}
+	baseEditService, ok := services.PlanEdit.(*productionEditService)
+	if !ok {
+		t.Fatal("production edit service is not injectable")
+	}
+	assertFailureOrder := func(label string, calls, order []string, failAt int) {
+		t.Helper()
+		prefix := order[:failAt+1]
+		if len(calls) < len(prefix) {
+			t.Fatalf("%s calls=%v want prefix=%v", label, calls, prefix)
+		}
+		for i := range prefix {
+			if calls[i] != prefix[i] {
+				t.Fatalf("%s calls=%v want prefix=%v", label, calls, prefix)
+			}
+		}
+		for _, got := range calls[len(prefix):] {
+			if got != "audit_edit_rejected" && got != "audit_edit_publish_rejected" {
+				t.Fatalf("%s performed later work after %s: %v", label, order[failAt], calls)
+			}
+		}
+	}
+	failedService := func(fail string, calls *[]string) *productionEditService {
+		t.Helper()
+		copy := *baseEditService
+		copy.stage = func(stage string) error {
+			*calls = append(*calls, stage)
+			if stage == fail {
+				return errors.New("injected " + stage)
+			}
+			return nil
+		}
+		return &copy
+	}
+	assertNoPublishedSuffix := func(before int64) {
+		t.Helper()
+		after, readErr := os.ReadFile(cfg.LifecycleAuditPath)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if int64(len(after)) < before || strings.Contains(string(after[before:]), `"Type":"edit_published"`) {
+			t.Fatalf("failed operation recorded publication: %s", after[before:])
+		}
+	}
+
+	editOrder := []string{"original_verify", "atomic_create"}
+	for failAt, fail := range editOrder {
+		t.Run("edit_failure_"+fail, func(t *testing.T) {
+			var calls []string
+			output := filepath.Join(dir, "failed-edit-"+fail+".json")
+			beforeAudit := fileSize(t, cfg.LifecycleAuditPath)
+			code, _, _ := invoke(t, []string{"plan", "edit", "--artifact", path, "--sql", sqlPath, "--editor", "editor", "--reason", "failure matrix", "--output", output, "--json"}, "", false, Services{PlanEdit: failedService(fail, &calls)})
+			if code == 0 || !os.IsNotExist(func() error { _, statErr := os.Stat(output); return statErr }()) {
+				t.Fatalf("edit failure %s created output code=%d", fail, code)
+			}
+			assertFailureOrder("edit "+fail, calls, editOrder, failAt)
+			assertNoPublishedSuffix(beforeAudit)
+		})
+	}
+
+	revalidateOrder := []string{"audit_edit_requested", "original_verify", "target_inspect_stale", "identity_isolation", "parse", "ast_bind", "rebind", "simulation", "fingerprint", "safety", "policy", "precheck", "guardrail", "audit_edit_validated", "atomic_create"}
+	for failAt, fail := range revalidateOrder {
+		t.Run("revalidate_failure_"+fail, func(t *testing.T) {
+			var calls []string
+			output := filepath.Join(dir, "failed-revalidate-"+fail+".json")
+			beforeAudit := fileSize(t, cfg.LifecycleAuditPath)
+			beforeTarget := snapshotProductionTarget(t, ctx, url, name, a.Digest)
+			code, _, _ := invoke(t, []string{"plan", "revalidate", "--draft", draftPath, "--output", output, "--json"}, "", false, Services{PlanEdit: failedService(fail, &calls)})
+			if code == 0 || !os.IsNotExist(func() error { _, statErr := os.Stat(output); return statErr }()) {
+				t.Fatalf("revalidate failure %s created output code=%d", fail, code)
+			}
+			assertFailureOrder("revalidate "+fail, calls, revalidateOrder, failAt)
+			assertNoPublishedSuffix(beforeAudit)
+			afterTarget := snapshotProductionTarget(t, ctx, url, name, a.Digest)
+			if beforeTarget != afterTarget {
+				t.Fatalf("revalidate failure %s mutated production: before=%+v after=%+v", fail, beforeTarget, afterTarget)
+			}
+		})
+	}
+
+	publishOrder := []string{"audit_edit_publish_requested", "immediate_rerun", "audit_edit_requested", "original_verify", "target_inspect_stale", "identity_isolation", "parse", "ast_bind", "rebind", "simulation", "fingerprint", "safety", "policy", "precheck", "guardrail", "audit_edit_validated", "approval_freshness_proof", "sign", "atomic_create", "audit_edit_published"}
+	for failAt, fail := range publishOrder {
+		t.Run("publish_failure_"+fail, func(t *testing.T) {
+			var calls []string
+			output := filepath.Join(dir, "failed-publish-"+fail+".json")
+			beforeAudit := fileSize(t, cfg.LifecycleAuditPath)
+			beforeTarget := snapshotProductionTarget(t, ctx, url, name, a.Digest)
+			code, _, _ := invoke(t, []string{"plan", "publish", "--attested", attestedPath, "--output", output, "--json"}, "", false, Services{PlanEdit: failedService(fail, &calls)})
+			if code == 0 || !os.IsNotExist(func() error { _, statErr := os.Stat(output); return statErr }()) {
+				t.Fatalf("publish failure %s left output code=%d", fail, code)
+			}
+			assertFailureOrder("publish "+fail, calls, publishOrder, failAt)
+			assertNoPublishedSuffix(beforeAudit)
+			afterTarget := snapshotProductionTarget(t, ctx, url, name, a.Digest)
+			if beforeTarget != afterTarget {
+				t.Fatalf("publish failure %s mutated production: before=%+v after=%+v", fail, beforeTarget, afterTarget)
+			}
+		})
+	}
 	tampered.GuardrailDigest = "sha256:" + strings.Repeat("f", 64)
 	tamperedRaw, _ := json.Marshal(tampered)
 	tamperedPath := filepath.Join(dir, "tampered-attested.json")

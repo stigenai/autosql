@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"reflect"
 	"strings"
 	"time"
@@ -48,6 +49,9 @@ func (s *productionEditService) checkpoint(name string) error {
 
 func (s *productionEditService) TrustedEditor() string { return s.editor }
 func (s *productionEditService) VerifyOriginal(a artifact.Artifact) error {
+	if err := s.checkpoint("original_verify"); err != nil {
+		return err
+	}
 	p, err := s.policyFor(a)
 	if err != nil {
 		return err
@@ -155,15 +159,15 @@ func (s *productionEditService) Revalidate(ctx context.Context, e planedit.Edite
 	if s.audit == nil {
 		return planedit.Eligible{}, errors.New("durable edit audit required")
 	}
-	if err := s.checkpoint("audit_requested"); err != nil {
-		return planedit.Eligible{}, err
-	}
 	reason := ""
 	if len(e.Provenance) > 0 {
 		sum := sha256.Sum256([]byte(e.Provenance[len(e.Provenance)-1].Reason))
 		reason = "reason_sha256:" + hex.EncodeToString(sum[:])
 	}
 	event := func(kind, stage string) error {
+		if err := s.checkpoint("audit_" + kind); err != nil {
+			return err
+		}
 		return s.audit.AppendDurable(ctx, executor.LifecycleEvent{Type: kind, ExecutionID: e.Digest, Target: s.editor, PlanDigest: e.CandidatePlan.Digest, Guidance: stage + " " + reason, At: time.Now().UTC()})
 	}
 	if err := event("edit_requested", "requested"); err != nil {
@@ -185,9 +189,6 @@ func (s *productionEditService) Revalidate(ctx context.Context, e planedit.Edite
 func (s *productionEditService) revalidateCore(ctx context.Context, e planedit.EditedArtifact) (planedit.Eligible, error) {
 	orig, err := artifact.Parse(e.OriginalGeneratedArtifact)
 	if err != nil {
-		return planedit.Eligible{}, err
-	}
-	if err = s.checkpoint("original_verify"); err != nil {
 		return planedit.Eligible{}, err
 	}
 	if err = s.VerifyOriginal(orig); err != nil {
@@ -228,7 +229,7 @@ func (s *productionEditService) Publish(ctx context.Context, e planedit.Eligible
 	if s.audit == nil {
 		return out, errors.New("durable edit audit required")
 	}
-	if err = s.checkpoint("audit_publish_requested"); err != nil {
+	if err = s.checkpoint("audit_edit_publish_requested"); err != nil {
 		return out, err
 	}
 	if err = s.audit.AppendDurable(ctx, executor.LifecycleEvent{Type: "edit_publish_requested", ExecutionID: e.Edit.Digest, Target: s.editor, PlanDigest: e.Edit.CandidatePlan.Digest, At: time.Now().UTC()}); err != nil {
@@ -237,13 +238,18 @@ func (s *productionEditService) Publish(ctx context.Context, e planedit.Eligible
 	published := false
 	defer func() {
 		if !published && err != nil {
-			if ae := s.audit.AppendDurable(ctx, executor.LifecycleEvent{Type: "edit_rejected", ExecutionID: e.Edit.Digest, Target: s.editor, PlanDigest: e.Edit.CandidatePlan.Digest, Guidance: "publish", At: time.Now().UTC()}); ae != nil {
+			if checkpointErr := s.checkpoint("audit_edit_publish_rejected"); checkpointErr != nil {
+				err = fmt.Errorf("%v; rejection audit: %w", err, checkpointErr)
+			} else if ae := s.audit.AppendDurable(ctx, executor.LifecycleEvent{Type: "edit_rejected", ExecutionID: e.Edit.Digest, Target: s.editor, PlanDigest: e.Edit.CandidatePlan.Digest, Guidance: "publish", At: time.Now().UTC()}); ae != nil {
 				err = fmt.Errorf("%v; rejection audit: %w", err, ae)
 			}
 		}
 	}()
 	// Review attestations are not authorization. Re-run the complete trusted
 	// pipeline from the embedded draft immediately before signing.
+	if err = s.checkpoint("immediate_rerun"); err != nil {
+		return out, err
+	}
 	fresh, err := s.Revalidate(ctx, e.Edit)
 	if err != nil {
 		return artifact.Artifact{}, err
@@ -270,11 +276,51 @@ func (s *productionEditService) Publish(ctx context.Context, e planedit.Eligible
 	if err = out.Sign(s.keyID, s.private); err != nil {
 		return out, err
 	}
-	if s.audit != nil {
-		err = s.audit.AppendDurable(ctx, executor.LifecycleEvent{Type: "edit_published", ExecutionID: e.Edit.Digest, ArtifactDigest: out.Digest, PlanDigest: out.Plan.Digest, BundleDigest: out.GuardrailDigest, At: time.Now().UTC()})
-	}
-	published = err == nil
+	published = true
 	return out, err
+}
+
+// AtomicCreate is used by the shipped edit CLI after all trusted work has
+// completed. Keeping the output boundary on the production service makes it
+// injectable in ordered fail-closed tests without replacing the real writer.
+func (s *productionEditService) AtomicCreate(path string, data []byte) error {
+	if err := s.checkpoint("atomic_create"); err != nil {
+		return err
+	}
+	return atomicCreate(path, data)
+}
+
+// PublishOutput makes the signed file durable before recording publication.
+// If the final audit cannot be made durable, the file is removed so callers
+// never observe an unaudited release.
+func (s *productionEditService) PublishOutput(ctx context.Context, eligible planedit.Eligible, a artifact.Artifact, path string, data []byte) (err error) {
+	if err = s.AtomicCreate(path, data); err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.Remove(path)
+			if s.audit != nil {
+				if checkpointErr := s.checkpoint("audit_edit_publish_rejected"); checkpointErr != nil {
+					err = fmt.Errorf("%v; rejection audit: %w", err, checkpointErr)
+				} else if auditErr := s.audit.AppendDurable(ctx, executor.LifecycleEvent{Type: "edit_rejected", ExecutionID: eligible.Edit.Digest, Target: s.editor, PlanDigest: eligible.Edit.CandidatePlan.Digest, Guidance: "output", At: time.Now().UTC()}); auditErr != nil {
+					err = fmt.Errorf("%v; rejection audit: %w", err, auditErr)
+				}
+			}
+		}
+	}()
+	if s.audit == nil {
+		return errors.New("durable edit audit required")
+	}
+	if err = s.checkpoint("audit_edit_published"); err != nil {
+		return err
+	}
+	if err = s.audit.AppendDurable(ctx, executor.LifecycleEvent{Type: "edit_published", ExecutionID: eligible.Edit.Digest, ArtifactDigest: a.Digest, PlanDigest: a.Plan.Digest, BundleDigest: a.GuardrailDigest, At: time.Now().UTC()}); err != nil {
+		return err
+	}
+	committed = true
+	return nil
 }
 func decodePrivate(value string) (ed25519.PrivateKey, error) {
 	raw, err := base64.RawStdEncoding.DecodeString(value)
