@@ -150,6 +150,7 @@ func (s Service) Diagnose(ctx context.Context, dir string) (Diagnosis, error) {
 	}
 	out.History = len(history)
 	by := map[string]revision.Revision{}
+	var dirtyCandidate *Divergence
 	for _, r := range rows {
 		by[r.Version] = r
 	}
@@ -159,8 +160,7 @@ func (s Service) Diagnose(ctx context.Context, dir string) (Diagnosis, error) {
 			if m.Version == r.Version {
 				found = true
 				if r.State == "pending" || r.State == "partial" || r.State == "failed" {
-					out.First = &Divergence{Version: r.Version, Kind: "dirty", Expected: "applied", Actual: r.State, RootCause: "incomplete revision evidence", SuggestedCommand: safeCommand("reconcile", r.Version)}
-					break
+					dirtyCandidate = &Divergence{Version: r.Version, Kind: "dirty", Expected: "applied", Actual: r.State, RootCause: "incomplete revision evidence", SuggestedCommand: safeCommand("reconcile", r.Version)}
 				}
 				if r.FileDigest != m.SQLDigest || r.ArtifactDigest != m.ArtifactDigest {
 					out.First = &Divergence{Version: r.Version, Kind: "checksum", Expected: m.SQLDigest, Actual: r.FileDigest, RootCause: "recorded revision differs from verified manifest", SuggestedCommand: safeCommand("remove", r.Version)}
@@ -172,6 +172,10 @@ func (s Service) Diagnose(ctx context.Context, dir string) (Diagnosis, error) {
 			break
 		}
 		if !found {
+			if dirtyCandidate != nil {
+				out.First = dirtyCandidate
+				break
+			}
 			out.First = &Divergence{Version: r.Version, Kind: "unknown", Actual: r.FileName, RootCause: "revision is absent from verified manifest", SuggestedCommand: safeCommand("remove", r.Version)}
 			break
 		}
@@ -206,6 +210,10 @@ func (s Service) Diagnose(ctx context.Context, dir string) (Diagnosis, error) {
 			seenHistory[key] = true
 			a, ok := artifacts[h.ArtifactDigest]
 			if !ok {
+				if dirtyCandidate != nil {
+					out.First = dirtyCandidate
+					break
+				}
 				out.First = &Divergence{Kind: "executor_unknown", Actual: h.ArtifactDigest, RootCause: "executor history references an untrusted artifact", SuggestedCommand: "autosql migrate diagnose --config <trusted-config> --env <environment>"}
 				break
 			}
@@ -230,6 +238,9 @@ func (s Service) Diagnose(ctx context.Context, dir string) (Diagnosis, error) {
 				break
 			}
 		}
+	}
+	if out.First == nil && dirtyCandidate != nil {
+		out.First = dirtyCandidate
 	}
 	if out.First == nil {
 		for _, m := range snap.Manifest.Entries {
