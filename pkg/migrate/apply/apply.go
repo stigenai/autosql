@@ -214,6 +214,21 @@ func (e Engine) Run(ctx context.Context, r Request) (out Result, err error) {
 		return out, nil
 	}
 	if len(candidates) == 0 {
+		// Persist an append-only manifest generation even when this target skips
+		// a checkpoint it is already inside. A later suffix can then prove its
+		// ancestry without executing or recording the checkpoint revision.
+		tx, er := s.Begin(ctx)
+		if er != nil {
+			return out, er
+		}
+		if er = s.RecordManifest(ctx, tx, snap.Manifest, parentGeneration(records), r.Now()); er == nil {
+			er = tx.Commit(ctx)
+		} else {
+			_ = tx.Rollback(context.WithoutCancel(ctx))
+		}
+		if er != nil {
+			return out, er
+		}
 		out.Status = "no_op"
 		return out, nil
 	}
@@ -279,7 +294,7 @@ func reconcileHistory(snap migrate.Snapshot, revs []revision.Revision, rows []re
 			return fmt.Errorf("%w: revision artifact absent", ErrRefused)
 		}
 		known[a.Digest] = true
-		if r.State == "baseline" || r.State == "checkpoint" {
+		if r.State == "baseline" {
 			if len(by[a.Digest]) != 0 {
 				return fmt.Errorf("%w: baseline has executor history", ErrRefused)
 			}

@@ -439,7 +439,7 @@ func canonicalExecutableSQL(v string) string {
 	lines := strings.Split(v, "\n")
 	for len(lines) > 0 {
 		t := strings.TrimSpace(lines[0])
-		if strings.HasPrefix(t, "-- autosql:") || strings.HasPrefix(t, "-- autosql-rename-hints-") {
+		if strings.HasPrefix(t, "-- autosql:") || strings.HasPrefix(t, "-- autosql-rename-hints-") || strings.HasPrefix(t, "-- autosql-checkpoint-") {
 			lines = lines[1:]
 			continue
 		}

@@ -19,6 +19,7 @@ import (
 	"autosql/pkg/plan"
 	"autosql/pkg/plugin"
 	"autosql/pkg/policy"
+	"autosql/pkg/postgres"
 	"autosql/pkg/precheck"
 	"autosql/pkg/schema"
 	"autosql/pkg/simulate"
@@ -102,7 +103,7 @@ func (a liveAuthority) VerifyApproval(_ context.Context, v approval.Approval) (a
 	return approval.VerifiedApproval{Identity: approval.Identity{ID: "reviewer", Roles: []string{"reviewer"}}, PlanDigest: v.PlanDigest, Environment: v.Environment, ApprovedAt: a.at, ExpiresAt: a.expires}, nil
 }
 
-func liveGenerated(t *testing.T, dev, prod string) (string, VerifyArtifact, func()) {
+func liveGenerated(t *testing.T, dev, prod string) (string, VerifyArtifact, func(), func() func()) {
 	t.Helper()
 	dir := t.TempDir()
 	if _, e := migrate.Update(dir, migrate.UpdateRequest{ManifestVersion: migrate.ManifestVersion}); e != nil {
@@ -173,7 +174,34 @@ func liveGenerated(t *testing.T, dev, prod string) (string, VerifyArtifact, func
 		}
 		addPolicies(next)
 	}
-	return dir, verify, appendSecond
+	appendCheckpointSuffix := func() func() {
+		r.Version, r.Label = "2", "checkpoint"
+		r.Desired = schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{}}}
+		if _, e = (migrate.GenerateService{}).CreateCheckpoint(context.Background(), migrate.CheckpointRequest{GenerateRequest: r, DataPolicy: "schema_only"}); e != nil {
+			t.Fatal(e)
+		}
+		next, e := migrate.LoadSnapshot(dir)
+		if e != nil {
+			t.Fatal(e)
+		}
+		addPolicies(next)
+		return func() {
+			doc2, e := source.LoadContext(context.Background(), source.Input{URI: "desired3.sql", Format: source.FormatSQL, Data: []byte("CREATE SCHEMA app; CREATE TABLE app.widgets (id bigint); CREATE TABLE app.gadgets (id bigint);")})
+			if e != nil {
+				t.Fatal(e)
+			}
+			r.Version, r.Label, r.Desired = "3", "gadgets", doc2
+			if _, e = (migrate.GenerateService{}).Generate(context.Background(), r); e != nil {
+				t.Fatal(e)
+			}
+			next, e = migrate.LoadSnapshot(dir)
+			if e != nil {
+				t.Fatal(e)
+			}
+			addPolicies(next)
+		}
+	}
+	return dir, verify, appendSecond, appendCheckpointSuffix
 }
 
 func mixedSnapshot(t *testing.T) (string, VerifyArtifact) {
@@ -289,7 +317,7 @@ func TestCoordinatorOutboxPartialDrainTwoFileAllInOneIsIdempotent(t *testing.T) 
 	if dev == "" || prod == "" {
 		t.Skip("live generation databases unset")
 	}
-	dir, verify, appendSecond := liveGenerated(t, dev, prod)
+	dir, verify, appendSecond, _ := liveGenerated(t, dev, prod)
 	clean, e := pgx.Connect(context.Background(), prod)
 	if e != nil {
 		t.Fatal(e)
@@ -474,12 +502,133 @@ func TestCoordinatorOutboxPartialDrainTwoFileAllInOneIsIdempotent(t *testing.T) 
 	}
 }
 
+func TestCheckpointActualEngineFreshFullAndExistingEquivalent(t *testing.T) {
+	dev, prod := os.Getenv("AUTOSQL_GENERATE_TEST_DSN"), os.Getenv("AUTOSQL_GENERATE_PROD_TEST_DSN")
+	if dev == "" || prod == "" {
+		t.Skip("live generation databases unset")
+	}
+	ctx := context.Background()
+	tag := "autosql_cp_" + strings.ToLower(strings.ReplaceAll(time.Now().Format("150405.000000"), ".", ""))
+	cleanup := func() {
+		c, e := pgx.Connect(ctx, prod)
+		if e != nil {
+			t.Fatal(e)
+		}
+		_, _ = c.Exec(ctx, `drop schema if exists app cascade; drop table if exists autosql_migration_history`)
+		c.Close(ctx)
+	}
+	defer cleanup()
+	guard := func(verify VerifyArtifact) GuardedApply {
+		return func(ctx context.Context, v artifact.VerifiedArtifact, s executor.Session, tx executor.Tx) (executor.ExternalExecution, error) {
+			a, _ := v.Payload()
+			x, e := executor.NewPostgreSQL(executor.Config{LockedSession: s, LockAlreadyHeld: true, Transaction: tx, Now: time.Now, Reauthorize: func(context.Context, artifact.Artifact) error { _, z := verify(a); return z }, State: func(context.Context, executor.Session) (executor.RuntimeState, error) {
+				return executor.RuntimeState{Fingerprint: a.Plan.FromFingerprint, SourceRevision: a.SourceRevision, Environment: a.TargetEnvironment, DatabaseIdentity: a.DatabaseIdentity}, nil
+			}}, v)
+			if e != nil {
+				return executor.ExternalExecution{}, e
+			}
+			_, e = x.ApplyAuthorized(ctx, a.Checks)
+			if tx != nil {
+				return x.ExternalExecution(), e
+			}
+			return executor.ExternalExecution{Result: x.Result()}, e
+		}
+	}
+	run := func(dir string, verify VerifyArtifact, revSchema string) (Result, []revision.Revision, string) {
+		store, e := revision.Open(revision.Config{URL: prod, Schema: revSchema})
+		if e != nil {
+			t.Fatal(e)
+		}
+		if e = store.Init(ctx); e != nil {
+			t.Fatal(e)
+		}
+		got, e := (Engine{Store: store, Verify: verify, Apply: guard(verify)}).Run(ctx, Request{Directory: dir, Operator: "acceptance", TargetIdentity: revSchema, Transaction: "file"})
+		if e != nil {
+			t.Fatalf("apply %s: %+v %v", revSchema, got, e)
+		}
+		session, e := store.OpenSession(ctx)
+		if e != nil {
+			t.Fatal(e)
+		}
+		rows, e := session.Revisions(ctx)
+		session.Close(ctx)
+		if e != nil {
+			t.Fatal(e)
+		}
+		doc, e := postgres.InspectURL(ctx, prod, postgres.Options{Schemas: []string{"app"}})
+		if e != nil {
+			t.Fatal(e)
+		}
+		doc, e = postgres.New().Normalize(ctx, doc)
+		if e != nil {
+			t.Fatal(e)
+		}
+		fp, e := schema.SemanticFingerprint(doc)
+		if e != nil {
+			t.Fatal(e)
+		}
+		return got, rows, fp
+	}
+	// Existing target gets v1 first, then encounters a checkpoint and must skip it.
+	existingDir, existingVerify, _, checkpointSuffix := liveGenerated(t, dev, prod)
+	cleanup()
+	first, rows, _ := run(existingDir, existingVerify, tag+"e")
+	if first.FinalVersion != "1.0.0" || len(rows) != 1 {
+		t.Fatalf("initial incremental=%+v rows=%+v", first, rows)
+	}
+	appendSuffix := checkpointSuffix()
+	encounter, encounterRows, _ := run(existingDir, existingVerify, tag+"e")
+	if encounter.Status != "no_op" || len(encounterRows) != 1 {
+		t.Fatalf("checkpoint encounter=%+v rows=%+v", encounter, encounterRows)
+	}
+	appendSuffix()
+	existing, existingRows, existingFP := run(existingDir, existingVerify, tag+"e")
+	if existing.FinalVersion != "3.0.0" || len(existingRows) != 2 {
+		t.Fatalf("existing=%+v rows=%+v", existing, existingRows)
+	}
+	for _, r := range existingRows {
+		if r.Kind == "checkpoint" {
+			t.Fatal("existing target executed checkpoint")
+		}
+	}
+	// Fresh target selects checkpoint plus suffix and persists covered revisions.
+	cleanup()
+	fresh, freshRows, freshFP := run(existingDir, existingVerify, tag+"f")
+	if fresh.FinalVersion != "3.0.0" || len(freshRows) != 2 || freshRows[0].Kind != "checkpoint" || len(freshRows[0].Supersedes) != 1 {
+		t.Fatalf("fresh=%+v rows=%+v", fresh, freshRows)
+	}
+	no, _, _ := run(existingDir, existingVerify, tag+"f")
+	if no.Status != "no_op" {
+		t.Fatalf("checkpoint retry=%+v", no)
+	}
+	c, e := pgx.Connect(ctx, prod)
+	if e != nil {
+		t.Fatal(e)
+	}
+	var histories, targets int
+	if e = c.QueryRow(ctx, `select count(*),count(distinct target_identity) from autosql_migration_history`).Scan(&histories, &targets); e != nil || histories == 0 || targets != 1 {
+		t.Fatalf("executor history count=%d targets=%d err=%v", histories, targets, e)
+	}
+	c.Close(ctx)
+	// A separate fresh target applying the uncompacted historical chain converges.
+	cleanup()
+	fullDir, fullVerify, appendFull, _ := liveGenerated(t, dev, prod)
+	appendFull()
+	full, fullRows, fullFP := run(fullDir, fullVerify, tag+"h")
+	if full.FinalVersion != "2.0.0" || len(fullRows) != 2 {
+		t.Fatalf("full=%+v rows=%+v", full, fullRows)
+	}
+	if freshFP != fullFP || existingFP != fullFP {
+		t.Fatalf("fingerprints fresh=%s full=%s existing=%s", freshFP, fullFP, existingFP)
+	}
+}
+
 func TestCoordinatorManifestReplacementWhileAcquiringCanonicalLock(t *testing.T) {
 	dev, prod := os.Getenv("AUTOSQL_GENERATE_TEST_DSN"), os.Getenv("AUTOSQL_GENERATE_PROD_TEST_DSN")
 	if dev == "" || prod == "" {
 		t.Skip("live generation databases unset")
 	}
-	dir, verify, appendSecond := liveGenerated(t, dev, prod)
+	dir, verify, appendSecond, _ := liveGenerated(t, dev, prod)
 	schema := "autosql_swap_" + strings.ReplaceAll(time.Now().Format("150405.000000"), ".", "")
 	store, e := revision.Open(revision.Config{URL: prod, Schema: schema})
 	if e != nil {
@@ -529,7 +678,7 @@ func TestCoordinatorDirectRevisionWriterRacesFileAllAndBaseline(t *testing.T) {
 	if dev == "" || prod == "" {
 		t.Skip("live generation databases unset")
 	}
-	dir, verify, _ := liveGenerated(t, dev, prod)
+	dir, verify, _, _ := liveGenerated(t, dev, prod)
 	for _, mode := range []string{"file", "all", "baseline"} {
 		t.Run(mode, func(t *testing.T) {
 			schema := "autosql_race_" + mode + strings.ReplaceAll(time.Now().Format("150405.000000"), ".", "")
