@@ -22,6 +22,14 @@ Unknown or duplicated fields, YAML aliases, anchors,
 custom tags, multiple documents, and trailing content are errors. Errors
 identify the invalid field or operation but never echo source content.
 
+`add_column` signs an instance-level `synchronization_mode`. `none` requires
+the synchronization effect to be exactly `none` and forbids transform,
+ordering, and batch fields. `backfill` requires the backfill/dual-write effect,
+a transform, positive batch, and exact structured unique ordering evidence.
+Mode/effect mismatches are invalid. Legacy add-column artifacts without
+backfill fields upgrade explicitly to `none`; legacy artifacts suggesting a
+backfill are refused because v0 cannot prove the complete v1 ordering contract.
+
 The minimum supported server is PostgreSQL 14. Artifacts may select 14–18 and
 are rejected before execution when the target is older. Version schemas expose
 compatibility surfaces during expansion and may be retained after contract.
@@ -34,7 +42,7 @@ must still compare the artifact's minimum version with the discovered target.
 | Operation | Availability | Expand | Synchronize/backfill | Contract | Rewrite / lock | Reverse |
 |---|---|---|---|---|---|---|
 | add table | online | create table | none | publish | none / brief access-exclusive | drop if unused |
-| add column | online | nullable column | stable batched backfill and dual-write | final constraints | none / brief access-exclusive | drop destination |
+| add column | online or conditional by signed mode | nullable column | `none`, or signed stable batched backfill and dual-write | final constraints | none / brief access-exclusive | drop destination |
 | rename column | conditional | compatibility destination | signed source transform, uniquely ordered batched backfill, and dual-write | remove source | shadow copy / brief access-exclusive | restore source name |
 | alter column type | conditional | typed shadow column | immutable transform and dual-write | swap and remove source | shadow copy / brief access-exclusive | only for declared lossless transform |
 | set not null | conditional | NOT VALID check | signed fill transform, uniquely ordered batched backfill, and validate | set constraint | scan, no table rewrite / brief access-exclusive | drop constraint |

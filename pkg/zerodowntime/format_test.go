@@ -12,7 +12,7 @@ import (
 func valid(t *testing.T) Migration {
 	t.Helper()
 	m, err := New("add_accounts", VersionSchema{Name: "v_accounts", ExposeDuringExpand: true}, Requirements{MinimumPostgres: 14, LockTimeoutMS: 1000, StatementTimeoutMS: 60000}, []Operation{
-		{ID: "01", Kind: AddColumn, Table: "accounts", Column: "display_name", DataType: "text", Expression: "coalesce(name, 'unknown')", Ordering: &Ordering{Columns: []string{"id"}, Unique: UniqueEvidence{Kind: "constraint", Name: "accounts_pkey", Columns: []string{"id"}}}, BatchSize: 500, Effects: mustEffects(AddColumn), Reversal: Reversal{Mode: "automatic"}},
+		{ID: "01", Kind: AddColumn, Table: "accounts", Column: "display_name", DataType: "text", Expression: "coalesce(name, 'unknown')", Ordering: &Ordering{Columns: []string{"id"}, Unique: UniqueEvidence{Kind: "constraint", Name: "accounts_pkey", Columns: []string{"id"}}}, BatchSize: 500, SynchronizationMode: "backfill", Effects: mustEffects(AddColumn), Reversal: Reversal{Mode: "automatic"}},
 		{ID: "02", Kind: CreateIndex, Table: "accounts", Index: "accounts_display_name_idx", Expression: "display_name", IndexMode: &IndexMode{Concurrent: true}, Effects: mustEffects(CreateIndex), Reversal: Reversal{Mode: "automatic"}},
 	}, map[string]string{"owner": "database"})
 	if err != nil {
@@ -133,6 +133,7 @@ func TestEveryBackfillClaimRequiresExecutionEvidence(t *testing.T) {
 		op.Kind = kind
 		op.Effects = mustEffects(kind)
 		op.DataType = ""
+		op.SynchronizationMode = ""
 		switch kind {
 		case RenameColumn:
 			op.NewName = "display_name_v2"
@@ -151,6 +152,38 @@ func TestEveryBackfillClaimRequiresExecutionEvidence(t *testing.T) {
 		if err := m.Validate(); err == nil {
 			t.Fatalf("%s accepted without ordering", kind)
 		}
+	}
+}
+
+func TestAddColumnSynchronizationModesAreSignedAndExact(t *testing.T) {
+	noEffects, _ := AddColumnEffects("none")
+	none := Operation{ID: "01", Kind: AddColumn, Table: "users", Column: "nickname", DataType: "text", SynchronizationMode: "none", Effects: noEffects, Reversal: Reversal{Mode: "automatic"}}
+	req := Requirements{MinimumPostgres: 14, LockTimeoutMS: 1, StatementTimeoutMS: 2}
+	schema := VersionSchema{Name: "v_users"}
+	if _, err := New("add_nickname", schema, req, []Operation{none}, nil); err != nil {
+		t.Fatal(err)
+	}
+	bad := none
+	bad.Effects = mustEffects(AddColumn)
+	if _, err := New("add_nickname", schema, req, []Operation{bad}, nil); err == nil {
+		t.Fatal("no-backfill mode accepted backfill effects")
+	}
+	bad = none
+	bad.Expression = "lower(name)"
+	if _, err := New("add_nickname", schema, req, []Operation{bad}, nil); err == nil {
+		t.Fatal("no-backfill mode accepted transform")
+	}
+	back := valid(t).Operations[0]
+	if _, err := New("add_nickname", schema, req, []Operation{back}, nil); err != nil {
+		t.Fatal(err)
+	}
+	back.Effects = noEffects
+	if _, err := New("add_nickname", schema, req, []Operation{back}, nil); err == nil {
+		t.Fatal("backfill mode accepted none effects")
+	}
+	back.Ordering = nil
+	if _, err := New("add_nickname", schema, req, []Operation{back}, nil); err == nil {
+		t.Fatal("backfill mode accepted missing ordering")
 	}
 }
 
@@ -297,6 +330,9 @@ func TestLegacyUpgradeIsExplicitAndStable(t *testing.T) {
 	if m.Metadata["upgraded_from"] != LegacyVersion || m.Version != Version {
 		t.Fatalf("upgrade evidence missing: %+v", m)
 	}
+	if m.Operations[0].SynchronizationMode != "none" || m.Operations[0].Effects.Synchronize != "none" {
+		t.Fatal("legacy no-backfill add column did not get explicit mode")
+	}
 	a, _ := m.MarshalJSONCanonical()
 	m2, err := UpgradeLegacyJSON([]byte(legacy))
 	if err != nil {
@@ -308,6 +344,10 @@ func TestLegacyUpgradeIsExplicitAndStable(t *testing.T) {
 	}
 	if _, err := UpgradeLegacyJSON([]byte(strings.Replace(legacy, LegacyVersion, "unknown", 1))); err == nil {
 		t.Fatal("unknown legacy version accepted")
+	}
+	ambiguous := strings.Replace(legacy, `"data_type":"text"`, `"data_type":"text","expression":"lower(nickname)"`, 1)
+	if _, err := UpgradeLegacyJSON([]byte(ambiguous)); err == nil {
+		t.Fatal("ambiguous legacy backfill accepted")
 	}
 }
 

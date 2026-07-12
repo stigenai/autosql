@@ -43,20 +43,21 @@ const (
 )
 
 type Operation struct {
-	ID         string        `json:"id" yaml:"id"`
-	Kind       OperationKind `json:"kind" yaml:"kind"`
-	Table      string        `json:"table" yaml:"table"`
-	Column     string        `json:"column,omitempty" yaml:"column,omitempty"`
-	NewName    string        `json:"new_name,omitempty" yaml:"new_name,omitempty"`
-	DataType   string        `json:"data_type,omitempty" yaml:"data_type,omitempty"`
-	Index      string        `json:"index,omitempty" yaml:"index,omitempty"`
-	Expression string        `json:"expression,omitempty" yaml:"expression,omitempty"`
-	Ordering   *Ordering     `json:"ordering,omitempty" yaml:"ordering,omitempty"`
-	BatchSize  int           `json:"batch_size,omitempty" yaml:"batch_size,omitempty"`
-	Unique     bool          `json:"unique,omitempty" yaml:"unique,omitempty"`
-	IndexMode  *IndexMode    `json:"index_mode,omitempty" yaml:"index_mode,omitempty"`
-	Effects    PhaseEffect   `json:"effects" yaml:"effects"`
-	Reversal   Reversal      `json:"reversal" yaml:"reversal"`
+	ID                  string        `json:"id" yaml:"id"`
+	Kind                OperationKind `json:"kind" yaml:"kind"`
+	Table               string        `json:"table" yaml:"table"`
+	Column              string        `json:"column,omitempty" yaml:"column,omitempty"`
+	NewName             string        `json:"new_name,omitempty" yaml:"new_name,omitempty"`
+	DataType            string        `json:"data_type,omitempty" yaml:"data_type,omitempty"`
+	Index               string        `json:"index,omitempty" yaml:"index,omitempty"`
+	Expression          string        `json:"expression,omitempty" yaml:"expression,omitempty"`
+	Ordering            *Ordering     `json:"ordering,omitempty" yaml:"ordering,omitempty"`
+	BatchSize           int           `json:"batch_size,omitempty" yaml:"batch_size,omitempty"`
+	Unique              bool          `json:"unique,omitempty" yaml:"unique,omitempty"`
+	SynchronizationMode string        `json:"synchronization_mode,omitempty" yaml:"synchronization_mode,omitempty"`
+	IndexMode           *IndexMode    `json:"index_mode,omitempty" yaml:"index_mode,omitempty"`
+	Effects             PhaseEffect   `json:"effects" yaml:"effects"`
+	Reversal            Reversal      `json:"reversal" yaml:"reversal"`
 }
 
 type Ordering struct {
@@ -216,6 +217,9 @@ func validateOperation(op Operation, pg int) error {
 		return errors.New("unsupported operation or PostgreSQL version")
 	}
 	expected, _ := Effects(op.Kind)
+	if op.Kind == AddColumn && op.SynchronizationMode == "none" {
+		expected = addColumnNoBackfillEffects()
+	}
 	if op.Effects != expected {
 		return errors.New("signed phase effects do not match operation capability")
 	}
@@ -224,11 +228,11 @@ func validateOperation(op Operation, pg int) error {
 	}
 	switch op.Kind {
 	case AddTable:
-		if hasColumnFields(op) || op.Index != "" || op.Ordering != nil || op.BatchSize != 0 || op.Unique || op.IndexMode != nil {
+		if hasColumnFields(op) || op.Index != "" || op.Ordering != nil || op.BatchSize != 0 || op.Unique || op.IndexMode != nil || op.SynchronizationMode != "" {
 			return errors.New("table operation has incompatible fields")
 		}
 	case DropTable:
-		if hasColumnFields(op) || op.Index != "" || op.Ordering != nil || op.BatchSize != 0 || op.Unique || op.IndexMode != nil {
+		if hasColumnFields(op) || op.Index != "" || op.Ordering != nil || op.BatchSize != 0 || op.Unique || op.IndexMode != nil || op.SynchronizationMode != "" {
 			return errors.New("table operation has incompatible fields")
 		}
 	case AddColumn:
@@ -238,14 +242,27 @@ func validateOperation(op Operation, pg int) error {
 		if op.NewName != "" || op.Index != "" || op.Unique || op.IndexMode != nil {
 			return errors.New("add_column has incompatible fields")
 		}
-		if op.Expression != "" {
+		switch op.SynchronizationMode {
+		case "none":
+			if op.Expression != "" || op.Ordering != nil || op.BatchSize != 0 {
+				return errors.New("no-backfill add_column forbids transform, ordering, and batch")
+			}
+		case "backfill":
+			if op.Expression == "" {
+				return errors.New("backfill add_column requires transform")
+			}
+		default:
+			return errors.New("add_column requires explicit synchronization_mode none or backfill")
+		}
+		if op.SynchronizationMode == "backfill" {
 			if err := validateBackfill(op); err != nil {
 				return err
 			}
-		} else if op.Ordering != nil || op.BatchSize != 0 {
-			return errors.New("ordering and batch_size require an expression")
 		}
 	case AlterColumnType:
+		if op.SynchronizationMode != "" {
+			return errors.New("alter_column_type does not consume synchronization_mode")
+		}
 		if op.Column == "" || validateDataType(op.DataType) != nil || op.Expression == "" {
 			return errors.New("column, safe data_type, and transform expression are required")
 		}
@@ -256,6 +273,9 @@ func validateOperation(op Operation, pg int) error {
 			return err
 		}
 	case RenameColumn:
+		if op.SynchronizationMode != "" {
+			return errors.New("rename_column does not consume synchronization_mode")
+		}
 		if op.Column == "" || op.NewName == "" || op.Expression == "" {
 			return errors.New("column, new_name, and source transform are required")
 		}
@@ -266,6 +286,9 @@ func validateOperation(op Operation, pg int) error {
 			return err
 		}
 	case SetNotNull:
+		if op.SynchronizationMode != "" {
+			return errors.New("set_not_null does not consume synchronization_mode")
+		}
 		if op.Column == "" || op.Expression == "" {
 			return errors.New("set_not_null requires column and fill expression")
 		}
@@ -276,6 +299,9 @@ func validateOperation(op Operation, pg int) error {
 			return err
 		}
 	case DropColumn:
+		if op.SynchronizationMode != "" {
+			return errors.New("drop_column does not consume synchronization_mode")
+		}
 		if op.Column == "" {
 			return errors.New("column is required")
 		}
@@ -283,6 +309,9 @@ func validateOperation(op Operation, pg int) error {
 			return errors.New("column operation has incompatible fields")
 		}
 	case CreateIndex:
+		if op.SynchronizationMode != "" {
+			return errors.New("create_index does not consume synchronization_mode")
+		}
 		if op.Index == "" || op.Expression == "" {
 			return errors.New("index and expression are required")
 		}
@@ -296,6 +325,9 @@ func validateOperation(op Operation, pg int) error {
 			return errors.New("concurrent index operation does not support partitioned indexes or constraint backing")
 		}
 	case DropIndex:
+		if op.SynchronizationMode != "" {
+			return errors.New("drop_index does not consume synchronization_mode")
+		}
 		if op.Index == "" {
 			return errors.New("index is required")
 		}
@@ -541,6 +573,20 @@ func Effects(kind OperationKind) (PhaseEffect, bool) {
 	e, ok := effects[kind]
 	return e, ok
 }
+func addColumnNoBackfillEffects() PhaseEffect {
+	return PhaseEffect{"add nullable destination column", "none", "enforce final default/constraints", "remove destination column"}
+}
+func AddColumnEffects(mode string) (PhaseEffect, bool) {
+	switch mode {
+	case "none":
+		return addColumnNoBackfillEffects(), true
+	case "backfill":
+		e, _ := Effects(AddColumn)
+		return e, true
+	default:
+		return PhaseEffect{}, false
+	}
+}
 
 func capability(kind OperationKind, pg int) (Capability, bool) {
 	if pg < 14 || pg > 18 {
@@ -689,6 +735,13 @@ func UpgradeLegacyJSON(data []byte) (Migration, error) {
 			return Migration{}, invalid("legacy operation unsupported")
 		}
 		old.Operations[i].Effects = e
+		if old.Operations[i].Kind == AddColumn {
+			if old.Operations[i].Expression != "" || old.Operations[i].Ordering != nil || old.Operations[i].BatchSize != 0 {
+				return Migration{}, invalid("legacy add_column backfill is ambiguous and requires explicit v1 artifact")
+			}
+			old.Operations[i].SynchronizationMode = "none"
+			old.Operations[i].Effects = addColumnNoBackfillEffects()
+		}
 		switch old.Operations[i].Kind {
 		case AlterColumnType, DropColumn, DropTable, CreateIndex, DropIndex:
 			return Migration{}, invalid("legacy operation requires explicit v1 semantics and cannot be silently upgraded")
