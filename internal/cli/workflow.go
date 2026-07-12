@@ -73,6 +73,7 @@ type Services struct {
 	ReadPlan ReadPlanService
 	Apply    ApplyService
 	PlanEdit PlanEditService
+	Down     DownService
 }
 type PlanEditService interface {
 	TrustedEditor() string

@@ -38,6 +38,15 @@ type PGXConnector struct{}
 func WrapPGX(c *pgx.Conn) Session { return pgxSession{c} }
 func WrapPGXTx(x pgx.Tx) Tx       { return pgxTx{x} }
 
+// RawPGXTx returns the underlying PostgreSQL transaction for trusted
+// inspection code. Other Tx implementations deliberately return nil.
+func RawPGXTx(x Tx) pgx.Tx {
+	if tx, ok := x.(pgxTx); ok {
+		return tx.x
+	}
+	return nil
+}
+
 type borrowedSession struct {
 	Session
 	tx Tx

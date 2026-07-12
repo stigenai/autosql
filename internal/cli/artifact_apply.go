@@ -15,14 +15,16 @@ import (
 // provide trusted verification policy, the exact bound guardrail input, and an
 // executor mutation factory. No raw plan or SQL execution path exists here.
 type VerifiedArtifactApplyService struct {
-	Policy         artifact.VerifyPolicy
-	PolicyFor      func(artifact.Artifact) (artifact.VerifyPolicy, error)
-	Guardrail      guardrail.Guardrail
-	Input          func(artifact.Artifact) (guardrail.Input, error)
-	Mutation       func(artifact.VerifiedArtifact) (guardrail.AuthorizedMutation, error)
-	MutationLocked func(artifact.VerifiedArtifact, executor.Session, executor.Tx) (guardrail.AuthorizedMutation, error)
-	NoEdits        bool
-	LifecycleAudit executor.LifecycleAudit
+	Policy                artifact.VerifyPolicy
+	PolicyFor             func(artifact.Artifact) (artifact.VerifyPolicy, error)
+	InstallPolicy         func(string, artifact.VerifyPolicy)
+	Guardrail             guardrail.Guardrail
+	Input                 func(artifact.Artifact) (guardrail.Input, error)
+	Mutation              func(artifact.VerifiedArtifact) (guardrail.AuthorizedMutation, error)
+	MutationLocked        func(artifact.VerifiedArtifact, executor.Session, executor.Tx) (guardrail.AuthorizedMutation, error)
+	MutationLockedAttempt func(artifact.VerifiedArtifact, executor.Session, executor.Tx, int) (guardrail.AuthorizedMutation, error)
+	NoEdits               bool
+	LifecycleAudit        executor.LifecycleAudit
 }
 
 func (s VerifiedArtifactApplyService) DrainLifecycle(ctx context.Context, e executor.LifecycleEvent) error {
@@ -33,16 +35,27 @@ func (s VerifiedArtifactApplyService) DrainLifecycle(ctx context.Context, e exec
 }
 
 func (s VerifiedArtifactApplyService) ApplyVersioned(ctx context.Context, v artifact.VerifiedArtifact, session executor.Session, tx executor.Tx) (executor.ExternalExecution, error) {
+	return s.ApplyVersionedAttempt(ctx, v, session, tx, 1)
+}
+func (s VerifiedArtifactApplyService) ApplyVersionedAttempt(ctx context.Context, v artifact.VerifiedArtifact, session executor.Session, tx executor.Tx, attempt int) (executor.ExternalExecution, error) {
 	var out executor.ExternalExecution
 	p, err := v.Payload()
-	if err != nil || s.Input == nil || s.MutationLocked == nil {
+	if err != nil || s.Input == nil || s.MutationLocked == nil && s.MutationLockedAttempt == nil {
 		return out, errors.New("versioned guarded apply is not configured")
 	}
 	in, err := s.Input(p)
 	if err != nil {
 		return out, err
 	}
-	mutation, err := s.MutationLocked(v, session, tx)
+	var mutation guardrail.AuthorizedMutation
+	if s.MutationLockedAttempt != nil {
+		mutation, err = s.MutationLockedAttempt(v, session, tx, attempt)
+	} else {
+		if attempt != 1 {
+			return out, errors.New("versioned reapply attempt is not configured")
+		}
+		mutation, err = s.MutationLocked(v, session, tx)
+	}
 	if err != nil {
 		return out, err
 	}

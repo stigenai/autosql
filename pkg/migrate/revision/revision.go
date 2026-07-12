@@ -16,7 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-const SchemaVersion = 5
+const SchemaVersion = 6
 
 var (
 	ErrConfig = errors.New("invalid revision store configuration")
@@ -252,6 +252,9 @@ check (kind in ('migration','baseline','checkpoint','reversal')), check (state i
 		}
 		_, err := tx.Exec(ctx, `create table `+ev+` (sequence bigint generated always as identity primary key, version text not null references `+r+`(version), attempt integer not null, event_type text not null, statement_ordinal integer not null default 0, redacted_detail text not null default '', operator_identity text not null, at timestamptz not null)`)
 		return err
+	case 6:
+		_, err := tx.Exec(ctx, `alter table `+r+` drop constraint if exists `+q(c.RevisionsTable+"_kind_check")+`, add constraint `+q(c.RevisionsTable+"_kind_check")+` check (kind in ('migration','baseline','checkpoint','reversal','reapply'))`)
+		return err
 	case 3:
 		_, err := tx.Exec(ctx, `alter table `+r+` add column duration_ns bigint not null default 0 check(duration_ns>=0), add column manifest_generation text not null default ''`)
 		return err
@@ -321,7 +324,7 @@ type Revision struct {
 
 // Revisions returns the authoritative rows visible on this pinned session.
 func (s *Session) Revisions(ctx context.Context) ([]Revision, error) {
-	rows, err := s.conn.Query(ctx, `select version,description,kind,file_name,file_digest,manifest_digest,manifest_generation,artifact_digest,plan_digest,checks_digest,bundle_digest,state,statement_ordinal,attempt,redacted_error,operator_identity,started_at,updated_at,completed_at,from_version,to_version,supersedes,reversal_of,duration_ns from `+q(s.config.Schema, s.config.RevisionsTable)+` order by version`)
+	rows, err := s.conn.Query(ctx, `select version,description,kind,file_name,file_digest,manifest_digest,manifest_generation,artifact_digest,plan_digest,checks_digest,bundle_digest,state,statement_ordinal,attempt,redacted_error,operator_identity,started_at,updated_at,completed_at,from_version,to_version,supersedes,reversal_of,duration_ns from `+q(s.config.Schema, s.config.RevisionsTable)+` order by started_at,version`)
 	if err != nil {
 		return nil, errors.New("read pinned revision snapshot")
 	}
@@ -361,6 +364,27 @@ func (s *Session) ExecEvent(ctx context.Context, tx pgx.Tx, e Event) error {
 	_, err := tx.Exec(ctx, `insert into `+q(s.config.Schema, s.config.EventsTable)+`(version,attempt,event_type,statement_ordinal,redacted_detail,operator_identity,at) values($1,$2,$3,$4,$5,$6,$7)`, e.Version, e.Attempt, e.Type, e.Ordinal, e.Detail, e.Operator, e.At.UTC())
 	if err != nil {
 		return errors.New("insert transactional revision event")
+	}
+	return nil
+}
+
+// ExecReversal appends a reversal revision and one link event per original
+// artifact in the caller's canonical executor transaction. It intentionally
+// has no update/delete path for prior revisions.
+func (s *Session) ExecReversal(ctx context.Context, tx pgx.Tx, r Revision, originalArtifacts []string) error {
+	if len(originalArtifacts) == 0 || r.Kind != "reversal" || r.ReversalOf == "" || r.State != "applied" {
+		return ErrConfig
+	}
+	if err := s.ExecRevision(ctx, tx, r); err != nil {
+		return err
+	}
+	for i, digest := range originalArtifacts {
+		if digest == "" {
+			return ErrConfig
+		}
+		if err := s.ExecEvent(ctx, tx, Event{Version: r.Version, Attempt: r.Attempt, Type: "reversal_of", Ordinal: i + 1, Detail: digest, Operator: r.Operator, At: r.UpdatedAt}); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -601,36 +625,36 @@ func (s *Store) Status(ctx context.Context, manifest migrate.Manifest) (Status, 
 		return Status{}, e
 	}
 	rows.Close()
-	history := map[string]map[string]bool{}
+	history := map[string]map[int]map[string]bool{}
 	var reg *string
 	if e = tx.QueryRow(ctx, `select to_regclass($1)::text`, c.ExecutorHistorySchema+"."+c.ExecutorHistoryTable).Scan(&reg); e != nil {
 		return Status{}, fmt.Errorf("locate executor history: %w", e)
 	}
-	artifacts := []string{}
-	for _, r := range records {
-		if r.ArtifactDigest != "" {
-			artifacts = append(artifacts, r.ArtifactDigest)
-		}
-	}
-	if reg != nil && len(artifacts) > 0 {
-		hr, he := tx.Query(ctx, `select artifact_digest,state from `+q(c.ExecutorHistorySchema, c.ExecutorHistoryTable)+` where artifact_digest=any($1::text[])`, artifacts)
+	evidenceKey := func(planDigest, bundleDigest string) string { return planDigest + "\x00" + bundleDigest }
+	if reg != nil && len(records) > 0 {
+		hr, he := tx.Query(ctx, `select plan_digest,bundle_digest,attempt,state from `+q(c.ExecutorHistorySchema, c.ExecutorHistoryTable))
 		if he != nil {
 			return Status{}, fmt.Errorf("read executor history: %w", he)
 		}
 		for hr.Next() {
-			var d, st string
-			if he = hr.Scan(&d, &st); he != nil {
+			var planDigest, bundleDigest, st string
+			var attempt int
+			if he = hr.Scan(&planDigest, &bundleDigest, &attempt, &st); he != nil {
 				hr.Close()
 				return Status{}, fmt.Errorf("scan executor history: %w", he)
 			}
-			if d == "" || st == "" {
+			if planDigest == "" || bundleDigest == "" || st == "" {
 				hr.Close()
 				return Status{}, errors.New("malformed executor history")
 			}
-			if history[d] == nil {
-				history[d] = map[string]bool{}
+			key := evidenceKey(planDigest, bundleDigest)
+			if history[key] == nil {
+				history[key] = map[int]map[string]bool{}
 			}
-			history[d][st] = true
+			if history[key][attempt] == nil {
+				history[key][attempt] = map[string]bool{}
+			}
+			history[key][attempt][st] = true
 		}
 		if he = hr.Err(); he != nil {
 			hr.Close()
@@ -639,6 +663,49 @@ func (s *Store) Status(ctx context.Context, manifest migrate.Manifest) (Status, 
 		hr.Close()
 	}
 	out := Status{ManifestDigest: manifest.Digest, Counts: map[string]int{}}
+	reversedTo := ""
+	validReversals := map[string]bool{}
+	validReapplies := map[string]bool{}
+	controlKeys := make([]string, 0, len(records))
+	for v := range records {
+		controlKeys = append(controlKeys, v)
+	}
+	sort.Slice(controlKeys, func(i, j int) bool {
+		a, b := records[controlKeys[i]], records[controlKeys[j]]
+		if a.StartedAt.Equal(b.StartedAt) {
+			return controlKeys[i] < controlKeys[j]
+		}
+		return a.StartedAt.Before(b.StartedAt)
+	})
+	for _, v := range controlKeys {
+		r := records[v]
+		if r.Kind == "reapply" {
+			targetOK := false
+			for _, m := range manifest.Entries {
+				targetOK = targetOK || m.Version == r.ToVersion
+			}
+			attemptHistory := history[evidenceKey(r.PlanDigest, r.BundleDigest)][r.Attempt]
+			valid := r.State == "applied" && r.Attempt > 1 && targetOK && r.ReversalOf != "" && r.FileName != "" && r.FileDigest != "" && r.ArtifactDigest != "" && r.PlanDigest != "" && r.ChecksDigest != "" && r.BundleDigest != "" && attemptHistory["confirmed"] && !attemptHistory["intended"] && !attemptHistory["uncertain"]
+			validReapplies[v] = valid
+			if valid {
+				reversedTo = r.ToVersion
+			}
+			continue
+		}
+		if r.Kind != "reversal" {
+			continue
+		}
+		targetOK := false
+		for _, m := range manifest.Entries {
+			targetOK = targetOK || m.Version == r.ToVersion
+		}
+		attemptHistory := history[evidenceKey(r.PlanDigest, r.BundleDigest)][r.Attempt]
+		valid := r.State == "applied" && targetOK && r.ReversalOf != "" && r.ArtifactDigest != "" && r.PlanDigest != "" && r.ChecksDigest != "" && r.BundleDigest != "" && attemptHistory["confirmed"] && !attemptHistory["intended"] && !attemptHistory["uncertain"]
+		validReversals[v] = valid
+		if valid {
+			reversedTo = r.ToVersion
+		}
+	}
 	seen := map[string]bool{}
 	for index, m := range manifest.Entries {
 		seen[m.Version] = true
@@ -658,9 +725,23 @@ func (s *Store) Status(ctx context.Context, manifest migrate.Manifest) (Status, 
 			if r.State == "failed" || r.State == "partial" {
 				entry.Dirty = true
 			}
-			if history[r.ArtifactDigest]["intended"] || history[r.ArtifactDigest]["uncertain"] {
+			attemptHistory := history[evidenceKey(r.PlanDigest, r.BundleDigest)][r.Attempt]
+			if attemptHistory["intended"] || attemptHistory["uncertain"] {
 				entry.Dirty = true
 				entry.Guidance = "reconcile incomplete executor history without rewriting revision state"
+			}
+		}
+		if reversedTo != "" {
+			targetIndex := -1
+			for i, x := range manifest.Entries {
+				if x.Version == reversedTo {
+					targetIndex = i
+				}
+			}
+			if index > targetIndex {
+				entry.Classification = "reversed"
+				entry.Dirty = false
+				entry.Guidance = "append-only reversal applied; forward migration remains available for reapply"
 			}
 		}
 		out.Entries = append(out.Entries, entry)
@@ -670,6 +751,16 @@ func (s *Store) Status(ctx context.Context, manifest migrate.Manifest) (Status, 
 	}
 	for v, r := range records {
 		if seen[v] {
+			continue
+		}
+		if r.Kind == "reversal" && validReversals[v] {
+			out.Entries = append(out.Entries, StatusEntry{Version: v, File: r.FileName, Classification: "reversal", RecordedState: r.State, Attempt: r.Attempt, StatementOrdinal: r.StatementOrdinal, Guidance: "verified append-only reversal to " + r.ToVersion})
+			out.Counts["reversal"]++
+			continue
+		}
+		if r.Kind == "reapply" && validReapplies[v] {
+			out.Entries = append(out.Entries, StatusEntry{Version: v, File: r.FileName, Classification: "reapply", RecordedState: r.State, Attempt: r.Attempt, StatementOrdinal: r.StatementOrdinal, Guidance: "append-only forward reapply of " + r.ToVersion})
+			out.Counts["reapply"]++
 			continue
 		}
 		out.Entries = append(out.Entries, StatusEntry{Version: v, File: r.FileName, Classification: "unknown", RecordedState: r.State, Attempt: r.Attempt, StatementOrdinal: r.StatementOrdinal, Unknown: true, Dirty: true, Guidance: "revision is absent from the verified manifest"})
