@@ -1,12 +1,16 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -53,6 +57,112 @@ func (t ambiguousTx) Commit(ctx context.Context) error {
 	return errors.New("commit password=seeded-commit-secret")
 }
 
+type productionTargetSnapshot struct {
+	Fingerprint, SchemaDefinition string
+	HistoryRows, AdvisoryLocks    int
+}
+
+func freshProductionDatabase(t *testing.T, ctx context.Context, baseURL, suffix string) string {
+	t.Helper()
+	cfg, err := pgx.ParseConfig(baseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	random := make([]byte, 6)
+	if _, err = rand.Read(random); err != nil {
+		t.Fatal(err)
+	}
+	database := "autosql_cs5_" + suffix + "_" + hex.EncodeToString(random)
+	adminCfg := cfg.Copy()
+	adminCfg.Database = "postgres"
+	admin, err := pgx.ConnectConfig(ctx, adminCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = admin.Exec(ctx, "create database "+pgx.Identifier{database}.Sanitize()); err != nil {
+		_ = admin.Close(ctx)
+		t.Fatal(err)
+	}
+	_ = admin.Close(ctx)
+	t.Cleanup(func() {
+		cleanup, connectErr := pgx.ConnectConfig(context.Background(), adminCfg)
+		if connectErr != nil {
+			return
+		}
+		_, _ = cleanup.Exec(context.Background(), `select pg_terminate_backend(pid) from pg_stat_activity where datname=$1 and pid <> pg_backend_pid()`, database)
+		_, _ = cleanup.Exec(context.Background(), "drop database if exists "+pgx.Identifier{database}.Sanitize())
+		_ = cleanup.Close(context.Background())
+	})
+	target, err := url.Parse(baseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target.Path = "/" + database
+	return target.String()
+}
+
+func snapshotProductionTarget(t *testing.T, ctx context.Context, url, schemaName, digest string) productionTargetSnapshot {
+	t.Helper()
+	doc, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{schemaName}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := schema.SemanticFingerprint(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	var definition string
+	err = conn.QueryRow(ctx, `select coalesce((select nspname from pg_namespace where nspname=$1),'')`, schemaName).Scan(&definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var history int
+	var historyTable *string
+	if err = conn.QueryRow(ctx, `select to_regclass('autosql_migration_history')::text`).Scan(&historyTable); err != nil {
+		t.Fatal(err)
+	}
+	if historyTable != nil {
+		if err = conn.QueryRow(ctx, `select count(*) from autosql_migration_history where artifact_digest=$1`, digest).Scan(&history); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var locks int
+	if err = conn.QueryRow(ctx, `select count(*) from pg_locks where locktype='advisory' and database=(select oid from pg_database where datname=current_database())`).Scan(&locks); err != nil {
+		t.Fatal(err)
+	}
+	return productionTargetSnapshot{Fingerprint: fingerprint, SchemaDefinition: definition, HistoryRows: history, AdvisoryLocks: locks}
+}
+
+func fileSize(t *testing.T, path string) int64 {
+	t.Helper()
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return 0
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.Size()
+}
+
+func assertTargetUnchanged(t *testing.T, before, after productionTargetSnapshot, lifecyclePath, approvalPath string, lifecycleBytes, approvalBytes int64) {
+	t.Helper()
+	if before != after {
+		t.Fatalf("refused apply changed target: before=%+v after=%+v", before, after)
+	}
+	if got := fileSize(t, lifecyclePath); got != lifecycleBytes {
+		t.Fatalf("refused apply changed lifecycle audit: before=%d after=%d", lifecycleBytes, got)
+	}
+	if got := fileSize(t, approvalPath); got != approvalBytes {
+		t.Fatalf("refused apply changed approval audit: before=%d after=%d", approvalBytes, got)
+	}
+}
+
 func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 	url := os.Getenv("AUTOSQL_PROD_TEST_URL")
 	if url == "" {
@@ -71,7 +181,11 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 	_, editPriv, _ := ed25519.GenerateKey(rand.Reader)
 	releaseAt := time.Now().UTC().Add(5 * time.Second)
 	dir := t.TempDir()
-	name := "autosql_prod_" + strings.ToLower(time.Now().Format("150405000000"))
+	schemaNonce := make([]byte, 6)
+	if _, err = rand.Read(schemaNonce); err != nil {
+		t.Fatal(err)
+	}
+	name := "autosql_prod_" + hex.EncodeToString(schemaNonce)
 	cfg := applyConfig{DatabaseURL: "env://AUTOSQL_PROD_TEST_URL", Environment: "test", DatabaseIdentity: "prod-test", SourceRevision: "test-rev", KeyID: "test-key", PublicKey: base64.RawStdEncoding.EncodeToString(pub), Issuer: "test-issuer", Signer: "test-signer", Author: "author", Requester: "requester", ApprovalAuditPath: filepath.Join(dir, "approval.jsonl"), LifecycleAuditPath: filepath.Join(dir, "lifecycle.jsonl"), ArtifactDirectory: dir, PostgresVersion: 15, Schemas: []string{name}, ExpectedPlanDigest: "pending", ExpectedChecksDigest: "pending", ExpectedGuardrailDigest: "pending", ExpectedApprovalIdentity: "release", KeyStatus: "active", KeyPurpose: "plan-artifact", KeyNotBefore: time.Now().UTC().Add(-time.Hour), KeyNotAfter: time.Now().UTC().Add(2 * time.Hour), EditorIdentity: "editor", EditSigningKeyID: "edit-key", EditSigningKeyReference: "env://AUTOSQL_EDIT_TEST_KEY", DevelopmentURLReference: "env://AUTOSQL_DEV_TEST_URL", FreshApprovalIdentity: "fresh-approver", FreshApprovalProofDigest: "sha256:" + strings.Repeat("9", 64), FreshApprovalAt: releaseAt, EditReleaseCreatedAt: releaseAt, EditReleaseExpiresAt: releaseAt.Add(time.Hour)}
 	raw, _ := json.Marshal(cfg)
 	configPath := filepath.Join(dir, "apply.json")
@@ -299,8 +413,9 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 	if !strings.Contains(auditText, a.Digest) || !strings.Contains(auditText, p.Digest) || !strings.Contains(auditText, bundle) {
 		t.Fatal("lifecycle audit bindings missing")
 	}
-	// Install the edited release manifest and prove both artifact and digest
-	// apply paths consume the freshly published artifact.
+	// Install the edited release manifest. Every following apply scenario gets
+	// its own database and audit files so prior execution cannot turn a real
+	// first mutation into an accidental no-op or hide side effects.
 	cfg.ExpectedPlanDigest, cfg.ExpectedChecksDigest, cfg.ExpectedGuardrailDigest = published.Plan.Digest, published.Checks.Digest, published.GuardrailDigest
 	cfg.ExpectedApprovalIdentity, cfg.KeyID, cfg.PublicKey = published.Approval.Identity, "edit-key", base64.RawStdEncoding.EncodeToString(editPriv.Public().(ed25519.PublicKey))
 	cfg.ExpectedApprovalProofDigest = published.Approval.ProofDigest
@@ -310,44 +425,143 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 		cfg.ExpectedValidationContextDigests[att.Stage] = att.ConfigDigest
 		cfg.ExpectedValidationAttestations[att.Stage] = att
 	}
-	raw, _ = json.Marshal(cfg)
-	if err = os.WriteFile(configPath, raw, 0600); err != nil {
-		t.Fatal(err)
-	}
-	editedServices, err := ProductionServices()
-	if err != nil {
-		t.Fatal(err)
-	}
 	if wait := time.Until(releaseAt); wait > 0 {
 		time.Sleep(wait + 10*time.Millisecond)
-	}
-	code, out, _ = invoke(t, []string{"apply", "--artifact", publishedPath, "--json"}, "", false, editedServices)
-	if code != 0 || !strings.Contains(out, "no_op") {
-		t.Fatalf("edited artifact apply code=%d out=%s", code, out)
 	}
 	if err = os.WriteFile(filepath.Join(dir, published.Plan.Digest+".json"), publishedRaw, 0600); err != nil {
 		t.Fatal(err)
 	}
-	editedServices.ReadPlan = &fakeRead{from: current, to: desired, p: published.Plan}
-	code, out, _ = invoke(t, []string{"apply", "--from", "from", "--to", "to", "--approve-digest", published.Plan.Digest, "--json"}, "", false, editedServices)
-	if code != 0 || !strings.Contains(out, "no_op") {
-		t.Fatalf("edited digest apply code=%d out=%s", code, out)
+
+	executableSteps := 0
+	for _, step := range published.Plan.Steps {
+		if step.Kind == plan.StepExecutable {
+			executableSteps++
+		}
 	}
-	code, _, _ = invoke(t, []string{"apply", "--artifact", publishedPath, "--no-edits", "--json"}, "", false, editedServices)
-	if code == 0 {
-		t.Fatal("request no-edits accepted edited artifact")
+	applyEdited := func(mode, targetURL string) {
+		t.Helper()
+		cfg.NoEdits = false
+		cfg.LifecycleAuditPath = filepath.Join(dir, "edited-"+mode+"-lifecycle.jsonl")
+		cfg.ApprovalAuditPath = filepath.Join(dir, "edited-"+mode+"-approval.jsonl")
+		raw, _ = json.Marshal(cfg)
+		if err = os.WriteFile(configPath, raw, 0600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("AUTOSQL_PROD_TEST_URL", targetURL)
+		modeServices, serviceErr := ProductionServices()
+		if serviceErr != nil {
+			t.Fatal(serviceErr)
+		}
+		args := []string{"apply", "--artifact", publishedPath, "--json"}
+		if mode == "digest" {
+			modeServices.ReadPlan = &fakeRead{from: current, to: desired, p: published.Plan}
+			args = []string{"apply", "--from", "from", "--to", "to", "--approve-digest", published.Plan.Digest, "--json"}
+		}
+		before := snapshotProductionTarget(t, ctx, targetURL, name, published.Digest)
+		if before.Fingerprint != published.Plan.FromFingerprint || before.SchemaDefinition != "" || before.HistoryRows != 0 || before.AdvisoryLocks != 0 {
+			t.Fatalf("%s target not fresh: %+v from=%s url=%s", mode, before, published.Plan.FromFingerprint, targetURL)
+		}
+		code, out, _ = invoke(t, args, "", false, modeServices)
+		if code != 0 || strings.Contains(out, "no_op") || !strings.Contains(out, fmt.Sprintf(`"applied_steps":%d`, executableSteps)) {
+			t.Fatalf("edited %s first apply code=%d out=%s", mode, code, out)
+		}
+		after := snapshotProductionTarget(t, ctx, targetURL, name, published.Digest)
+		if after.SchemaDefinition != name || after.Fingerprint != published.Plan.ToFingerprint || after.HistoryRows != executableSteps || after.AdvisoryLocks != 0 {
+			t.Fatalf("edited %s mutation evidence=%+v want fingerprint=%s history=%d", mode, after, published.Plan.ToFingerprint, executableSteps)
+		}
+		conn, connectErr := pgx.Connect(ctx, targetURL)
+		if connectErr != nil {
+			t.Fatal(connectErr)
+		}
+		var confirmed, exactSQL int
+		if connectErr = conn.QueryRow(ctx, `select count(*), count(*) filter (where step_hash <> '' and plan_digest=$2 and bundle_digest=$3 and state='confirmed') from autosql_migration_history where artifact_digest=$1`, published.Digest, published.Plan.Digest, published.GuardrailDigest).Scan(&confirmed, &exactSQL); connectErr != nil {
+			t.Fatal(connectErr)
+		}
+		_ = conn.Close(ctx)
+		if confirmed != executableSteps || exactSQL != executableSteps {
+			t.Fatalf("edited %s SQL/history not confirmed: rows=%d bound=%d", mode, confirmed, exactSQL)
+		}
+		lifecycle, readErr := os.ReadFile(cfg.LifecycleAuditPath)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		for _, event := range []string{"requested", "lock_acquired", "confirmed", "completed"} {
+			if !strings.Contains(string(lifecycle), `"Type":"`+event+`"`) {
+				t.Fatalf("edited %s lifecycle missing %s: %s", mode, event, lifecycle)
+			}
+		}
+		for _, binding := range []string{published.Digest, published.Plan.Digest, published.GuardrailDigest} {
+			if !strings.Contains(string(lifecycle), binding) {
+				t.Fatalf("edited %s lifecycle missing binding %s", mode, binding)
+			}
+		}
+		approvalAudit, readErr := os.ReadFile(cfg.ApprovalAuditPath)
+		if readErr != nil || !strings.Contains(string(approvalAudit), published.GuardrailDigest) || !strings.Contains(string(approvalAudit), cfg.Requester) || !strings.Contains(string(approvalAudit), `"type":"apply_authorized"`) {
+			t.Fatalf("edited %s approval audit missing release binding: err=%v audit=%s", mode, readErr, approvalAudit)
+		}
+		code, out, _ = invoke(t, args, "", false, modeServices)
+		if code != 0 || !strings.Contains(out, "no_op") {
+			t.Fatalf("edited %s second apply code=%d out=%s", mode, code, out)
+		}
+		second := snapshotProductionTarget(t, ctx, targetURL, name, published.Digest)
+		if second.Fingerprint != after.Fingerprint || second.SchemaDefinition != after.SchemaDefinition || second.HistoryRows != after.HistoryRows || second.AdvisoryLocks != 0 {
+			t.Fatalf("edited %s no-op changed target: first=%+v second=%+v", mode, after, second)
+		}
 	}
-	cfg.NoEdits = true
-	raw, _ = json.Marshal(cfg)
-	if err = os.WriteFile(configPath, raw, 0600); err != nil {
-		t.Fatal(err)
+
+	artifactTarget := freshProductionDatabase(t, ctx, url, "artifact")
+	digestTarget := freshProductionDatabase(t, ctx, url, "digest")
+	applyEdited("artifact", artifactTarget)
+	applyEdited("digest", digestTarget)
+
+	assertRefused := func(label, targetURL, artifactPath string, requestNoEdits, configuredNoEdits bool) {
+		t.Helper()
+		cfg.NoEdits = configuredNoEdits
+		cfg.LifecycleAuditPath = filepath.Join(dir, label+"-lifecycle.jsonl")
+		cfg.ApprovalAuditPath = filepath.Join(dir, label+"-approval.jsonl")
+		raw, _ = json.Marshal(cfg)
+		if err = os.WriteFile(configPath, raw, 0600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("AUTOSQL_PROD_TEST_URL", targetURL)
+		refusingServices, serviceErr := ProductionServices()
+		if serviceErr != nil {
+			t.Fatal(serviceErr)
+		}
+		before := snapshotProductionTarget(t, ctx, targetURL, name, published.Digest)
+		artifactBefore, readErr := os.ReadFile(artifactPath)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		parsedBefore, parseErr := artifact.Parse(artifactBefore)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		lifecycleBytes, approvalBytes := fileSize(t, cfg.LifecycleAuditPath), fileSize(t, cfg.ApprovalAuditPath)
+		args := []string{"apply", "--artifact", artifactPath, "--json"}
+		if requestNoEdits {
+			args = append(args[:3], "--no-edits", "--json")
+		}
+		code, _, _ = invoke(t, args, "", false, refusingServices)
+		if code == 0 {
+			t.Fatalf("%s accepted refused artifact", label)
+		}
+		after := snapshotProductionTarget(t, ctx, targetURL, name, published.Digest)
+		assertTargetUnchanged(t, before, after, cfg.LifecycleAuditPath, cfg.ApprovalAuditPath, lifecycleBytes, approvalBytes)
+		artifactAfter, readErr := os.ReadFile(artifactPath)
+		if readErr != nil || !bytes.Equal(artifactBefore, artifactAfter) {
+			t.Fatalf("%s changed artifact bytes: err=%v", label, readErr)
+		}
+		parsedAfter, parseErr := artifact.Parse(artifactAfter)
+		if parseErr != nil || parsedAfter.Digest != parsedBefore.Digest || parsedAfter.Signature != parsedBefore.Signature {
+			t.Fatalf("%s changed artifact digest/signature: err=%v", label, parseErr)
+		}
 	}
-	noEditServices, err := ProductionServices()
-	if err != nil {
-		t.Fatal(err)
-	}
-	code, _, _ = invoke(t, []string{"apply", "--artifact", publishedPath, "--json"}, "", false, noEditServices)
-	if code == 0 {
-		t.Fatal("configured no-edits accepted edited artifact")
-	}
+
+	assertRefused("request-no-edits", freshProductionDatabase(t, ctx, url, "request_no_edits"), publishedPath, true, false)
+	assertRefused("configured-no-edits", freshProductionDatabase(t, ctx, url, "configured_no_edits"), publishedPath, false, true)
+	// Once the trusted manifest advances to the edited release, replaying the
+	// originally approved artifact must fail before audit, lock, history, SQL,
+	// schema, or fingerprint state changes on a fresh target.
+	assertRefused("original-approval-replay", freshProductionDatabase(t, ctx, url, "approval_replay"), path, false, false)
 }
