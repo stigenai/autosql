@@ -40,7 +40,7 @@ func fixture(t *testing.T) (Artifact, ed25519.PublicKey, ed25519.PrivateKey) {
 		t.Fatal(e)
 	}
 	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-	a, e := New(p, checks, now, now.Add(time.Hour), "git:abc", "prod", "sha256:"+strings.Repeat("a", 64), Approval{Identity: "alice", ApprovedAt: now}, map[string]string{"ticket": "DB-1"})
+	a, e := New(p, checks, now, now.Add(time.Hour), "git:abc", "prod", "db-1", "sha256:"+strings.Repeat("a", 64), Approval{Identity: "alice", ApprovedAt: now}, map[string]string{"ticket": "DB-1"})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -60,15 +60,16 @@ func cloneArtifact(t *testing.T, a Artifact) Artifact {
 }
 func TestSignatureBindsEverySemanticArea(t *testing.T) {
 	a, pub, _ := fixture(t)
-	if e := a.Verify(map[string]ed25519.PublicKey{"key-1": pub}, a.CreatedAt); e != nil {
+	if _, e := a.VerifyTrusted(trustedPolicy(a, pub, a.CreatedAt)); e != nil {
 		t.Fatal(e)
 	}
 	tests := map[string]func(*Artifact){"sql": func(x *Artifact) { x.Plan.Steps = append(x.Plan.Steps, plan.Step{ID: "x"}) }, "checks": func(x *Artifact) { x.Checks.ID = "other" }, "from": func(x *Artifact) { x.Plan.FromFingerprint = "sha256:" + string(make([]byte, 64)) }, "order": func(x *Artifact) { x.Plan.Phases = nil }, "created": func(x *Artifact) { x.CreatedAt = x.CreatedAt.Add(time.Second) }, "expiry": func(x *Artifact) { x.ExpiresAt = x.ExpiresAt.Add(time.Second) }, "revision": func(x *Artifact) { x.SourceRevision = "git:def" }, "environment": func(x *Artifact) { x.TargetEnvironment = "stage" }, "approval": func(x *Artifact) { x.Approval.Identity = "bob" }, "approval time": func(x *Artifact) { x.Approval.ApprovedAt = x.Approval.ApprovedAt.Add(time.Second) }, "guardrail": func(x *Artifact) { x.GuardrailDigest = "other" }, "metadata": func(x *Artifact) { x.Metadata["ticket"] = "DB-2" }, "signature": func(x *Artifact) { x.Signature.Value = "AAAA" }}
+	tests["database"] = func(x *Artifact) { x.DatabaseIdentity = "db-2" }
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
 			x := cloneArtifact(t, a)
 			mutate(&x)
-			if e := x.Verify(map[string]ed25519.PublicKey{"key-1": pub}, a.CreatedAt); e == nil {
+			if _, e := x.VerifyTrusted(trustedPolicy(x, pub, a.CreatedAt)); e == nil {
 				t.Fatal("mutation verified")
 			}
 		})
@@ -76,16 +77,50 @@ func TestSignatureBindsEverySemanticArea(t *testing.T) {
 }
 func TestUnknownKeyExpiryAndUnknownFieldsFail(t *testing.T) {
 	a, pub, _ := fixture(t)
-	if e := a.Verify(map[string]ed25519.PublicKey{"other": pub}, a.CreatedAt); e == nil {
+	p := trustedPolicy(a, pub, a.CreatedAt)
+	p.Keys = map[string]KeyRecord{"other": p.Keys["key-1"]}
+	if _, e := a.VerifyTrusted(p); e == nil {
 		t.Fatal("key confusion accepted")
 	}
-	if !errors.Is(a.Verify(map[string]ed25519.PublicKey{"key-1": pub}, a.ExpiresAt), ErrExpired) {
+	p = trustedPolicy(a, pub, a.ExpiresAt)
+	if _, e := a.VerifyTrusted(p); !errors.Is(e, ErrExpired) {
 		t.Fatal("expiry accepted")
 	}
 	b, _ := a.MarshalCanonical()
 	b = append(b[:len(b)-1], []byte(`,"future":true}`)...)
 	if _, e := Parse(b); e == nil {
 		t.Fatal("unknown field accepted")
+	}
+}
+func TestSignatureEnvelopeAndSigningKeyValidation(t *testing.T) {
+	a, pub, _ := fixture(t)
+	for name, mutate := range map[string]func(*Artifact){"key id": func(x *Artifact) { x.Signature.KeyID = "other" }, "algorithm": func(x *Artifact) { x.Signature.Algorithm = "Other" }, "padding": func(x *Artifact) { x.Signature.Value += "=" }} {
+		t.Run(name, func(t *testing.T) {
+			x := cloneArtifact(t, a)
+			mutate(&x)
+			if _, e := x.VerifyTrusted(trustedPolicy(x, pub, a.CreatedAt)); e == nil {
+				t.Fatal("envelope mutation accepted")
+			}
+		})
+	}
+	unsigned := a
+	if e := unsigned.Sign("", make([]byte, ed25519.PrivateKeySize)); e == nil {
+		t.Fatal("empty key id")
+	}
+	defer func() {
+		if recover() != nil {
+			t.Fatal("short key panicked")
+		}
+	}()
+	if e := unsigned.Sign("key", []byte{1}); e == nil {
+		t.Fatal("short key accepted")
+	}
+}
+func TestMetadataMustBeCanonicalObject(t *testing.T) {
+	a, _, priv := fixture(t)
+	a.Metadata = nil
+	if e := a.Sign("key-1", priv); e == nil {
+		t.Fatal("nil metadata accepted")
 	}
 }
 func TestTrustedBindingsAndRecomputedInnerDigestsStillRequireSignature(t *testing.T) {
@@ -166,33 +201,35 @@ func TestErrorsAreTypedStableAndRedacted(t *testing.T) {
 	}
 }
 func registryConformance(t *testing.T, r Registry) {
-	a, _, priv := fixture(t)
-	ctx := context.Background()
-	if e := r.Put(ctx, a); e != nil {
+	a, pub, _ := fixture(t)
+	v, e := a.VerifyTrusted(trustedPolicy(a, pub, a.CreatedAt))
+	if e != nil {
 		t.Fatal(e)
 	}
-	if e := r.Put(ctx, a); e != nil {
+	ctx := context.Background()
+	if e := r.Put(ctx, v); e != nil {
+		t.Fatal(e)
+	}
+	if e := r.Put(ctx, v); e != nil {
 		t.Fatal(e)
 	}
 	got, e := r.Get(ctx, a.Digest)
 	if e != nil || got.Digest != a.Digest {
 		t.Fatalf("get=%v %v", got.Digest, e)
 	}
-	bad := a
-	if e := bad.Sign("key-2", priv); e != nil {
-		t.Fatal(e)
-	}
-	if e := r.Put(ctx, bad); !errors.Is(e, ErrCollision) {
-		t.Fatalf("collision=%v", e)
-	}
 }
 func TestRegistriesImmutableAndConcurrent(t *testing.T) {
 	t.Run("memory", func(t *testing.T) { registryConformance(t, NewMemoryRegistry()) })
 	t.Run("local", func(t *testing.T) {
 		dir := t.TempDir()
+		_ = os.Chmod(dir, 0700)
 		r := &LocalRegistry{Dir: dir}
 		registryConformance(t, r)
-		a, _, _ := fixture(t)
+		a, pub, _ := fixture(t)
+		v, e := a.VerifyTrusted(trustedPolicy(a, pub, a.CreatedAt))
+		if e != nil {
+			t.Fatal(e)
+		}
 		other := &LocalRegistry{Dir: dir}
 		var wg sync.WaitGroup
 		for i := 0; i < 20; i++ {
@@ -200,9 +237,9 @@ func TestRegistriesImmutableAndConcurrent(t *testing.T) {
 			go func(i int) {
 				defer wg.Done()
 				if i%2 == 0 {
-					_ = r.Put(context.Background(), a)
+					_ = r.Put(context.Background(), v)
 				} else {
-					_ = other.Put(context.Background(), a)
+					_ = other.Put(context.Background(), v)
 				}
 			}(i)
 		}
@@ -218,8 +255,13 @@ func TestRegistriesImmutableAndConcurrent(t *testing.T) {
 	})
 }
 func TestLocalRegistryRejectsTraversalSymlinkHardlinkAndWrongMode(t *testing.T) {
-	a, _, _ := fixture(t)
+	a, pub, _ := fixture(t)
+	v, e := a.VerifyTrusted(trustedPolicy(a, pub, a.CreatedAt))
+	if e != nil {
+		t.Fatal(e)
+	}
 	dir := t.TempDir()
+	_ = os.Chmod(dir, 0700)
 	r := &LocalRegistry{Dir: dir}
 	if _, e := r.Get(context.Background(), "../../secret"); e == nil {
 		t.Fatal("traversal accepted")
@@ -228,11 +270,11 @@ func TestLocalRegistryRejectsTraversalSymlinkHardlinkAndWrongMode(t *testing.T) 
 	target := filepath.Join(t.TempDir(), "target")
 	_ = os.WriteFile(target, []byte("x"), 0600)
 	_ = os.Symlink(target, path)
-	if e := r.Put(context.Background(), a); e == nil {
+	if e := r.Put(context.Background(), v); e == nil {
 		t.Fatal("symlink accepted")
 	}
 	_ = os.Remove(path)
-	if e := r.Put(context.Background(), a); e != nil {
+	if e := r.Put(context.Background(), v); e != nil {
 		t.Fatal(e)
 	}
 	_ = os.Chmod(path, 0644)
@@ -246,6 +288,27 @@ func TestLocalRegistryRejectsTraversalSymlinkHardlinkAndWrongMode(t *testing.T) 
 	}
 	if _, e := r.Get(context.Background(), a.Digest); e == nil {
 		t.Fatal("hardlink accepted")
+	}
+}
+func TestLocalRegistryAtomicNoReplaceCollision(t *testing.T) {
+	a, pub, _ := fixture(t)
+	v, e := a.VerifyTrusted(trustedPolicy(a, pub, a.CreatedAt))
+	if e != nil {
+		t.Fatal(e)
+	}
+	dir := t.TempDir()
+	_ = os.Chmod(dir, 0700)
+	_ = os.Chmod(dir, 0700)
+	path := filepath.Join(dir, a.Digest+".json")
+	if e = os.WriteFile(path, []byte("different"), 0600); e != nil {
+		t.Fatal(e)
+	}
+	if e = (&LocalRegistry{Dir: dir}).Put(context.Background(), v); !errors.Is(e, ErrCollision) {
+		t.Fatalf("collision=%v", e)
+	}
+	got, _ := os.ReadFile(path)
+	if string(got) != "different" {
+		t.Fatal("existing artifact replaced")
 	}
 }
 
@@ -286,6 +349,12 @@ func TestStaleCheckIsLockScopedAndExecutionFree(t *testing.T) {
 				t.Fatal("runtime mismatch accepted")
 			}
 		})
+	}
+}
+func TestZeroVerifiedArtifactCannotAuthorizeStaleCheck(t *testing.T) {
+	s := &lockState{}
+	if e := CheckStale(context.Background(), s, VerifiedArtifact{}); e == nil || s.calls != 0 {
+		t.Fatalf("error=%v calls=%d", e, s.calls)
 	}
 }
 func trustedPolicy(a Artifact, pub ed25519.PublicKey, now time.Time) VerifyPolicy {

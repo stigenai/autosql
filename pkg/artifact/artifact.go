@@ -58,6 +58,7 @@ type Artifact struct {
 	ExpiresAt         time.Time         `json:"expires_at"`
 	SourceRevision    string            `json:"source_revision"`
 	TargetEnvironment string            `json:"target_environment"`
+	DatabaseIdentity  string            `json:"database_identity"`
 	Approval          Approval          `json:"approval"`
 	GuardrailDigest   string            `json:"guardrail_digest"`
 	Metadata          map[string]string `json:"metadata"`
@@ -77,37 +78,42 @@ type VerifyPolicy struct {
 	Issuer, Identity, Purpose string
 }
 type VerifiedArtifact struct {
-	artifact         Artifact
-	databaseIdentity string
+	artifact Artifact
+	marker   [32]byte
 }
 
 func (v VerifiedArtifact) Digest() string { return v.artifact.Digest }
+func (v VerifiedArtifact) forRegistry() (Artifact, error) {
+	if v.marker != verifiedMarker(v.artifact) || v.artifact.Digest == "" {
+		return Artifact{}, fail("verified_token", ErrInvalid)
+	}
+	return v.artifact, nil
+}
 
-func New(p plan.Plan, checks precheck.Plan, created, expires time.Time, revision, environment, guardrailDigest string, approval Approval, metadata map[string]string) (Artifact, error) {
-	a := Artifact{Version: Version, Plan: p, Checks: checks, CreatedAt: created.UTC(), ExpiresAt: expires.UTC(), SourceRevision: revision, TargetEnvironment: environment, Approval: approval, GuardrailDigest: guardrailDigest, Metadata: clone(metadata)}
+func New(p plan.Plan, checks precheck.Plan, created, expires time.Time, revision, environment, databaseIdentity, guardrailDigest string, approval Approval, metadata map[string]string) (Artifact, error) {
+	a := Artifact{Version: Version, Plan: p, Checks: checks, CreatedAt: created.UTC(), ExpiresAt: expires.UTC(), SourceRevision: revision, TargetEnvironment: environment, DatabaseIdentity: databaseIdentity, Approval: approval, GuardrailDigest: guardrailDigest, Metadata: clone(metadata)}
 	d, err := digest(a)
 	a.Digest = d
 	return a, err
 }
 func (a *Artifact) Sign(keyID string, private ed25519.PrivateKey) error {
+	if keyID == "" || len(private) != ed25519.PrivateKeySize {
+		return fail("signing_key", ErrInvalid)
+	}
 	if err := a.validateUnsigned(); err != nil {
 		return err
 	}
+	a.Signature = Signature{KeyID: keyID, Algorithm: "Ed25519"}
 	d, err := digest(*a)
 	if err != nil {
 		return err
 	}
 	a.Digest = d
-	a.Signature = Signature{KeyID: keyID, Algorithm: "Ed25519", Value: base64.StdEncoding.EncodeToString(ed25519.Sign(private, []byte(signatureDomain+d)))}
+	a.Signature.Value = base64.RawStdEncoding.EncodeToString(ed25519.Sign(private, []byte(signatureDomain+d)))
 	return nil
 }
 func (a Artifact) Verify(keys map[string]ed25519.PublicKey, now time.Time) error {
-	records := map[string]KeyRecord{}
-	for id, key := range keys {
-		records[id] = KeyRecord{PublicKey: key, Issuer: "legacy", Identity: "legacy", Environment: a.TargetEnvironment, Purpose: "plan-artifact", Status: "active", NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour)}
-	}
-	_, err := a.VerifyTrusted(VerifyPolicy{Now: func() time.Time { return now }, Expected: ExpectedBindings{PlanDigest: a.Plan.Digest, ChecksDigest: a.Checks.Digest, GuardrailDigest: a.GuardrailDigest, SourceRevision: a.SourceRevision, Environment: a.TargetEnvironment, DatabaseIdentity: "legacy", ApprovalIdentity: a.Approval.Identity}, Keys: records, Issuer: "legacy", Identity: "legacy", Purpose: "plan-artifact"})
-	return err
+	return fail("trusted_policy_required", ErrInvalid)
 }
 func (a Artifact) VerifyTrusted(policy VerifyPolicy) (VerifiedArtifact, error) {
 	if policy.Now == nil {
@@ -125,7 +131,7 @@ func (a Artifact) VerifyTrusted(policy VerifyPolicy) (VerifiedArtifact, error) {
 		return VerifiedArtifact{}, fail("time", ErrExpired)
 	}
 	expected := policy.Expected
-	if expected.PlanDigest == "" || expected.ChecksDigest == "" || expected.GuardrailDigest == "" || expected.SourceRevision == "" || expected.Environment == "" || expected.DatabaseIdentity == "" || expected.ApprovalIdentity == "" || a.Plan.Digest != expected.PlanDigest || a.Checks.Digest != expected.ChecksDigest || a.GuardrailDigest != expected.GuardrailDigest || a.SourceRevision != expected.SourceRevision || a.TargetEnvironment != expected.Environment || a.Approval.Identity != expected.ApprovalIdentity {
+	if expected.PlanDigest == "" || expected.ChecksDigest == "" || expected.GuardrailDigest == "" || expected.SourceRevision == "" || expected.Environment == "" || expected.DatabaseIdentity == "" || expected.ApprovalIdentity == "" || a.Plan.Digest != expected.PlanDigest || a.Checks.Digest != expected.ChecksDigest || a.GuardrailDigest != expected.GuardrailDigest || a.SourceRevision != expected.SourceRevision || a.TargetEnvironment != expected.Environment || a.DatabaseIdentity != expected.DatabaseIdentity || a.Approval.Identity != expected.ApprovalIdentity {
 		return VerifiedArtifact{}, fail("binding", ErrInvalid)
 	}
 	changeDigest, ce := guardrail.ChangeDigest(a.Plan.Changes)
@@ -159,14 +165,16 @@ func (a Artifact) VerifyTrusted(policy VerifyPolicy) (VerifiedArtifact, error) {
 	if a.Signature.Algorithm != "Ed25519" {
 		return VerifiedArtifact{}, fail("algorithm", ErrInvalid)
 	}
-	sig, e := base64.StdEncoding.DecodeString(a.Signature.Value)
+	sig, e := base64.RawStdEncoding.Strict().DecodeString(a.Signature.Value)
 	if e != nil || !ed25519.Verify(record.PublicKey, []byte(signatureDomain+a.Digest), sig) {
 		return VerifiedArtifact{}, fail("signature", ErrInvalid)
 	}
-	return VerifiedArtifact{artifact: a, databaseIdentity: policy.Expected.DatabaseIdentity}, nil
+	v := VerifiedArtifact{artifact: a}
+	v.marker = verifiedMarker(a)
+	return v, nil
 }
 func (a Artifact) validateUnsigned() error {
-	if a.Version != Version || a.SourceRevision == "" || a.TargetEnvironment == "" || a.GuardrailDigest == "" || a.Approval.Identity == "" || a.CreatedAt.IsZero() || !a.ExpiresAt.After(a.CreatedAt) || a.Approval.ApprovedAt.IsZero() || a.Approval.ApprovedAt.After(a.CreatedAt) || a.CreatedAt.Location() != time.UTC || a.ExpiresAt.Location() != time.UTC || a.Approval.ApprovedAt.Location() != time.UTC {
+	if a.Version != Version || a.SourceRevision == "" || a.TargetEnvironment == "" || a.DatabaseIdentity == "" || a.GuardrailDigest == "" || a.Approval.Identity == "" || a.Metadata == nil || a.CreatedAt.IsZero() || !a.ExpiresAt.After(a.CreatedAt) || a.Approval.ApprovedAt.IsZero() || a.Approval.ApprovedAt.After(a.CreatedAt) || a.CreatedAt.Location() != time.UTC || a.ExpiresAt.Location() != time.UTC || a.Approval.ApprovedAt.Location() != time.UTC {
 		return fmt.Errorf("%w: required metadata", ErrInvalid)
 	}
 	if err := a.Plan.Validate(); err != nil {
@@ -183,7 +191,7 @@ func (a Artifact) validateUnsigned() error {
 }
 func digest(a Artifact) (string, error) {
 	a.Digest = ""
-	a.Signature = Signature{}
+	a.Signature.Value = ""
 	b, e := json.Marshal(a)
 	if e != nil {
 		return "", e
@@ -208,7 +216,7 @@ func (a Artifact) validateStored() error {
 	if a.Signature.KeyID == "" || a.Signature.Algorithm != "Ed25519" {
 		return fail("signature", ErrInvalid)
 	}
-	sig, err := base64.StdEncoding.DecodeString(a.Signature.Value)
+	sig, err := base64.RawStdEncoding.Strict().DecodeString(a.Signature.Value)
 	if err != nil || len(sig) != ed25519.SignatureSize {
 		return fail("signature", ErrInvalid)
 	}
@@ -280,15 +288,21 @@ type LockedState interface {
 }
 
 func CheckStale(ctx context.Context, state LockedState, v VerifiedArtifact) error {
+	if v.marker != verifiedMarker(v.artifact) || v.artifact.Digest == "" {
+		return fail("verified_token", ErrInvalid)
+	}
 	return state.WithLock(ctx, func(ctx context.Context, r FingerprintReader) error {
 		got, err := r.State(ctx)
 		if err != nil {
 			return err
 		}
 		a := v.artifact
-		if !strings.EqualFold(got.Fingerprint, a.Plan.FromFingerprint) || got.SourceRevision != a.SourceRevision || got.Environment != a.TargetEnvironment || got.DatabaseIdentity != v.databaseIdentity {
+		if !strings.EqualFold(got.Fingerprint, a.Plan.FromFingerprint) || got.SourceRevision != a.SourceRevision || got.Environment != a.TargetEnvironment || got.DatabaseIdentity != a.DatabaseIdentity {
 			return ErrStale
 		}
 		return nil
 	})
+}
+func verifiedMarker(a Artifact) [32]byte {
+	return sha256.Sum256([]byte("autosql.artifact.verified/v1\x00" + a.Digest + "\x00" + a.Signature.Value))
 }

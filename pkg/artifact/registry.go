@@ -2,8 +2,11 @@ package artifact
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
-	"fmt"
+	"golang.org/x/sys/unix"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -14,7 +17,7 @@ var ErrCollision = errors.New("artifact digest collision")
 var ErrNotFound = errors.New("artifact not found")
 
 type Registry interface {
-	Put(context.Context, Artifact) error
+	Put(context.Context, VerifiedArtifact) error
 	Get(context.Context, string) (Artifact, error)
 }
 type MemoryRegistry struct {
@@ -23,8 +26,9 @@ type MemoryRegistry struct {
 }
 
 func NewMemoryRegistry() *MemoryRegistry { return &MemoryRegistry{m: map[string][]byte{}} }
-func (r *MemoryRegistry) Put(_ context.Context, a Artifact) error {
-	if e := a.validateStored(); e != nil {
+func (r *MemoryRegistry) Put(_ context.Context, v VerifiedArtifact) error {
+	a, e := v.forRegistry()
+	if e != nil {
 		return e
 	}
 	b, e := a.MarshalCanonical()
@@ -57,8 +61,9 @@ type LocalRegistry struct {
 	mu  sync.Mutex
 }
 
-func (r *LocalRegistry) Put(_ context.Context, a Artifact) error {
-	if e := a.validateStored(); e != nil {
+func (r *LocalRegistry) Put(_ context.Context, v VerifiedArtifact) error {
+	a, e := v.forRegistry()
+	if e != nil {
 		return e
 	}
 	b, e := a.MarshalCanonical()
@@ -69,101 +74,113 @@ func (r *LocalRegistry) Put(_ context.Context, a Artifact) error {
 	defer r.mu.Unlock()
 	_, statErr := os.Lstat(r.Dir)
 	created := os.IsNotExist(statErr)
-	if e = os.MkdirAll(r.Dir, 0700); e != nil {
-		return e
-	}
-	if e = os.Chmod(r.Dir, 0700); e != nil {
-		return e
+	if created {
+		if e = os.MkdirAll(r.Dir, 0700); e != nil {
+			return fail("registry_io", ErrInvalid)
+		}
+		if e = os.Chmod(r.Dir, 0700); e != nil {
+			return fail("registry_io", ErrInvalid)
+		}
+		parent, pe := os.Open(filepath.Dir(r.Dir))
+		if pe != nil {
+			return fail("registry_io", ErrInvalid)
+		}
+		e = parent.Sync()
+		closeErr := parent.Close()
+		if e != nil || closeErr != nil {
+			return fail("registry_io", ErrInvalid)
+		}
 	}
 	if e = trustedDir(r.Dir); e != nil {
 		return e
 	}
-	if created {
-		if parent, pe := os.Open(filepath.Dir(r.Dir)); pe == nil {
-			e = parent.Sync()
-			parent.Close()
-			if e != nil {
-				return fail("registry", ErrInvalid)
-			}
-		}
-	}
-	lockPath := filepath.Join(r.Dir, ".lock")
-	if _, le := os.Lstat(lockPath); le == nil {
-		if e = trustedFile(lockPath); e != nil {
-			return e
-		}
-	}
-	lock, e := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	dfd, e := openTrustedDir(r.Dir)
 	if e != nil {
-		return fail("registry", ErrInvalid)
+		return e
 	}
-	defer lock.Close()
-	if info, le := lock.Stat(); le != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || info.Sys().(*syscall.Stat_t).Nlink != 1 {
-		return fail("registry", ErrInvalid)
+	defer unix.Close(dfd)
+	lockfd, e := unix.Openat(dfd, ".lock", unix.O_CREAT|unix.O_RDWR|unix.O_NOFOLLOW, 0600)
+	if e != nil {
+		return fail("registry_io", ErrInvalid)
 	}
-	if e = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); e != nil {
-		return fail("registry", ErrInvalid)
+	defer unix.Close(lockfd)
+	if e = trustedFD(lockfd, 0600); e != nil {
+		return e
 	}
-	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
-	path := filepath.Join(r.Dir, a.Digest+".json")
-	if _, se := os.Lstat(path); se == nil {
-		if e = trustedFile(path); e != nil {
+	if e = unix.Flock(lockfd, unix.LOCK_EX); e != nil {
+		return fail("registry_io", ErrInvalid)
+	}
+	defer unix.Flock(lockfd, unix.LOCK_UN)
+	target := a.Digest + ".json"
+	if fd, oe := unix.Openat(dfd, target, unix.O_RDONLY|unix.O_NOFOLLOW, 0); oe == nil {
+		defer unix.Close(fd)
+		if e = trustedFD(fd, 0600); e != nil {
 			return e
 		}
-	}
-	if old, e := os.ReadFile(path); e == nil {
+		old, e := readFD(fd)
+		if e != nil {
+			return e
+		}
 		if string(old) == string(b) {
 			return nil
 		}
 		return ErrCollision
 	}
-	tmp, e := os.CreateTemp(r.Dir, ".artifact-*")
+	random := make([]byte, 16)
+	if _, e = rand.Read(random); e != nil {
+		return fail("registry_io", ErrInvalid)
+	}
+	tmp := ".artifact-" + hex.EncodeToString(random)
+	tfd, e := unix.Openat(dfd, tmp, unix.O_CREAT|unix.O_EXCL|unix.O_WRONLY|unix.O_NOFOLLOW, 0600)
 	if e != nil {
+		return fail("registry_io", ErrInvalid)
+	}
+	cleanup := true
+	defer func() {
+		unix.Close(tfd)
+		if cleanup {
+			unix.Unlinkat(dfd, tmp, 0)
+		}
+	}()
+	if e = trustedFD(tfd, 0600); e != nil {
 		return e
 	}
-	name := tmp.Name()
-	defer os.Remove(name)
-	if e = tmp.Chmod(0600); e == nil {
-		_, e = tmp.Write(b)
+	if _, e = unix.Write(tfd, b); e != nil {
+		return fail("registry_io", ErrInvalid)
 	}
-	if e == nil {
-		e = tmp.Sync()
+	if e = unix.Fsync(tfd); e != nil {
+		return fail("registry_io", ErrInvalid)
 	}
-	if closeErr := tmp.Close(); e == nil {
-		e = closeErr
+	if e = unix.Linkat(dfd, tmp, dfd, target, 0); e != nil {
+		return fail("registry_collision", ErrCollision)
 	}
-	if e != nil {
-		return e
+	if e = unix.Unlinkat(dfd, tmp, 0); e != nil {
+		return fail("registry_io", ErrInvalid)
 	}
-	if e = os.Rename(name, path); e != nil {
-		return e
+	cleanup = false
+	if e = unix.Fsync(dfd); e != nil {
+		return fail("registry_io", ErrInvalid)
 	}
-	dir, e := os.Open(r.Dir)
-	if e == nil {
-		e = dir.Sync()
-		dir.Close()
-	}
-	return e
+	return nil
 }
 func (r *LocalRegistry) Get(_ context.Context, d string) (Artifact, error) {
 	if !digestPattern.MatchString(d) {
 		return Artifact{}, fail("digest", ErrInvalid)
 	}
-	if e := trustedDir(r.Dir); e != nil {
+	dfd, e := openTrustedDir(r.Dir)
+	if e != nil {
 		return Artifact{}, e
 	}
-	path := filepath.Join(r.Dir, d+".json")
-	info, e := os.Lstat(path)
-	if os.IsNotExist(e) {
-		return Artifact{}, ErrNotFound
+	defer unix.Close(dfd)
+	fd, e := unix.Openat(dfd, d+".json", unix.O_RDONLY|unix.O_NOFOLLOW, 0)
+	if e != nil {
+		return Artifact{}, fail("registry_not_found", ErrNotFound)
 	}
-	if e != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || info.Sys().(*syscall.Stat_t).Nlink != 1 {
-		return Artifact{}, fail("registry", ErrInvalid)
+	defer unix.Close(fd)
+	if e = trustedFD(fd, 0600); e != nil {
+		return Artifact{}, e
 	}
-	b, e := os.ReadFile(path)
-	if os.IsNotExist(e) {
-		return Artifact{}, ErrNotFound
-	}
+	b, e := readFD(fd)
 	if e != nil {
 		return Artifact{}, e
 	}
@@ -172,23 +189,12 @@ func (r *LocalRegistry) Get(_ context.Context, d string) (Artifact, error) {
 		return Artifact{}, e
 	}
 	if a.Digest != d {
-		return Artifact{}, fmt.Errorf("%w: filename digest", ErrCollision)
+		return Artifact{}, fail("registry_collision", ErrCollision)
 	}
 	if e = a.validateStored(); e != nil {
 		return Artifact{}, e
 	}
 	return a, nil
-}
-func trustedFile(path string) error {
-	info, e := os.Lstat(path)
-	if e != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 {
-		return fail("registry", ErrInvalid)
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || stat.Uid != uint32(os.Geteuid()) || stat.Nlink != 1 {
-		return fail("registry", ErrInvalid)
-	}
-	return nil
 }
 func trustedDir(path string) error {
 	info, e := os.Lstat(path)
@@ -200,4 +206,37 @@ func trustedDir(path string) error {
 		return fail("registry", ErrInvalid)
 	}
 	return nil
+}
+func openTrustedDir(path string) (int, error) {
+	fd, e := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	if e != nil {
+		return -1, fail("registry_io", ErrInvalid)
+	}
+	if e = trustedFD(fd, 0700); e != nil {
+		unix.Close(fd)
+		return -1, e
+	}
+	return fd, nil
+}
+func trustedFD(fd int, mode uint32) error {
+	var s unix.Stat_t
+	if e := unix.Fstat(fd, &s); e != nil {
+		return fail("registry_trust", ErrInvalid)
+	}
+	kind := s.Mode & unix.S_IFMT
+	if s.Uid != uint32(os.Geteuid()) || (kind == unix.S_IFREG && s.Nlink != 1) || (kind != unix.S_IFREG && kind != unix.S_IFDIR) || uint32(s.Mode)&0777 != mode {
+		return fail("registry_trust", ErrInvalid)
+	}
+	return nil
+}
+func readFD(fd int) ([]byte, error) {
+	f := os.NewFile(uintptr(fd), "")
+	if f == nil {
+		return nil, fail("registry_io", ErrInvalid)
+	}
+	b, e := io.ReadAll(io.LimitReader(f, 4<<20+1))
+	if e != nil || len(b) > 4<<20 {
+		return nil, fail("registry_io", ErrInvalid)
+	}
+	return b, nil
 }

@@ -2,7 +2,10 @@ module autosql
 
 go 1.24
 
-require github.com/jackc/pgx/v5 v5.7.5
+require (
+	github.com/jackc/pgx/v5 v5.7.5
+	golang.org/x/sys v0.32.0
+)
 
 require (
 	github.com/jackc/pgpassfile v1.0.0 // indirect
