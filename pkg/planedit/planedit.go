@@ -4,7 +4,6 @@ import (
 	"autosql/pkg/artifact"
 	"autosql/pkg/plan"
 	"autosql/pkg/precheck"
-	"autosql/pkg/schema"
 	"autosql/pkg/source"
 	"context"
 	"crypto/sha256"
@@ -14,7 +13,6 @@ import (
 	"fmt"
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 	"google.golang.org/protobuf/encoding/protojson"
-	"regexp"
 	"strings"
 	"time"
 )
@@ -76,45 +74,32 @@ func parse(file, sql string) ([]source.Statement, error) {
 }
 
 func bindDDL(e EditedArtifact) error {
-	steps := make([]plan.Step, 0)
+	original := make([]plan.Step, 0)
+	candidate := make([]plan.Step, 0)
+	for _, s := range e.OriginalPlan.Steps {
+		if s.Kind == plan.StepExecutable {
+			original = append(original, s)
+		}
+	}
 	for _, s := range e.CandidatePlan.Steps {
 		if s.Kind == plan.StepExecutable {
-			steps = append(steps, s)
+			candidate = append(candidate, s)
 		}
 	}
-	ss, err := source.SplitSQL("edited.sql", e.EditedSQL)
-	if err != nil || len(ss) != len(steps) {
+	if len(original) != len(candidate) {
 		return fmt.Errorf("%w: statement/change cardinality", ErrInvalid)
 	}
-	changes := map[string]schema.Change{}
-	for _, c := range e.CandidatePlan.Changes.Changes {
-		changes[c.ID] = c
-	}
-	for i, st := range ss {
-		c, ok := changes[steps[i].ChangeID]
-		if !ok {
+	for i := range original {
+		if original[i].ChangeID != candidate[i].ChangeID {
+			return fmt.Errorf("%w: change binding mismatch", ErrInvalid)
+		}
+		want, err := pg_query.Fingerprint(original[i].SQL)
+		if err != nil {
 			return ErrInvalid
 		}
-		r := c.After
-		if r == nil {
-			r = c.Before
-		}
-		if r == nil {
-			return ErrInvalid
-		}
-		lower := strings.ToLower(st.SQL)
-		keyword := map[schema.Operation]string{schema.OperationCreate: "create", schema.OperationAlter: "alter", schema.OperationDrop: "drop", schema.OperationRename: "rename"}[c.Operation]
-		if keyword == "" || !strings.Contains(lower, keyword) {
-			return fmt.Errorf("%w: DDL operation mismatch", ErrInvalid)
-		}
-		// Require every qualified object component to be present in the parsed
-		// statement. This prevents rebinding an approved change to another object.
-		for _, part := range strings.Split(strings.ToLower(r.Name.String()), ".") {
-			part = strings.Trim(part, `"`)
-			matched, _ := regexp.MatchString(`(^|[^a-z0-9_])`+regexp.QuoteMeta(part)+`([^a-z0-9_]|$)`, lower)
-			if part != "" && !matched {
-				return fmt.Errorf("%w: DDL object mismatch", ErrInvalid)
-			}
+		got, err := pg_query.Fingerprint(candidate[i].SQL)
+		if err != nil || got != want {
+			return fmt.Errorf("%w: edited AST differs from generated statement", ErrInvalid)
 		}
 	}
 	return nil
@@ -262,14 +247,15 @@ func (p Pipeline) Revalidate(ctx context.Context, e EditedArtifact) (Eligible, e
 	return Eligible{Edit: e, Checks: checks, GuardrailDigest: bundle, FinalFingerprint: fp, Attestations: []artifact.ValidationAttestation{mk("parse_rebind", "pg_query_go/v6+autosql/plan", rebuilt.Digest), mk("simulation", fmt.Sprintf("%T", p.Simulator), fp), mk("safety", fmt.Sprintf("%T", p.Safety), hash("safety", []byte(rebuilt.Digest))), mk("policy_precheck_guardrail", fmt.Sprintf("%T", p.Binder), bundle)}}, nil
 }
 func (e Eligible) FreshArtifact(created, expires time.Time, revision, environment, database string, approval artifact.Approval) (artifact.Artifact, error) {
-	if len(e.Attestations) != 4 || !approval.ApprovedAt.After(e.Edit.Provenance[len(e.Edit.Provenance)-1].EditedAt) {
+	original, parseErr := artifact.Parse(e.Edit.OriginalGeneratedArtifact)
+	if parseErr != nil || len(e.Attestations) != 4 || !approval.ApprovedAt.After(e.Edit.Provenance[len(e.Edit.Provenance)-1].EditedAt) || approval.Identity == original.Approval.Identity {
 		return artifact.Artifact{}, errors.New("fresh post-edit approval required")
 	}
 	a, err := artifact.New(e.Edit.CandidatePlan, e.Checks, created, expires, revision, environment, database, e.GuardrailDigest, approval, map[string]string{"autosql.edit_digest": e.Edit.Digest})
 	if err != nil {
 		return a, err
 	}
-	orig, _ := artifact.Parse(e.Edit.OriginalGeneratedArtifact)
+	orig := original
 	sig, _ := json.Marshal(orig.Signature)
 	candidate, _ := e.Edit.CandidatePlan.MarshalCanonical()
 	a.EditProvenance = &artifact.EditProvenance{Version: "autosql.edit-provenance/v1", OriginalArtifact: append([]byte(nil), e.Edit.OriginalGeneratedArtifact...), OriginalLength: len(e.Edit.OriginalGeneratedArtifact), OriginalBytesDigest: provHash("original-bytes", e.Edit.OriginalGeneratedArtifact), OriginalArtifactDigest: orig.Digest, OriginalPlanDigest: orig.Plan.Digest, OriginalSignatureDigest: provHash("signature", sig), CandidatePlanDigest: a.Plan.Digest, CandidateBytesDigest: provHash("candidate", candidate), ChainDigest: e.Edit.Provenance[len(e.Edit.Provenance)-1].Digest, Records: append([]artifact.EditRecord(nil), e.Edit.Provenance...), Attestations: append([]artifact.ValidationAttestation(nil), e.Attestations...)}

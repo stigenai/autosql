@@ -32,6 +32,8 @@ type applyConfig struct {
 	ExpectedPlanDigest, ExpectedChecksDigest, ExpectedGuardrailDigest, ExpectedApprovalIdentity, KeyStatus, KeyPurpose                                                        string
 	KeyNotBefore, KeyNotAfter                                                                                                                                                 time.Time
 	NoEdits                                                                                                                                                                   bool
+	GeneratorKeyID, GeneratorPublicKey, GeneratorPurpose                                                                                                                      string
+	ExpectedValidationContextDigests                                                                                                                                          map[string]string
 	EditorIdentity, EditSigningKeyID, EditSigningKeyReference, DevelopmentURLReference, FreshApprovalIdentity                                                                 string
 	FreshApprovalAt, EditReleaseCreatedAt, EditReleaseExpiresAt                                                                                                               time.Time
 }
@@ -88,7 +90,17 @@ func productionServices(connector executor.Connector) (Services, error) {
 		if c.ExpectedPlanDigest == "" || c.ExpectedChecksDigest == "" || c.ExpectedGuardrailDigest == "" || c.ExpectedApprovalIdentity == "" || c.KeyStatus == "" || c.KeyPurpose == "" || c.KeyNotBefore.IsZero() || c.KeyNotAfter.IsZero() {
 			return artifact.VerifyPolicy{}, errors.New("trusted release manifest bindings required")
 		}
-		return artifact.VerifyPolicy{Now: time.Now, NoEdits: c.NoEdits, Expected: artifact.ExpectedBindings{PlanDigest: c.ExpectedPlanDigest, ChecksDigest: c.ExpectedChecksDigest, GuardrailDigest: c.ExpectedGuardrailDigest, SourceRevision: c.SourceRevision, Environment: c.Environment, DatabaseIdentity: c.DatabaseIdentity, ApprovalIdentity: c.ExpectedApprovalIdentity}, Keys: map[string]artifact.KeyRecord{c.KeyID: {PublicKey: ed25519.PublicKey(pub), Issuer: c.Issuer, Identity: c.Signer, Environment: c.Environment, Purpose: c.KeyPurpose, Status: c.KeyStatus, NotBefore: c.KeyNotBefore.UTC(), NotAfter: c.KeyNotAfter.UTC()}}, Issuer: c.Issuer, Identity: c.Signer, Purpose: c.KeyPurpose}, nil
+		vp := artifact.VerifyPolicy{Now: time.Now, NoEdits: c.NoEdits, Expected: artifact.ExpectedBindings{PlanDigest: c.ExpectedPlanDigest, GeneratedPlanDigest: c.ExpectedPlanDigest, ChecksDigest: c.ExpectedChecksDigest, GuardrailDigest: c.ExpectedGuardrailDigest, SourceRevision: c.SourceRevision, Environment: c.Environment, DatabaseIdentity: c.DatabaseIdentity, ApprovalIdentity: c.ExpectedApprovalIdentity}, Keys: map[string]artifact.KeyRecord{c.KeyID: {PublicKey: ed25519.PublicKey(pub), Issuer: c.Issuer, Identity: c.Signer, Environment: c.Environment, Purpose: c.KeyPurpose, Status: c.KeyStatus, NotBefore: c.KeyNotBefore.UTC(), NotAfter: c.KeyNotAfter.UTC()}}, Issuer: c.Issuer, Identity: c.Signer, Purpose: c.KeyPurpose}
+		vp.ExpectedValidationContextDigests = c.ExpectedValidationContextDigests
+		if c.NoEdits {
+			generatorPub, decodeErr := base64.RawStdEncoding.Strict().DecodeString(c.GeneratorPublicKey)
+			if decodeErr != nil || len(generatorPub) != ed25519.PublicKeySize || c.GeneratorKeyID == "" || c.GeneratorPurpose == "" {
+				return artifact.VerifyPolicy{}, errors.New("trusted generator manifest required")
+			}
+			vp.GeneratorPurpose = c.GeneratorPurpose
+			vp.GeneratorKeys = map[string]artifact.KeyRecord{c.GeneratorKeyID: {PublicKey: ed25519.PublicKey(generatorPub), Purpose: c.GeneratorPurpose}}
+		}
+		return vp, nil
 	}
 	input := func(a artifact.Artifact) (guardrail.Input, error) {
 		doc := policy.Document{Version: policy.LanguageVersion, Rules: []policy.Rule{{Name: "configured apply", Target: "all", Assert: policy.Expression{Eq: []any{true, true}}, Message: "apply allowed"}}}

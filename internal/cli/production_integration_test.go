@@ -54,9 +54,9 @@ func (t ambiguousTx) Commit(ctx context.Context) error {
 }
 
 func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
-	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	url := os.Getenv("AUTOSQL_PROD_TEST_URL")
 	if url == "" {
-		t.Skip("AUTOSQL_TEST_POSTGRES_URL unset")
+		t.Skip("AUTOSQL_PROD_TEST_URL unset")
 	}
 	devURL := os.Getenv("AUTOSQL_DEV_TEST_URL")
 	if devURL == "" {

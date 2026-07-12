@@ -216,7 +216,7 @@ func TestSuccessfulEditRequiresFreshApproval(t *testing.T) {
 
 func TestPostgreSQLParserRejectsUnsafeEditedStatements(t *testing.T) {
 	a, raw, _ := fixture(t)
-	cases := map[string]string{"syntax": "CREATE TABLE (", "transaction": "BEGIN", "session": "SET search_path=public", "role": "CREATE ROLE attacker", "advisory": "SELECT pg_advisory_lock(1)", "history": "DELETE FROM autosql_migration_history", "copy_meta": "COPY x FROM STDIN", "dml": "INSERT INTO t VALUES (1)", "procedural": "DO $$ BEGIN NULL; END $$", "function": "CREATE FUNCTION pwn() RETURNS void LANGUAGE SQL AS 'DELETE FROM t'", "wrong_object": "CREATE SCHEMA evil"}
+	cases := map[string]string{"syntax": "CREATE TABLE (", "transaction": "BEGIN", "session": "SET search_path=public", "role": "CREATE ROLE attacker", "advisory": "SELECT pg_advisory_lock(1)", "history": "DELETE FROM autosql_migration_history", "copy_meta": "COPY x FROM STDIN", "dml": "INSERT INTO t VALUES (1)", "procedural": "DO $$ BEGIN NULL; END $$", "function": "CREATE FUNCTION pwn() RETURNS void LANGUAGE SQL AS 'DELETE FROM t'", "wrong_object": "CREATE SCHEMA evil", "if_not_exists": "CREATE SCHEMA IF NOT EXISTS app", "authorization": "CREATE SCHEMA app AUTHORIZATION CURRENT_USER", "comment_spoof": "CREATE /* SCHEMA app */ SCHEMA evil"}
 	for name, sql := range cases {
 		t.Run(name, func(t *testing.T) {
 			if _, err := New(raw, a, sql, "edit.sql", Editor{Identity: "editor", At: time.Now().UTC(), Reason: "review"}); err == nil {

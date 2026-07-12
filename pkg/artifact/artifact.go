@@ -87,6 +87,9 @@ type ArtifactOrigin struct {
 	PlanDigest    string `json:"plan_digest"`
 	Generator     string `json:"generator"`
 	GeneratorHash string `json:"generator_hash"`
+	KeyID         string `json:"key_id,omitempty"`
+	Purpose       string `json:"purpose,omitempty"`
+	Signature     string `json:"signature,omitempty"`
 }
 type Artifact struct {
 	Version           string            `json:"version"`
@@ -112,11 +115,14 @@ type KeyRecord struct {
 	NotBefore, NotAfter                            time.Time
 }
 type VerifyPolicy struct {
-	Now                       func() time.Time
-	Expected                  ExpectedBindings
-	Keys                      map[string]KeyRecord
-	Issuer, Identity, Purpose string
-	NoEdits                   bool
+	Now                              func() time.Time
+	Expected                         ExpectedBindings
+	Keys                             map[string]KeyRecord
+	Issuer, Identity, Purpose        string
+	NoEdits                          bool
+	GeneratorKeys                    map[string]KeyRecord
+	GeneratorPurpose                 string
+	ExpectedValidationContextDigests map[string]string
 }
 type VerifiedArtifact struct {
 	artifact Artifact
@@ -138,11 +144,22 @@ func (v VerifiedArtifact) forRegistry() (Artifact, error) {
 }
 
 func New(p plan.Plan, checks precheck.Plan, created, expires time.Time, revision, environment, databaseIdentity, guardrailDigest string, approval Approval, metadata map[string]string) (Artifact, error) {
-	a := Artifact{Version: Version, Plan: p, Checks: checks, CreatedAt: created.UTC(), ExpiresAt: expires.UTC(), SourceRevision: revision, TargetEnvironment: environment, DatabaseIdentity: databaseIdentity, Approval: approval, GuardrailDigest: guardrailDigest, Metadata: clone(metadata), Origin: ArtifactOrigin{Kind: "generated", PlanDigest: p.Digest, Generator: "autosql/" + plan.PlannerVersion}}
+	a := Artifact{Version: Version, Plan: p, Checks: checks, CreatedAt: created.UTC(), ExpiresAt: expires.UTC(), SourceRevision: revision, TargetEnvironment: environment, DatabaseIdentity: databaseIdentity, Approval: approval, GuardrailDigest: guardrailDigest, Metadata: clone(metadata), Origin: ArtifactOrigin{Kind: "unattested", PlanDigest: p.Digest, Generator: "autosql/" + plan.PlannerVersion}}
 	a.Origin.GeneratorHash = originHash(a.Origin)
 	d, err := digest(a)
 	a.Digest = d
 	return a, err
+}
+
+func NewGenerated(p plan.Plan, checks precheck.Plan, created, expires time.Time, revision, environment, databaseIdentity, guardrailDigest string, approval Approval, metadata map[string]string, keyID, purpose string, private ed25519.PrivateKey) (Artifact, error) {
+	a, err := New(p, checks, created, expires, revision, environment, databaseIdentity, guardrailDigest, approval, metadata)
+	if err != nil || keyID == "" || purpose == "" || len(private) != ed25519.PrivateKeySize {
+		return Artifact{}, fail("generator_key", ErrInvalid)
+	}
+	a.Origin.Kind, a.Origin.KeyID, a.Origin.Purpose = "generated", keyID, purpose
+	a.Origin.GeneratorHash = originHash(a.Origin)
+	a.Origin.Signature = base64.RawStdEncoding.EncodeToString(ed25519.Sign(private, []byte("autosql.artifact.generator/v1\x00"+a.Origin.GeneratorHash)))
+	return a, nil
 }
 func (a *Artifact) Sign(keyID string, private ed25519.PrivateKey) error {
 	if keyID == "" || len(private) != ed25519.PrivateKeySize {
@@ -180,12 +197,26 @@ func (a Artifact) VerifyTrusted(policy VerifyPolicy) (VerifiedArtifact, error) {
 		return VerifiedArtifact{}, fail("policy", ErrInvalid)
 	}
 	now := policy.Now().UTC()
-	generated := policy.Expected.GeneratedPlanDigest
-	if generated == "" {
-		generated = policy.Expected.PlanDigest
+	if policy.NoEdits {
+		generated := policy.Expected.GeneratedPlanDigest
+		record, ok := policy.GeneratorKeys[a.Origin.KeyID]
+		sig, decodeErr := base64.RawStdEncoding.Strict().DecodeString(a.Origin.Signature)
+		if a.EditProvenance != nil || a.Origin.Kind != "generated" || generated == "" || a.Origin.PlanDigest != generated || a.Plan.Digest != generated || policy.GeneratorPurpose == "" || a.Origin.Purpose != policy.GeneratorPurpose || !ok || record.Purpose != policy.GeneratorPurpose || len(record.PublicKey) != ed25519.PublicKeySize || decodeErr != nil || !ed25519.Verify(record.PublicKey, []byte("autosql.artifact.generator/v1\x00"+a.Origin.GeneratorHash), sig) {
+			return VerifiedArtifact{}, fail("edits_forbidden", ErrInvalid)
+		}
 	}
-	if policy.NoEdits && (a.EditProvenance != nil || a.Origin.Kind != "generated" || generated == "" || a.Origin.PlanDigest != generated || a.Plan.Digest != generated) {
-		return VerifiedArtifact{}, fail("edits_forbidden", ErrInvalid)
+	if a.EditProvenance != nil && len(policy.ExpectedValidationContextDigests) > 0 {
+		seen := map[string]bool{}
+		for _, att := range a.EditProvenance.Attestations {
+			expected, ok := policy.ExpectedValidationContextDigests[att.Stage]
+			if !ok || expected != att.ConfigDigest {
+				return VerifiedArtifact{}, fail("validation_context", ErrInvalid)
+			}
+			seen[att.Stage] = true
+		}
+		if len(seen) != len(policy.ExpectedValidationContextDigests) {
+			return VerifiedArtifact{}, fail("validation_context", ErrInvalid)
+		}
 	}
 	if err := a.validateUnsigned(); err != nil {
 		return VerifiedArtifact{}, fail("structure", ErrInvalid)
@@ -249,7 +280,7 @@ func (a Artifact) VerifyTrusted(policy VerifyPolicy) (VerifiedArtifact, error) {
 	return v, nil
 }
 func (a Artifact) validateUnsigned() error {
-	if a.Version != Version || a.SourceRevision == "" || a.TargetEnvironment == "" || a.DatabaseIdentity == "" || a.GuardrailDigest == "" || a.Approval.Identity == "" || a.Metadata == nil || a.CreatedAt.IsZero() || !a.ExpiresAt.After(a.CreatedAt) || a.Approval.ApprovedAt.IsZero() || a.Approval.ApprovedAt.After(a.CreatedAt) || a.CreatedAt.Location() != time.UTC || a.ExpiresAt.Location() != time.UTC || a.Approval.ApprovedAt.Location() != time.UTC || (a.Origin.Kind != "generated" && a.Origin.Kind != "edited") || a.Origin.PlanDigest != a.Plan.Digest || a.Origin.Generator == "" || a.Origin.GeneratorHash != originHash(a.Origin) {
+	if a.Version != Version || a.SourceRevision == "" || a.TargetEnvironment == "" || a.DatabaseIdentity == "" || a.GuardrailDigest == "" || a.Approval.Identity == "" || a.Metadata == nil || a.CreatedAt.IsZero() || !a.ExpiresAt.After(a.CreatedAt) || a.Approval.ApprovedAt.IsZero() || a.Approval.ApprovedAt.After(a.CreatedAt) || a.CreatedAt.Location() != time.UTC || a.ExpiresAt.Location() != time.UTC || a.Approval.ApprovedAt.Location() != time.UTC || (a.Origin.Kind != "unattested" && a.Origin.Kind != "generated" && a.Origin.Kind != "edited") || a.Origin.PlanDigest != a.Plan.Digest || a.Origin.Generator == "" || a.Origin.GeneratorHash != originHash(a.Origin) {
 		return fmt.Errorf("%w: required metadata", ErrInvalid)
 	}
 	if err := a.Plan.Validate(); err != nil {
@@ -272,6 +303,7 @@ func (a Artifact) validateUnsigned() error {
 
 func originHash(o ArtifactOrigin) string {
 	o.GeneratorHash = ""
+	o.Signature = ""
 	b, _ := json.Marshal(o)
 	s := sha256.Sum256(append([]byte("autosql.artifact.origin/v1\x00"), b...))
 	return "sha256:" + hex.EncodeToString(s[:])

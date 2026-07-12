@@ -8,6 +8,7 @@ import (
 	"autosql/pkg/schema"
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"os"
@@ -406,15 +407,26 @@ func TestNoEditsPolicyDoesNotTrustForgedMetadataMarker(t *testing.T) {
 		t.Fatalf("ordinary policy=%v", err)
 	}
 	policy.NoEdits = true
-	if _, err := a.VerifyTrusted(policy); err != nil {
-		t.Fatalf("metadata marker became edit authority: %v", err)
+	if _, err := a.VerifyTrusted(policy); err == nil {
+		t.Fatal("ordinary artifact self-asserted generated origin")
 	}
 }
 
 func TestNoEditsRequiresSignedGeneratedOrigin(t *testing.T) {
-	a, pub, priv := fixture(t)
+	base, pub, priv := fixture(t)
+	genPub, genPriv, _ := ed25519.GenerateKey(rand.Reader)
+	a, err := NewGenerated(base.Plan, base.Checks, base.CreatedAt, base.ExpiresAt, base.SourceRevision, base.TargetEnvironment, base.DatabaseIdentity, base.GuardrailDigest, base.Approval, base.Metadata, "generator-key", "plan-generator", genPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = a.Sign("key-1", priv); err != nil {
+		t.Fatal(err)
+	}
 	policy := trustedPolicy(a, pub, a.CreatedAt)
 	policy.NoEdits = true
+	policy.Expected.GeneratedPlanDigest = a.Plan.Digest
+	policy.GeneratorPurpose = "plan-generator"
+	policy.GeneratorKeys = map[string]KeyRecord{"generator-key": {PublicKey: genPub, Purpose: "plan-generator"}}
 	if _, err := a.VerifyTrusted(policy); err != nil {
 		t.Fatalf("generated artifact rejected: %v", err)
 	}
