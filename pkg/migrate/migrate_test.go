@@ -1,84 +1,430 @@
 package migrate
 
 import (
+	"bytes"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
-func TestUpdateVerifyAndTamperMatrix(t *testing.T) {
+func trustedDir(t *testing.T) string {
+	t.Helper()
 	d := t.TempDir()
-	if err := os.Chmod(d, 0700); err != nil {
-		t.Fatal(err)
+	if e := os.Chmod(d, 0700); e != nil {
+		t.Fatal(e)
 	}
-	files := []File{{Name: "V1__init.sql", SQL: []byte("-- autosql:transaction=required\nCREATE TABLE t(id bigint);\n")}, {Name: "1.1__index.sql", SQL: []byte("CREATE INDEX i ON t(id);\n")}}
-	m, err := Update(d, UpdateRequest{Files: files})
-	if err != nil {
-		t.Fatal(err)
+	return d
+}
+func baseFiles() []File {
+	return []File{
+		{Name: "V1__init.sql", SQL: []byte("-- autosql:transaction=required\n-- autosql:plan-digest=sha256:" + strings.Repeat("1", 64) + "\nCREATE TABLE t(id bigint);\n")},
+		{Name: "1.1__index.sql", SQL: []byte("-- autosql:check-bundle-digest=sha256:" + strings.Repeat("2", 64) + "\nCREATE INDEX i ON t(id);\n")},
 	}
-	if len(m.Entries) != 2 || m.Entries[1].Parents[0] != "1.0.0" {
+}
+
+func TestUpdateVerifySnapshotAndTypedMetadata(t *testing.T) {
+	d := trustedDir(t)
+	files := baseFiles()
+	m, e := Update(d, UpdateRequest{Files: files})
+	if e != nil {
+		t.Fatal(e)
+	}
+	if len(m.Entries) != 2 || m.Entries[1].Parents[0] != "1.0.0" || m.Entries[0].Directives.Transaction != TransactionRequired || len(m.Entries[0].Statements) != 1 || m.Entries[1].Directives.CheckBundleDigest == "" || m.Entries[1].ChainDigest == "" {
 		t.Fatalf("manifest=%+v", m)
 	}
-	if _, err = Verify(d); err != nil {
-		t.Fatal(err)
+	s, e := LoadSnapshot(d)
+	if e != nil || !bytes.Equal(s.Files[files[0].Name], files[0].SQL) {
+		t.Fatalf("snapshot=%+v err=%v", s, e)
 	}
-	for name, mutate := range map[string]func(){"sql": func() { _ = os.WriteFile(filepath.Join(d, files[0].Name), []byte("CREATE TABLE x(id bigint);"), 0600) }, "manifest": func() {
-		raw, _ := os.ReadFile(filepath.Join(d, ManifestFile))
-		raw[len(raw)-2] ^= 1
-		_ = os.WriteFile(filepath.Join(d, ManifestFile), raw, 0600)
-	}} {
-		t.Run(name, func(t *testing.T) {
-			Update(d, UpdateRequest{Files: files})
-			mutate()
+	if _, e = Verify(d); e != nil {
+		t.Fatal(e)
+	}
+}
+
+func TestTamperAdditionRemovalEditReorderAndCanonicalJSON(t *testing.T) {
+	t.Run("root-addition", func(t *testing.T) {
+		d := trustedDir(t)
+		_, _ = Update(d, UpdateRequest{Files: baseFiles()})
+		if e := os.WriteFile(filepath.Join(d, "V9__foreign.sql"), []byte("SELECT 9"), 0600); e != nil {
+			t.Fatal(e)
+		}
+		if _, e := Verify(d); e == nil {
+			t.Fatal("addition accepted")
+		}
+	})
+	for _, tc := range []struct {
+		name   string
+		mutate func(string, Manifest) error
+	}{
+		{"edit", func(d string, m Manifest) error {
+			return os.WriteFile(filepath.Join(d, genDir, m.Generation, m.Entries[0].File), []byte("SELECT 2"), 0600)
+		}},
+		{"remove", func(d string, m Manifest) error {
+			return os.Remove(filepath.Join(d, genDir, m.Generation, m.Entries[0].File))
+		}},
+		{"generation-addition", func(d string, m Manifest) error {
+			return os.WriteFile(filepath.Join(d, genDir, m.Generation, "V9__foreign.sql"), []byte("SELECT 9"), 0600)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := trustedDir(t)
+			m, _ := Update(d, UpdateRequest{Files: baseFiles()})
+			if e := tc.mutate(d, m); e != nil {
+				t.Fatal(e)
+			}
 			if _, e := Verify(d); e == nil {
 				t.Fatal("tamper accepted")
 			}
 		})
 	}
+	t.Run("manifest-reorder", func(t *testing.T) {
+		d := trustedDir(t)
+		m, _ := Update(d, UpdateRequest{Files: baseFiles()})
+		m.Entries[0], m.Entries[1] = m.Entries[1], m.Entries[0]
+		c := m
+		c.Digest = ""
+		m.Digest = digest("manifest", canonical(c))
+		if e := os.WriteFile(filepath.Join(d, ManifestFile), canonical(m), 0600); e != nil {
+			t.Fatal(e)
+		}
+		if _, e := Verify(d); e == nil {
+			t.Fatal("semantic reorder accepted")
+		}
+	})
+	t.Run("duplicate-json", func(t *testing.T) {
+		raw := []byte(`{"version":"x","version":"y"}`)
+		if _, e := strictManifest(raw); e == nil {
+			t.Fatal("duplicate key accepted")
+		}
+	})
+	t.Run("noncanonical-json", func(t *testing.T) {
+		d := trustedDir(t)
+		_, _ = Update(d, UpdateRequest{Files: baseFiles()})
+		p := filepath.Join(d, ManifestFile)
+		raw, _ := os.ReadFile(p)
+		raw = append([]byte(" \n"), raw...)
+		if e := os.WriteFile(p, raw, 0600); e != nil {
+			t.Fatal(e)
+		}
+		if _, e := Load(d); e == nil {
+			t.Fatal("noncanonical accepted")
+		}
+	})
 }
-func TestRejectsCollisionsTraversalAndUnauthorizedFork(t *testing.T) {
-	cases := [][]File{{{Name: "V1__a.sql", SQL: []byte("SELECT 1;")}, {Name: "v1__A.sql", SQL: []byte("SELECT 1;")}}, {{Name: "../V1__a.sql", SQL: []byte("SELECT 1;")}}, {{Name: "V1__a.sql", SQL: []byte("SELECT 1;")}, {Name: "V2__b.sql", SQL: []byte("SELECT 2;"), Parents: []string{"0.0.0"}}}}
-	for _, files := range cases {
-		if _, e := build(files); e == nil {
-			t.Fatal("invalid candidate accepted")
+
+func TestDeterminismAndInputOrder(t *testing.T) {
+	a := baseFiles()
+	b := []File{a[1], a[0]}
+	ma, e := build(a)
+	if e != nil {
+		t.Fatal(e)
+	}
+	mb, e := build(b)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if !bytes.Equal(canonical(ma), canonical(mb)) {
+		t.Fatalf("nondeterministic\n%s\n%s", canonical(ma), canonical(mb))
+	}
+	for i := 0; i < 100; i++ {
+		m, _ := build(a)
+		if m.Digest != ma.Digest || m.Generation != ma.Generation {
+			t.Fatal("unstable output")
 		}
 	}
 }
-func TestConcurrentWritersRemainVerifiable(t *testing.T) {
-	d := t.TempDir()
-	_ = os.Chmod(d, 0700)
+
+func TestSemverPrereleaseOrderingAndValidation(t *testing.T) {
+	order := []string{"1.0.0-1", "1.0.0-alpha", "1.0.0-alpha.1", "1.0.0-alpha.beta", "1.0.0-beta", "1.0.0"}
+	for i := 1; i < len(order); i++ {
+		a, e := ParseVersion(order[i-1])
+		if e != nil {
+			t.Fatal(e)
+		}
+		b, e := ParseVersion(order[i])
+		if e != nil {
+			t.Fatal(e)
+		}
+		if a.Compare(b) >= 0 {
+			t.Fatalf("%s !< %s", order[i-1], order[i])
+		}
+	}
+	for _, bad := range []string{"1.0.0-01", "1.0.0-a..b", "1.0.0-a."} {
+		if _, e := ParseVersion(bad); e == nil {
+			t.Fatalf("accepted %q", bad)
+		}
+	}
+}
+
+func TestGraphValidationAndChainBinding(t *testing.T) {
+	linear := []File{{Name: "V1__a.sql", SQL: []byte("SELECT 1;")}, {Name: "V2__b.sql", SQL: []byte("SELECT 2;")}, {Name: "V3__c.sql", SQL: []byte("SELECT 3;")}}
+	bad := [][]File{
+		{{Name: "V1__a.sql", SQL: []byte("SELECT 1;"), Parents: []string{"9.0.0"}}},
+		{{Name: "V1__a.sql", SQL: []byte("SELECT 1;")}, {Name: "V2__b.sql", SQL: []byte("SELECT 2;"), Parents: []string{"2.0.0"}, NonLinear: true}},
+		{{Name: "V1__a.sql", SQL: []byte("SELECT 1;")}, {Name: "V2__b.sql", SQL: []byte("SELECT 2;"), Parents: []string{"1.0.0", "1.0.0"}, NonLinear: true}},
+	}
+	for _, f := range bad {
+		if _, e := build(f); e == nil {
+			t.Fatal("invalid graph accepted")
+		}
+	}
+	fork := append([]File(nil), linear...)
+	fork[2].Parents = []string{"1.0.0"}
+	fork[2].NonLinear = true
+	m, e := build(fork)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if !m.Entries[2].NonLinear || m.Entries[2].Parents[0] != "1.0.0" {
+		t.Fatal("graph not persisted")
+	}
+	changed := append([]File(nil), fork...)
+	changed[0].SQL = []byte("SELECT 10;")
+	m2, _ := build(changed)
+	if m.Entries[2].ChainDigest == m2.Entries[2].ChainDigest {
+		t.Fatal("ancestor tamper absent from chain")
+	}
+}
+
+func TestDirectiveValidationAndDigestBoundaries(t *testing.T) {
+	valid := File{Name: "V1__a.sql", SQL: []byte("-- autosql:transaction=forbidden\nSELECT 1; SELECT 2;\n")}
+	a, e := build([]File{valid})
+	if e != nil {
+		t.Fatal(e)
+	}
+	if len(a.Entries[0].Statements) != 2 || a.Entries[0].Statements[0].Ordinal != 1 {
+		t.Fatal("statement boundaries missing")
+	}
+	variants := [][]byte{
+		[]byte("-- autosql:transaction=nope\nSELECT 1"),
+		[]byte("-- autosql:unknown=x\nSELECT 1"),
+		[]byte("-- autosql:transaction=auto\n-- autosql:transaction=required\nSELECT 1"),
+		[]byte("-- autosql:plan-digest=no\nSELECT 1"),
+		[]byte("SELECT 1;\n-- autosql:transaction=required"),
+	}
+	for _, sql := range variants {
+		if _, e := build([]File{{Name: "V1__a.sql", SQL: sql}}); e == nil {
+			t.Fatalf("invalid directive accepted: %s", sql)
+		}
+	}
+	b, _ := build([]File{{Name: valid.Name, SQL: []byte("-- autosql:transaction=forbidden\nSELECT 1;\nSELECT 2;\n")}})
+	if a.Entries[0].BoundaryDigest == b.Entries[0].BoundaryDigest {
+		t.Fatal("boundary reorder/position not bound")
+	}
+}
+
+func TestCASRequiredAndConcurrentWriters(t *testing.T) {
+	d := trustedDir(t)
+	first, e := Update(d, UpdateRequest{Files: baseFiles()})
+	if e != nil {
+		t.Fatal(e)
+	}
+	if _, e = Update(d, UpdateRequest{Files: baseFiles()}); e == nil {
+		t.Fatal("missing CAS accepted")
+	}
+	if _, e = Update(d, UpdateRequest{Files: baseFiles(), ExpectedManifestDigest: "sha256:" + strings.Repeat("0", 64)}); e == nil {
+		t.Fatal("stale CAS accepted")
+	}
 	var wg sync.WaitGroup
+	wins := 0
+	var mu sync.Mutex
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, _ = Update(d, UpdateRequest{Files: []File{{Name: "V1__init.sql", SQL: []byte("SELECT 1;\n")}}})
+			f := baseFiles()
+			f = append(f, File{Name: "V2__writer" + string(rune('a'+i)) + ".sql", SQL: []byte("SELECT 3;")})
+			if _, e := Update(d, UpdateRequest{Files: f, ExpectedManifestDigest: first.Digest}); e == nil {
+				mu.Lock()
+				wins++
+				mu.Unlock()
+			}
 		}(i)
 	}
 	wg.Wait()
-	if _, e := Verify(d); e != nil {
+	if wins != 1 {
+		t.Fatalf("writers committed=%d", wins)
+	}
+	if _, e = Verify(d); e != nil {
 		t.Fatal(e)
 	}
 }
-func TestSnapshotAndCompareSwap(t *testing.T) {
-	d := t.TempDir()
-	_ = os.Chmod(d, 0755)
-	files := []File{{Name: "V1__init.sql", SQL: []byte("SELECT 1;\n")}}
+
+func TestCASNoopStillDetectsGenerationTamper(t *testing.T) {
+	d := trustedDir(t)
+	files := baseFiles()
 	m, e := Update(d, UpdateRequest{Files: files})
 	if e != nil {
 		t.Fatal(e)
 	}
-	s, e := LoadSnapshot(d)
-	if e != nil || s.Manifest.Digest != m.Digest || string(s.Files[files[0].Name]) != string(files[0].SQL) {
-		t.Fatalf("snapshot=%+v err=%v", s, e)
+	p := filepath.Join(d, genDir, m.Generation, files[0].Name)
+	if e = os.WriteFile(p, []byte("SELECT 99"), 0600); e != nil {
+		t.Fatal(e)
 	}
-	if _, e = Update(d, UpdateRequest{Files: files, ExpectedManifestDigest: "sha256:" + strings.Repeat("0", 64)}); e == nil {
-		t.Fatal("stale CAS accepted")
+	if _, e = Update(d, UpdateRequest{Files: files, ExpectedManifestDigest: m.Digest}); e == nil {
+		t.Fatal("same-digest update concealed tamper")
 	}
 }
+
+func TestNoFollowModesLinksAndUnicodeSize(t *testing.T) {
+	t.Run("symlink-root", func(t *testing.T) {
+		real := trustedDir(t)
+		link := filepath.Join(t.TempDir(), "link")
+		if e := os.Symlink(real, link); e != nil {
+			t.Fatal(e)
+		}
+		if _, e := Update(link, UpdateRequest{Files: baseFiles()}); e == nil {
+			t.Fatal("symlink root accepted")
+		}
+	})
+	t.Run("unsafe-root-mode", func(t *testing.T) {
+		d := trustedDir(t)
+		_ = os.Chmod(d, 0777)
+		if _, e := Update(d, UpdateRequest{Files: baseFiles()}); e == nil {
+			t.Fatal("unsafe root accepted")
+		}
+	})
+	t.Run("hardlink", func(t *testing.T) {
+		d := trustedDir(t)
+		m, _ := Update(d, UpdateRequest{Files: baseFiles()})
+		p := filepath.Join(d, genDir, m.Generation, m.Entries[0].File)
+		if e := os.Link(p, p+".link"); e != nil {
+			t.Fatal(e)
+		}
+		if _, e := Verify(d); e == nil {
+			t.Fatal("linked file accepted")
+		}
+	})
+	t.Run("unicode", func(t *testing.T) {
+		if _, e := build([]File{{Name: "V1__café.sql", SQL: []byte("SELECT 1")}}); e == nil {
+			t.Fatal("ambiguous unicode name accepted")
+		}
+		if _, e := build([]File{{Name: "V1__a.sql", SQL: []byte{0xff}}}); e == nil {
+			t.Fatal("invalid utf8 accepted")
+		}
+	})
+	t.Run("size", func(t *testing.T) {
+		if _, e := build([]File{{Name: "V1__a.sql", SQL: bytes.Repeat([]byte("x"), maxFile+1)}}); e == nil {
+			t.Fatal("oversize accepted")
+		}
+	})
+}
+
+func TestCheckedWriteAndFsyncFailuresNeverExposeMixedSnapshot(t *testing.T) {
+	for fail := 1; fail <= 12; fail++ {
+		t.Run(string(rune('a'+fail)), func(t *testing.T) {
+			d := trustedDir(t)
+			old, e := Update(d, UpdateRequest{Files: baseFiles()})
+			if e != nil {
+				t.Fatal(e)
+			}
+			next := baseFiles()
+			next = append(next, File{Name: "V2__next.sql", SQL: []byte("SELECT 3;")})
+			calls := 0
+			boom := errors.New("injected")
+			ops := Ops{Write: func(fd int, p []byte) (int, error) {
+				calls++
+				if calls == fail {
+					return 0, boom
+				}
+				if len(p) > 1 {
+					return unix.Write(fd, p[:len(p)/2])
+				}
+				return unix.Write(fd, p)
+			}, Fsync: func(fd int) error {
+				calls++
+				if calls == fail {
+					return boom
+				}
+				return unix.Fsync(fd)
+			}, Renameat: func(a int, ap string, b int, bp string) error {
+				calls++
+				if calls == fail {
+					return boom
+				}
+				return unix.Renameat(a, ap, b, bp)
+			}}
+			_, _ = UpdateWithOps(d, UpdateRequest{Files: next, ExpectedManifestDigest: old.Digest}, ops)
+			s, e := LoadSnapshot(d)
+			if e != nil {
+				t.Fatalf("mixed/unreadable state after boundary %d: %v", fail, e)
+			}
+			if s.Manifest.Digest != old.Digest && len(s.Manifest.Entries) != 3 {
+				t.Fatalf("neither old nor new: %+v", s.Manifest)
+			}
+		})
+	}
+	if e := writeAll(1, []byte("x"), Ops{Write: func(int, []byte) (int, error) { return 0, nil }}); !errors.Is(e, io.ErrShortWrite) {
+		t.Fatal("zero write accepted")
+	}
+}
+
+func TestRecoveryPreservesUnpublishedGeneration(t *testing.T) {
+	d := trustedDir(t)
+	old, _ := Update(d, UpdateRequest{Files: baseFiles()})
+	next := baseFiles()
+	next = append(next, File{Name: "V2__next.sql", SQL: []byte("SELECT 3")})
+	calls := 0
+	_, e := UpdateWithOps(d, UpdateRequest{Files: next, ExpectedManifestDigest: old.Digest}, Ops{Renameat: func(a int, ap string, b int, bp string) error { calls++; return errors.New("stop before publish") }})
+	if e == nil {
+		t.Fatal("fault did not fire")
+	}
+	if e = Recover(d); e == nil {
+		t.Fatal("unpublished transaction silently discarded")
+	}
+	s, e := LoadSnapshot(d)
+	if e != nil || s.Manifest.Digest != old.Digest {
+		t.Fatalf("old snapshot lost: %v %+v", e, s.Manifest)
+	}
+}
+
+func TestV0ToV1AtomicMigration(t *testing.T) {
+	d := trustedDir(t)
+	sql := []byte("SELECT 1;\n")
+	if e := os.WriteFile(filepath.Join(d, "V1__legacy.sql"), sql, 0600); e != nil {
+		t.Fatal(e)
+	}
+	type le struct {
+		File      string   `json:"file"`
+		Parents   []string `json:"parents,omitempty"`
+		NonLinear bool     `json:"nonlinear,omitempty"`
+	}
+	type lm struct {
+		Version string `json:"version"`
+		Entries []le   `json:"entries"`
+		Digest  string `json:"digest"`
+	}
+	old := lm{Version: LegacyVersion, Entries: []le{{File: "V1__legacy.sql"}}}
+	c := old
+	c.Digest = ""
+	old.Digest = digest("manifest-v0", canonical(c))
+	if e := os.WriteFile(filepath.Join(d, ManifestFile), canonical(old), 0600); e != nil {
+		t.Fatal(e)
+	}
+	m, e := MigrateManifest(d, LegacyVersion)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if m.Version != ManifestVersion {
+		t.Fatal("not upgraded")
+	}
+	if _, e = Verify(d); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = os.Stat(filepath.Join(d, "V1__legacy.sql")); !os.IsNotExist(e) {
+		t.Fatal("legacy root SQL was not atomically retired")
+	}
+	if _, e = os.Stat(filepath.Join(d, ManifestFile+".v0")); e != nil {
+		t.Fatal("legacy fixture not retained")
+	}
+}
+
 func TestConflictIsTyped(t *testing.T) {
 	_, e := build([]File{{Name: "bad", SQL: []byte("x")}})
 	if e == nil {
