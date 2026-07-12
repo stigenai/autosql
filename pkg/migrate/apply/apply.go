@@ -398,15 +398,22 @@ func selectTrusted(snap migrate.Snapshot, records []revision.Revision, r Request
 		}
 	}
 	by := map[string]revision.Revision{}
+	coveredByCheckpoint := map[string]bool{}
 	for _, x := range records {
 		if _, ok := by[x.Version]; ok {
 			return nil, fmt.Errorf("%w: duplicate revision", ErrRefused)
 		}
 		by[x.Version] = x
+		if x.Kind == "checkpoint" && (x.State == "checkpoint" || x.State == "applied") {
+			for _, v := range x.Supersedes {
+				coveredByCheckpoint[v] = true
+			}
+		}
 	}
 	applied := map[string]bool{}
 	for _, m := range snap.Manifest.Entries {
 		_, isApplied := by[m.Version]
+		isApplied = isApplied || coveredByCheckpoint[m.Version]
 		for _, p := range m.Parents {
 			if !applied[p] {
 				return nil, fmt.Errorf("%w: migration parent closure is incomplete", ErrRefused)
@@ -444,6 +451,9 @@ func selectTrusted(snap migrate.Snapshot, records []revision.Revision, r Request
 		}
 	}
 	for i, m := range snap.Manifest.Entries {
+		if coveredByCheckpoint[m.Version] {
+			continue
+		}
 		if freshCheckpoint >= 0 && i < freshCheckpoint {
 			continue
 		}
@@ -562,7 +572,15 @@ func parentGeneration(rs []revision.Revision) string {
 }
 
 func baseRevision(c candidate, m migrate.Manifest, r Request, at time.Time, state, kind string) revision.Revision {
-	return revision.Revision{Version: c.entry.Version, Description: c.entry.Name, Kind: kind, FileName: c.entry.File, FileDigest: c.entry.SQLDigest, ManifestDigest: m.Digest, ManifestGeneration: m.Generation, ArtifactDigest: c.entry.ArtifactDigest, PlanDigest: c.entry.Directives.PlanDigest, ChecksDigest: c.entry.Directives.CheckDigest, BundleDigest: c.entry.Directives.BundleDigest, State: state, Attempt: 1, Operator: r.Operator, StartedAt: at, UpdatedAt: at, FromVersion: c.payload.Metadata["autosql.migration.from"], ToVersion: c.entry.Version}
+	x := revision.Revision{Version: c.entry.Version, Description: c.entry.Name, Kind: kind, FileName: c.entry.File, FileDigest: c.entry.SQLDigest, ManifestDigest: m.Digest, ManifestGeneration: m.Generation, ArtifactDigest: c.entry.ArtifactDigest, PlanDigest: c.entry.Directives.PlanDigest, ChecksDigest: c.entry.Directives.CheckDigest, BundleDigest: c.entry.Directives.BundleDigest, State: state, Attempt: 1, Operator: r.Operator, StartedAt: at, UpdatedAt: at, FromVersion: c.payload.Metadata["autosql.migration.from"], ToVersion: c.entry.Version}
+	if kind == "checkpoint" {
+		for _, e := range m.Entries {
+			if versionInRange(e.Version, c.entry.CoveredFrom, c.entry.CoveredTo) {
+				x.Supersedes = append(x.Supersedes, e.Version)
+			}
+		}
+	}
+	return x
 }
 func baseline(ctx context.Context, s *revision.Session, cs []candidate, snap migrate.Snapshot, r Request, now func() time.Time, parent string, verify VerifyArtifact) error {
 	m := snap.Manifest

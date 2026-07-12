@@ -3,14 +3,18 @@ package migrate
 import (
 	"autosql/pkg/approval"
 	"autosql/pkg/artifact"
+	"autosql/pkg/guardrail"
 	"autosql/pkg/plan"
 	"autosql/pkg/plugin"
 	"autosql/pkg/postgres"
+	"autosql/pkg/safety"
 	"autosql/pkg/schema"
 	"autosql/pkg/simulate"
+	"autosql/pkg/source"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -18,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	pg_query "github.com/pganalyze/pg_query_go/v6"
 )
 
 var ErrCheckpointPolicy = errors.New("checkpoint data omission policy denied")
@@ -44,6 +49,10 @@ type CheckpointVerification struct {
 // VerifyCheckpoints checks the immutable generation, artifact encoding and all
 // checkpoint range/head/fingerprint/data-policy bindings without mutation.
 func VerifyCheckpoints(directory string) (CheckpointVerification, error) {
+	return VerifyCheckpointsTrusted(directory, nil)
+}
+
+func VerifyCheckpointsTrusted(directory string, verify func(artifact.Artifact) (artifact.VerifiedArtifact, error)) (CheckpointVerification, error) {
 	s, err := LoadSnapshot(directory)
 	if err != nil {
 		return CheckpointVerification{}, err
@@ -65,6 +74,11 @@ func VerifyCheckpoints(directory string) (CheckpointVerification, error) {
 		a, er := artifact.Parse(s.Files[e.ArtifactFile])
 		if er != nil {
 			return CheckpointVerification{}, fmt.Errorf("%w: checkpoint artifact", ErrInvalid)
+		}
+		if verify != nil {
+			if _, er = verify(a); er != nil {
+				return CheckpointVerification{}, fmt.Errorf("%w: checkpoint trust", ErrInvalid)
+			}
 		}
 		md := a.Metadata
 		if md["autosql.checkpoint.covered_from"] != e.CoveredFrom || md["autosql.checkpoint.covered_to"] != e.CoveredTo || md["autosql.checkpoint.head_chain"] != s.Manifest.Entries[to].ChainDigest || md["autosql.checkpoint.schema_fingerprint"] != e.SchemaFingerprint || md["autosql.checkpoint.data_policy"] != e.DataPolicy || a.Plan.ToFingerprint != e.SchemaFingerprint {
@@ -147,9 +161,69 @@ func (s GenerateService) CreateCheckpoint(ctx context.Context, r CheckpointReque
 	if err != nil || p.ToFingerprint != fingerprint {
 		return out, generationFailure("plan", ErrGenerateStage)
 	}
+	replaySQL, err := declaredReplaySQL(snap, r.DeclaredReplay)
+	if err != nil {
+		return out, generationFailure("data_replay", ErrCheckpointPolicy)
+	}
+	p, err = plan.AppendReplay(p, replaySQL)
+	if err != nil {
+		return out, generationFailure("data_replay", ErrGenerateStage)
+	}
 	checks, err := generationChecks(p, executableStatements(p), r.PrecheckAssertions)
 	if err != nil {
 		return out, generationFailure("prechecks", ErrGenerateStage)
+	}
+	g := generationGuardrail(r.GenerateRequest)
+	si := safety.Input{Changes: p.Changes, Statements: p.SafetyStatements(), Target: safety.Target{Engine: "postgresql", Version: r.PostgresVersion}}
+	if err = s.checkpoint(r.GenerateRequest, "safety"); err != nil {
+		return out, err
+	}
+	diagnostics, err := g.Safety.Run(ctx, si)
+	if err != nil {
+		return out, generationFailure("safety", ErrGenerateStage)
+	}
+	for _, d := range diagnostics {
+		if d.Suppressed == nil && d.Severity == safety.SeverityError {
+			return out, generationFailure("safety", ErrGenerateStage)
+		}
+	}
+	if err = s.checkpoint(r.GenerateRequest, "policy"); err != nil {
+		return out, err
+	}
+	violations, err := g.Policy.Evaluate(ctx, r.Policy, schemaPolicyResources(doc), migrationPolicyResources(p))
+	if err != nil || len(violations) != 0 {
+		return out, generationFailure("policy", ErrGenerateStage)
+	}
+	bindings, err := guardrail.BuildStatementBindings(p.Changes, si.Statements)
+	if err != nil {
+		return out, generationFailure("guardrail_bindings", ErrGenerateStage)
+	}
+	guardWorkspace, err := emptyCheckpointWorkspace(ctx, r.GenerateRequest)
+	if err != nil {
+		return out, generationFailure("guardrail_database", ErrGenerateStage)
+	}
+	defer guardWorkspace.Close()
+	in := guardrail.Input{Changes: p.Changes, Safety: si, Policy: r.Policy, PolicyIdentity: r.PolicyIdentity, SchemaResources: schemaPolicyResources(doc), MigrationResources: migrationPolicyResources(p), Precheck: checks, Approval: approval.Request{Plan: approval.Plan{Environment: r.Environment, Author: r.Author, ExpiresAt: r.ExpiresAt}, Approvals: append([]approval.Approval(nil), r.Approvals...), RequestedBy: r.Requester}, StatementBindings: bindings, Database: replayDB{url: guardWorkspace.URL}}
+	if err = s.checkpoint(r.GenerateRequest, "guardrail"); err != nil {
+		return out, err
+	}
+	bundle, err := g.BundleDigest(in)
+	if err != nil {
+		return out, generationFailure("guardrail", ErrGenerateStage)
+	}
+	for i := range in.Approval.Approvals {
+		in.Approval.Approvals[i].PlanDigest = bundle
+		in.Approval.Approvals[i].Environment = r.Environment
+	}
+	in.Approval.Plan.Digest = bundle
+	g.Approval.Authority = r.Authority
+	g.Approval.Audit = r.ApprovalAudit
+	if _, err = g.Apply(ctx, in); err != nil {
+		return out, generationFailure("guardrail_approval_precheck", ErrGenerateStage)
+	}
+	approved, err := trustedArtifactApproval(ctx, r.Authority, in.Approval.Approvals, bundle, r.Environment)
+	if err != nil {
+		return out, generationFailure("approval_evidence", ErrGenerateStage)
 	}
 	coveredFrom, coveredTo := snap.Manifest.Entries[0].Version, snap.Manifest.Entries[len(snap.Manifest.Entries)-1].Version
 	declared := append([]string(nil), r.DeclaredReplay...)
@@ -164,18 +238,20 @@ func (s GenerateService) CreateCheckpoint(ctx context.Context, r CheckpointReque
 	metadata["autosql.migration.manifest"] = snap.Manifest.Digest
 	metadata["autosql.migration.from"] = p.FromFingerprint
 	metadata["autosql.migration.to"] = p.ToFingerprint
-	approvals := append([]approval.Approval(nil), r.Approvals...)
-	for i := range approvals {
-		approvals[i].PlanDigest, approvals[i].Environment = p.Digest, r.Environment
-	}
-	approved, err := trustedArtifactApproval(ctx, r.Authority, approvals, p.Digest, r.Environment)
-	if err != nil {
-		return out, generationFailure("approval_evidence", ErrGenerateStage)
-	}
 	if err = s.checkpoint(r.GenerateRequest, "sign"); err != nil {
 		return out, err
 	}
-	a, err := artifact.NewGenerated(p, checks, r.CreatedAt.UTC(), r.ExpiresAt.UTC(), r.SourceRevision, r.Environment, r.DatabaseIdentity, p.Digest, approved, metadata, r.GeneratorKeyID, r.GeneratorPurpose, r.GeneratorPrivateKey)
+	a, err := artifact.NewGenerated(p, checks, r.CreatedAt.UTC(), r.ExpiresAt.UTC(), r.SourceRevision, r.Environment, r.DatabaseIdentity, bundle, approved, metadata, r.GeneratorKeyID, r.GeneratorPurpose, r.GeneratorPrivateKey)
+	if err == nil {
+		simConfig := sha(strings.Join([]string{r.ProductionIdentity, r.DevelopmentIdentity, p.FromFingerprint, p.ToFingerprint}, "\x00"))
+		safetyConfig := shaJSON(si)
+		policyConfig := shaJSON(struct {
+			Policy                   any
+			Identity, Checks, Bundle string
+		}{r.Policy, r.PolicyIdentity, checks.Digest, bundle})
+		atts := []artifact.ValidationAttestation{{Stage: "replay_simulation", Implementation: "autosql/pkg/migrate.GenerateService", Version: "1", ConfigDigest: simConfig, ResultDigest: fingerprint, At: r.CreatedAt.UTC(), ExpiresAt: r.ExpiresAt.UTC(), Simulation: &artifact.SimulationAttestation{TargetIdentity: r.ProductionIdentity, DevelopmentIdentity: r.DevelopmentIdentity, FromFingerprint: p.FromFingerprint, ToFingerprint: p.ToFingerprint, DatabaseVersion: fmt.Sprint(r.PostgresVersion), ConfigDigest: simConfig}}, {Stage: "safety", Implementation: "autosql/pkg/safety.Runner", Version: "1", ConfigDigest: safetyConfig, ResultDigest: shaJSON(diagnostics), At: r.CreatedAt.UTC(), ExpiresAt: r.ExpiresAt.UTC(), Safety: &artifact.SafetyAttestation{Analyzers: []string{"compatibility", "postgresql-operational"}, Threshold: string(safety.SeverityError), SuppressionsDigest: shaJSON([]safety.Diagnostic{}), DiagnosticsDigest: shaJSON(diagnostics), ConfigDigest: safetyConfig}}, {Stage: "policy_precheck_guardrail", Implementation: "autosql/pkg/guardrail.Guardrail", Version: "1", ConfigDigest: policyConfig, ResultDigest: bundle, At: r.CreatedAt.UTC(), ExpiresAt: r.ExpiresAt.UTC(), Policy: &artifact.PolicyAttestation{DocumentDigest: shaJSON(r.Policy), LimitsDigest: shaJSON(g.Policy.Limits), ResourcesDigest: shaJSON([]any{in.SchemaResources, in.MigrationResources}), ConfigDigest: policyConfig}, Precheck: &artifact.PrecheckGuardrailAttestation{ChecksDigest: checks.Digest, GuardrailDigest: bundle, ConfigDigest: policyConfig}}}
+		err = a.SetValidationAttestations(atts)
+	}
 	if err == nil {
 		err = a.Sign(r.SigningKeyID, r.SigningPrivateKey)
 	}
@@ -186,7 +262,7 @@ func (s GenerateService) CreateCheckpoint(ctx context.Context, r CheckpointReque
 	if err != nil {
 		return out, generationFailure("encode", ErrGenerateStage)
 	}
-	sql := renderCheckpointSQL(statements, p.Digest, checks.Digest, r.DataPolicy, declared)
+	sql := renderCheckpointSQL(p, checks.Digest, bundle, r.DataPolicy, declared)
 	name := fmt.Sprintf("V%s__%s.sql", r.Version, r.Label)
 	files := snapshotFiles(snap)
 	files = append(files, File{Name: name, SQL: sql, ArtifactName: name + ".artifact.json", Artifact: raw, Kind: "checkpoint", CoveredFrom: coveredFrom, CoveredTo: coveredTo, SchemaFingerprint: fingerprint, DataPolicy: r.DataPolicy})
@@ -206,7 +282,7 @@ func checkpointSchemas(ctx context.Context, databaseURL string) ([]string, error
 		return nil, err
 	}
 	defer c.Close(context.Background())
-	rows, err := c.Query(ctx, `select n.nspname from pg_namespace n where n.nspname <> 'information_schema' and n.nspname !~ '^pg_' and exists(select 1 from pg_class c where c.relnamespace=n.oid and c.relkind in ('r','p','v','m','S','f')) order by n.nspname`)
+	rows, err := c.Query(ctx, `select n.nspname from pg_namespace n where n.nspname <> 'information_schema' and n.nspname !~ '^pg_' and (n.nspname <> 'public' or exists(select 1 from pg_class c where c.relnamespace=n.oid and c.relkind in ('r','p','v','m','S','f'))) order by n.nspname`)
 	if err != nil {
 		return nil, err
 	}
@@ -233,8 +309,10 @@ func validateCheckpointData(s Snapshot, r CheckpointRequest) error {
 	known := map[string]bool{}
 	for _, e := range s.Manifest.Entries {
 		known[e.Version] = true
-		u := strings.ToUpper(string(s.Files[e.File]))
-		data := strings.Contains(u, "INSERT ") || strings.Contains(u, "COPY ") || strings.Contains(u, "UPDATE ") || strings.Contains(u, "DELETE ")
+		data, classifyErr := checkpointSideEffects(e.File, s.Files[e.File])
+		if classifyErr != nil {
+			data = true
+		}
 		if data && (r.DataPolicy != "declared_replay" || !r.PolicyApproved || !declared[e.Version]) {
 			return generationFailure("data_policy", ErrCheckpointPolicy)
 		}
@@ -247,16 +325,82 @@ func validateCheckpointData(s Snapshot, r CheckpointRequest) error {
 	return nil
 }
 
-func renderCheckpointSQL(ss []plugin.Statement, planDigest, checks, policy string, replay []string) []byte {
-	var b strings.Builder
-	fmt.Fprintf(&b, "-- autosql:transaction=required\n-- autosql:plan-digest=%s\n-- autosql:check-digest=%s\n-- autosql:bundle-digest=%s\n-- autosql:check-bundle-digest=%s\n-- autosql-checkpoint-data-policy: %s\n-- autosql-checkpoint-declared-replay: %s\n", planDigest, directiveDigest(checks), planDigest, planDigest, policy, strings.Join(replay, ","))
-	for _, s := range ss {
-		if s.Kind == plugin.StatementExecutable {
-			b.WriteString(strings.TrimSpace(s.SQL))
-			b.WriteString(";\n")
+func checkpointSideEffects(name string, raw []byte) (bool, error) {
+	parts, err := source.SplitSQL(name, string(raw))
+	if err != nil {
+		return true, err
+	}
+	for _, part := range parts {
+		encoded, err := pg_query.ParseToJSON(part.SQL)
+		if err != nil {
+			return true, err
+		}
+		var tree any
+		if json.Unmarshal([]byte(encoded), &tree) != nil {
+			return true, ErrInvalid
+		}
+		if astSideEffect(tree) {
+			return true, nil
 		}
 	}
+	return false, nil
+}
+
+func astSideEffect(v any) bool {
+	switch x := v.(type) {
+	case []any:
+		for _, item := range x {
+			if astSideEffect(item) {
+				return true
+			}
+		}
+	case map[string]any:
+		for k, item := range x {
+			switch k {
+			case "InsertStmt", "UpdateStmt", "DeleteStmt", "MergeStmt", "CopyStmt", "TruncateStmt", "DoStmt", "CallStmt", "CreateFunctionStmt", "AlterFunctionStmt", "VariableSetStmt", "FuncCall":
+				return true
+			}
+			if astSideEffect(item) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func renderCheckpointSQL(p plan.Plan, checks, bundle, policy string, replay []string) []byte {
+	var b strings.Builder
+	fmt.Fprintf(&b, "-- autosql:transaction=required\n-- autosql:plan-digest=%s\n-- autosql:check-digest=%s\n-- autosql:bundle-digest=%s\n-- autosql:check-bundle-digest=%s\n-- autosql-checkpoint-data-policy: %s\n-- autosql-checkpoint-declared-replay: %s\n", p.Digest, directiveDigest(checks), bundle, bundle, policy, strings.Join(replay, ","))
+	for _, q := range executableStatements(p) {
+		b.WriteString(strings.TrimSpace(q))
+		b.WriteString(";\n")
+	}
 	return []byte(b.String())
+}
+
+func declaredReplaySQL(s Snapshot, versions []string) ([]string, error) {
+	wanted := map[string]bool{}
+	for _, v := range versions {
+		wanted[v] = true
+	}
+	var out []string
+	for _, e := range s.Manifest.Entries {
+		if !wanted[e.Version] {
+			continue
+		}
+		parts, err := source.SplitSQL(e.File, string(s.Files[e.File]))
+		if err != nil {
+			return nil, err
+		}
+		for _, part := range parts {
+			side, err := checkpointSideEffects(e.File, []byte(part.SQL))
+			if err != nil || !side {
+				continue
+			}
+			out = append(out, strings.TrimSuffix(strings.TrimSpace(part.SQL), ";"))
+		}
+	}
+	return out, nil
 }
 
 func simulateCheckpoint(ctx context.Context, r GenerateRequest, want schema.Document, statements []plugin.Statement) (fp string, err error) {
@@ -315,4 +459,32 @@ func simulateCheckpoint(ctx context.Context, r GenerateRequest, want schema.Docu
 		return "", err
 	}
 	return schema.SemanticFingerprint(doc)
+}
+
+func emptyCheckpointWorkspace(ctx context.Context, r GenerateRequest) (replayWorkspace, error) {
+	var out replayWorkspace
+	actual, err := simulate.ResolvePostgresIdentity(ctx, r.DevelopmentURL)
+	if err != nil || actual != r.DevelopmentIdentity || actual == r.ProductionIdentity {
+		return out, errors.New("development identity mismatch")
+	}
+	u, err := url.Parse(r.DevelopmentURL)
+	if err != nil {
+		return out, err
+	}
+	admin, err := pgx.Connect(ctx, r.DevelopmentURL)
+	if err != nil {
+		return out, err
+	}
+	defer admin.Close(context.Background())
+	random := make([]byte, 12)
+	if _, err = rand.Read(random); err != nil {
+		return out, err
+	}
+	name := "autosql_checkpoint_guard_" + hex.EncodeToString(random)
+	if _, err = admin.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()); err != nil {
+		return out, err
+	}
+	du := *u
+	du.Path = "/" + name
+	return replayWorkspace{URL: du.String(), adminURL: r.DevelopmentURL, name: name}, nil
 }

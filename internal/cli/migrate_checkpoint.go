@@ -2,12 +2,14 @@ package cli
 
 import (
 	"autosql/pkg/approval"
+	"autosql/pkg/artifact"
 	"autosql/pkg/migrate"
 	"autosql/pkg/policy"
 	"autosql/pkg/schema"
 	"autosql/pkg/secret"
 	"autosql/pkg/simulate"
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"os"
@@ -23,20 +25,58 @@ func runMigrateCheckpoint(ctx context.Context, args []string, o output) error {
 	case "create":
 		return runMigrateCheckpointCreate(ctx, args[1:], o)
 	case "verify":
-		return runMigrateCheckpointVerify(args[1:], o)
+		return runMigrateCheckpointVerify(ctx, args[1:], o)
 	default:
 		return usageError(errors.New("checkpoint create or verify required"))
 	}
 }
 
-func runMigrateCheckpointVerify(args []string, o output) error {
+func runMigrateCheckpointVerify(ctx context.Context, args []string, o output) error {
 	fs := newFlags("migrate checkpoint verify", o.streams.Err)
 	dir := fs.String("dir", "", "migration directory")
+	cfg := fs.String("generation-config", "", "trusted generation configuration")
 	jf := fs.Bool("json", false, "JSON")
-	if err := fs.Parse(args); err != nil || *dir == "" || fs.NArg() != 0 {
-		return usageError(errors.New("--dir required"))
+	if err := fs.Parse(args); err != nil || *dir == "" || *cfg == "" || fs.NArg() != 0 {
+		return usageError(errors.New("--dir and --generation-config required"))
 	}
-	r, err := migrate.VerifyCheckpoints(*dir)
+	raw, err := os.ReadFile(*cfg)
+	if err != nil {
+		return &Error{Kind: "config", Message: "read generation configuration failed", Code: ExitConfig}
+	}
+	var c generationConfig
+	d := json.NewDecoder(strings.NewReader(string(raw)))
+	d.DisallowUnknownFields()
+	if d.Decode(&c) != nil {
+		return &Error{Kind: "config", Message: "parse generation configuration failed", Code: ExitConfig}
+	}
+	resolver := secret.NewResolver()
+	gt, err := resolver.Resolve(ctx, secret.Reference(c.GeneratorPrivateKeyReference))
+	if err != nil {
+		return &Error{Kind: "secret", Message: "resolve generator key failed", Code: ExitSecret}
+	}
+	gk, err := decodePrivate(gt)
+	if err != nil {
+		return &Error{Kind: "config", Message: "decode generator key failed", Code: ExitConfig}
+	}
+	st, err := resolver.Resolve(ctx, secret.Reference(c.SigningPrivateKeyReference))
+	if err != nil {
+		return &Error{Kind: "secret", Message: "resolve signing key failed", Code: ExitSecret}
+	}
+	sk, err := decodePrivate(st)
+	if err != nil {
+		return &Error{Kind: "config", Message: "decode signing key failed", Code: ExitConfig}
+	}
+	verify := func(a artifact.Artifact) (artifact.VerifiedArtifact, error) {
+		contexts := map[string]string{}
+		atts := map[string]artifact.ValidationAttestation{}
+		for _, v := range a.ValidationAttestations {
+			contexts[v.Stage] = v.ConfigDigest
+			atts[v.Stage] = v
+		}
+		p := artifact.VerifyPolicy{Now: time.Now, NoEdits: true, Expected: artifact.ExpectedBindings{PlanDigest: a.Plan.Digest, GeneratedPlanDigest: a.Plan.Digest, ChecksDigest: a.Checks.Digest, GuardrailDigest: a.GuardrailDigest, SourceRevision: c.SourceRevision, Environment: c.Environment, DatabaseIdentity: c.DatabaseIdentity, ApprovalIdentity: a.Approval.Identity, ApprovalProofDigest: a.Approval.ProofDigest}, Keys: map[string]artifact.KeyRecord{c.SigningKeyID: {PublicKey: sk.Public().(ed25519.PublicKey), Issuer: "checkpoint-config", Identity: "release", Environment: c.Environment, Purpose: "release", Status: "active", NotBefore: a.CreatedAt.Add(-time.Second), NotAfter: a.ExpiresAt}}, Issuer: "checkpoint-config", Identity: "release", Purpose: "release", GeneratorKeys: map[string]artifact.KeyRecord{c.GeneratorKeyID: {PublicKey: gk.Public().(ed25519.PublicKey), Purpose: c.GeneratorPurpose}}, GeneratorPurpose: c.GeneratorPurpose, ExpectedValidationContextDigests: contexts, ExpectedValidationAttestations: atts}
+		return a.VerifyTrusted(p)
+	}
+	r, err := migrate.VerifyCheckpointsTrusted(*dir, verify)
 	if err != nil {
 		return &Error{Kind: "migration", Message: "checkpoint verification failed", Code: ExitMigration, Cause: err}
 	}

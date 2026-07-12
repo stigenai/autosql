@@ -181,6 +181,41 @@ func (p Plan) Validate() error {
 	}
 	return nil
 }
+
+// AppendReplay binds policy-approved canonical replay statements to the final
+// schema change and recomputes all step, phase, and digest evidence. This is
+// used by signed schema checkpoints; callers must classify and authorize the
+// statements before invoking it.
+func AppendReplay(p Plan, sql []string) (Plan, error) {
+	if err := p.Validate(); err != nil {
+		return Plan{}, err
+	}
+	if len(sql) == 0 {
+		return p, nil
+	}
+	if len(p.Changes.Changes) == 0 {
+		return Plan{}, fmt.Errorf("%w: replay requires schema change", ErrInvalidPlan)
+	}
+	statements := p.renderedStatements()
+	changeID := p.Changes.Changes[len(p.Changes.Changes)-1].ID
+	for _, q := range sql {
+		if strings.TrimSpace(q) == "" {
+			return Plan{}, fmt.Errorf("%w: empty replay", ErrInvalidPlan)
+		}
+		statements = append(statements, plugin.Statement{SQL: q, ChangeID: changeID, Transactional: true, Kind: plugin.StatementExecutable})
+	}
+	steps, err := bindSteps(p.Changes, statements)
+	if err != nil {
+		return Plan{}, err
+	}
+	p.Steps = steps
+	p.Phases = phases(steps)
+	p.Digest, err = digestPlan(Plan{Version: p.Version, PlannerVersion: p.PlannerVersion, Driver: p.Driver, FromFingerprint: p.FromFingerprint, ToFingerprint: p.ToFingerprint, Changes: p.Changes, Steps: p.Steps, Phases: p.Phases})
+	if err != nil {
+		return Plan{}, err
+	}
+	return p, p.Validate()
+}
 func jsonEqual(a, b any) bool {
 	x, _ := json.Marshal(a)
 	y, _ := json.Marshal(b)

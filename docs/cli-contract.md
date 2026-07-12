@@ -121,7 +121,9 @@ repeatable `--declare-replay VERSION` and matching `CheckpointDataPolicy`,
 trusted generation configuration; checkpoints never silently claim that schema rendering
 preserves data or seed rows.
 
-`migrate checkpoint verify --dir PATH [--json]` is read-only and verifies the
+`migrate checkpoint verify --dir PATH --generation-config FILE [--json]` is
+read-only and verifies generator and release signatures, environment/database,
+expiry, approval, typed validation attestations, and the
 immutable generation plus checkpoint range, head, artifact, fingerprint, and
 data-policy bindings. A fresh database applies only the latest valid checkpoint
 and its suffix. A database with any recorded revision in a checkpoint's covered

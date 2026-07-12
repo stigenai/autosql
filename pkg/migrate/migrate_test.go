@@ -166,6 +166,22 @@ func TestCheckpointMetadataDeterministicAfterLongHistory(t *testing.T) {
 	}
 }
 
+func TestCheckpointASTSideEffectClassification(t *testing.T) {
+	mutating := []string{"-- hidden\n INSERT INTO t VALUES(1)", "WITH changed AS (DELETE FROM t RETURNING *) SELECT * FROM changed", "MERGE INTO t USING s ON false WHEN NOT MATCHED THEN INSERT VALUES(1)", "TRUNCATE t", "SELECT setval('s', 4)", "DO $$ BEGIN PERFORM 1; END $$", "CREATE FUNCTION f() RETURNS void LANGUAGE sql AS $$ SELECT 1 $$"}
+	for _, q := range mutating {
+		got, err := checkpointSideEffects("x.sql", []byte(q))
+		if err != nil || !got {
+			t.Fatalf("side effect not classified %q: %v", q, err)
+		}
+	}
+	for _, q := range []string{"  -- comment\nCREATE TABLE t(id bigint)", "ALTER TABLE t ADD COLUMN n text", "CREATE SCHEMA empty"} {
+		got, err := checkpointSideEffects("x.sql", []byte(q))
+		if err != nil || got {
+			t.Fatalf("schema statement classified as data %q: %v", q, err)
+		}
+	}
+}
+
 func TestSemverPrereleaseOrderingAndValidation(t *testing.T) {
 	order := []string{"1.0.0-1", "1.0.0-alpha", "1.0.0-alpha.1", "1.0.0-alpha.beta", "1.0.0-beta", "1.0.0"}
 	for i := 1; i < len(order); i++ {
