@@ -16,6 +16,7 @@ import (
 // executor mutation factory. No raw plan or SQL execution path exists here.
 type VerifiedArtifactApplyService struct {
 	Policy    artifact.VerifyPolicy
+	PolicyFor func(artifact.Artifact) (artifact.VerifyPolicy, error)
 	Guardrail guardrail.Guardrail
 	Input     func(artifact.Artifact) (guardrail.Input, error)
 	Mutation  func(artifact.VerifiedArtifact) (guardrail.AuthorizedMutation, error)
@@ -33,7 +34,14 @@ func (s VerifiedArtifactApplyService) Apply(ctx context.Context, request ApplyRe
 	if err != nil {
 		return ApplyResult{Status: "refused"}, err
 	}
-	v, err := a.VerifyTrusted(s.Policy)
+	verifyPolicy := s.Policy
+	if s.PolicyFor != nil {
+		verifyPolicy, err = s.PolicyFor(a)
+		if err != nil {
+			return ApplyResult{Status: "refused"}, err
+		}
+	}
+	v, err := a.VerifyTrusted(verifyPolicy)
 	if err != nil {
 		return ApplyResult{Status: "refused"}, err
 	}

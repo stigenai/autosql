@@ -28,12 +28,22 @@ var (
 type RuntimeState struct{ Fingerprint, SourceRevision, Environment, DatabaseIdentity string }
 type StateReader func(context.Context, *pgx.Conn) (RuntimeState, error)
 type Clock func() time.Time
+type LifecycleEvent struct {
+	Type, ExecutionID, Target, ArtifactDigest, PlanDigest, BundleDigest, StepID, Guidance string
+	At                                                                                    time.Time
+}
+type LifecycleAudit interface {
+	AppendDurable(context.Context, LifecycleEvent) error
+}
+type StepConfirmer func(context.Context, *pgx.Conn, plan.Step) error
 
 type Config struct {
 	URL         string
 	State       StateReader
 	Now         Clock
 	Reauthorize func(context.Context, artifact.Artifact) error
+	Confirm     StepConfirmer
+	Audit       LifecycleAudit
 }
 
 type Result struct {
@@ -66,9 +76,18 @@ func NewPostgreSQL(config Config, verified artifact.VerifiedArtifact) (*PostgreS
 }
 
 func (e *PostgreSQL) Result() Result { return e.result }
+func (e *PostgreSQL) audit(ctx context.Context, typ, step, guidance string) error {
+	if e.config.Audit == nil {
+		return nil
+	}
+	return e.config.Audit.AppendDurable(ctx, LifecycleEvent{Type: typ, ExecutionID: e.artifact.Digest, Target: e.artifact.DatabaseIdentity + "/" + e.artifact.TargetEnvironment, ArtifactDigest: e.artifact.Digest, PlanDigest: e.artifact.Plan.Digest, BundleDigest: e.artifact.GuardrailDigest, StepID: step, Guidance: guidance, At: e.config.Now().UTC()})
+}
 
 func (e *PostgreSQL) ApplyAuthorized(ctx context.Context, checks precheck.Plan) ([]precheck.Result, error) {
 	e.result = Result{}
+	if err := e.audit(ctx, "requested", "", ""); err != nil {
+		return nil, errors.New("durable lifecycle audit failed")
+	}
 	conn, err := pgx.Connect(ctx, e.config.URL)
 	if err != nil {
 		return nil, errors.New("connect executor database")
@@ -83,6 +102,9 @@ func (e *PostgreSQL) ApplyAuthorized(ctx context.Context, checks precheck.Plan) 
 		return nil, err
 	}
 	defer conn.Exec(context.WithoutCancel(ctx), `select pg_advisory_unlock(hashtextextended($1, 0))`, identity)
+	if err := e.audit(ctx, "lock_acquired", "", ""); err != nil {
+		return nil, errors.New("durable lifecycle audit failed")
+	}
 	if e.config.Reauthorize != nil {
 		if err := e.config.Reauthorize(ctx, e.artifact); err != nil {
 			return nil, ErrExpired
@@ -102,6 +124,7 @@ func (e *PostgreSQL) ApplyAuthorized(ctx context.Context, checks precheck.Plan) 
 		return nil, nil
 	}
 	if !strings.EqualFold(state.Fingerprint, e.artifact.Plan.FromFingerprint) || state.SourceRevision != e.artifact.SourceRevision || state.Environment != e.artifact.TargetEnvironment || state.DatabaseIdentity != e.artifact.DatabaseIdentity {
+		_ = e.audit(ctx, "stale", "", "")
 		return nil, ErrStale
 	}
 	var results []precheck.Result
@@ -144,6 +167,7 @@ func (e *PostgreSQL) ApplyAuthorized(ctx context.Context, checks precheck.Plan) 
 			}
 		}
 	}
+	_ = e.audit(ctx, "completed", e.result.LastConfirmed, "")
 	return results, nil
 }
 
@@ -276,10 +300,23 @@ func (e *PostgreSQL) nontransactionalPhase(ctx context.Context, conn *pgx.Conn, 
 		if err := insertHistory(ctx, conn, e.artifact.Digest, step, phase, "intended", e.result.LastConfirmed, "reconcile, explicitly skip, or create a new signed plan"); err != nil {
 			return err
 		}
+		if err := e.audit(ctx, "intent", step.ID, ""); err != nil {
+			return errors.New("durable lifecycle audit failed")
+		}
 		if step.Kind == plan.StepExecutable {
 			if _, err := conn.Exec(ctx, step.SQL); err != nil {
 				e.result.Partial = true
 				return ErrPartial
+			}
+		}
+		if e.config.Confirm != nil {
+			if err := e.config.Confirm(ctx, conn, step); err != nil {
+				e.result.Uncertain = true
+				e.result.PendingStep = step.ID
+				e.result.ExecutionID = e.artifact.Digest
+				e.result.RecoveryGuidance = "reconcile postcondition before retry"
+				_ = e.audit(ctx, "uncertain", step.ID, e.result.RecoveryGuidance)
+				return ErrReconcile
 			}
 		}
 		if _, err := conn.Exec(ctx, `update autosql_migration_history set state='confirmed', confirmed_at=clock_timestamp(), last_confirmed_step=$4, recovery_guidance='' where artifact_digest=$1 and step_id=$2 and attempt=$3`, e.artifact.Digest, step.ID, 1, step.ID); err != nil {
@@ -288,6 +325,9 @@ func (e *PostgreSQL) nontransactionalPhase(ctx context.Context, conn *pgx.Conn, 
 		}
 		e.result.AppliedSteps++
 		e.result.LastConfirmed = step.ID
+		if err := e.audit(ctx, "confirmed", step.ID, ""); err != nil {
+			return errors.New("durable lifecycle audit failed")
+		}
 	}
 	return nil
 }
