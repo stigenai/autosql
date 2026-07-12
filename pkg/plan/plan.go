@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
 	"sort"
 	"strings"
 
@@ -129,13 +128,6 @@ func Build(ctx context.Context, driver plugin.Driver, current, desired schema.Do
 	if err := p.Validate(); err != nil {
 		return Plan{}, err
 	}
-	raw, err := json.Marshal(p)
-	if err != nil {
-		return Plan{}, err
-	}
-	if err = json.Unmarshal(raw, &p); err != nil {
-		return Plan{}, err
-	}
 	return p, nil
 }
 
@@ -167,10 +159,12 @@ func (p Plan) Validate() error {
 		stepIDs[s.ID] = true
 	}
 	rebuilt, err := bindSteps(p.Changes, p.renderedStatements())
-	if err != nil || !reflect.DeepEqual(rebuilt, p.Steps) {
+	gotSteps, _ := json.Marshal(rebuilt)
+	wantSteps, _ := json.Marshal(p.Steps)
+	if err != nil || string(gotSteps) != string(wantSteps) {
 		return fmt.Errorf("%w: step identity, coverage, order, or topology", ErrInvalidPlan)
 	}
-	if expected := phases(p.Steps); !reflect.DeepEqual(expected, p.Phases) {
+	if expected := phases(p.Steps); !jsonEqual(expected, p.Phases) {
 		return fmt.Errorf("%w: phase identity, coverage, or order", ErrInvalidPlan)
 	}
 	for _, s := range p.Steps {
@@ -185,6 +179,11 @@ func (p Plan) Validate() error {
 		return fmt.Errorf("%w: digest mismatch", ErrInvalidPlan)
 	}
 	return nil
+}
+func jsonEqual(a, b any) bool {
+	x, _ := json.Marshal(a)
+	y, _ := json.Marshal(b)
+	return string(x) == string(y)
 }
 
 func validFingerprint(value string) bool {
@@ -260,6 +259,13 @@ func EditSQL(p Plan, sql []string) (Plan, error) {
 	if err := p.Validate(); err != nil {
 		return Plan{}, err
 	}
+	raw, err := json.Marshal(p)
+	if err != nil {
+		return Plan{}, err
+	}
+	if err = json.Unmarshal(raw, &p); err != nil {
+		return Plan{}, err
+	}
 	count := 0
 	for _, s := range p.Steps {
 		if s.Kind == StepExecutable {
@@ -269,29 +275,23 @@ func EditSQL(p Plan, sql []string) (Plan, error) {
 	if len(sql) != count {
 		return Plan{}, fmt.Errorf("%w: edited statement count", ErrInvalidPlan)
 	}
-	oldToNew := map[string]string{}
+	var rendered []plugin.Statement
 	idx := 0
-	for i := range p.Steps {
-		old := p.Steps[i].ID
-		if p.Steps[i].Kind == StepExecutable {
-			if strings.TrimSpace(sql[idx]) == "" {
-				return Plan{}, fmt.Errorf("%w: empty edited SQL", ErrInvalidPlan)
-			}
-			p.Steps[i].SQL = sql[idx]
-			idx++
+	for _, s := range p.Steps {
+		if s.Kind == StepTopology {
+			rendered = append(rendered, plugin.Statement{ChangeID: s.ChangeID, Transactional: true, Kind: plugin.StatementTopology})
+			continue
 		}
-		p.Steps[i].ID = stableID("step", p.Steps[i].ChangeID, fmt.Sprint(i), string(p.Steps[i].Kind), p.Steps[i].SQL, string(p.Steps[i].Transaction))
-		oldToNew[old] = p.Steps[i].ID
+		if strings.TrimSpace(sql[idx]) == "" {
+			return Plan{}, fmt.Errorf("%w: empty edited SQL", ErrInvalidPlan)
+		}
+		transactional := !strings.Contains(strings.ToUpper(sql[idx]), "CONCURRENTLY")
+		rendered = append(rendered, plugin.Statement{SQL: sql[idx], ChangeID: s.ChangeID, Transactional: transactional, Kind: plugin.StatementExecutable})
+		idx++
 	}
-	for i := range p.Steps {
-		for j, d := range p.Steps[i].DependsOn {
-			n := oldToNew[d]
-			if n == "" {
-				return Plan{}, fmt.Errorf("%w: edited dependency", ErrInvalidPlan)
-			}
-			p.Steps[i].DependsOn[j] = n
-		}
-		sort.Strings(p.Steps[i].DependsOn)
+	p.Steps, err = bindSteps(p.Changes, rendered)
+	if err != nil {
+		return Plan{}, err
 	}
 	p.Phases = phases(p.Steps)
 	p.Digest = ""

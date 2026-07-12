@@ -31,6 +31,8 @@ type applyConfig struct {
 	ExpectedPlanDigest, ExpectedChecksDigest, ExpectedGuardrailDigest, ExpectedApprovalIdentity, KeyStatus, KeyPurpose                                                        string
 	KeyNotBefore, KeyNotAfter                                                                                                                                                 time.Time
 	NoEdits                                                                                                                                                                   bool
+	EditorIdentity, EditSigningKeyID, EditSigningKeyReference, DevelopmentURLReference, FreshApprovalIdentity                                                                 string
+	FreshApprovalAt, EditReleaseCreatedAt, EditReleaseExpiresAt                                                                                                               time.Time
 }
 type staticAuthority struct{ actors map[string]approval.Identity }
 
@@ -133,7 +135,26 @@ func productionServices(connector executor.Connector) (Services, error) {
 		}}, v)
 	}
 	verified := VerifiedArtifactApplyService{PolicyFor: policyFor, Guardrail: g, Input: input, Mutation: mutation, NoEdits: c.NoEdits}
-	return Services{ReadPlan: DefaultReadPlan{}, Apply: resolvingApply{verified: verified, directory: c.ArtifactDirectory}}, nil
+	var editService PlanEditService
+	if c.EditorIdentity != "" {
+		if c.EditorIdentity == c.Author || c.EditorIdentity == c.Requester {
+			return Services{}, errors.New("editor must be separated from author and requester")
+		}
+		keyText, resolveErr := resolver.Resolve(context.Background(), secret.Reference(c.EditSigningKeyReference))
+		if resolveErr != nil {
+			return Services{}, errors.New("resolve edit signing key")
+		}
+		private, decodeErr := decodePrivate(keyText)
+		if decodeErr != nil {
+			return Services{}, decodeErr
+		}
+		devURL, resolveErr := resolver.Resolve(context.Background(), secret.Reference(c.DevelopmentURLReference))
+		if resolveErr != nil {
+			return Services{}, errors.New("resolve edit development URL")
+		}
+		editService = &productionEditService{editor: c.EditorIdentity, policyFor: policyFor, g: g, input: input, url: url, developmentURL: devURL, revision: c.SourceRevision, environment: c.Environment, database: c.DatabaseIdentity, keyID: c.EditSigningKeyID, version: c.PostgresVersion, private: private, approval: artifact.Approval{Identity: c.FreshApprovalIdentity, ApprovedAt: c.FreshApprovalAt.UTC()}, created: c.EditReleaseCreatedAt.UTC(), expires: c.EditReleaseExpiresAt.UTC(), audit: &executor.FileAudit{Path: c.LifecycleAuditPath}, schemas: append([]string(nil), c.Schemas...)}
+	}
+	return Services{ReadPlan: DefaultReadPlan{}, Apply: resolvingApply{verified: verified, directory: c.ArtifactDirectory}, PlanEdit: editService}, nil
 }
 
 type resolvingApply struct {

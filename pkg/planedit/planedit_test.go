@@ -2,14 +2,16 @@ package planedit
 
 import (
 	"autosql/pkg/artifact"
+	"autosql/pkg/executor"
 	"autosql/pkg/guardrail"
 	"autosql/pkg/plan"
-	"autosql/pkg/plugin/sample"
+	"autosql/pkg/postgres"
 	"autosql/pkg/precheck"
 	"autosql/pkg/schema"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -21,7 +23,9 @@ func fixture(t *testing.T) (artifact.Artifact, []byte, ed25519.PrivateKey) {
 	empty := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{}}}
 	n := schema.Name{Name: "app"}
 	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{{ID: schema.StableID(schema.KindSchema, n), Kind: schema.KindSchema, Name: n, Spec: []byte(`{}`)}}}}
-	p, err := plan.Build(context.Background(), sample.Driver{}, empty, desired, plan.Options{})
+	empty, _ = postgres.New().Normalize(context.Background(), empty)
+	desired, _ = postgres.New().Normalize(context.Background(), desired)
+	p, err := plan.Build(context.Background(), postgres.New(), empty, desired, plan.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,6 +57,29 @@ func fixture(t *testing.T) (artifact.Artifact, []byte, ed25519.PrivateKey) {
 	return a, raw, priv
 }
 
+func TestDraftValidateSurvivesReloadAndRejectsTampering(t *testing.T) {
+	a, raw, _ := fixture(t)
+	e, err := New(raw, a, a.Plan.Steps[0].SQL, "edit.sql", Editor{Identity: "editor", At: time.Now().UTC(), Reason: "review"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, _ := json.Marshal(e)
+	var loaded EditedArtifact
+	if err = json.Unmarshal(encoded, &loaded); err != nil || loaded.Validate() != nil {
+		t.Fatalf("reload=%v validate=%v", err, loaded.Validate())
+	}
+	for name, mutate := range map[string]func(*EditedArtifact){"digest": func(x *EditedArtifact) { x.Digest = "sha256:" + strings.Repeat("0", 64) }, "original": func(x *EditedArtifact) { x.OriginalGeneratedArtifact[0] ^= 1 }, "reason": func(x *EditedArtifact) { x.Provenance[0].Reason = "changed" }, "sql": func(x *EditedArtifact) { x.EditedSQL = "DROP TABLE secret" }} {
+		t.Run(name, func(t *testing.T) {
+			var x EditedArtifact
+			_ = json.Unmarshal(encoded, &x)
+			mutate(&x)
+			if x.Validate() == nil {
+				t.Fatal("tamper accepted")
+			}
+		})
+	}
+}
+
 type sim struct {
 	log *[]string
 	err error
@@ -81,7 +108,16 @@ type bind struct {
 
 func (b bind) Bind(_ context.Context, p plan.Plan) (precheck.Plan, string, error) {
 	*b.log = append(*b.log, "bind")
-	return precheck.Plan{Digest: "checks"}, "bundle", b.err
+	cd, _ := guardrail.ChangeDigest(p.Changes)
+	var statements []string
+	for _, s := range p.Steps {
+		if s.Kind == plan.StepExecutable {
+			statements = append(statements, s.SQL)
+		}
+	}
+	checks := precheck.Plan{ID: "checks", ChangeDigest: cd, Statements: statements}
+	checks.Digest, _ = precheck.Digest(checks)
+	return checks, "sha256:" + strings.Repeat("c", 64), b.err
 }
 func TestEditInvalidatesAuthorizationAndRetainsProvenance(t *testing.T) {
 	a, raw, _ := fixture(t)
@@ -137,11 +173,55 @@ func TestSuccessfulEditRequiresFreshApproval(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fresh, err := eligible.FreshArtifact(a.CreatedAt, a.ExpiresAt, a.SourceRevision, a.TargetEnvironment, a.DatabaseIdentity, artifact.Approval{Identity: "bob", ApprovedAt: a.CreatedAt})
+	approved := time.Now().UTC().Add(time.Minute)
+	fresh, err := eligible.FreshArtifact(approved, approved.Add(time.Hour), a.SourceRevision, a.TargetEnvironment, a.DatabaseIdentity, artifact.Approval{Identity: "bob", ApprovedAt: approved})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if fresh.Digest == a.Digest || fresh.Signature.Value != "" || fresh.Approval.Identity == a.Approval.Identity || !IsEdited(fresh) {
 		t.Fatalf("fresh=%+v", fresh)
+	}
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	if err = fresh.Sign("edited-key", priv); err != nil {
+		t.Fatal(err)
+	}
+	raw, err = fresh.MarshalCanonical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := artifact.Parse(raw)
+	if err != nil || parsed.EditProvenance == nil || string(parsed.EditProvenance.OriginalArtifact) != string(e.OriginalGeneratedArtifact) {
+		t.Fatalf("published provenance err=%v", err)
+	}
+	tampered := parsed
+	tampered.EditProvenance.OriginalArtifact[0] ^= 1
+	if err = tampered.Sign("edited-key", priv); err == nil {
+		t.Fatal("tampered provenance signed")
+	}
+	policy := artifact.VerifyPolicy{Now: func() time.Time { return approved }, Expected: artifact.ExpectedBindings{PlanDigest: fresh.Plan.Digest, ChecksDigest: fresh.Checks.Digest, GuardrailDigest: fresh.GuardrailDigest, SourceRevision: fresh.SourceRevision, Environment: fresh.TargetEnvironment, DatabaseIdentity: fresh.DatabaseIdentity, ApprovalIdentity: fresh.Approval.Identity}, Keys: map[string]artifact.KeyRecord{"edited-key": {PublicKey: pub, Issuer: "issuer", Identity: "signer", Environment: fresh.TargetEnvironment, Purpose: "plan-artifact", Status: "active", NotBefore: approved.Add(-time.Hour), NotAfter: approved.Add(time.Hour)}}, Issuer: "issuer", Identity: "signer", Purpose: "plan-artifact"}
+	v, err := fresh.VerifyTrusted(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = executor.NewPostgreSQL(executor.Config{URL: "unused", State: func(context.Context, executor.Session) (executor.RuntimeState, error) {
+		return executor.RuntimeState{}, nil
+	}, NoEdits: true}, v); err == nil {
+		t.Fatal("executor no-edits accepted edited artifact")
+	}
+	policy.NoEdits = true
+	if _, err = fresh.VerifyTrusted(policy); err == nil {
+		t.Fatal("typed provenance bypassed no-edits")
+	}
+}
+
+func TestPostgreSQLParserRejectsUnsafeEditedStatements(t *testing.T) {
+	a, raw, _ := fixture(t)
+	cases := map[string]string{"syntax": "CREATE TABLE (", "transaction": "BEGIN", "session": "SET search_path=public", "role": "CREATE ROLE attacker", "advisory": "SELECT pg_advisory_lock(1)", "history": "DELETE FROM autosql_migration_history", "copy_meta": "COPY x FROM STDIN"}
+	for name, sql := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := New(raw, a, sql, "edit.sql", Editor{Identity: "editor", At: time.Now().UTC(), Reason: "review"}); err == nil {
+				t.Fatal("unsafe edit accepted")
+			}
+		})
 	}
 }

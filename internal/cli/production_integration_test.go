@@ -63,9 +63,11 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 		t.Fatal(err)
 	}
 	pub := priv.Public().(ed25519.PublicKey)
+	_, editPriv, _ := ed25519.GenerateKey(rand.Reader)
+	releaseAt := time.Now().UTC().Add(5 * time.Minute)
 	dir := t.TempDir()
 	name := "autosql_prod_" + strings.ToLower(time.Now().Format("150405000000"))
-	cfg := applyConfig{DatabaseURL: "env://AUTOSQL_PROD_TEST_URL", Environment: "test", DatabaseIdentity: "prod-test", SourceRevision: "test-rev", KeyID: "test-key", PublicKey: base64.RawStdEncoding.EncodeToString(pub), Issuer: "test-issuer", Signer: "test-signer", Author: "author", Requester: "requester", ApprovalAuditPath: filepath.Join(dir, "approval.jsonl"), LifecycleAuditPath: filepath.Join(dir, "lifecycle.jsonl"), ArtifactDirectory: dir, PostgresVersion: 15, Schemas: []string{name}, ExpectedPlanDigest: "pending", ExpectedChecksDigest: "pending", ExpectedGuardrailDigest: "pending", ExpectedApprovalIdentity: "release", KeyStatus: "active", KeyPurpose: "plan-artifact", KeyNotBefore: time.Now().UTC().Add(-time.Hour), KeyNotAfter: time.Now().UTC().Add(2 * time.Hour)}
+	cfg := applyConfig{DatabaseURL: "env://AUTOSQL_PROD_TEST_URL", Environment: "test", DatabaseIdentity: "prod-test", SourceRevision: "test-rev", KeyID: "test-key", PublicKey: base64.RawStdEncoding.EncodeToString(pub), Issuer: "test-issuer", Signer: "test-signer", Author: "author", Requester: "requester", ApprovalAuditPath: filepath.Join(dir, "approval.jsonl"), LifecycleAuditPath: filepath.Join(dir, "lifecycle.jsonl"), ArtifactDirectory: dir, PostgresVersion: 15, Schemas: []string{name}, ExpectedPlanDigest: "pending", ExpectedChecksDigest: "pending", ExpectedGuardrailDigest: "pending", ExpectedApprovalIdentity: "release", KeyStatus: "active", KeyPurpose: "plan-artifact", KeyNotBefore: time.Now().UTC().Add(-time.Hour), KeyNotAfter: time.Now().UTC().Add(2 * time.Hour), EditorIdentity: "editor", EditSigningKeyID: "edit-key", EditSigningKeyReference: "env://AUTOSQL_EDIT_TEST_KEY", DevelopmentURLReference: "env://AUTOSQL_PROD_TEST_URL", FreshApprovalIdentity: "fresh-approver", FreshApprovalAt: releaseAt, EditReleaseCreatedAt: releaseAt, EditReleaseExpiresAt: releaseAt.Add(time.Hour)}
 	raw, _ := json.Marshal(cfg)
 	configPath := filepath.Join(dir, "apply.json")
 	if err = os.WriteFile(configPath, raw, 0600); err != nil {
@@ -73,6 +75,7 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 	}
 	t.Setenv("AUTOSQL_APPLY_CONFIG", configPath)
 	t.Setenv("AUTOSQL_PROD_TEST_URL", url)
+	t.Setenv("AUTOSQL_EDIT_TEST_KEY", base64.RawStdEncoding.EncodeToString(editPriv))
 	services, err := ProductionServices()
 	if err != nil {
 		t.Fatal(err)
@@ -144,11 +147,38 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 	if err = os.WriteFile(path, artifactRaw, 0600); err != nil {
 		t.Fatal(err)
 	}
+	sqlPath := filepath.Join(dir, "edited.sql")
+	if err = os.WriteFile(sqlPath, []byte("  "+p.Steps[0].SQL), 0600); err != nil {
+		t.Fatal(err)
+	}
+	draftPath := filepath.Join(dir, "draft.json")
+	code, out, _ := invoke(t, []string{"plan", "edit", "--artifact", path, "--sql", sqlPath, "--editor", "editor", "--reason", "reviewed", "--output", draftPath, "--json"}, "", false, services)
+	if code != 0 {
+		t.Fatalf("edit code=%d out=%s", code, out)
+	}
+	attestedPath := filepath.Join(dir, "attested.json")
+	code, out, _ = invoke(t, []string{"plan", "revalidate", "--draft", draftPath, "--output", attestedPath, "--json"}, "", false, services)
+	if code != 0 {
+		t.Fatalf("revalidate code=%d out=%s", code, out)
+	}
+	publishedPath := filepath.Join(dir, "published.json")
+	code, out, _ = invoke(t, []string{"plan", "publish", "--attested", attestedPath, "--output", publishedPath, "--json"}, "", false, services)
+	if code != 0 {
+		t.Fatalf("publish code=%d out=%s", code, out)
+	}
+	publishedRaw, err := os.ReadFile(publishedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	published, err := artifact.Parse(publishedRaw)
+	if err != nil || published.EditProvenance == nil {
+		t.Fatalf("published provenance err=%v", err)
+	}
 	injected, err := productionServices(ambiguousConnector{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	code, out, _ := invoke(t, []string{"apply", "--artifact", path, "--json"}, "", false, injected)
+	code, out, _ = invoke(t, []string{"apply", "--artifact", path, "--json"}, "", false, injected)
 	lastStep := p.Steps[len(p.Steps)-1].ID
 	for _, want := range []string{`"status":"uncertain"`, `"applied_steps":0`, `"pending_step":"` + lastStep + `"`, `"execution_id":"` + a.Digest + `"`, "reconcile transaction outcome"} {
 		if code != int(ExitMigration) || !strings.Contains(out, want) || strings.Contains(out, "seeded-commit-secret") {

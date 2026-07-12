@@ -50,6 +50,37 @@ type Signature struct {
 	Algorithm string `json:"algorithm"`
 	Value     string `json:"value"`
 }
+type EditRecord struct {
+	Digest         string    `json:"digest"`
+	ParentDigest   string    `json:"parent_digest"`
+	SQLDigest      string    `json:"sql_digest"`
+	EditorIdentity string    `json:"editor_identity"`
+	EditedAt       time.Time `json:"edited_at"`
+	Reason         string    `json:"reason"`
+	Source         string    `json:"source"`
+}
+type ValidationAttestation struct {
+	Stage          string    `json:"stage"`
+	Implementation string    `json:"implementation"`
+	Version        string    `json:"version"`
+	ConfigDigest   string    `json:"config_digest"`
+	ResultDigest   string    `json:"result_digest"`
+	At             time.Time `json:"at"`
+}
+type EditProvenance struct {
+	Version                 string                  `json:"version"`
+	OriginalArtifact        []byte                  `json:"original_artifact"`
+	OriginalLength          int                     `json:"original_length"`
+	OriginalBytesDigest     string                  `json:"original_bytes_digest"`
+	OriginalArtifactDigest  string                  `json:"original_artifact_digest"`
+	OriginalPlanDigest      string                  `json:"original_plan_digest"`
+	OriginalSignatureDigest string                  `json:"original_signature_digest"`
+	CandidatePlanDigest     string                  `json:"candidate_plan_digest"`
+	CandidateBytesDigest    string                  `json:"candidate_bytes_digest"`
+	ChainDigest             string                  `json:"chain_digest"`
+	Records                 []EditRecord            `json:"records"`
+	Attestations            []ValidationAttestation `json:"attestations"`
+}
 type Artifact struct {
 	Version           string            `json:"version"`
 	Plan              plan.Plan         `json:"plan"`
@@ -64,6 +95,7 @@ type Artifact struct {
 	Metadata          map[string]string `json:"metadata"`
 	Digest            string            `json:"digest"`
 	Signature         Signature         `json:"signature"`
+	EditProvenance    *EditProvenance   `json:"edit_provenance,omitempty"`
 }
 type ExpectedBindings struct{ PlanDigest, ChecksDigest, GuardrailDigest, SourceRevision, Environment, DatabaseIdentity, ApprovalIdentity string }
 type KeyRecord struct {
@@ -119,6 +151,14 @@ func (a *Artifact) Sign(keyID string, private ed25519.PrivateKey) error {
 	a.Signature.Value = base64.RawStdEncoding.EncodeToString(ed25519.Sign(private, []byte(signatureDomain+d)))
 	return nil
 }
+
+// ResetAuthorization clears signing material and recomputes the artifact digest.
+func (a *Artifact) ResetAuthorization() error {
+	a.Signature = Signature{}
+	d, err := digest(*a)
+	a.Digest = d
+	return err
+}
 func (a Artifact) Verify(keys map[string]ed25519.PublicKey, now time.Time) error {
 	return fail("trusted_policy_required", ErrInvalid)
 }
@@ -127,7 +167,7 @@ func (a Artifact) VerifyTrusted(policy VerifyPolicy) (VerifiedArtifact, error) {
 		return VerifiedArtifact{}, fail("policy", ErrInvalid)
 	}
 	now := policy.Now().UTC()
-	if policy.NoEdits && a.Metadata["autosql.edited"] == "true" {
+	if policy.NoEdits && a.EditProvenance != nil {
 		return VerifiedArtifact{}, fail("edits_forbidden", ErrInvalid)
 	}
 	if err := a.validateUnsigned(); err != nil {
@@ -198,12 +238,58 @@ func (a Artifact) validateUnsigned() error {
 	if err := a.Plan.Validate(); err != nil {
 		return fmt.Errorf("%w: plan: %v", ErrInvalid, err)
 	}
+	if a.EditProvenance != nil {
+		if err := validateEditProvenance(a); err != nil {
+			return err
+		}
+	}
 	wantChecks, checkErr := precheck.Digest(a.Checks)
 	if a.Checks.Digest == "" || checkErr != nil || wantChecks != a.Checks.Digest {
 		return fmt.Errorf("%w: checks", ErrInvalid)
 	}
 	if !digestPattern.MatchString(a.Plan.Digest) || !rawDigestPattern.MatchString(a.Checks.Digest) || !digestPattern.MatchString(a.GuardrailDigest) || a.Digest != "" && !digestPattern.MatchString(a.Digest) {
 		return fail("digest_format", ErrInvalid)
+	}
+	return nil
+}
+func editHash(domain string, b []byte) string {
+	s := sha256.Sum256(append([]byte("autosql.edit-provenance."+domain+"/v1\x00"), b...))
+	return "sha256:" + hex.EncodeToString(s[:])
+}
+func validateEditProvenance(a Artifact) error {
+	p := a.EditProvenance
+	if p.Version != "autosql.edit-provenance/v1" || p.OriginalLength != len(p.OriginalArtifact) || p.OriginalBytesDigest != editHash("original-bytes", p.OriginalArtifact) || p.CandidatePlanDigest != a.Plan.Digest {
+		return fail("edit_provenance", ErrInvalid)
+	}
+	original, err := Parse(p.OriginalArtifact)
+	if err != nil || original.Digest != p.OriginalArtifactDigest || original.Plan.Digest != p.OriginalPlanDigest {
+		return fail("edit_original", ErrInvalid)
+	}
+	sigRaw, _ := json.Marshal(original.Signature)
+	if p.OriginalSignatureDigest != editHash("signature", sigRaw) {
+		return fail("edit_signature", ErrInvalid)
+	}
+	planRaw, _ := a.Plan.MarshalCanonical()
+	if p.CandidateBytesDigest != editHash("candidate", planRaw) {
+		return fail("edit_candidate", ErrInvalid)
+	}
+	parent := p.OriginalPlanDigest
+	for _, r := range p.Records {
+		copy := r
+		copy.Digest = ""
+		raw, _ := json.Marshal(copy)
+		if r.ParentDigest != parent || r.Digest != editHash("record", raw) || r.EditorIdentity == "" || r.Reason == "" || r.Source == "" || r.EditedAt.IsZero() || r.EditedAt.Location() != time.UTC {
+			return fail("edit_chain", ErrInvalid)
+		}
+		parent = r.Digest
+	}
+	if len(p.Records) == 0 || p.ChainDigest != parent {
+		return fail("edit_chain", ErrInvalid)
+	}
+	for _, v := range p.Attestations {
+		if v.Stage == "" || v.Implementation == "" || v.Version == "" || !digestPattern.MatchString(v.ConfigDigest) || !digestPattern.MatchString(v.ResultDigest) || v.At.IsZero() || v.At.Location() != time.UTC {
+			return fail("edit_attestation", ErrInvalid)
+		}
 	}
 	return nil
 }

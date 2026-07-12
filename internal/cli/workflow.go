@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"autosql/pkg/artifact"
 	"autosql/pkg/plan"
+	"autosql/pkg/planedit"
 	"autosql/pkg/postgres"
 	"autosql/pkg/schema"
 	"autosql/pkg/secret"
@@ -70,6 +72,13 @@ type ApplyService interface {
 type Services struct {
 	ReadPlan ReadPlanService
 	Apply    ApplyService
+	PlanEdit PlanEditService
+}
+type PlanEditService interface {
+	TrustedEditor() string
+	VerifyOriginal(artifact.Artifact) error
+	Revalidate(context.Context, planedit.EditedArtifact) (planedit.Eligible, error)
+	Publish(context.Context, planedit.Eligible) (artifact.Artifact, error)
 }
 type Provider interface {
 	Load(context.Context, string) (schema.Document, error)

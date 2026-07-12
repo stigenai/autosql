@@ -66,7 +66,7 @@ func NewPostgreSQL(config Config, verified artifact.VerifiedArtifact) (*PostgreS
 	if err != nil {
 		return nil, err
 	}
-	if config.NoEdits && payload.Metadata["autosql.edited"] == "true" {
+	if config.NoEdits && payload.EditProvenance != nil {
 		return nil, errors.New("edited artifacts are forbidden")
 	}
 	if config.URL == "" || config.State == nil {

@@ -64,9 +64,13 @@ func RunWithServices(ctx context.Context, args []string, streams Streams, servic
 	case len(args) >= 2 && args[0] == "schema" && args[1] == "diff":
 		err = runSchemaDiff(ctx, args[2:], o, services.ReadPlan)
 	case len(args) >= 2 && args[0] == "plan" && args[1] == "edit":
-		err = runPlanEdit(ctx, args[2:], o)
+		err = runPlanEdit(ctx, args[2:], o, services.PlanEdit)
 	case len(args) >= 2 && args[0] == "plan" && args[1] == "review":
 		err = runPlanReview(ctx, args[2:], o)
+	case len(args) >= 2 && args[0] == "plan" && args[1] == "revalidate":
+		err = runPlanRevalidate(ctx, args[2:], o, services.PlanEdit)
+	case len(args) >= 2 && args[0] == "plan" && args[1] == "publish":
+		err = runPlanPublish(ctx, args[2:], o, services.PlanEdit)
 	case args[0] == "plan":
 		err = runPlan(ctx, args[1:], o, services.ReadPlan)
 	case args[0] == "apply":
@@ -286,7 +290,7 @@ func usageError(err error) *Error {
 	return &Error{Kind: "usage", Message: err.Error(), Code: ExitUsage, Cause: err}
 }
 func usage() string {
-	return "usage: autosql <command>\n\ncommands:\n  version [--json]\n  config validate [--config path] [--env name] [--preflight] [--json]\n  schema load --source sql:path|json:path [--source ...] [--json]\n  schema inspect --url env://NAME|file://path [--format native|sql|json]\n  schema diff --from source --to source [--max-changes n] [--json]\n  plan --from source --to source [--max-changes n] [--json]\n  plan edit --artifact file --sql file --editor id --reason text --output file\n  plan review --artifact file [--json]\n  apply --from source --to source [--dry-run|--approve-digest digest|--artifact path] [--no-edits] [--json]"
+	return "usage: autosql <command>\n\ncommands:\n  version [--json]\n  config validate [--config path] [--env name] [--preflight] [--json]\n  schema load --source sql:path|json:path [--source ...] [--json]\n  schema inspect --url env://NAME|file://path [--format native|sql|json]\n  schema diff --from source --to source [--max-changes n] [--json]\n  plan --from source --to source [--max-changes n] [--json]\n  plan edit --artifact file --sql file --editor id --reason text --output file\n  plan review --artifact file [--json]\n  plan revalidate --draft file --output file [--json]\n  plan publish --attested file --output file [--json]\n  apply --from source --to source [--dry-run|--approve-digest digest|--artifact path] [--no-edits] [--json]"
 }
 func contains(args []string, want string) bool {
 	for _, a := range args {
