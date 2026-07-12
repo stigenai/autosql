@@ -192,6 +192,10 @@ func TestLiveTrustedManifestRejectsEveryMaterialDeviation(t *testing.T) {
 		"omitted_operator": `alter table %s drop column operator_identity`,
 		"extra_column":     `alter table %s add column attacker text`,
 		"extra_index":      `create index attacker_index on %s(active_version)`,
+		"partial_index":    `create index attacker_partial on %s(active_version) where active_version<>''`,
+		"expression_index": `create index attacker_expression on %s((lower(active_version)))`,
+		"persistence":      `alter table %s set unlogged`,
+		"rls":              `alter table %s enable row level security`,
 	}
 	for name, format := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -253,6 +257,120 @@ func TestLiveTrustedManifestRejectsEveryMaterialDeviation(t *testing.T) {
 		}
 		if err := s.Init(ctx); !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("precreated namespace accepted: %v", err)
+		}
+	})
+	t.Run("check_or_true_bypass", func(t *testing.T) {
+		s, c, n, _ := liveStore(t)
+		ctx := context.Background()
+		if err := s.Init(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Exec(ctx, `alter table `+q(n, "operations")+` drop constraint operations_progress_check,add constraint operations_progress_check check (((progress>=0) and (progress<=100)) or true)`); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Init(ctx); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("semantic bypass accepted: %v", err)
+		}
+	})
+	for name, suffix := range map[string]string{"fk_delete_action": " on delete cascade", "fk_deferrable": " deferrable initially deferred"} {
+		t.Run(name, func(t *testing.T) {
+			s, c, n, _ := liveStore(t)
+			ctx := context.Background()
+			if err := s.Init(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.Exec(ctx, `alter table `+q(n, "object_mappings")+` drop constraint object_mappings_operation_id_fkey,add constraint object_mappings_operation_id_fkey foreign key(operation_id) references `+q(n, "operations")+`(operation_id)`+suffix); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Init(ctx); !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("FK mutation accepted: %v", err)
+			}
+		})
+	}
+	t.Run("constraint_not_valid", func(t *testing.T) {
+		s, c, n, _ := liveStore(t)
+		ctx := context.Background()
+		if err := s.Init(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Exec(ctx, `alter table `+q(n, "operations")+` drop constraint operations_progress_check,add constraint operations_progress_check check ((progress>=0) and (progress<=100)) not valid`); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Init(ctx); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("unvalidated constraint accepted: %v", err)
+		}
+	})
+	t.Run("invalid_index", func(t *testing.T) {
+		s, c, n, _ := liveStore(t)
+		ctx := context.Background()
+		if err := s.Init(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Exec(ctx, `set allow_system_table_mods=on`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Exec(ctx, `update pg_index set indisvalid=false where indexrelid=$1::regclass`, n+".meta_pkey"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Init(ctx); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("invalid index accepted: %v", err)
+		}
+	})
+	t.Run("rule", func(t *testing.T) {
+		s, c, n, _ := liveStore(t)
+		ctx := context.Background()
+		if err := s.Init(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Exec(ctx, `create rule attacker_rule as on insert to `+q(n, "meta")+` do also nothing`); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Init(ctx); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("rule accepted: %v", err)
+		}
+	})
+	t.Run("trigger", func(t *testing.T) {
+		s, c, n, app := liveStore(t)
+		ctx := context.Background()
+		if err := s.Init(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Exec(ctx, `create function `+q(app, "attacker_trigger")+`() returns trigger language plpgsql as $$ begin return new; end $$; create trigger attacker before insert on `+q(n, "meta")+` for each row execute function `+q(app, "attacker_trigger")+`() `); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Init(ctx); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("trigger accepted: %v", err)
+		}
+	})
+	for name, alter := range map[string]string{"increment": "increment by 7", "min": "minvalue 0", "max": "maxvalue 1000", "start": "start with 2", "cache": "cache 7", "cycle": "cycle", "type": "as integer"} {
+		t.Run("sequence_"+name, func(t *testing.T) {
+			s, c, n, _ := liveStore(t)
+			ctx := context.Background()
+			if err := s.Init(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.Exec(ctx, `alter sequence `+q(n, "audit_sequence_seq")+` `+alter); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Init(ctx); !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("sequence mutation accepted: %v", err)
+			}
+		})
+	}
+	t.Run("sequence_binding", func(t *testing.T) {
+		s, c, n, _ := liveStore(t)
+		ctx := context.Background()
+		if err := s.Init(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Exec(ctx, `set allow_system_table_mods=on`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Exec(ctx, `update pg_depend set deptype='a' where objid=$1::regclass and deptype='i'`, n+".audit_sequence_seq"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Init(ctx); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("sequence binding mutation accepted: %v", err)
 		}
 	})
 }
