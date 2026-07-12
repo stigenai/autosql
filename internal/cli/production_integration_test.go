@@ -28,17 +28,30 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-type ambiguousConnector struct{ executor.PGXConnector }
+type ambiguousConnector struct {
+	executor.PGXConnector
+	closed *bool
+}
 
-func (ambiguousConnector) Connect(ctx context.Context, url string) (executor.Session, error) {
+func (c ambiguousConnector) Connect(ctx context.Context, url string) (executor.Session, error) {
 	s, e := (executor.PGXConnector{}).Connect(ctx, url)
 	if e != nil {
 		return nil, e
 	}
-	return ambiguousSession{Session: s}, nil
+	return ambiguousSession{Session: s, closed: c.closed}, nil
 }
 
-type ambiguousSession struct{ executor.Session }
+type ambiguousSession struct {
+	executor.Session
+	closed *bool
+}
+
+func (s ambiguousSession) Close(ctx context.Context) error {
+	if s.closed != nil {
+		*s.closed = true
+	}
+	return s.Session.Close(ctx)
+}
 
 func (s ambiguousSession) Begin(ctx context.Context) (executor.Tx, error) {
 	tx, e := s.Session.Begin(ctx)
@@ -140,18 +153,23 @@ func assertExecutorLockAvailable(t *testing.T, ctx context.Context, url, databas
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close(ctx)
 	identity := fmt.Sprintf("%d:%s%d:%s", len(databaseIdentity), databaseIdentity, len(environment), environment)
 	var locked bool
 	if err = conn.QueryRow(ctx, `select pg_try_advisory_lock(hashtextextended($1, 0))`, identity).Scan(&locked); err != nil {
+		_ = conn.Close(context.Background())
 		t.Fatal(err)
 	}
 	if !locked {
+		_ = conn.Close(context.Background())
 		t.Fatalf("executor lock remains held for exact identity %q", identity)
 	}
 	var unlocked bool
 	if err = conn.QueryRow(ctx, `select pg_advisory_unlock(hashtextextended($1, 0))`, identity).Scan(&unlocked); err != nil || !unlocked {
+		_ = conn.Close(context.Background())
 		t.Fatalf("release exact executor lock %q: unlocked=%v err=%v", identity, unlocked, err)
+	}
+	if err = conn.Close(ctx); err != nil {
+		t.Fatalf("close exact executor lock probe %q: %v", identity, err)
 	}
 }
 
@@ -203,7 +221,7 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 		t.Fatal(err)
 	}
 	name := "autosql_prod_" + hex.EncodeToString(schemaNonce)
-	cfg := applyConfig{DatabaseURL: "env://AUTOSQL_PROD_TEST_URL", Environment: "test", DatabaseIdentity: "prod-test", SourceRevision: "test-rev", KeyID: "test-key", PublicKey: base64.RawStdEncoding.EncodeToString(pub), Issuer: "test-issuer", Signer: "test-signer", Author: "author", Requester: "requester", ApprovalAuditPath: filepath.Join(dir, "approval.jsonl"), LifecycleAuditPath: filepath.Join(dir, "lifecycle.jsonl"), ArtifactDirectory: dir, PostgresVersion: 15, Schemas: []string{name}, ExpectedPlanDigest: "pending", ExpectedChecksDigest: "pending", ExpectedGuardrailDigest: "pending", ExpectedApprovalIdentity: "release", KeyStatus: "active", KeyPurpose: "plan-artifact", KeyNotBefore: time.Now().UTC().Add(-time.Hour), KeyNotAfter: time.Now().UTC().Add(2 * time.Hour), EditorIdentity: "editor", EditSigningKeyID: "edit-key", EditSigningKeyReference: "env://AUTOSQL_EDIT_TEST_KEY", DevelopmentURLReference: "env://AUTOSQL_DEV_TEST_URL", FreshApprovalIdentity: "fresh-approver", FreshApprovalProofDigest: "sha256:" + strings.Repeat("9", 64), FreshApprovalAt: releaseAt, EditReleaseCreatedAt: releaseAt, EditReleaseExpiresAt: releaseAt.Add(time.Hour)}
+	cfg := applyConfig{DatabaseURL: "env://AUTOSQL_PROD_TEST_URL", Environment: "test/" + name, DatabaseIdentity: "prod-test/" + name, SourceRevision: "test-rev", KeyID: "test-key", PublicKey: base64.RawStdEncoding.EncodeToString(pub), Issuer: "test-issuer", Signer: "test-signer", Author: "author", Requester: "requester", ApprovalAuditPath: filepath.Join(dir, "approval.jsonl"), LifecycleAuditPath: filepath.Join(dir, "lifecycle.jsonl"), ArtifactDirectory: dir, PostgresVersion: 15, Schemas: []string{name}, ExpectedPlanDigest: "pending", ExpectedChecksDigest: "pending", ExpectedGuardrailDigest: "pending", ExpectedApprovalIdentity: "release", KeyStatus: "active", KeyPurpose: "plan-artifact", KeyNotBefore: time.Now().UTC().Add(-time.Hour), KeyNotAfter: time.Now().UTC().Add(2 * time.Hour), EditorIdentity: "editor", EditSigningKeyID: "edit-key", EditSigningKeyReference: "env://AUTOSQL_EDIT_TEST_KEY", DevelopmentURLReference: "env://AUTOSQL_DEV_TEST_URL", FreshApprovalIdentity: "fresh-approver", FreshApprovalProofDigest: "sha256:" + strings.Repeat("9", 64), FreshApprovalAt: releaseAt, EditReleaseCreatedAt: releaseAt, EditReleaseExpiresAt: releaseAt.Add(time.Hour)}
 	raw, _ := json.Marshal(cfg)
 	configPath := filepath.Join(dir, "apply.json")
 	if err = os.WriteFile(configPath, raw, 0600); err != nil {
@@ -458,7 +476,10 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 	if err != nil || published.EditProvenance == nil {
 		t.Fatalf("published provenance err=%v", err)
 	}
-	injected, err := productionServices(ambiguousConnector{})
+	jsonAmbiguousURL := freshProductionDatabase(t, ctx, url, "ambiguity_json")
+	t.Setenv("AUTOSQL_PROD_TEST_URL", jsonAmbiguousURL)
+	jsonClosed := false
+	injected, err := productionServices(ambiguousConnector{closed: &jsonClosed})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -469,14 +490,14 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 			t.Fatalf("json uncertain code=%d want=%s out=%s", code, want, out)
 		}
 	}
-	reset, err := pgx.Connect(ctx, url)
-	if err != nil {
-		t.Fatal(err)
+	if !jsonClosed {
+		t.Fatal("JSON ambiguity path did not close executor session")
 	}
-	_, _ = reset.Exec(ctx, "drop schema if exists "+pgx.Identifier{name}.Sanitize()+" cascade")
-	_, _ = reset.Exec(ctx, "delete from autosql_migration_history where artifact_digest=$1", a.Digest)
-	_ = reset.Close(ctx)
-	injected, err = productionServices(ambiguousConnector{})
+	assertExecutorLockAvailable(t, ctx, jsonAmbiguousURL, cfg.DatabaseIdentity, cfg.Environment)
+	humanAmbiguousURL := freshProductionDatabase(t, ctx, url, "ambiguity_human")
+	t.Setenv("AUTOSQL_PROD_TEST_URL", humanAmbiguousURL)
+	humanClosed := false
+	injected, err = productionServices(ambiguousConnector{closed: &humanClosed})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -486,13 +507,11 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 			t.Fatalf("human uncertain code=%d want=%s stderr=%s", code, want, human)
 		}
 	}
-	reset, err = pgx.Connect(ctx, url)
-	if err != nil {
-		t.Fatal(err)
+	if !humanClosed {
+		t.Fatal("human ambiguity path did not close executor session")
 	}
-	_, _ = reset.Exec(ctx, "drop schema if exists "+pgx.Identifier{name}.Sanitize()+" cascade")
-	_, _ = reset.Exec(ctx, "delete from autosql_migration_history where artifact_digest=$1", a.Digest)
-	_ = reset.Close(ctx)
+	assertExecutorLockAvailable(t, ctx, humanAmbiguousURL, cfg.DatabaseIdentity, cfg.Environment)
+	t.Setenv("AUTOSQL_PROD_TEST_URL", url)
 	defer func() {
 		conn, _ := pgx.Connect(ctx, url)
 		if conn != nil {
