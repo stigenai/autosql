@@ -79,7 +79,7 @@ func TestApplyPromptsAndExplicitModes(t *testing.T) {
 		tty             bool
 		flags           []string
 		wantCode, calls int
-	}{"accept": {"DIGEST", true, nil, 0, 1}, "refuse": {"no", true, nil, 7, 0}, "eof": {"", true, nil, 7, 0}, "noninteractive": {"", false, nil, 7, 0}, "auto": {"", false, []string{"--auto-approve"}, 0, 1}, "artifact": {"", false, []string{"--artifact", "signed.json"}, 0, 1}} {
+	}{"accept": {"DIGEST", true, nil, 0, 1}, "refuse": {"no", true, nil, 7, 0}, "eof": {"", true, nil, 7, 0}, "noninteractive": {"", false, nil, 7, 0}, "digest": {"", false, []string{"--approve-digest", "DIGEST"}, 0, 1}, "mismatch": {"", false, []string{"--approve-digest", "wrong"}, 7, 0}, "artifact": {"", false, []string{"--artifact", "signed.json"}, 7, 0}} {
 		t.Run(name, func(t *testing.T) {
 			r, p := workflowFixture(t)
 			a := &fakeApply{result: ApplyResult{Status: "success"}}
@@ -89,6 +89,11 @@ func TestApplyPromptsAndExplicitModes(t *testing.T) {
 			}
 			args := []string{"apply", "--from", "from", "--to", "to", "--json"}
 			args = append(args, fixture.flags...)
+			for i := range args {
+				if args[i] == "DIGEST" {
+					args[i] = p.Digest
+				}
+			}
 			code, out, _ := invoke(t, args, input, fixture.tty, Services{ReadPlan: r, Apply: a})
 			if code != fixture.wantCode || a.calls != fixture.calls {
 				t.Fatalf("code=%d calls=%d out=%s", code, a.calls, out)
@@ -98,7 +103,7 @@ func TestApplyPromptsAndExplicitModes(t *testing.T) {
 				if name == "accept" {
 					wantMode = "interactive"
 				}
-				if a.request.ApprovalMode != wantMode || a.request.AutoApproved != (name == "auto") {
+				if a.request.ApprovalMode != wantMode || a.request.AssertedDigest != p.Digest {
 					t.Fatalf("request=%+v", a.request)
 				}
 			}
@@ -107,24 +112,52 @@ func TestApplyPromptsAndExplicitModes(t *testing.T) {
 }
 func TestApplyStatusesLimitsFailClosedAndRedaction(t *testing.T) {
 	r, _ := workflowFixture(t)
-	code, out, _ := invoke(t, []string{"apply", "--from", "from", "--to", "to", "--auto-approve", "--json"}, "", false, Services{ReadPlan: r})
+	_, p := workflowFixture(t)
+	code, out, _ := invoke(t, []string{"apply", "--from", "from", "--to", "to", "--approve-digest", p.Digest, "--json"}, "", false, Services{ReadPlan: r})
 	if code != 7 || !strings.Contains(out, "refused") {
 		t.Fatalf("code=%d out=%s", code, out)
 	}
 	r, _ = workflowFixture(t)
 	code, _, _ = invoke(t, []string{"plan", "--from", "from", "--to", "to", "--max-changes", "0"}, "", false, Services{ReadPlan: r})
-	if code != 0 {
+	if code != int(ExitValidation) {
 		t.Fatal(code)
 	}
 	r, _ = workflowFixture(t)
 	a := &fakeApply{result: ApplyResult{Status: "partial_failure"}, err: errors.New("postgres://user:seeded-secret@db")}
-	code, out, _ = invoke(t, []string{"apply", "--from", "from", "--to", "to", "--auto-approve", "--json"}, "", false, Services{ReadPlan: r, Apply: a})
+	code, out, _ = invoke(t, []string{"apply", "--from", "from", "--to", "to", "--approve-digest", r.p.Digest, "--json"}, "", false, Services{ReadPlan: r, Apply: a})
 	if code != 7 || strings.Contains(out, "seeded-secret") || !strings.Contains(out, "partial_failure") {
 		t.Fatalf("code=%d out=%s", code, out)
 	}
 	var envelope Envelope
 	if e := json.Unmarshal([]byte(out), &envelope); e != nil {
 		t.Fatal(e)
+	}
+	r, _ = workflowFixture(t)
+	a = &fakeApply{err: errors.New("failed before mutation")}
+	code, out, _ = invoke(t, []string{"apply", "--from", "from", "--to", "to", "--approve-digest", r.p.Digest, "--json"}, "", false, Services{ReadPlan: r, Apply: a})
+	if code != int(ExitMigration) || strings.Contains(out, "partial_failure") {
+		t.Fatalf("generic failure code=%d out=%s", code, out)
+	}
+}
+
+func TestApplySanitizesSuccessAndRejectsConflictingModes(t *testing.T) {
+	for _, jsonMode := range []bool{false, true} {
+		r, _ := workflowFixture(t)
+		a := &fakeApply{result: ApplyResult{Status: "success", Message: "postgres://user:hunter2@db/app password=also-secret"}}
+		args := []string{"apply", "--from", "from", "--to", "to", "--approve-digest", r.p.Digest}
+		if jsonMode {
+			args = append(args, "--json")
+		}
+		code, out, _ := invoke(t, args, "", false, Services{ReadPlan: r, Apply: a})
+		if code != 0 || strings.Contains(out, "hunter2") || strings.Contains(out, "also-secret") {
+			t.Fatalf("json=%v code=%d out=%s", jsonMode, code, out)
+		}
+	}
+	r, _ := workflowFixture(t)
+	a := &fakeApply{}
+	code, _, _ := invoke(t, []string{"apply", "--from", "from", "--to", "to", "--dry-run", "--approve-digest", r.p.Digest}, "", false, Services{ReadPlan: r, Apply: a})
+	if code != int(ExitUsage) || a.calls != 0 {
+		t.Fatalf("code=%d calls=%d", code, a.calls)
 	}
 }
 func TestNoOpMaxLimitAndArtifactOnly(t *testing.T) {
@@ -148,7 +181,7 @@ func TestNoOpMaxLimitAndArtifactOnly(t *testing.T) {
 	r, _ = workflowFixture(t)
 	a := &fakeApply{result: ApplyResult{Status: "success"}}
 	code, _, _ = invoke(t, []string{"apply", "--artifact", "signed.json"}, "", false, Services{ReadPlan: r, Apply: a})
-	if code != 0 || a.calls != 1 || r.loads != 0 || a.request.ArtifactPath != "signed.json" || a.request.ApprovalMode != "artifact" || a.request.AutoApproved {
+	if code != int(ExitMigration) || a.calls != 0 || r.loads != 0 {
 		t.Fatalf("artifact code=%d calls=%d loads=%d", code, a.calls, r.loads)
 	}
 	a = &fakeApply{}

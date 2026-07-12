@@ -282,7 +282,7 @@ func usageError(err error) *Error {
 	return &Error{Kind: "usage", Message: err.Error(), Code: ExitUsage, Cause: err}
 }
 func usage() string {
-	return "usage: autosql <command>\n\ncommands:\n  version [--json]\n  config validate [--config path] [--env name] [--preflight] [--json]\n  schema load --source sql:path|json:path [--source ...] [--json]\n  schema inspect --url env://NAME|file://path [--format native|sql|json]\n  schema diff --from source --to source [--max-changes n] [--json]\n  plan --from source --to source [--max-changes n] [--json]\n  apply --from source --to source [--dry-run|--auto-approve|--artifact path] [--json]"
+	return "usage: autosql <command>\n\ncommands:\n  version [--json]\n  config validate [--config path] [--env name] [--preflight] [--json]\n  schema load --source sql:path|json:path [--source ...] [--json]\n  schema inspect --url env://NAME|file://path [--format native|sql|json]\n  schema diff --from source --to source [--max-changes n] [--json]\n  plan --from source --to source [--max-changes n] [--json]\n  apply --from source --to source [--dry-run|--approve-digest digest|--artifact path] [--json]"
 }
 func contains(args []string, want string) bool {
 	for _, a := range args {

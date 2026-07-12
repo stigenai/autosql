@@ -50,14 +50,22 @@ credentials are registered with the command redactor and never serialized.
 
 `--from` and `--to` use the same source syntax: `sql:path`, `native:path`,
 `live:env://NAME` (or `file://`), and registered `provider:name:reference`.
-Schema/include/exclude filters apply to live reads. `--max-changes` is enforced
-before apply. Diff, plan, and `apply --dry-run` receive no mutation capability.
+Schema/include/exclude filters apply only when both inputs are live reads; local
+or provider inputs reject selectors. An omitted `--max-changes` is unlimited,
+while an explicit zero permits only a no-op. Diff, plan, and `apply --dry-run`
+receive no mutation capability.
 
 Interactive apply prints the exact plan digest and requires it to be typed on a
-TTY. Noninteractive apply requires `--auto-approve` or `--artifact path`.
+TTY. Noninteractive apply requires `--approve-digest DIGEST`, which must exactly
+match the computed plan. `--dry-run`, `--approve-digest`, and `--artifact` are
+mutually exclusive. Artifact execution is fail-closed pending cs5.7 signature
+and payload verification.
 Mutation is delegated only to the injected `ApplyService`; the default binary
 returns `refused` until the guarded executor is wired. Stable statuses are
-`no_op`, `success`, `refused`, and `partial_failure`.
+`planned`, `dry_run`, `no_op`, `success`, `refused`, and `partial_failure`.
+`partial_failure` is reported only when the executor returns structured evidence
+of partial mutation; a generic pre-mutation error has no fabricated status.
+Successful executor messages are sanitized before human or JSON serialization.
 
 ## JSON envelope
 

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -25,11 +26,35 @@ type ReadPlanService interface {
 	Plan(context.Context, schema.Document, schema.Document) (plan.Plan, error)
 }
 type ApplyRequest struct {
-	Plan         plan.Plan
-	ArtifactPath string
-	AutoApproved bool
-	ApprovalMode string
+	Plan           plan.Plan
+	ArtifactPath   string
+	AssertedDigest string
+	ApprovalMode   string
 }
+
+type optionalInt struct {
+	value int
+	set   bool
+}
+
+func (v *optionalInt) String() string { return fmt.Sprint(v.value) }
+func (v *optionalInt) Set(raw string) error {
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return errors.New("must be a nonnegative integer")
+	}
+	v.value, v.set = n, true
+	return nil
+}
+
+func hasSelectors(r LoadRequest) bool { return len(r.Schemas)+len(r.Include)+len(r.Exclude) > 0 }
+func validateSelectors(from, to string, r LoadRequest) error {
+	if hasSelectors(r) && (!strings.HasPrefix(from, "live:") || !strings.HasPrefix(to, "live:")) {
+		return usageError(errors.New("--schema, --include, and --exclude are supported only when both sources are live"))
+	}
+	return nil
+}
+
 type ApplyResult struct {
 	Status       string `json:"status"`
 	AppliedSteps int    `json:"applied_steps,omitempty"`
@@ -105,7 +130,8 @@ func runSchemaDiff(ctx context.Context, args []string, o output, r ReadPlanServi
 	fs := newFlags("schema diff", o.streams.Err)
 	from := fs.String("from", "", "source spec")
 	to := fs.String("to", "", "source spec")
-	max := fs.Int("max-changes", 0, "maximum changes")
+	var max optionalInt
+	fs.Var(&max, "max-changes", "maximum changes")
 	jsonFlag := fs.Bool("json", false, "JSON")
 	var schemas, include, exclude stringList
 	fs.Var(&schemas, "schema", "schema")
@@ -117,15 +143,21 @@ func runSchemaDiff(ctx context.Context, args []string, o output, r ReadPlanServi
 	if fs.NArg() != 0 {
 		return usageError(errors.New("unexpected positional arguments"))
 	}
-	if *from == "" || *to == "" || *max < 0 {
-		return usageError(errors.New("--from, --to, and nonnegative --max-changes required"))
+	if *from == "" || *to == "" {
+		return usageError(errors.New("--from and --to required"))
+	}
+	filter := LoadRequest{Schemas: schemas.value(), Include: include.value(), Exclude: exclude.value()}
+	if e := validateSelectors(*from, *to, filter); e != nil {
+		return e
 	}
 	o.json = *jsonFlag
-	a, e := r.Load(ctx, LoadRequest{Spec: *from, Schemas: schemas.value(), Include: include.value(), Exclude: exclude.value()})
+	filter.Spec = *from
+	a, e := r.Load(ctx, filter)
 	if e != nil {
 		return &Error{Kind: "validation", Message: "load source failed", Code: ExitValidation, Cause: e}
 	}
-	b, e := r.Load(ctx, LoadRequest{Spec: *to, Schemas: schemas.value(), Include: include.value(), Exclude: exclude.value()})
+	filter.Spec = *to
+	b, e := r.Load(ctx, filter)
 	if e != nil {
 		return &Error{Kind: "validation", Message: "load target failed", Code: ExitValidation, Cause: e}
 	}
@@ -133,7 +165,7 @@ func runSchemaDiff(ctx context.Context, args []string, o output, r ReadPlanServi
 	if e != nil {
 		return &Error{Kind: "migration", Message: "diff failed", Code: ExitMigration, Cause: e}
 	}
-	if *max > 0 && len(changes.Changes) > *max {
+	if max.set && len(changes.Changes) > max.value {
 		return &Error{Kind: "validation", Message: "maximum change count exceeded", Code: ExitValidation, Cause: e}
 	}
 	status := "success"
@@ -162,7 +194,8 @@ func runPlan(ctx context.Context, args []string, o output, r ReadPlanService) er
 	fs := newFlags("plan", o.streams.Err)
 	from := fs.String("from", "", "source")
 	to := fs.String("to", "", "target")
-	max := fs.Int("max-changes", 0, "maximum changes")
+	var max optionalInt
+	fs.Var(&max, "max-changes", "maximum changes")
 	jsonFlag := fs.Bool("json", false, "JSON")
 	var schemas, include, exclude stringList
 	fs.Var(&schemas, "schema", "schema")
@@ -174,18 +207,22 @@ func runPlan(ctx context.Context, args []string, o output, r ReadPlanService) er
 	if fs.NArg() != 0 {
 		return usageError(errors.New("unexpected positional arguments"))
 	}
-	if *from == "" || *to == "" || *max < 0 {
-		return usageError(errors.New("--from, --to, and nonnegative --max-changes required"))
+	if *from == "" || *to == "" {
+		return usageError(errors.New("--from and --to required"))
 	}
 	o.json = *jsonFlag
-	_, _, p, e := loadPlanInputs(ctx, *from, *to, LoadRequest{Schemas: schemas.value(), Include: include.value(), Exclude: exclude.value()}, r)
+	filter := LoadRequest{Schemas: schemas.value(), Include: include.value(), Exclude: exclude.value()}
+	if e := validateSelectors(*from, *to, filter); e != nil {
+		return e
+	}
+	_, _, p, e := loadPlanInputs(ctx, *from, *to, filter, r)
 	if e != nil {
 		return &Error{Kind: "migration", Message: "planning failed", Code: ExitMigration, Cause: e}
 	}
-	if *max > 0 && len(p.Changes.Changes) > *max {
+	if max.set && len(p.Changes.Changes) > max.value {
 		return &Error{Kind: "validation", Message: "maximum change count exceeded", Code: ExitValidation}
 	}
-	status := "success"
+	status := "planned"
 	if len(p.Changes.Changes) == 0 {
 		status = "no_op"
 	}
@@ -198,8 +235,9 @@ func runApply(ctx context.Context, args []string, o output, s Services, tty bool
 	to := fs.String("to", "", "target")
 	artifact := fs.String("artifact", "", "signed artifact")
 	dry := fs.Bool("dry-run", false, "plan only")
-	auto := fs.Bool("auto-approve", false, "noninteractive approval")
-	max := fs.Int("max-changes", 0, "maximum changes")
+	approveDigest := fs.String("approve-digest", "", "assert the exact computed plan digest")
+	var max optionalInt
+	fs.Var(&max, "max-changes", "maximum changes")
 	jsonFlag := fs.Bool("json", false, "JSON")
 	var schemas, include, exclude stringList
 	fs.Var(&schemas, "schema", "schema")
@@ -212,34 +250,37 @@ func runApply(ctx context.Context, args []string, o output, s Services, tty bool
 		return usageError(errors.New("unexpected positional arguments"))
 	}
 	o.json = *jsonFlag
-	if *artifact != "" && *from == "" && *to == "" {
-		if *dry {
-			return usageError(errors.New("--dry-run with --artifact requires --from and --to"))
-		}
-		if s.Apply == nil {
-			return &Error{Kind: "migration", Message: "apply service is not wired", Code: ExitMigration, Status: "refused"}
-		}
-		result, e := s.Apply.Apply(ctx, ApplyRequest{ArtifactPath: *artifact, ApprovalMode: "artifact"})
-		if e != nil {
-			status := result.Status
-			if status == "" {
-				status = "partial_failure"
-			}
-			return &Error{Kind: "migration", Message: "apply failed", Code: ExitMigration, Status: status, Cause: e}
-		}
-		if result.Status == "" {
-			result.Status = "success"
-		}
-		return o.success(result, result.Status)
+	modeCount := 0
+	if *dry {
+		modeCount++
 	}
-	if *from == "" || *to == "" || *max < 0 {
+	if *approveDigest != "" {
+		modeCount++
+	}
+	if *artifact != "" {
+		modeCount++
+	}
+	if modeCount > 1 {
+		return usageError(errors.New("--dry-run, --approve-digest, and --artifact are mutually exclusive"))
+	}
+	if hasSelectors(LoadRequest{Schemas: schemas.value(), Include: include.value(), Exclude: exclude.value()}) && (*from == "" || *to == "") {
+		return usageError(errors.New("selectors require --from and --to live sources"))
+	}
+	if *artifact != "" {
+		return &Error{Kind: "migration", Message: "artifact verification is not available until cs5.7", Code: ExitMigration, Status: "refused"}
+	}
+	if *from == "" || *to == "" {
 		return usageError(errors.New("--from and --to required unless --artifact is used"))
 	}
-	_, _, p, e := loadPlanInputs(ctx, *from, *to, LoadRequest{Schemas: schemas.value(), Include: include.value(), Exclude: exclude.value()}, s.ReadPlan)
+	filter := LoadRequest{Schemas: schemas.value(), Include: include.value(), Exclude: exclude.value()}
+	if e := validateSelectors(*from, *to, filter); e != nil {
+		return e
+	}
+	_, _, p, e := loadPlanInputs(ctx, *from, *to, filter, s.ReadPlan)
 	if e != nil {
 		return &Error{Kind: "migration", Message: "planning failed", Code: ExitMigration, Cause: e}
 	}
-	if *max > 0 && len(p.Changes.Changes) > *max {
+	if max.set && len(p.Changes.Changes) > max.value {
 		return &Error{Kind: "validation", Message: "maximum change count exceeded", Code: ExitValidation}
 	}
 	if len(p.Changes.Changes) == 0 {
@@ -247,18 +288,21 @@ func runApply(ctx context.Context, args []string, o output, s Services, tty bool
 	}
 	if *dry {
 		b, _ := p.MarshalCanonical()
-		return o.success(map[string]any{"status": "success", "dry_run": true, "plan": p}, string(b))
+		return o.success(map[string]any{"status": "dry_run", "dry_run": true, "plan": p}, string(b))
 	}
-	approved := *auto || *artifact != ""
+	approved := *approveDigest != "" || *artifact != ""
 	approvalMode := "interactive"
-	if *auto {
-		approvalMode = "auto"
+	if *approveDigest != "" {
+		approvalMode = "digest"
 	} else if *artifact != "" {
 		approvalMode = "artifact"
 	}
+	if *approveDigest != "" && *approveDigest != p.Digest {
+		return &Error{Kind: "migration", Message: "approved digest does not match computed plan", Code: ExitMigration, Status: "refused"}
+	}
 	if !approved {
 		if !tty {
-			return &Error{Kind: "migration", Message: "noninteractive apply requires --auto-approve or --artifact", Code: ExitMigration, Status: "refused"}
+			return &Error{Kind: "migration", Message: "noninteractive apply requires --approve-digest or --artifact", Code: ExitMigration, Status: "refused"}
 		}
 		fmt.Fprintf(o.streams.Err, "type plan digest %s to apply: ", p.Digest)
 		line, readErr := bufio.NewReader(o.streams.In).ReadString('\n')
@@ -273,18 +317,26 @@ func runApply(ctx context.Context, args []string, o output, s Services, tty bool
 	if s.Apply == nil {
 		return &Error{Kind: "migration", Message: "apply service is not wired", Code: ExitMigration, Status: "refused"}
 	}
-	result, e := s.Apply.Apply(ctx, ApplyRequest{Plan: p, ArtifactPath: *artifact, AutoApproved: *auto, ApprovalMode: approvalMode})
+	asserted := *approveDigest
+	if approvalMode == "interactive" {
+		asserted = p.Digest
+	}
+	result, e := s.Apply.Apply(ctx, ApplyRequest{Plan: p, ArtifactPath: *artifact, AssertedDigest: asserted, ApprovalMode: approvalMode})
 	if e != nil {
-		status := result.Status
-		if status == "" {
-			status = "partial_failure"
-		}
-		return &Error{Kind: "migration", Message: "apply failed", Code: ExitMigration, Status: status, Cause: e}
+		return applyFailure(result, e)
 	}
 	if result.Status == "" {
 		result.Status = "success"
 	}
 	return o.success(result, result.Status)
+}
+
+func applyFailure(result ApplyResult, cause error) error {
+	status := ""
+	if result.Status == "partial_failure" {
+		status = result.Status
+	}
+	return &Error{Kind: "migration", Message: "apply failed", Code: ExitMigration, Status: status, Cause: cause}
 }
 func schemaSQL(doc schema.Document) (string, error) {
 	statements, e := postgres.RenderDocument(context.Background(), doc, nil)
