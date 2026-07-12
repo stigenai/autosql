@@ -126,7 +126,7 @@ func liveGenerated(t *testing.T, dev, prod string) (string, VerifyArtifact, func
 	return dir, verify, appendSecond
 }
 
-func TestLiveGenerationApplyRetryBaselineAndAtomicEvidence(t *testing.T) {
+func TestCoordinatorOutboxPartialDrainTwoFileAllInOneIsIdempotent(t *testing.T) {
 	dev, prod := os.Getenv("AUTOSQL_GENERATE_TEST_DSN"), os.Getenv("AUTOSQL_GENERATE_PROD_TEST_DSN")
 	if dev == "" || prod == "" {
 		t.Skip("live generation databases unset")
@@ -293,5 +293,81 @@ func TestLiveGenerationApplyRetryBaselineAndAtomicEvidence(t *testing.T) {
 	var history *string
 	if e = check.QueryRow(context.Background(), `select to_regclass('public.autosql_migration_history')::text`).Scan(&history); e != nil || history != nil {
 		t.Fatalf("baseline created executor history=%v err=%v", history, e)
+	}
+}
+
+func TestCoordinatorManifestReplacementWhileAcquiringCanonicalLock(t *testing.T) {
+	dev, prod := os.Getenv("AUTOSQL_GENERATE_TEST_DSN"), os.Getenv("AUTOSQL_GENERATE_PROD_TEST_DSN")
+	if dev == "" || prod == "" {
+		t.Skip("live generation databases unset")
+	}
+	dir, verify, appendSecond := liveGenerated(t, dev, prod)
+	schema := "autosql_swap_" + strings.ReplaceAll(time.Now().Format("150405.000000"), ".", "")
+	store, e := revision.Open(revision.Config{URL: prod, Schema: schema})
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e = store.Init(context.Background()); e != nil {
+		t.Fatal(e)
+	}
+	called := false
+	_, e = (Engine{Store: store, Verify: verify}).Run(context.Background(), Request{Directory: dir, Operator: "op", Transaction: "file", DryRun: true, beforeLock: func() { called = true; appendSecond() }})
+	if !called || !errors.Is(e, ErrRefused) {
+		t.Fatalf("called=%v err=%v", called, e)
+	}
+	s, e := store.OpenSession(context.Background())
+	if e != nil {
+		t.Fatal(e)
+	}
+	rows, e := s.Revisions(context.Background())
+	hist, he := s.ExecutorRecords(context.Background())
+	_ = s.Close(context.Background())
+	if e != nil || he != nil || len(rows) != 0 || len(hist) != 0 {
+		t.Fatalf("rows=%v history=%v err=%v/%v", rows, hist, e, he)
+	}
+}
+
+func TestCoordinatorDirectRevisionWriterRacesFileAllAndBaseline(t *testing.T) {
+	dev, prod := os.Getenv("AUTOSQL_GENERATE_TEST_DSN"), os.Getenv("AUTOSQL_GENERATE_PROD_TEST_DSN")
+	if dev == "" || prod == "" {
+		t.Skip("live generation databases unset")
+	}
+	dir, verify, _ := liveGenerated(t, dev, prod)
+	for _, mode := range []string{"file", "all", "baseline"} {
+		t.Run(mode, func(t *testing.T) {
+			schema := "autosql_race_" + mode + strings.ReplaceAll(time.Now().Format("150405.000000"), ".", "")
+			store, _ := revision.Open(revision.Config{URL: prod, Schema: schema})
+			if e := store.Init(context.Background()); e != nil {
+				t.Fatal(e)
+			}
+			held, e := store.OpenSession(context.Background())
+			if e != nil {
+				t.Fatal(e)
+			}
+			ok, e := held.LockWriters(context.Background())
+			if e != nil || !ok {
+				t.Fatal(e)
+			}
+			done := make(chan error, 1)
+			now := time.Now().UTC()
+			go func() {
+				done <- store.Insert(context.Background(), revision.Revision{Version: "9.0.0", Description: "race", Kind: "migration", FileName: "unknown.sql", FileDigest: "sha256:x", ManifestDigest: "sha256:y", ManifestGeneration: "race", State: "applied", Attempt: 1, Operator: "racer", StartedAt: now, UpdatedAt: now})
+			}()
+			select {
+			case e := <-done:
+				t.Fatalf("writer bypassed barrier: %v", e)
+			case <-time.After(30 * time.Millisecond):
+			}
+			_ = held.UnlockWriters(context.Background())
+			_ = held.Close(context.Background())
+			if e := <-done; e != nil {
+				t.Fatal(e)
+			}
+			req := Request{Directory: dir, Operator: "op", Transaction: map[bool]string{true: "all", false: "file"}[mode == "all"], DryRun: mode != "baseline", Baseline: mode == "baseline"}
+			_, e = (Engine{Store: store, Verify: verify}).Run(context.Background(), req)
+			if !errors.Is(e, ErrRefused) {
+				t.Fatalf("race accepted: %v", e)
+			}
+		})
 	}
 }

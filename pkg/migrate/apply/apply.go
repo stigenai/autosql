@@ -39,6 +39,7 @@ type Request struct {
 	Transaction              string
 	Operator, TargetIdentity string
 	Now                      func() time.Time
+	beforeLock               func()
 }
 type FileResult struct {
 	Version, File, Status string
@@ -103,6 +104,9 @@ func (e Engine) Run(ctx context.Context, r Request) (out Result, err error) {
 	if err != nil {
 		return out, ErrRefused
 	}
+	if r.beforeLock != nil {
+		r.beforeLock()
+	}
 	locked, err := s.Lock(ctx, lockKey)
 	if err != nil {
 		return out, errors.New("acquire migration lock")
@@ -155,6 +159,9 @@ func (e Engine) Run(ctx context.Context, r Request) (out Result, err error) {
 	}
 	if snap.Manifest.Digest == "" || snap.Manifest.Generation == "" {
 		return out, ErrRefused
+	}
+	if snap.Manifest.Digest != pre.Manifest.Digest || snap.Manifest.Generation != pre.Manifest.Generation {
+		return out, fmt.Errorf("%w: migration snapshot changed while acquiring lock", ErrRefused)
 	}
 	lockedDB, lockedEnv, targetErr := trustedTarget(snap, e.Verify)
 	if targetErr != nil {
