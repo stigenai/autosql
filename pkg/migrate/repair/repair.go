@@ -69,8 +69,8 @@ func (p Proposal) validate() error {
 }
 
 type AuditRecord struct {
-	Type, ProposalDigest, Action, TargetVersion, Operator string
-	At                                                    time.Time
+	EventID, Type, ProposalDigest, Action, TargetVersion, Operator string
+	At                                                             time.Time
 }
 type Audit interface {
 	AppendDurable(context.Context, AuditRecord) error
@@ -86,7 +86,9 @@ type Service struct {
 	Now             func() time.Time
 	LockIdentity    string
 	Authorize       func(context.Context, Proposal, revision.Revision) error
+	Hooks           Hooks
 }
+type Hooks struct{ AfterRequested, BeforeCommit, AfterCommit, AfterApplied func() error }
 
 type Divergence struct {
 	Version, Kind, Expected, Actual, RootCause, SuggestedCommand string `json:",omitempty"`
@@ -287,9 +289,39 @@ func (s Service) Apply(ctx context.Context, p Proposal) error {
 		return s.refuse(ctx, p)
 	}
 	defer session.Unlock(context.Background(), lockIdentity)
+	recovered := false
+	pending, e := session.PendingOutbox(ctx)
+	if e != nil {
+		return e
+	}
+	for _, item := range pending {
+		var record AuditRecord
+		if json.Unmarshal(item.Payload, &record) != nil || record.EventID != item.ID {
+			continue
+		}
+		if e = s.Audit.AppendDurable(ctx, record); e != nil {
+			return e
+		}
+		if e = session.FinalizeOutbox(ctx, item.ID); e != nil {
+			return e
+		}
+		if record.ProposalDigest == p.Digest {
+			recovered = true
+		}
+	}
+	if recovered {
+		return nil
+	}
 	rows, e := session.Revisions(ctx)
 	if e != nil {
 		return e
+	}
+	alreadyApplied, checkErr := session.HasRepairProposal(ctx, p.Digest)
+	if checkErr != nil {
+		return checkErr
+	}
+	if alreadyApplied {
+		return nil
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Version < rows[j].Version })
 	var before *revision.Revision
@@ -300,16 +332,26 @@ func (s Service) Apply(ctx context.Context, p Proposal) error {
 		}
 	}
 	if before == nil || before.State != p.ExpectedBeforeState || revisionDigest(*before) != p.ExpectedBeforeDigest || before.ManifestDigest != p.ManifestDigest || before.BundleDigest != p.GuardrailDigest {
+		already, checkErr := session.HasRepairProposal(ctx, p.Digest)
+		if checkErr != nil {
+			return checkErr
+		}
+		if recovered || already {
+			return nil
+		}
 		return s.refuse(ctx, p)
 	}
 	if e = s.Authorize(ctx, p, *before); e != nil {
 		return s.refuse(ctx, p)
 	}
-	if e = s.Audit.AppendDurable(ctx, AuditRecord{Type: "repair_requested", ProposalDigest: p.Digest, Action: p.Action, TargetVersion: p.TargetVersion, Operator: p.Operator, At: s.Now()}); e != nil {
+	requested := AuditRecord{EventID: "repair-requested/" + p.Digest, Type: "repair_requested", ProposalDigest: p.Digest, Action: p.Action, TargetVersion: p.TargetVersion, Operator: p.Operator, At: s.Now()}
+	if e = s.Audit.AppendDurable(ctx, requested); e != nil {
 		return e
 	}
-	if e = s.Audit.AppendDurable(ctx, AuditRecord{Type: "repair_applied", ProposalDigest: p.Digest, Action: p.Action, TargetVersion: p.TargetVersion, Operator: p.Operator, At: s.Now()}); e != nil {
-		return e
+	if s.Hooks.AfterRequested != nil {
+		if e = s.Hooks.AfterRequested(); e != nil {
+			return e
+		}
 	}
 	tx, e := session.Begin(ctx)
 	if e != nil {
@@ -319,11 +361,38 @@ func (s Service) Apply(ctx context.Context, p Proposal) error {
 	if e = session.Repair(ctx, tx, p.TargetVersion, p.Action, p.ExpectedBeforeState, p.ExpectedAfterState, p.Digest, p.Operator, s.Now()); e != nil {
 		return e
 	}
-	return tx.Commit(ctx)
+	applied := AuditRecord{EventID: "repair-applied/" + p.Digest, Type: "repair_applied", ProposalDigest: p.Digest, Action: p.Action, TargetVersion: p.TargetVersion, Operator: p.Operator, At: s.Now()}
+	raw, _ := json.Marshal(applied)
+	if e = session.EnqueueOutbox(ctx, tx, applied.EventID, raw); e != nil {
+		return e
+	}
+	if s.Hooks.BeforeCommit != nil {
+		if e = s.Hooks.BeforeCommit(); e != nil {
+			return e
+		}
+	}
+	if e = tx.Commit(ctx); e != nil {
+		return e
+	}
+	if s.Hooks.AfterCommit != nil {
+		if e = s.Hooks.AfterCommit(); e != nil {
+			return e
+		}
+	}
+	if e = s.Audit.AppendDurable(ctx, applied); e != nil {
+		return e
+	}
+	if e = session.FinalizeOutbox(ctx, applied.EventID); e != nil {
+		return e
+	}
+	if s.Hooks.AfterApplied != nil {
+		return s.Hooks.AfterApplied()
+	}
+	return nil
 }
 func (s Service) refuse(ctx context.Context, p Proposal) error {
 	if s.Audit != nil && s.Now != nil {
-		_ = s.Audit.AppendDurable(ctx, AuditRecord{Type: "repair_refused", ProposalDigest: p.Digest, Action: p.Action, TargetVersion: p.TargetVersion, Operator: p.Operator, At: s.Now()})
+		_ = s.Audit.AppendDurable(ctx, AuditRecord{EventID: "repair-refused/" + p.Digest, Type: "repair_refused", ProposalDigest: p.Digest, Action: p.Action, TargetVersion: p.TargetVersion, Operator: p.Operator, At: s.Now()})
 	}
 	return ErrRefused
 }

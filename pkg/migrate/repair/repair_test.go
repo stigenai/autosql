@@ -1,11 +1,13 @@
 package repair
 
 import (
+	"autosql/pkg/artifact"
 	"autosql/pkg/migrate/revision"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -87,8 +89,8 @@ func TestLiveMarkRemoveStaleAuditAtomicity(t *testing.T) {
 	if len(audit.records) != 2 || audit.records[0].Type != "repair_requested" || audit.records[1].Type != "repair_applied" {
 		t.Fatalf("audit=%+v", audit.records)
 	}
-	if e = svc.Apply(ctx, mark); !errors.Is(e, ErrRefused) {
-		t.Fatalf("stale retry=%v", e)
+	if e = svc.Apply(ctx, mark); e != nil {
+		t.Fatalf("idempotent retry=%v", e)
 	}
 	s, _ := store.OpenSession(ctx)
 	rows, _ := s.Revisions(ctx)
@@ -103,13 +105,13 @@ func TestLiveMarkRemoveStaleAuditAtomicity(t *testing.T) {
 		t.Fatal("audit failure accepted")
 	}
 	s, _ = store.OpenSession(ctx)
-	unchanged, _ := s.Revisions(ctx)
+	committed, _ := s.Revisions(ctx)
 	s.Close(ctx)
-	if len(unchanged) != 1 {
-		t.Fatal("audit failure mutated")
+	if len(committed) != 2 || committed[1].Kind != "reversal" {
+		t.Fatal("applied-audit failure lost committed tombstone")
 	}
 	if e = svc.Apply(ctx, remove); e != nil {
-		t.Fatal(e)
+		t.Fatalf("outbox recovery: %v", e)
 	}
 	s, _ = store.OpenSession(ctx)
 	final, _ := s.Revisions(ctx)
@@ -145,6 +147,16 @@ func TestLiveMarkRemoveStaleAuditAtomicity(t *testing.T) {
 	if wins != 1 || refused != 1 {
 		t.Fatalf("concurrent CAS wins=%d refused=%d", wins, refused)
 	}
+	stale := race
+	stale.Reason = "different stale repair after incident review"
+	stale.Digest = ""
+	stale.Signature = artifact.Signature{}
+	if e = stale.Sign("operator", key); e != nil {
+		t.Fatal(e)
+	}
+	if e = svc.Apply(ctx, stale); !errors.Is(e, ErrRefused) {
+		t.Fatalf("distinct stale proposal=%v", e)
+	}
 	denied := svc
 	denied.Authorize = func(context.Context, Proposal, revision.Revision) error { return errors.New("policy denied") }
 	third := base
@@ -161,5 +173,64 @@ func TestLiveMarkRemoveStaleAuditAtomicity(t *testing.T) {
 	s.Close(ctx)
 	if afterDenied[len(afterDenied)-1].State != "partial" {
 		t.Fatal("authorization denial mutated")
+	}
+	for i, name := range []string{"after_requested", "before_commit", "after_commit", "after_applied"} {
+		t.Run(name, func(t *testing.T) {
+			row := base
+			row.Version = fmt.Sprintf("%d.0.0", 10+i)
+			row.State = "partial"
+			if er := store.Insert(ctx, row); er != nil {
+				t.Fatal(er)
+			}
+			p := proposal(t, row, "reconcile", "applied", key, now)
+			fault := svc
+			boom := func() error { return errors.New("injected crash") }
+			switch name {
+			case "after_requested":
+				fault.Hooks.AfterRequested = boom
+			case "before_commit":
+				fault.Hooks.BeforeCommit = boom
+			case "after_commit":
+				fault.Hooks.AfterCommit = boom
+			case "after_applied":
+				fault.Hooks.AfterApplied = boom
+			}
+			if er := fault.Apply(ctx, p); er == nil {
+				t.Fatal("fault did not fire")
+			}
+			session, _ := store.OpenSession(ctx)
+			current, _ := session.Revisions(ctx)
+			pending, _ := session.PendingOutbox(ctx)
+			session.Close(ctx)
+			state := ""
+			for _, x := range current {
+				if x.Version == row.Version {
+					state = x.State
+				}
+			}
+			committed := name == "after_commit" || name == "after_applied"
+			if committed && state != "applied" || !committed && state != "partial" {
+				t.Fatalf("state=%s", state)
+			}
+			if name == "after_commit" && len(pending) == 0 {
+				t.Fatal("committed repair missing outbox")
+			}
+			clean := svc
+			if er := clean.Apply(ctx, p); er != nil {
+				t.Fatalf("recovery=%v", er)
+			}
+			session, _ = store.OpenSession(ctx)
+			finalRows, _ := session.Revisions(ctx)
+			remaining, _ := session.PendingOutbox(ctx)
+			session.Close(ctx)
+			for _, x := range finalRows {
+				if x.Version == row.Version && x.State != "applied" {
+					t.Fatalf("recovery state=%s", x.State)
+				}
+			}
+			if len(remaining) != 0 {
+				t.Fatalf("outbox not drained: %d", len(remaining))
+			}
+		})
 	}
 }

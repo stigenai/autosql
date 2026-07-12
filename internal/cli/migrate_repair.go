@@ -20,6 +20,14 @@ import (
 type repairAuditFile struct{ path string }
 
 func (a repairAuditFile) AppendDurable(_ context.Context, r repair.AuditRecord) error {
+	if existing, e := os.ReadFile(a.path); e == nil {
+		for _, line := range strings.Split(strings.TrimSpace(string(existing)), "\n") {
+			var prior repair.AuditRecord
+			if json.Unmarshal([]byte(line), &prior) == nil && prior.EventID == r.EventID {
+				return nil
+			}
+		}
+	}
 	f, e := os.OpenFile(a.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if e != nil {
 		return errors.New("open repair audit")

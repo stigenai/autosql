@@ -408,6 +408,12 @@ func (s *Session) Repair(ctx context.Context, tx pgx.Tx, version, action, before
 	return s.ExecEvent(ctx, tx, Event{Version: version, Attempt: 1, Type: "repair_applied", Detail: "proposal=" + proposal, Operator: operator, At: at})
 }
 
+func (s *Session) HasRepairProposal(ctx context.Context, proposal string) (bool, error) {
+	var ok bool
+	err := s.conn.QueryRow(ctx, `select exists(select 1 from `+q(s.config.Schema, s.config.EventsTable)+` where event_type='repair_applied' and redacted_detail=$1)`, `proposal=`+proposal).Scan(&ok)
+	return ok, err
+}
+
 func validateRevision(r Revision) error {
 	if r.Version == "" || r.FileName == "" || r.FileDigest == "" || r.ManifestDigest == "" || r.ManifestGeneration == "" || r.Attempt < 1 || r.Operator == "" || r.StartedAt.IsZero() || r.UpdatedAt.IsZero() || r.Duration < 0 {
 		return ErrConfig
