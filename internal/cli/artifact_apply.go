@@ -17,6 +17,7 @@ import (
 type VerifiedArtifactApplyService struct {
 	Policy                artifact.VerifyPolicy
 	PolicyFor             func(artifact.Artifact) (artifact.VerifyPolicy, error)
+	InstallPolicy         func(string, artifact.VerifyPolicy)
 	Guardrail             guardrail.Guardrail
 	Input                 func(artifact.Artifact) (guardrail.Input, error)
 	Mutation              func(artifact.VerifiedArtifact) (guardrail.AuthorizedMutation, error)

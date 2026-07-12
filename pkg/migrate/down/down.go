@@ -143,7 +143,7 @@ func Build(ctx context.Context, r Request) (DownPlan, error) {
 	}
 	target, headIndex := -1, -1
 	logicalHead := head.Version
-	if head.Kind == "reversal" && head.ToVersion != "" {
+	if (head.Kind == "reversal" || head.Kind == "reapply") && head.ToVersion != "" {
 		logicalHead = head.ToVersion
 	}
 	for i, e := range r.Snapshot.Manifest.Entries {
@@ -162,10 +162,17 @@ func Build(ctx context.Context, r Request) (DownPlan, error) {
 		if row.Kind == "reversal" {
 			continue
 		}
-		if _, exists := rows[row.Version]; exists {
+		logicalVersion := row.Version
+		if row.Kind == "reapply" {
+			logicalVersion = row.ToVersion
+		}
+		if logicalVersion == "" {
+			return out, fmt.Errorf("%w: malformed revision evidence", ErrRefused)
+		}
+		if existing, exists := rows[logicalVersion]; exists && (row.Kind != "reapply" || row.Attempt <= existing.Attempt) {
 			return out, fmt.Errorf("%w: duplicate revision evidence", ErrRefused)
 		}
-		rows[row.Version] = row
+		rows[logicalVersion] = row
 	}
 	for i := target + 1; i <= headIndex; i++ {
 		entry := r.Snapshot.Manifest.Entries[i]
@@ -210,7 +217,7 @@ func Build(ctx context.Context, r Request) (DownPlan, error) {
 	byArtifact := map[string][]revision.ExecutorRecord{}
 	seenHistory := map[string]bool{}
 	for _, x := range r.Executor {
-		k := x.ArtifactDigest + "\x00" + x.StepID + fmt.Sprint(x.Attempt)
+		k := x.ArtifactDigest + "\x00" + x.StepID + "\x00" + fmt.Sprint(x.Attempt)
 		if seenHistory[k] {
 			return out, fmt.Errorf("%w: duplicate executor evidence", ErrRefused)
 		}
@@ -219,6 +226,7 @@ func Build(ctx context.Context, r Request) (DownPlan, error) {
 	}
 	for _, o := range originals {
 		a := originalPlans[o.ArtifactDigest]
+		active := rows[o.Version]
 		expected := map[string]plan.Phase{}
 		for _, phase := range a.Plan.Phases {
 			for _, id := range phase.StepIDs {
@@ -229,7 +237,12 @@ func Build(ctx context.Context, r Request) (DownPlan, error) {
 				}
 			}
 		}
-		historyRows := byArtifact[o.ArtifactDigest]
+		historyRows := []revision.ExecutorRecord{}
+		for _, x := range byArtifact[o.ArtifactDigest] {
+			if x.Attempt == active.Attempt {
+				historyRows = append(historyRows, x)
+			}
+		}
 		if len(historyRows) != len(expected) {
 			return out, fmt.Errorf("%w: executor evidence gap", ErrRefused)
 		}
@@ -241,7 +254,7 @@ func Build(ctx context.Context, r Request) (DownPlan, error) {
 					step = candidate
 				}
 			}
-			if !ok || x.State != "confirmed" || x.Attempt != 1 || x.StepHash != executor.StepHash(step) || x.PhaseID != phase.ID || x.PhaseMode != string(phase.Transaction) || x.ExecutionID != a.Digest || x.PlanDigest != a.Plan.Digest || x.BundleDigest != a.GuardrailDigest || r.TargetIdentity != "" && x.TargetIdentity != r.TargetIdentity {
+			if !ok || x.State != "confirmed" || x.Attempt != active.Attempt || x.StepHash != executor.StepHash(step) || x.PhaseID != phase.ID || x.PhaseMode != string(phase.Transaction) || x.ExecutionID != a.Digest || x.PlanDigest != a.Plan.Digest || x.BundleDigest != a.GuardrailDigest || r.TargetIdentity != "" && x.TargetIdentity != r.TargetIdentity {
 				return out, fmt.Errorf("%w: executor evidence binding mismatch", ErrRefused)
 			}
 		}

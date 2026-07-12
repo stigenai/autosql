@@ -333,7 +333,7 @@ func reconcileHistory(snap migrate.Snapshot, revs []revision.Revision, rows []re
 		for _, p := range a.Plan.Phases {
 			for _, id := range p.StepIDs {
 				st := stepByID(a, id)
-				if st.Kind == plan.StepExecutable || p.Transaction == plan.TransactionRequired {
+				if st.Kind == plan.StepExecutable {
 					expected[id] = p
 				}
 			}
@@ -345,7 +345,7 @@ func reconcileHistory(snap migrate.Snapshot, revs []revision.Revision, rows []re
 			}
 		}
 		if len(attemptRows) != len(expected) {
-			return fmt.Errorf("%w: incomplete executor history", ErrRefused)
+			return fmt.Errorf("%w: incomplete executor history for %s revision %s (%d confirmed, %d expected)", ErrRefused, r.Kind, r.Version, len(attemptRows), len(expected))
 		}
 		for _, x := range attemptRows {
 			p, ok := expected[x.StepID]

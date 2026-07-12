@@ -324,7 +324,7 @@ type Revision struct {
 
 // Revisions returns the authoritative rows visible on this pinned session.
 func (s *Session) Revisions(ctx context.Context) ([]Revision, error) {
-	rows, err := s.conn.Query(ctx, `select version,description,kind,file_name,file_digest,manifest_digest,manifest_generation,artifact_digest,plan_digest,checks_digest,bundle_digest,state,statement_ordinal,attempt,redacted_error,operator_identity,started_at,updated_at,completed_at,from_version,to_version,supersedes,reversal_of,duration_ns from `+q(s.config.Schema, s.config.RevisionsTable)+` order by version`)
+	rows, err := s.conn.Query(ctx, `select version,description,kind,file_name,file_digest,manifest_digest,manifest_generation,artifact_digest,plan_digest,checks_digest,bundle_digest,state,statement_ordinal,attempt,redacted_error,operator_identity,started_at,updated_at,completed_at,from_version,to_version,supersedes,reversal_of,duration_ns from `+q(s.config.Schema, s.config.RevisionsTable)+` order by started_at,version`)
 	if err != nil {
 		return nil, errors.New("read pinned revision snapshot")
 	}
@@ -630,35 +630,31 @@ func (s *Store) Status(ctx context.Context, manifest migrate.Manifest) (Status, 
 	if e = tx.QueryRow(ctx, `select to_regclass($1)::text`, c.ExecutorHistorySchema+"."+c.ExecutorHistoryTable).Scan(&reg); e != nil {
 		return Status{}, fmt.Errorf("locate executor history: %w", e)
 	}
-	artifacts := []string{}
-	for _, r := range records {
-		if r.ArtifactDigest != "" {
-			artifacts = append(artifacts, r.ArtifactDigest)
-		}
-	}
-	if reg != nil && len(artifacts) > 0 {
-		hr, he := tx.Query(ctx, `select artifact_digest,attempt,state from `+q(c.ExecutorHistorySchema, c.ExecutorHistoryTable)+` where artifact_digest=any($1::text[])`, artifacts)
+	evidenceKey := func(planDigest, bundleDigest string) string { return planDigest + "\x00" + bundleDigest }
+	if reg != nil && len(records) > 0 {
+		hr, he := tx.Query(ctx, `select plan_digest,bundle_digest,attempt,state from `+q(c.ExecutorHistorySchema, c.ExecutorHistoryTable))
 		if he != nil {
 			return Status{}, fmt.Errorf("read executor history: %w", he)
 		}
 		for hr.Next() {
-			var d, st string
+			var planDigest, bundleDigest, st string
 			var attempt int
-			if he = hr.Scan(&d, &attempt, &st); he != nil {
+			if he = hr.Scan(&planDigest, &bundleDigest, &attempt, &st); he != nil {
 				hr.Close()
 				return Status{}, fmt.Errorf("scan executor history: %w", he)
 			}
-			if d == "" || st == "" {
+			if planDigest == "" || bundleDigest == "" || st == "" {
 				hr.Close()
 				return Status{}, errors.New("malformed executor history")
 			}
-			if history[d] == nil {
-				history[d] = map[int]map[string]bool{}
+			key := evidenceKey(planDigest, bundleDigest)
+			if history[key] == nil {
+				history[key] = map[int]map[string]bool{}
 			}
-			if history[d][attempt] == nil {
-				history[d][attempt] = map[string]bool{}
+			if history[key][attempt] == nil {
+				history[key][attempt] = map[string]bool{}
 			}
-			history[d][attempt][st] = true
+			history[key][attempt][st] = true
 		}
 		if he = hr.Err(); he != nil {
 			hr.Close()
@@ -674,7 +670,13 @@ func (s *Store) Status(ctx context.Context, manifest migrate.Manifest) (Status, 
 	for v := range records {
 		controlKeys = append(controlKeys, v)
 	}
-	sort.Strings(controlKeys)
+	sort.Slice(controlKeys, func(i, j int) bool {
+		a, b := records[controlKeys[i]], records[controlKeys[j]]
+		if a.StartedAt.Equal(b.StartedAt) {
+			return controlKeys[i] < controlKeys[j]
+		}
+		return a.StartedAt.Before(b.StartedAt)
+	})
 	for _, v := range controlKeys {
 		r := records[v]
 		if r.Kind == "reapply" {
@@ -682,7 +684,7 @@ func (s *Store) Status(ctx context.Context, manifest migrate.Manifest) (Status, 
 			for _, m := range manifest.Entries {
 				targetOK = targetOK || m.Version == r.ToVersion
 			}
-			attemptHistory := history[r.ArtifactDigest][r.Attempt]
+			attemptHistory := history[evidenceKey(r.PlanDigest, r.BundleDigest)][r.Attempt]
 			valid := r.State == "applied" && r.Attempt > 1 && targetOK && r.ReversalOf != "" && r.FileName != "" && r.FileDigest != "" && r.ArtifactDigest != "" && r.PlanDigest != "" && r.ChecksDigest != "" && r.BundleDigest != "" && attemptHistory["confirmed"] && !attemptHistory["intended"] && !attemptHistory["uncertain"]
 			validReapplies[v] = valid
 			if valid {
@@ -697,7 +699,7 @@ func (s *Store) Status(ctx context.Context, manifest migrate.Manifest) (Status, 
 		for _, m := range manifest.Entries {
 			targetOK = targetOK || m.Version == r.ToVersion
 		}
-		attemptHistory := history[r.ArtifactDigest][r.Attempt]
+		attemptHistory := history[evidenceKey(r.PlanDigest, r.BundleDigest)][r.Attempt]
 		valid := r.State == "applied" && targetOK && r.ReversalOf != "" && r.ArtifactDigest != "" && r.PlanDigest != "" && r.ChecksDigest != "" && r.BundleDigest != "" && attemptHistory["confirmed"] && !attemptHistory["intended"] && !attemptHistory["uncertain"]
 		validReversals[v] = valid
 		if valid {
@@ -723,7 +725,7 @@ func (s *Store) Status(ctx context.Context, manifest migrate.Manifest) (Status, 
 			if r.State == "failed" || r.State == "partial" {
 				entry.Dirty = true
 			}
-			attemptHistory := history[r.ArtifactDigest][r.Attempt]
+			attemptHistory := history[evidenceKey(r.PlanDigest, r.BundleDigest)][r.Attempt]
 			if attemptHistory["intended"] || attemptHistory["uncertain"] {
 				entry.Dirty = true
 				entry.Guidance = "reconcile incomplete executor history without rewriting revision state"

@@ -29,9 +29,13 @@ apply configuration. The referenced JSON supplies the owner-controlled
 migration directory, revision schema, distinct development database reference
 and runtime identity, plan-signing key reference and ID, plan TTL, owner-only
 artifact directory, trusted release and generator key references, trusted
-operator, optional reverse statements/checks, external approval authority data,
-and scoped override public keys. Planning runs the complete static controls and
+operator, optional reverse statements/checks, exact rule/object safety
+suppressions, external approval authority data, and scoped override public
+keys. Planning runs the complete static controls and
 approval audit, then generator-attests, release-signs, verifies and atomically
 publishes an artifact for exactly the down plan. The artifact uses source
 revision `down:<locked-head>:<target>` and its digest/path are signed back into
-the down plan. Apply will read no other artifact.
+the down plan. Apply will read no other artifact. Under the locked transaction
+it proves the resulting semantic fingerprint equals the replayed target before
+committing DDL, executor evidence, and the append-only reversal revision
+together.

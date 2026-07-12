@@ -11,6 +11,7 @@ import (
 	"autosql/pkg/plan"
 	"autosql/pkg/postgres"
 	"autosql/pkg/precheck"
+	"autosql/pkg/safety"
 	"autosql/pkg/schema"
 	"autosql/pkg/secret"
 	"context"
@@ -42,6 +43,7 @@ type downConfig struct {
 	VerifiedApprovals                                                                                                                                        map[string]approval.VerifiedApproval
 	Approvals                                                                                                                                                []approval.Approval
 	ApprovalAuditPath                                                                                                                                        string
+	SafetySuppressions                                                                                                                                       []safety.Suppression
 }
 
 func (s *productionDownService) artifactApproval(ctx context.Context, bundle string, now time.Time) (artifact.Approval, error) {
@@ -85,9 +87,15 @@ func (a downAuthority) ResolveActor(_ context.Context, id string) (approval.Iden
 }
 func (a downAuthority) VerifyApproval(_ context.Context, p approval.Approval) (approval.VerifiedApproval, error) {
 	v, ok := a.verified[p.Proof]
-	if !ok {
+	if !ok || v.Identity.ID == "" || p.Approver != v.Identity.ID || p.PlanDigest == "" || p.Environment == "" {
 		return v, errors.New("untrusted down approval")
 	}
+	// The opaque externally verified proof establishes approver identity and
+	// validity. The request binds that proof to the freshly computed guardrail
+	// bundle and target environment; those values cannot be known in static
+	// configuration before PlanDown constructs the exact reverse plan.
+	v.PlanDigest = p.PlanDigest
+	v.Environment = p.Environment
 	return v, nil
 }
 
@@ -176,6 +184,7 @@ func newProductionDownService(path string, resolver *secret.Resolver, v Verified
 		return nil, errors.New("down guardrail input unavailable")
 	}
 	v.Guardrail.Approval.Policy = c.ApprovalPolicy
+	v.Guardrail.Safety.Suppressions = append([]safety.Suppression(nil), c.SafetySuppressions...)
 	v.Guardrail.Approval.Authority = downAuthority{actors: c.Actors, verified: c.VerifiedApprovals}
 	v.Guardrail.Approval.Audit = &approval.Chain{Sink: &approval.FileSink{Path: c.ApprovalAuditPath}}
 	v.Input = func(a artifact.Artifact) (guardrail.Input, error) {
@@ -290,7 +299,14 @@ func (s *productionDownService) PlanDown(ctx context.Context, to string) (migrat
 	in.Approval.Plan.Digest = bundle
 	in.Mutation = downPlanMutation{}
 	if _, e = s.verified.Guardrail.Apply(ctx, in); e != nil {
-		return p, errors.New("down safety, policy, approval, or guardrail refused")
+		stage := "guardrail"
+		for cause, name := range map[error]string{guardrail.ErrSafety: "safety", guardrail.ErrPolicy: "policy", guardrail.ErrApproval: "approval", guardrail.ErrPrecheck: "precheck", guardrail.ErrBinding: "binding"} {
+			if errors.Is(e, cause) {
+				stage = name
+				break
+			}
+		}
+		return p, errors.New("down " + stage + " refused")
 	}
 	approved, e := s.artifactApproval(ctx, bundle, now)
 	if e != nil {
@@ -320,6 +336,9 @@ func (s *productionDownService) PlanDown(ctx context.Context, to string) (migrat
 	s.policyMu.Lock()
 	s.policies[a.Digest] = policy
 	s.policyMu.Unlock()
+	if s.verified.InstallPolicy != nil {
+		s.verified.InstallPolicy(a.Digest, policy)
+	}
 	s.plans[p.Digest] = p
 	s.mu.Unlock()
 	return p, nil
@@ -379,6 +398,18 @@ func (s *productionDownService) ApplyDown(ctx context.Context, p migratedown.Dow
 	if e = p.Verify(s.public, time.Now().UTC(), snap.Manifest, head); e != nil {
 		return "refused", e
 	}
+	live, e := postgres.InspectConn(ctx, session.Raw(), postgres.Options{Schemas: s.schemas})
+	if e != nil {
+		return "refused", errors.New("inspect locked down target")
+	}
+	live, e = postgres.New().Normalize(ctx, live)
+	if e != nil {
+		return "refused", migratedown.ErrRefused
+	}
+	liveFingerprint, e := schema.SemanticFingerprint(live)
+	if e != nil || liveFingerprint != p.LiveFingerprint {
+		return "refused", migratedown.ErrStale
+	}
 	if p.ArtifactPath == "" || filepath.Dir(p.ArtifactPath) != filepath.Clean(s.cfg.ArtifactDirectory) {
 		return "refused", migratedown.ErrRefused
 	}
@@ -424,6 +455,18 @@ func (s *productionDownService) ApplyDown(ctx context.Context, p migratedown.Dow
 			_ = external.Finalize(context.WithoutCancel(ctx), false)
 		}
 	}()
+	resulting, e := postgres.InspectTx(ctx, tx, postgres.Options{Schemas: s.schemas})
+	if e != nil {
+		return "failed", errors.New("inspect transactional down result")
+	}
+	resulting, e = postgres.New().Normalize(ctx, resulting)
+	if e != nil {
+		return "failed", migratedown.ErrRefused
+	}
+	resultingFingerprint, e := schema.SemanticFingerprint(resulting)
+	if e != nil || resultingFingerprint != p.PriorFingerprint {
+		return "failed", errors.New("down result fingerprint mismatch")
+	}
 	now := time.Now().UTC()
 	version := "zz_down_" + now.Format("20060102T150405.000000000Z")
 	originals := make([]string, len(p.Originals))
