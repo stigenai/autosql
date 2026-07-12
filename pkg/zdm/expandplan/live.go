@@ -16,6 +16,7 @@ type InspectRequest struct {
 	URL, MetadataSchema, Target, Environment, ArtifactDigest string
 	Schemas                                                  []string
 	BeforeFinalInspection                                    func() error
+	Policy                                                   Policy
 }
 
 // InspectLive obtains a stable catalog snapshot in a read-only repeatable-read
@@ -23,6 +24,9 @@ type InspectRequest struct {
 func InspectLive(ctx context.Context, r InspectRequest) (Snapshot, error) {
 	if r.URL == "" || r.MetadataSchema == "" || r.Target == "" || r.Environment == "" || r.ArtifactDigest == "" || len(r.Schemas) == 0 {
 		return Snapshot{}, refuse("URL, metadata schema, target, environment, and application schemas are required")
+	}
+	if r.Policy.MaxLockMS <= 0 || r.Policy.MaxStatementMS <= 0 || r.Policy.MaxTransactionMS <= 0 {
+		return Snapshot{}, refuse("positive planning lock, statement, and transaction timeouts are required")
 	}
 	c, err := pgx.Connect(ctx, r.URL)
 	if err != nil {
@@ -35,6 +39,9 @@ func InspectLive(ctx context.Context, r InspectRequest) (Snapshot, error) {
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
 	if _, err = tx.Exec(ctx, `set local search_path=pg_catalog`); err != nil {
+		return Snapshot{}, err
+	}
+	if _, err = tx.Exec(ctx, `select pg_catalog.set_config('lock_timeout',$1,true),pg_catalog.set_config('statement_timeout',$2,true),pg_catalog.set_config('idle_in_transaction_session_timeout',$3,true)`, fmt.Sprintf("%dms", r.Policy.MaxLockMS), fmt.Sprintf("%dms", r.Policy.MaxStatementMS), fmt.Sprintf("%dms", r.Policy.MaxTransactionMS)); err != nil {
 		return Snapshot{}, err
 	}
 	if _, err = tx.Exec(ctx, `select pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtextextended($1,0::bigint))`, "autosql.zdm.expand-plan/v1/"+r.Target+"/"+r.Environment); err != nil {
@@ -64,13 +71,13 @@ func InspectLive(ctx context.Context, r InspectRequest) (Snapshot, error) {
 		}
 		s.SchemaCreate[ns] = ok
 	}
-	rows, err := tx.Query(ctx, `select n.nspname,c.relname,r.rolname,c.relkind='p',pg_catalog.pg_has_role(current_user,c.relowner,'USAGE') from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid=c.relnamespace join pg_catalog.pg_roles r on r.oid=c.relowner where n.nspname=any($1) and c.relkind in ('r','p') order by 1,2`, r.Schemas)
+	rows, err := tx.Query(ctx, `select n.nspname,c.relname,r.rolname,c.relkind='p',pg_catalog.pg_has_role(current_user,c.relowner,'USAGE'),greatest(c.reltuples,0)::bigint,pg_catalog.pg_total_relation_size(c.oid) from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid=c.relnamespace join pg_catalog.pg_roles r on r.oid=c.relowner where n.nspname=any($1) and c.relkind in ('r','p') order by 1,2`, r.Schemas)
 	if err != nil {
 		return Snapshot{}, err
 	}
 	for rows.Next() {
 		var t Table
-		if err = rows.Scan(&t.Schema, &t.Name, &t.Owner, &t.Partitioned, &t.CanAlter); err != nil {
+		if err = rows.Scan(&t.Schema, &t.Name, &t.Owner, &t.Partitioned, &t.CanAlter, &t.EstimatedRows, &t.EstimatedBytes); err != nil {
 			rows.Close()
 			return Snapshot{}, err
 		}

@@ -93,11 +93,12 @@ func runMigrateExpandPlan(parent context.Context, args []string, o output, redac
 	if err != nil || len(planKey) != ed25519.PrivateKeySize {
 		return &Error{Kind: "secret", Message: "plan signing key must be raw-base64 Ed25519 private key", Code: ExitSecret}
 	}
-	snap, err := expandplan.InspectLive(ctx, expandplan.InspectRequest{URL: url, MetadataSchema: *metadata, Target: *target, Environment: *environment, ArtifactDigest: m.Digest, Schemas: schemas.value()})
+	policy := expandplan.Policy{MaxLockMS: *maxLock, MaxLockHoldMS: *maxLockHold, MaxStatementMS: *maxStatement, MaxTransactionMS: *maxTx, AllowRewrite: *allowRewrite, AllowTableScan: *allowScan, AllowValidationScan: *allowValidation, AllowNonTransactional: *allowNonTx, AllowMaintenanceRequired: *allowMaintenance}
+	snap, err := expandplan.InspectLive(ctx, expandplan.InspectRequest{URL: url, MetadataSchema: *metadata, Target: *target, Environment: *environment, ArtifactDigest: m.Digest, Schemas: schemas.value(), Policy: policy})
 	if err != nil {
 		return &Error{Kind: "validation", Message: redactor.String(err.Error()), Code: ExitValidation, Cause: err}
 	}
-	req := expandplan.Request{Migration: m, Snapshot: snap, ExpectedFingerprint: *expected, Target: *target, Environment: *environment, Policy: expandplan.Policy{MaxLockMS: *maxLock, MaxLockHoldMS: *maxLockHold, MaxStatementMS: *maxStatement, MaxTransactionMS: *maxTx, AllowRewrite: *allowRewrite, AllowTableScan: *allowScan, AllowValidationScan: *allowValidation, AllowNonTransactional: *allowNonTx, AllowMaintenanceRequired: *allowMaintenance}, Verify: func(x zerodowntime.Migration) error { return x.Verify(ed25519.PublicKey(kb)) }, PlanKeyID: *planKeyID, PlanSigner: ed25519.PrivateKey(planKey)}
+	req := expandplan.Request{Migration: m, Snapshot: snap, ExpectedFingerprint: *expected, Target: *target, Environment: *environment, Policy: policy, Verify: func(x zerodowntime.Migration) error { return x.Verify(ed25519.PublicKey(kb)) }, PlanKeyID: *planKeyID, PlanSigner: ed25519.PrivateKey(planKey)}
 	p, err := expandplan.Build(req)
 	if err != nil {
 		return &Error{Kind: "validation", Message: redactor.String(err.Error()), Code: ExitValidation, Cause: err}
@@ -113,6 +114,12 @@ func runMigrateExpandPlan(parent context.Context, args []string, o output, redac
 	for _, s := range p.Steps {
 		for _, l := range s.Locks {
 			fmt.Fprintf(&human, "\nstep %d %s lock %s.%s %s acquire<=%dms hold~%dms<=%dms tx=%s", s.Ordinal, s.OperationID, l.Schema, l.Object, l.Mode, l.AcquisitionTimeoutMS, l.EstimatedHoldMS, l.MaximumHoldMS, l.TransactionBoundary)
+		}
+		for _, d := range s.Deferred {
+			fmt.Fprintf(&human, "\ndeferred %s %s scan=%t validation=%t nontransactional=%t estimate=%dms hard<=%dms", d.Phase, d.Kind, d.TableScan, d.ValidationScan, d.NonTransactional, d.EstimatedDurationMS, d.HardMaximumMS)
+			for _, l := range d.Locks {
+				fmt.Fprintf(&human, " lock %s.%s %s acquire<=%dms hold~%dms<=%dms", l.Schema, l.Object, l.Mode, l.AcquisitionTimeoutMS, l.EstimatedHoldMS, l.MaximumHoldMS)
+			}
 		}
 	}
 	return o.success(p, human.String())

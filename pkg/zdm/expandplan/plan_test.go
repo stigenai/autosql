@@ -27,7 +27,7 @@ func addNoneEffects() zerodowntime.PhaseEffect {
 	return e
 }
 func base(m zerodowntime.Migration) Request {
-	return Request{Migration: m, ExpectedFingerprint: "sha256:live", Target: "primary", Environment: "prod", Snapshot: Snapshot{Fingerprint: "sha256:live", Target: "primary", Environment: "prod", PostgresMajor: 16, Tables: map[string]Table{"users": {Schema: "public", Name: "users", Owner: "app", CanAlter: true, Columns: map[string]Column{"id": {Name: "id", Type: "bigint"}, "name": {Name: "name", Type: "text", Nullable: true}}}}, Indexes: map[string]Index{}, Mappings: map[string]Mapping{}, Schemas: []string{"public"}, SchemaCreate: map[string]bool{"public": true}, ExistingObjects: map[string]string{}, UniqueEvidence: map[string]UniqueEvidence{"users_pkey": {Name: "users_pkey", Table: "users", Columns: []string{"id"}, Constraint: true, Valid: true, Ready: true}}}, Policy: Policy{MaxLockMS: 100, MaxLockHoldMS: 1000, MaxStatementMS: 10000, MaxTransactionMS: 10000, AllowTableScan: true, AllowValidationScan: true, AllowNonTransactional: true}, Verify: func(zerodowntime.Migration) error { return nil }}
+	return Request{Migration: m, ExpectedFingerprint: "sha256:live", Target: "primary", Environment: "prod", Snapshot: Snapshot{Fingerprint: "sha256:live", Target: "primary", Environment: "prod", PostgresMajor: 16, Tables: map[string]Table{"users": {Schema: "public", Name: "users", Owner: "app", CanAlter: true, Columns: map[string]Column{"id": {Name: "id", Type: "bigint"}, "name": {Name: "name", Type: "text", Nullable: true}}}}, Indexes: map[string]Index{}, Mappings: map[string]Mapping{}, Schemas: []string{"public"}, SchemaCreate: map[string]bool{"public": true}, ExistingObjects: map[string]string{}, UniqueEvidence: map[string]UniqueEvidence{"users_pkey": {Name: "users_pkey", Table: "users", Columns: []string{"id"}, Constraint: true, Valid: true, Ready: true}}}, Policy: Policy{MaxLockMS: 100, MaxLockHoldMS: 10000, MaxStatementMS: 10000, MaxTransactionMS: 10000, AllowTableScan: true, AllowValidationScan: true, AllowNonTransactional: true}, Verify: func(zerodowntime.Migration) error { return nil }}
 }
 
 func TestBuildAdditiveAndBreakingPlans(t *testing.T) {
@@ -197,11 +197,31 @@ func TestStructuredLockEvidenceSeparatesAcquisitionAndHold(t *testing.T) {
 		t.Fatal(err)
 	}
 	l := p.Steps[0].Locks[0]
-	if l.AcquisitionTimeoutMS != 50 || l.MaximumHoldMS != 700 || l.EstimatedHoldMS > l.MaximumHoldMS || l.TransactionBoundary != p.Steps[0].TransactionGroup {
+	if l.AcquisitionTimeoutMS != 50 || l.MaximumHoldMS != 500 || l.EstimatedHoldMS > l.MaximumHoldMS || l.TransactionBoundary != p.Steps[0].TransactionGroup {
 		t.Fatalf("lock=%+v", l)
 	}
 	if len(p.PlanningLocks) < 2 || p.PlanningLocks[0].Phase != "planning" {
 		t.Fatalf("planning locks=%+v", p.PlanningLocks)
+	}
+}
+
+func TestConservativeIndexEstimateAndTinyBudgetRefusal(t *testing.T) {
+	op := zerodowntime.Operation{ID: "01", Kind: zerodowntime.CreateIndex, Table: "users", Index: "users_name_idx", Expression: "name", IndexMode: &zerodowntime.IndexMode{Concurrent: true}, Effects: effects(zerodowntime.CreateIndex), Reversal: zerodowntime.Reversal{Mode: "automatic"}}
+	r := base(migration(t, []zerodowntime.Operation{op}))
+	r.Policy.MaxLockHoldMS = 100
+	if _, err := Build(r); !errors.Is(err, ErrRefused) {
+		t.Fatal("tiny index hold budget accepted")
+	}
+	r = base(r.Migration)
+	x := r.Snapshot.Tables["users"]
+	x.EstimatedBytes = 100 << 20
+	r.Snapshot.Tables["users"] = x
+	p, err := Build(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Steps[0].EstimatedDurationMS <= 1000 || p.Steps[0].Locks[0].MaximumHoldMS <= p.Steps[0].EstimatedDurationMS {
+		t.Fatalf("size estimate=%+v", p.Steps[0])
 	}
 }
 

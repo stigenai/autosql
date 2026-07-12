@@ -43,6 +43,8 @@ type Table struct {
 	Columns             map[string]Column
 	Partitioned         bool
 	CanAlter            bool
+	EstimatedRows       int64
+	EstimatedBytes      int64
 }
 type Index struct {
 	Schema, Name, Table, Owner    string
@@ -101,7 +103,21 @@ type Step struct {
 	Postconditions      []Condition    `json:"postconditions"`
 	Handoff             []string       `json:"handoff,omitempty"`
 	SessionSetup        []string       `json:"session_setup"`
+	SessionReset        []string       `json:"session_reset,omitempty"`
+	DedicatedConnection bool           `json:"dedicated_connection"`
 	Locks               []LockEvidence `json:"locks"`
+	Deferred            []DeferredStep `json:"deferred,omitempty"`
+}
+type DeferredStep struct {
+	Phase               string         `json:"phase"`
+	Kind                string         `json:"kind"`
+	TableScan           bool           `json:"table_scan"`
+	ValidationScan      bool           `json:"validation_scan"`
+	NonTransactional    bool           `json:"nontransactional"`
+	EstimatedDurationMS int            `json:"estimated_duration_ms"`
+	HardMaximumMS       int            `json:"hard_maximum_ms"`
+	Locks               []LockEvidence `json:"locks"`
+	Recovery            string         `json:"recovery"`
 }
 type LockEvidence struct {
 	Schema               string `json:"schema,omitempty"`
@@ -189,9 +205,13 @@ func Build(r Request) (Plan, error) {
 		PostgresMajor int `json:"postgres_major"`
 	}{r.Snapshot.PostgresMajor}), PolicyDigest: digest(r.Policy)}
 	p.BindingsDigest = digest(bindings{p.ArtifactDigest, p.FromFingerprint, p.Target, p.Environment, p.CapabilityDigest, p.PolicyDigest})
-	p.PlanningLocks = append(p.PlanningLocks, LockEvidence{Object: "autosql.zdm.expand-plan/v1/" + r.Target + "/" + r.Environment, Kind: "advisory", Mode: "SHARED", AcquisitionTimeoutMS: r.Policy.MaxLockMS, Phase: "planning", EstimatedHoldMS: min(100, r.Policy.MaxLockHoldMS), MaximumHoldMS: r.Policy.MaxLockHoldMS, TransactionBoundary: "read-only-repeatable-read"})
+	planEstimate := 100
+	if planEstimate > r.Policy.MaxLockHoldMS {
+		return Plan{}, refuse("planning lock hold estimate %dms exceeds %dms policy", planEstimate, r.Policy.MaxLockHoldMS)
+	}
+	p.PlanningLocks = append(p.PlanningLocks, LockEvidence{Object: "autosql.zdm.expand-plan/v1/" + r.Target + "/" + r.Environment, Kind: "advisory", Mode: "SHARED", AcquisitionTimeoutMS: r.Policy.MaxLockMS, Phase: "planning", EstimatedHoldMS: planEstimate, MaximumHoldMS: r.Policy.MaxLockHoldMS, TransactionBoundary: "read-only-repeatable-read"})
 	for _, t := range r.Snapshot.Tables {
-		p.PlanningLocks = append(p.PlanningLocks, LockEvidence{Schema: t.Schema, Object: t.Name, Kind: "relation", Mode: "ACCESS SHARE", AcquisitionTimeoutMS: r.Policy.MaxLockMS, Phase: "planning", EstimatedHoldMS: min(100, r.Policy.MaxLockHoldMS), MaximumHoldMS: r.Policy.MaxLockHoldMS, TransactionBoundary: "read-only-repeatable-read"})
+		p.PlanningLocks = append(p.PlanningLocks, LockEvidence{Schema: t.Schema, Object: t.Name, Kind: "relation", Mode: "ACCESS SHARE", AcquisitionTimeoutMS: r.Policy.MaxLockMS, Phase: "planning", EstimatedHoldMS: planEstimate, MaximumHoldMS: r.Policy.MaxLockHoldMS, TransactionBoundary: "read-only-repeatable-read"})
 	}
 	sort.Slice(p.PlanningLocks, func(i, j int) bool {
 		return p.PlanningLocks[i].Schema+"/"+p.PlanningLocks[i].Object < p.PlanningLocks[j].Schema+"/"+p.PlanningLocks[j].Object
@@ -208,6 +228,11 @@ func Build(r Request) (Plan, error) {
 		steps, mappings, err := translate(r, op, used)
 		if err != nil {
 			return Plan{}, err
+		}
+		for i := range steps {
+			if err = finalizeStep(r, &steps[i]); err != nil {
+				return Plan{}, err
+			}
 		}
 		p.Steps = append(p.Steps, steps...)
 		p.Mappings = append(p.Mappings, mappings...)
@@ -248,19 +273,101 @@ func (p Plan) Validate() error {
 	}
 	p.Attestation = att
 	for i, s := range p.Steps {
-		if s.Ordinal != i+1 || s.OperationID == "" || s.Kind == "" || s.StatementBudgetMS <= 0 || len(s.SessionSetup) != 1 || (s.SessionSetup[0] != "SET LOCAL search_path=pg_catalog" && s.SessionSetup[0] != "SET search_path=pg_catalog") {
+		if s.Ordinal != i+1 || s.OperationID == "" || s.Kind == "" || s.StatementBudgetMS <= 0 || len(s.SessionSetup) != 4 {
 			return refuse("invalid step %d", i+1)
 		}
+		wantLocal := s.TransactionGroup != "none"
+		prefix := "SET "
+		if wantLocal {
+			prefix = "SET LOCAL "
+		}
+		want := []string{prefix + "search_path=pg_catalog", fmt.Sprintf("%slock_timeout=%dms", prefix, s.LocksAcquisitionTimeout()), fmt.Sprintf("%sstatement_timeout=%dms", prefix, s.StatementBudgetMS), fmt.Sprintf("%sidle_in_transaction_session_timeout=%dms", prefix, s.TransactionBudgetMS)}
+		for j := range want {
+			if s.SessionSetup[j] != want[j] {
+				return refuse("invalid session control")
+			}
+		}
+		if !wantLocal {
+			if !s.DedicatedConnection || len(s.SessionReset) != 4 {
+				return refuse("nontransactional step requires disposable connection and reset recovery")
+			}
+		}
 		for _, l := range s.Locks {
-			if l.Object == "" || l.Kind == "" || l.Mode == "" || l.AcquisitionTimeoutMS <= 0 || l.EstimatedHoldMS < 0 || l.MaximumHoldMS <= 0 || l.EstimatedHoldMS > l.MaximumHoldMS || l.Phase != "expand" || l.TransactionBoundary != s.TransactionGroup {
+			if l.Object == "" || l.Kind == "" || l.Mode == "" || l.AcquisitionTimeoutMS <= 0 || l.EstimatedHoldMS < 0 || l.MaximumHoldMS <= 0 || l.EstimatedHoldMS > l.MaximumHoldMS || !strings.HasPrefix(l.Phase, "expand") || l.TransactionBoundary != s.TransactionGroup {
 				return refuse("invalid structured lock evidence")
+			}
+		}
+		for _, d := range s.Deferred {
+			if d.Phase == "" || d.Kind == "" || d.EstimatedDurationMS <= 0 || d.HardMaximumMS < d.EstimatedDurationMS {
+				return refuse("invalid deferred risk evidence")
+			}
+			for _, l := range d.Locks {
+				if l.Object == "" || l.Mode == "" || l.AcquisitionTimeoutMS <= 0 || l.EstimatedHoldMS > l.MaximumHoldMS || !strings.HasPrefix(l.Phase, "synchronize-") {
+					return refuse("invalid deferred lock evidence")
+				}
 			}
 		}
 		if err := validateExpandSQL(s); err != nil {
 			return err
 		}
 	}
+	for _, l := range p.PlanningLocks {
+		if l.Kind == "" || l.Mode == "" || l.AcquisitionTimeoutMS <= 0 || l.EstimatedHoldMS > l.MaximumHoldMS || l.Phase != "planning" {
+			return refuse("invalid planning lock evidence")
+		}
+	}
 	return nil
+}
+func (s Step) LocksAcquisitionTimeout() int {
+	if len(s.Locks) == 0 {
+		return 1
+	}
+	return s.Locks[0].AcquisitionTimeoutMS
+}
+func finalizeStep(r Request, s *Step) error {
+	estimate, hard := 100, 500
+	if s.Kind == "create_index_concurrently" {
+		var size int64
+		for _, t := range r.Snapshot.Tables {
+			if len(s.Locks) > 0 && t.Schema == s.Locks[0].Schema && t.Name == s.Locks[0].Object {
+				size = t.EstimatedBytes
+			}
+		}
+		estimate = 1000 + int(size/(10<<20))*100
+		hard = estimate * 2
+	}
+	if hard > r.Policy.MaxLockHoldMS || hard > s.StatementBudgetMS {
+		return refuse("operation %s conservative %dms hard maximum exceeds lock-hold or statement budget", s.OperationID, hard)
+	}
+	if s.TransactionGroup != "none" && hard > s.TransactionBudgetMS {
+		return refuse("operation %s exceeds transaction budget", s.OperationID)
+	}
+	s.EstimatedDurationMS = estimate
+	for i := range s.Locks {
+		s.Locks[i].EstimatedHoldMS = estimate
+		s.Locks[i].MaximumHoldMS = hard
+	}
+	for _, d := range s.Deferred {
+		if d.HardMaximumMS > r.Policy.MaxStatementMS || d.HardMaximumMS > r.Policy.MaxTransactionMS {
+			return refuse("deferred %s exceeds configured budget", d.Phase)
+		}
+	}
+	prefix := "SET LOCAL "
+	if s.TransactionGroup == "none" {
+		prefix = "SET "
+	}
+	s.SessionSetup = []string{prefix + "search_path=pg_catalog", fmt.Sprintf("%slock_timeout=%dms", prefix, s.LocksAcquisitionTimeout()), fmt.Sprintf("%sstatement_timeout=%dms", prefix, s.StatementBudgetMS), fmt.Sprintf("%sidle_in_transaction_session_timeout=%dms", prefix, s.TransactionBudgetMS)}
+	return nil
+}
+func deferredBackfill(r Request, t Table, phase string) DeferredStep {
+	estimate := 1000 + int(t.EstimatedRows/10000)*100
+	hard := estimate * 2
+	return DeferredStep{Phase: phase, Kind: "batched_backfill", TableScan: true, EstimatedDurationMS: estimate, HardMaximumMS: hard, Recovery: "resume from durable batch cursor", Locks: []LockEvidence{{Schema: t.Schema, Object: t.Name, Kind: "relation", Mode: "ROW EXCLUSIVE", AcquisitionTimeoutMS: r.Migration.Requirements.LockTimeoutMS, Phase: "synchronize-backfill", EstimatedHoldMS: min(100, estimate), MaximumHoldMS: min(500, hard), TransactionBoundary: "per-batch"}}}
+}
+func deferredValidation(r Request, t Table, constraint string) DeferredStep {
+	estimate := 1000 + int(t.EstimatedBytes/(10<<20))*100
+	hard := estimate * 2
+	return DeferredStep{Phase: "validate", Kind: "validate_constraint", ValidationScan: true, EstimatedDurationMS: estimate, HardMaximumMS: hard, Recovery: "retry validation " + constraint + " without dropping NOT VALID check", Locks: []LockEvidence{{Schema: t.Schema, Object: t.Name, Kind: "relation", Mode: "SHARE UPDATE EXCLUSIVE", AcquisitionTimeoutMS: r.Migration.Requirements.LockTimeoutMS, Phase: "synchronize-validation", EstimatedHoldMS: estimate, MaximumHoldMS: hard, TransactionBoundary: "validation"}}}
 }
 func validateExpandSQL(s Step) error {
 	if s.SQL == "" {
@@ -345,7 +452,7 @@ func attestationPayload(a Attestation, digest string) []byte {
 
 func translate(r Request, op zerodowntime.Operation, used map[string]string) ([]Step, []Mapping, error) {
 	table, exists := r.Snapshot.Tables[op.Table]
-	base := Step{OperationID: op.ID, TransactionGroup: "expand-" + op.ID, StatementBudgetMS: r.Migration.Requirements.StatementTimeoutMS, TransactionBudgetMS: r.Policy.MaxTransactionMS, EstimatedDurationMS: min(100, r.Policy.MaxLockHoldMS), Reversible: true, Recovery: "drop the additive physical object before synchronization", Preconditions: []Condition{{Kind: "fingerprint", Expected: r.Snapshot.Fingerprint}, {Kind: "session_setting", Object: "search_path", Expected: "pg_catalog"}}, SessionSetup: []string{"SET LOCAL search_path=pg_catalog"}}
+	base := Step{OperationID: op.ID, TransactionGroup: "expand-" + op.ID, StatementBudgetMS: r.Migration.Requirements.StatementTimeoutMS, TransactionBudgetMS: r.Policy.MaxTransactionMS, Reversible: true, Recovery: "drop the additive physical object before synchronization", Preconditions: []Condition{{Kind: "fingerprint", Expected: r.Snapshot.Fingerprint}, {Kind: "session_setting", Object: "search_path", Expected: "pg_catalog"}}}
 	if op.Kind != zerodowntime.AddTable && !exists {
 		return nil, nil, refuse("operation %s references missing or ambiguous table %s", op.ID, op.Table)
 	}
@@ -367,7 +474,7 @@ func translate(r Request, op zerodowntime.Operation, used map[string]string) ([]
 	}
 	qtable := qi(table.Schema, table.Name)
 	if exists {
-		base.Locks = []LockEvidence{{Schema: table.Schema, Object: table.Name, Kind: "relation", Mode: "ACCESS EXCLUSIVE", AcquisitionTimeoutMS: r.Migration.Requirements.LockTimeoutMS, Phase: "expand", EstimatedHoldMS: min(100, r.Policy.MaxLockHoldMS), MaximumHoldMS: r.Policy.MaxLockHoldMS, TransactionBoundary: base.TransactionGroup}}
+		base.Locks = []LockEvidence{{Schema: table.Schema, Object: table.Name, Kind: "relation", Mode: "ACCESS EXCLUSIVE", AcquisitionTimeoutMS: r.Migration.Requirements.LockTimeoutMS, Phase: "expand", TransactionBoundary: base.TransactionGroup}}
 	}
 	switch op.Kind {
 	case zerodowntime.AddTable:
@@ -385,7 +492,7 @@ func translate(r Request, op zerodowntime.Operation, used map[string]string) ([]
 			return nil, nil, err
 		}
 		base.Kind = "create_shadow_table"
-		base.Locks = []LockEvidence{{Schema: m.Schema, Object: m.Schema, Kind: "namespace", Mode: "CREATE", AcquisitionTimeoutMS: r.Migration.Requirements.LockTimeoutMS, Phase: "expand", EstimatedHoldMS: min(100, r.Policy.MaxLockHoldMS), MaximumHoldMS: r.Policy.MaxLockHoldMS, TransactionBoundary: base.TransactionGroup}}
+		base.Locks = []LockEvidence{{Schema: m.Schema, Object: name, Kind: "relation", Mode: "ACCESS EXCLUSIVE", AcquisitionTimeoutMS: r.Migration.Requirements.LockTimeoutMS, Phase: "expand-create-table", TransactionBoundary: base.TransactionGroup}}
 		base.SQL = "CREATE TABLE " + qi(m.Schema, name) + " ()"
 		base.Postconditions = []Condition{{Kind: "relation_exists", Object: m.Schema + "." + name, Expected: "table"}}
 		return []Step{base}, []Mapping{m}, nil
@@ -397,7 +504,7 @@ func translate(r Request, op zerodowntime.Operation, used map[string]string) ([]
 		base.SQL = "ALTER TABLE " + qtable + " ADD COLUMN " + qi(op.Column) + " " + op.DataType
 		base.Postconditions = []Condition{{Kind: "column_exists", Object: table.Schema + "." + table.Name + "." + op.Column, Expected: op.DataType}}
 		if op.SynchronizationMode == "backfill" {
-			base.TableScan = true
+			base.Deferred = append(base.Deferred, deferredBackfill(r, table, "backfill"))
 			if !r.Policy.AllowTableScan {
 				return nil, nil, refuse("backfill table scan exceeds policy")
 			}
@@ -419,12 +526,13 @@ func translate(r Request, op zerodowntime.Operation, used map[string]string) ([]
 			return nil, nil, err
 		}
 		base.Kind = "create_index_concurrently"
-		base.Locks = []LockEvidence{{Schema: table.Schema, Object: table.Name, Kind: "relation", Mode: "SHARE UPDATE EXCLUSIVE", AcquisitionTimeoutMS: r.Migration.Requirements.LockTimeoutMS, Phase: "expand", EstimatedHoldMS: min(1000, r.Policy.MaxLockHoldMS), MaximumHoldMS: r.Policy.MaxLockHoldMS, TransactionBoundary: "none"}, {Schema: table.Schema, Object: table.Schema, Kind: "namespace", Mode: "CREATE", AcquisitionTimeoutMS: r.Migration.Requirements.LockTimeoutMS, Phase: "expand", EstimatedHoldMS: min(100, r.Policy.MaxLockHoldMS), MaximumHoldMS: r.Policy.MaxLockHoldMS, TransactionBoundary: "none"}}
+		base.Locks = []LockEvidence{{Schema: table.Schema, Object: table.Name, Kind: "relation", Mode: "SHARE UPDATE EXCLUSIVE", AcquisitionTimeoutMS: r.Migration.Requirements.LockTimeoutMS, Phase: "expand-concurrent-index-build", TransactionBoundary: "none"}}
 		base.NonTransactional = true
 		base.TableScan = true
 		base.TransactionGroup = "none"
 		base.TransactionBudgetMS = 0
-		base.SessionSetup = []string{"SET search_path=pg_catalog"}
+		base.DedicatedConnection = true
+		base.SessionReset = []string{"RESET search_path", "RESET lock_timeout", "RESET statement_timeout", "RESET idle_in_transaction_session_timeout"}
 		base.SQL = "CREATE " + map[bool]string{true: "UNIQUE ", false: ""}[op.Unique] + "INDEX CONCURRENTLY " + qi(table.Schema, name) + " ON " + qtable + " (" + op.Expression + ")"
 		base.Postconditions = []Condition{{Kind: "valid_index", Object: table.Schema + "." + name, Expected: "true"}}
 		if !r.Policy.AllowNonTransactional || !r.Policy.AllowTableScan {
@@ -454,8 +562,7 @@ func translate(r Request, op zerodowntime.Operation, used map[string]string) ([]
 			return nil, nil, err
 		}
 		base.Kind = "add_not_valid_check"
-		base.TableScan = true
-		base.ValidationScan = true
+		base.Deferred = append(base.Deferred, deferredBackfill(r, table, "backfill"), deferredValidation(r, table, name))
 		if !r.Policy.AllowTableScan || !r.Policy.AllowValidationScan {
 			return nil, nil, refuse("not-null backfill or validation scan exceeds policy")
 		}
@@ -484,7 +591,7 @@ func translate(r Request, op zerodowntime.Operation, used map[string]string) ([]
 			typ = col.Type
 		}
 		base.Kind = "add_shadow_column"
-		base.TableScan = true
+		base.Deferred = append(base.Deferred, deferredBackfill(r, table, "backfill"))
 		if !r.Policy.AllowTableScan {
 			return nil, nil, refuse("shadow backfill table scan exceeds policy")
 		}

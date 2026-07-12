@@ -17,6 +17,10 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+func livePolicy() expandplan.Policy {
+	return expandplan.Policy{MaxLockMS: 100, MaxLockHoldMS: 5000, MaxStatementMS: 5000, MaxTransactionMS: 5000}
+}
+
 func live(t *testing.T) (context.Context, *pgx.Conn, string, string, *zdm.Store) {
 	t.Helper()
 	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
@@ -62,7 +66,7 @@ func TestLivePlanningIsReadOnlyAndFencedToBaseline(t *testing.T) {
 	if err := c.QueryRow(ctx, `select count(*) from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid=c.relnamespace where n.nspname=any($1)`, []string{meta, app}).Scan(&before); err != nil {
 		t.Fatal(err)
 	}
-	snap, err := expandplan.InspectLive(ctx, expandplan.InspectRequest{URL: url, MetadataSchema: meta, Target: "primary", Environment: "test", ArtifactDigest: "pending", Schemas: []string{app}})
+	snap, err := expandplan.InspectLive(ctx, expandplan.InspectRequest{URL: url, MetadataSchema: meta, Target: "primary", Environment: "test", ArtifactDigest: "pending", Schemas: []string{app}, Policy: livePolicy()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +95,7 @@ func TestLivePlanningIsReadOnlyAndFencedToBaseline(t *testing.T) {
 	if _, err = c.Exec(ctx, "alter table "+pgx.Identifier{app, "accounts"}.Sanitize()+" add column drifted boolean"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = expandplan.InspectLive(ctx, expandplan.InspectRequest{URL: url, MetadataSchema: meta, Target: "primary", Environment: "test", ArtifactDigest: m.Digest, Schemas: []string{app}}); err == nil {
+	if _, err = expandplan.InspectLive(ctx, expandplan.InspectRequest{URL: url, MetadataSchema: meta, Target: "primary", Environment: "test", ArtifactDigest: m.Digest, Schemas: []string{app}, Policy: livePolicy()}); err == nil {
 		t.Fatal("expected baseline drift refusal")
 	}
 }
@@ -126,7 +130,7 @@ func TestLiveConcurrentDDLWaitsAndPlanRefusesFreshSnapshot(t *testing.T) {
 		}
 		return fmt.Errorf("concurrent DDL did not wait on planning relation lock")
 	}
-	_, err = expandplan.InspectLive(ctx, expandplan.InspectRequest{URL: url, MetadataSchema: meta, Target: "primary", Environment: "test", ArtifactDigest: "sha256:artifact", Schemas: []string{app}, BeforeFinalInspection: hook})
+	_, err = expandplan.InspectLive(ctx, expandplan.InspectRequest{URL: url, MetadataSchema: meta, Target: "primary", Environment: "test", ArtifactDigest: "sha256:artifact", Schemas: []string{app}, BeforeFinalInspection: hook, Policy: livePolicy()})
 	if err == nil {
 		t.Fatal("concurrent DDL produced a stale plan")
 	}
@@ -140,6 +144,32 @@ func TestLiveConcurrentDDLWaitsAndPlanRefusesFreshSnapshot(t *testing.T) {
 		t.Fatal("concurrent DDL goroutine did not terminate")
 	}
 	_ = other.Close(ctx)
+}
+
+func TestLivePlanningLockTimeoutIsActuallyBounded(t *testing.T) {
+	ctx, _, meta, app, _ := live(t)
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	blocker, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Close(ctx)
+	tx, err := blocker.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, "lock table "+pgx.Identifier{app, "accounts"}.Sanitize()+" in access exclusive mode"); err != nil {
+		t.Fatal(err)
+	}
+	policy := livePolicy()
+	policy.MaxLockMS = 25
+	started := time.Now()
+	_, err = expandplan.InspectLive(ctx, expandplan.InspectRequest{URL: url, MetadataSchema: meta, Target: "primary", Environment: "test", ArtifactDigest: "sha256:held", Schemas: []string{app}, Policy: policy})
+	elapsed := time.Since(started)
+	if err == nil || elapsed > time.Second || !strings.Contains(strings.ToLower(err.Error()), "lock timeout") {
+		t.Fatalf("bounded refusal elapsed=%v err=%v", elapsed, err)
+	}
 }
 
 func TestLiveSearchPathHijackIsNeutralizedByRequiredSessionSetup(t *testing.T) {
@@ -224,7 +254,7 @@ func TestLiveNonSuperuserIndexPlanningMatchesSchemaPermissionRefusal(t *testing.
 	if _, err = roleConn.Exec(ctx, "create index "+q(app, "should_refuse")+" on "+q(app, "items")+"(name)"); err == nil {
 		t.Fatal("database unexpectedly allowed CREATE INDEX without schema CREATE")
 	}
-	snap, err := expandplan.InspectLive(ctx, expandplan.InspectRequest{URL: roleURL, MetadataSchema: meta, Target: "primary", Environment: "test", ArtifactDigest: "pending", Schemas: []string{app}})
+	snap, err := expandplan.InspectLive(ctx, expandplan.InspectRequest{URL: roleURL, MetadataSchema: meta, Target: "primary", Environment: "test", ArtifactDigest: "pending", Schemas: []string{app}, Policy: livePolicy()})
 	if err != nil {
 		t.Fatal(err)
 	}
