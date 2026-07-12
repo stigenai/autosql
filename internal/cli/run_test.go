@@ -146,3 +146,21 @@ func TestSchemaInspectResolvesSecretAndEmitsEnvelope(t *testing.T) {
 		t.Fatalf("bad envelope: %s (%v)", out.String(), err)
 	}
 }
+func TestSchemaInspectOutputFormats(t *testing.T) {
+	previous := inspectPostgres
+	t.Cleanup(func() { inspectPostgres = previous })
+	n := schema.Name{Name: "app"}
+	inspectPostgres = func(context.Context, string, postgres.Options) (schema.Document, error) {
+		return schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{{ID: schema.StableID(schema.KindSchema, n), Kind: schema.KindSchema, Name: n, Spec: json.RawMessage(`{}`)}}}}, nil
+	}
+	t.Setenv("AUTOSQL_INSPECT_URL", "postgres://user:secret@db/app")
+	for _, fixture := range []struct{ format, want string }{{"native", `"version"`}, {"json", `  "graph"`}, {"sql", `CREATE SCHEMA "app"`}} {
+		t.Run(fixture.format, func(t *testing.T) {
+			var out bytes.Buffer
+			code := Run(context.Background(), []string{"schema", "inspect", "--url", "env://AUTOSQL_INSPECT_URL", "--format", fixture.format}, Streams{Out: &out, Err: &bytes.Buffer{}})
+			if code != 0 || !strings.Contains(out.String(), fixture.want) {
+				t.Fatalf("code=%d out=%s", code, out.String())
+			}
+		})
+	}
+}

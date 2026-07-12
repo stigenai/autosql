@@ -26,6 +26,7 @@ type Error struct {
 	Message string
 	Code    ExitCode
 	Cause   error
+	Status  string
 }
 
 func (e *Error) Error() string { return e.Message }
