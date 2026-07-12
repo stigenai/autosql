@@ -56,9 +56,12 @@ func validateSelectors(from, to string, r LoadRequest) error {
 }
 
 type ApplyResult struct {
-	Status       string `json:"status"`
-	AppliedSteps int    `json:"applied_steps,omitempty"`
-	Message      string `json:"message,omitempty"`
+	Status           string `json:"status"`
+	AppliedSteps     int    `json:"applied_steps,omitempty"`
+	Message          string `json:"message,omitempty"`
+	PendingStep      string `json:"pending_step,omitempty"`
+	ExecutionID      string `json:"execution_id,omitempty"`
+	RecoveryGuidance string `json:"recovery_guidance,omitempty"`
 }
 type ApplyService interface {
 	Apply(context.Context, ApplyRequest) (ApplyResult, error)

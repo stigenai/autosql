@@ -30,15 +30,18 @@ type StateReader func(context.Context, *pgx.Conn) (RuntimeState, error)
 type Clock func() time.Time
 
 type Config struct {
-	URL   string
-	State StateReader
-	Now   Clock
+	URL         string
+	State       StateReader
+	Now         Clock
+	Reauthorize func(context.Context, artifact.Artifact) error
 }
 
 type Result struct {
-	AppliedSteps  int
-	LastConfirmed string
-	Partial       bool
+	AppliedSteps                               int
+	LastConfirmed                              string
+	Partial                                    bool
+	Uncertain                                  bool
+	PendingStep, ExecutionID, RecoveryGuidance string
 }
 
 // PostgreSQL can be constructed only with a cryptographically verified artifact.
@@ -80,6 +83,11 @@ func (e *PostgreSQL) ApplyAuthorized(ctx context.Context, checks precheck.Plan) 
 		return nil, err
 	}
 	defer conn.Exec(context.WithoutCancel(ctx), `select pg_advisory_unlock(hashtextextended($1, 0))`, identity)
+	if e.config.Reauthorize != nil {
+		if err := e.config.Reauthorize(ctx, e.artifact); err != nil {
+			return nil, ErrExpired
+		}
+	}
 
 	// Time and live state are intentionally checked only after the session lock.
 	now := e.config.Now().UTC()
@@ -96,10 +104,7 @@ func (e *PostgreSQL) ApplyAuthorized(ctx context.Context, checks precheck.Plan) 
 	if !strings.EqualFold(state.Fingerprint, e.artifact.Plan.FromFingerprint) || state.SourceRevision != e.artifact.SourceRevision || state.Environment != e.artifact.TargetEnvironment || state.DatabaseIdentity != e.artifact.DatabaseIdentity {
 		return nil, ErrStale
 	}
-	results, err := runChecks(ctx, conn, checks)
-	if err != nil {
-		return results, err
-	}
+	var results []precheck.Result
 	if err = ensureHistory(ctx, conn); err != nil {
 		return nil, err
 	}
@@ -114,12 +119,26 @@ func (e *PostgreSQL) ApplyAuthorized(ctx context.Context, checks precheck.Plan) 
 	for _, step := range e.artifact.Plan.Steps {
 		steps[step.ID] = step
 	}
+	checksPending := true
 	for _, phase := range e.artifact.Plan.Phases {
 		if phase.Transaction == plan.TransactionRequired {
-			if err = e.transactionalPhase(ctx, conn, phase, steps, confirmed); err != nil {
+			var phaseChecks []precheck.Result
+			phaseChecks, err = e.transactionalPhase(ctx, conn, phase, steps, confirmed, checks, checksPending)
+			if checksPending {
+				results = phaseChecks
+				checksPending = false
+			}
+			if err != nil {
 				return results, err
 			}
 		} else {
+			if checksPending {
+				results, err = runChecks(ctx, conn, checks)
+				checksPending = false
+				if err != nil {
+					return results, err
+				}
+			}
 			if err = e.nontransactionalPhase(ctx, conn, phase, steps, confirmed); err != nil {
 				return results, err
 			}
@@ -172,7 +191,9 @@ func refuseUncertain(ctx context.Context, conn *pgx.Conn, digest string) error {
 	return nil
 }
 
-func runChecks(ctx context.Context, conn *pgx.Conn, p precheck.Plan) ([]precheck.Result, error) {
+func runChecks(ctx context.Context, conn interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, p precheck.Plan) ([]precheck.Result, error) {
 	var out []precheck.Result
 	for _, a := range p.Assertions {
 		checkCtx, cancel := context.WithCancel(ctx)
@@ -194,36 +215,53 @@ func runChecks(ctx context.Context, conn *pgx.Conn, p precheck.Plan) ([]precheck
 	return out, nil
 }
 
-func (e *PostgreSQL) transactionalPhase(ctx context.Context, conn *pgx.Conn, phase plan.Phase, steps map[string]plan.Step, confirmed map[string]bool) (err error) {
+func (e *PostgreSQL) transactionalPhase(ctx context.Context, conn *pgx.Conn, phase plan.Phase, steps map[string]plan.Step, confirmed map[string]bool, checks precheck.Plan, runPrechecks bool) (results []precheck.Result, err error) {
 	tx, err := conn.Begin(ctx)
 	if err != nil {
-		return errors.New("begin migration phase")
+		return nil, errors.New("begin migration phase")
 	}
 	defer func() {
 		if err != nil {
 			_ = tx.Rollback(context.WithoutCancel(ctx))
 		}
 	}()
+	if runPrechecks {
+		results, err = runChecks(ctx, tx, checks)
+		if err != nil {
+			return results, err
+		}
+	}
+	pendingCount := 0
+	last := e.result.LastConfirmed
 	for _, id := range phase.StepIDs {
 		if confirmed[id] {
 			continue
 		}
 		step := steps[id]
+		if step.Kind == plan.StepTopology {
+			continue
+		}
 		if step.Kind == plan.StepExecutable {
 			if _, err = tx.Exec(ctx, step.SQL); err != nil {
-				return errors.New("execute transactional migration step")
+				return results, errors.New("execute transactional migration step")
 			}
 		}
-		if err = insertHistory(ctx, tx, e.artifact.Digest, step, phase, "confirmed", e.result.LastConfirmed, ""); err != nil {
-			return err
+		if err = insertHistory(ctx, tx, e.artifact.Digest, step, phase, "confirmed", last, ""); err != nil {
+			return results, err
 		}
-		e.result.AppliedSteps++
-		e.result.LastConfirmed = step.ID
+		pendingCount++
+		last = step.ID
 	}
 	if err = tx.Commit(ctx); err != nil {
-		return errors.New("commit migration phase")
+		e.result.Uncertain = true
+		e.result.PendingStep = last
+		e.result.ExecutionID = e.artifact.Digest
+		e.result.RecoveryGuidance = "reconcile transaction outcome before retry"
+		return results, ErrReconcile
 	}
-	return nil
+	e.result.AppliedSteps += pendingCount
+	e.result.LastConfirmed = last
+	return results, nil
 }
 
 func (e *PostgreSQL) nontransactionalPhase(ctx context.Context, conn *pgx.Conn, phase plan.Phase, steps map[string]plan.Step, confirmed map[string]bool) error {
@@ -232,6 +270,9 @@ func (e *PostgreSQL) nontransactionalPhase(ctx context.Context, conn *pgx.Conn, 
 			continue
 		}
 		step := steps[id]
+		if step.Kind == plan.StepTopology {
+			continue
+		}
 		if err := insertHistory(ctx, conn, e.artifact.Digest, step, phase, "intended", e.result.LastConfirmed, "reconcile, explicitly skip, or create a new signed plan"); err != nil {
 			return err
 		}
@@ -254,7 +295,7 @@ func (e *PostgreSQL) nontransactionalPhase(ctx context.Context, conn *pgx.Conn, 
 func insertHistory(ctx context.Context, x interface {
 	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
 }, digest string, step plan.Step, phase plan.Phase, state, last, guidance string) error {
-	_, err := x.Exec(ctx, `insert into autosql_migration_history(artifact_digest,step_id,step_hash,attempt,phase_id,phase_mode,state,intended_at,confirmed_at,last_confirmed_step,recovery_guidance) values($1,$2,$3,1,$4,$5,$6,clock_timestamp(),case when $6='confirmed' then clock_timestamp() end,$7,$8) on conflict do nothing`, digest, step.ID, stepHash(step), phase.ID, phase.Transaction, state, last, guidance)
+	_, err := x.Exec(ctx, `insert into autosql_migration_history(artifact_digest,step_id,step_hash,attempt,phase_id,phase_mode,state,intended_at,confirmed_at,last_confirmed_step,recovery_guidance) values($1,$2,$3,1,$4,$5,$6,clock_timestamp(),case when $6='confirmed' then clock_timestamp() end,$7,$8)`, digest, step.ID, stepHash(step), phase.ID, phase.Transaction, state, last, guidance)
 	if err != nil {
 		return errors.New("write durable migration history")
 	}

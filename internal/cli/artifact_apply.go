@@ -70,6 +70,15 @@ func (s VerifiedArtifactApplyService) Apply(ctx context.Context, request ApplyRe
 				result.AppliedSteps = applied.Result().AppliedSteps
 			}
 		}
+		if applied, ok := mutation.(*executor.PostgreSQL); ok {
+			r := applied.Result()
+			result.PendingStep = r.PendingStep
+			result.ExecutionID = r.ExecutionID
+			result.RecoveryGuidance = r.RecoveryGuidance
+			if r.Uncertain {
+				result.Status = "uncertain"
+			}
+		}
 		return result, err
 	}
 	appliedSteps := len(verifiedPayload.Plan.Steps)
