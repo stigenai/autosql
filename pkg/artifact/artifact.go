@@ -131,21 +131,22 @@ type ArtifactOrigin struct {
 	Signature     string `json:"signature,omitempty"`
 }
 type Artifact struct {
-	Version           string            `json:"version"`
-	Plan              plan.Plan         `json:"plan"`
-	Checks            precheck.Plan     `json:"checks"`
-	CreatedAt         time.Time         `json:"created_at"`
-	ExpiresAt         time.Time         `json:"expires_at"`
-	SourceRevision    string            `json:"source_revision"`
-	TargetEnvironment string            `json:"target_environment"`
-	DatabaseIdentity  string            `json:"database_identity"`
-	Approval          Approval          `json:"approval"`
-	GuardrailDigest   string            `json:"guardrail_digest"`
-	Metadata          map[string]string `json:"metadata"`
-	Digest            string            `json:"digest"`
-	Signature         Signature         `json:"signature"`
-	EditProvenance    *EditProvenance   `json:"edit_provenance,omitempty"`
-	Origin            ArtifactOrigin    `json:"origin"`
+	Version                string                  `json:"version"`
+	Plan                   plan.Plan               `json:"plan"`
+	Checks                 precheck.Plan           `json:"checks"`
+	CreatedAt              time.Time               `json:"created_at"`
+	ExpiresAt              time.Time               `json:"expires_at"`
+	SourceRevision         string                  `json:"source_revision"`
+	TargetEnvironment      string                  `json:"target_environment"`
+	DatabaseIdentity       string                  `json:"database_identity"`
+	Approval               Approval                `json:"approval"`
+	GuardrailDigest        string                  `json:"guardrail_digest"`
+	Metadata               map[string]string       `json:"metadata"`
+	Digest                 string                  `json:"digest"`
+	Signature              Signature               `json:"signature"`
+	EditProvenance         *EditProvenance         `json:"edit_provenance,omitempty"`
+	ValidationAttestations []ValidationAttestation `json:"validation_attestations,omitempty"`
+	Origin                 ArtifactOrigin          `json:"origin"`
 }
 type ExpectedBindings struct{ PlanDigest, ChecksDigest, GuardrailDigest, SourceRevision, Environment, DatabaseIdentity, ApprovalIdentity, ApprovalProofDigest, GeneratedPlanDigest string }
 type KeyRecord struct {
@@ -217,6 +218,15 @@ func (a *Artifact) Sign(keyID string, private ed25519.PrivateKey) error {
 	a.Signature.Value = base64.RawStdEncoding.EncodeToString(ed25519.Sign(private, []byte(signatureDomain+d)))
 	return nil
 }
+func (a *Artifact) SetValidationAttestations(v []ValidationAttestation) error {
+	if a.Signature.Value != "" || a.EditProvenance != nil {
+		return fail("validation_attestations", ErrInvalid)
+	}
+	a.ValidationAttestations = append([]ValidationAttestation(nil), v...)
+	d, e := digest(*a)
+	a.Digest = d
+	return e
+}
 
 // ResetAuthorization clears signing material and recomputes the artifact digest.
 func (a *Artifact) ResetAuthorization() error {
@@ -245,9 +255,13 @@ func (a Artifact) VerifyTrusted(policy VerifyPolicy) (VerifiedArtifact, error) {
 			return VerifiedArtifact{}, fail("edits_forbidden", ErrInvalid)
 		}
 	}
-	if a.EditProvenance != nil && len(policy.ExpectedValidationContextDigests) > 0 {
+	attestations := a.ValidationAttestations
+	if a.EditProvenance != nil {
+		attestations = a.EditProvenance.Attestations
+	}
+	if len(attestations) > 0 && len(policy.ExpectedValidationContextDigests) > 0 {
 		seen := map[string]bool{}
-		for _, att := range a.EditProvenance.Attestations {
+		for _, att := range attestations {
 			expected, ok := policy.ExpectedValidationContextDigests[att.Stage]
 			if !ok || expected != att.ConfigDigest {
 				return VerifiedArtifact{}, fail("validation_context", ErrInvalid)
@@ -258,12 +272,12 @@ func (a Artifact) VerifyTrusted(policy VerifyPolicy) (VerifiedArtifact, error) {
 			return VerifiedArtifact{}, fail("validation_context", ErrInvalid)
 		}
 	}
-	if a.EditProvenance != nil && len(policy.ExpectedValidationAttestations) == 0 {
+	if len(attestations) > 0 && len(policy.ExpectedValidationAttestations) == 0 {
 		return VerifiedArtifact{}, fail("validation_attestation_manifest", ErrInvalid)
 	}
-	if a.EditProvenance != nil {
+	if len(attestations) > 0 {
 		seen := map[string]bool{}
-		for _, got := range a.EditProvenance.Attestations {
+		for _, got := range attestations {
 			want, ok := policy.ExpectedValidationAttestations[got.Stage]
 			if !ok || !reflect.DeepEqual(got.Simulation, want.Simulation) || !reflect.DeepEqual(got.Safety, want.Safety) || !reflect.DeepEqual(got.Policy, want.Policy) || !reflect.DeepEqual(got.Precheck, want.Precheck) || !reflect.DeepEqual(got.Editor, want.Editor) {
 				return VerifiedArtifact{}, fail("validation_attestation", ErrInvalid)
@@ -348,6 +362,34 @@ func (a Artifact) validateUnsigned() error {
 	if a.EditProvenance != nil {
 		if err := validateEditProvenance(a); err != nil {
 			return err
+		}
+	}
+	if a.Origin.Kind == "generated" && len(a.ValidationAttestations) > 0 {
+		seen := map[string]bool{}
+		for _, v := range a.ValidationAttestations {
+			if seen[v.Stage] || v.Implementation == "" || v.Version == "" || !digestPattern.MatchString(v.ConfigDigest) || !digestPattern.MatchString(v.ResultDigest) || v.At.IsZero() || v.At.Location() != time.UTC || !v.ExpiresAt.After(v.At) {
+				return fail("generated_attestation", ErrInvalid)
+			}
+			seen[v.Stage] = true
+			switch v.Stage {
+			case "replay_simulation":
+				if v.Simulation == nil || v.Simulation.TargetIdentity == v.Simulation.DevelopmentIdentity || v.Simulation.FromFingerprint == "" || v.Simulation.ToFingerprint == "" || v.Simulation.ConfigDigest != v.ConfigDigest {
+					return fail("generated_attestation", ErrInvalid)
+				}
+			case "safety":
+				if v.Safety == nil || len(v.Safety.Analyzers) == 0 || v.Safety.ConfigDigest != v.ConfigDigest {
+					return fail("generated_attestation", ErrInvalid)
+				}
+			case "policy_precheck_guardrail":
+				if v.Policy == nil || v.Precheck == nil || v.Policy.ConfigDigest != v.ConfigDigest || v.Precheck.ConfigDigest != v.ConfigDigest {
+					return fail("generated_attestation", ErrInvalid)
+				}
+			default:
+				return fail("generated_attestation", ErrInvalid)
+			}
+		}
+		if len(seen) != 3 {
+			return fail("generated_attestation", ErrInvalid)
 		}
 	}
 	wantChecks, checkErr := precheck.Digest(a.Checks)

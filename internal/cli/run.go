@@ -57,6 +57,16 @@ func RunWithServices(ctx context.Context, args []string, streams Streams, servic
 		err = runVersion(args[1:], o)
 	case len(args) >= 2 && args[0] == "config" && args[1] == "validate":
 		err = runConfigValidate(ctx, args[2:], o, redactor)
+	case len(args) >= 2 && args[0] == "migrate" && args[1] == "generate":
+		trusted := false
+		for _, arg := range args[2:] {
+			trusted = trusted || arg == "--generation-config" || strings.HasPrefix(arg, "--generation-config=")
+		}
+		if !trusted {
+			err = &Error{Kind: "config", Message: "migrate generate requires --generation-config", Code: ExitConfig}
+		} else {
+			err = runMigrateGenerate(ctx, args[2:], o, services.ReadPlan)
+		}
 	case len(args) >= 2 && args[0] == "schema" && args[1] == "load":
 		err = runSchemaLoad(ctx, args[2:], o)
 	case len(args) >= 2 && args[0] == "schema" && args[1] == "inspect":
@@ -292,7 +302,7 @@ func usageError(err error) *Error {
 	return &Error{Kind: "usage", Message: err.Error(), Code: ExitUsage, Cause: err}
 }
 func usage() string {
-	return "usage: autosql <command>\n\ncommands:\n  version [--json]\n  config validate [--config path] [--env name] [--preflight] [--json]\n  schema load --source sql:path|json:path [--source ...] [--json]\n  schema inspect --url env://NAME|file://path [--format native|sql|json]\n  schema diff --from source --to source [--max-changes n] [--json]\n  migrate status [--config path --env name | --url env://NAME --migration-dir path] [--revision-schema name] [--json]\n  plan --from source --to source [--max-changes n] [--json]\n  plan edit --artifact file --sql file --editor id --reason text --output file\n  plan review --artifact file [--json]\n  plan revalidate --draft file --output file [--json]\n  plan publish --attested file --output file [--json]\n  apply --from source --to source [--dry-run|--approve-digest digest|--artifact path] [--no-edits] [--json]"
+	return "usage: autosql <command>\n\ncommands:\n  version [--json]\n  config validate [--config path] [--env name] [--preflight] [--json]\n  migrate generate --dir path --from source --to source --version semver --label name [--rename-hints value] [--json]\n  migrate status [--config path --env name | --url env://NAME --migration-dir path] [--revision-schema name] [--json]\n  schema load --source sql:path|json:path [--source ...] [--json]\n  schema inspect --url env://NAME|file://path [--format native|sql|json]\n  schema diff --from source --to source [--max-changes n] [--json]\n  plan --from source --to source [--max-changes n] [--json]\n  plan edit --artifact file --sql file --editor id --reason text --output file\n  plan review --artifact file [--json]\n  plan revalidate --draft file --output file [--json]\n  plan publish --attested file --output file [--json]\n  apply --from source --to source [--dry-run|--approve-digest digest|--artifact path] [--no-edits] [--json]"
 }
 func contains(args []string, want string) bool {
 	for _, a := range args {

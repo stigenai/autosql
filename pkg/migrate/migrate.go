@@ -168,6 +168,8 @@ type Migration struct {
 	Version         string      `json:"version"`
 	Name            string      `json:"name"`
 	SQLDigest       string      `json:"sql_digest"`
+	ArtifactFile    string      `json:"artifact_file,omitempty"`
+	ArtifactDigest  string      `json:"artifact_digest,omitempty"`
 	Directives      Directives  `json:"directives"`
 	DirectiveDigest string      `json:"directive_digest"`
 	Statements      []Statement `json:"statements"`
@@ -183,10 +185,12 @@ type Manifest struct {
 	Digest     string      `json:"digest"`
 }
 type File struct {
-	Name      string
-	SQL       []byte
-	Parents   []string
-	NonLinear bool
+	Name         string
+	SQL          []byte
+	ArtifactName string
+	Artifact     []byte
+	Parents      []string
+	NonLinear    bool
 }
 type UpdateRequest struct {
 	Files                  []File
@@ -315,6 +319,7 @@ var generationRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 type chainMaterial struct {
 	Version, File, SQL, Directives, Boundaries string
+	Artifact                                   string `json:",omitempty"`
 	Parents, ParentChains                      []string
 	NonLinear                                  bool
 }
@@ -411,7 +416,17 @@ func parseFile(f File) (Migration, error) {
 	bd := digest("boundaries", canonical(stmts))
 	parents := append([]string(nil), f.Parents...)
 	sort.Strings(parents)
-	return Migration{File: name, Version: v.String(), Name: m[2], SQLDigest: digest("sql", sql), Directives: dirs, DirectiveDigest: dd, Statements: stmts, BoundaryDigest: bd, Parents: parents, NonLinear: f.NonLinear}, nil
+	entry := Migration{File: name, Version: v.String(), Name: m[2], SQLDigest: digest("sql", sql), Directives: dirs, DirectiveDigest: dd, Statements: stmts, BoundaryDigest: bd, Parents: parents, NonLinear: f.NonLinear}
+	if len(f.Artifact) > 0 || f.ArtifactName != "" {
+		if f.ArtifactName != name+".artifact.json" || len(f.Artifact) == 0 || len(f.Artifact) > maxFile || !utf8.Valid(f.Artifact) || bytes.IndexByte(f.Artifact, 0) >= 0 {
+			return Migration{}, fmt.Errorf("%w: artifact", ErrInvalid)
+		}
+		if err := validateMigrationArtifact(f.Artifact); err != nil {
+			return Migration{}, fmt.Errorf("%w: artifact", ErrInvalid)
+		}
+		entry.ArtifactFile, entry.ArtifactDigest = f.ArtifactName, digest("artifact", f.Artifact)
+	}
+	return entry, nil
 }
 func build(files []File) (Manifest, error) {
 	seenName := map[string]bool{}
@@ -482,7 +497,7 @@ func build(files []File) (Manifest, error) {
 			parentChains[j] = entries[byVersion[p]].ChainDigest
 		}
 		sort.Strings(parentChains)
-		material := chainMaterial{e.Version, e.File, e.SQLDigest, e.DirectiveDigest, e.BoundaryDigest, append([]string(nil), e.Parents...), parentChains, e.NonLinear}
+		material := chainMaterial{Version: e.Version, File: e.File, SQL: e.SQLDigest, Directives: e.DirectiveDigest, Boundaries: e.BoundaryDigest, Artifact: e.ArtifactDigest, Parents: append([]string(nil), e.Parents...), ParentChains: parentChains, NonLinear: e.NonLinear}
 		e.ChainDigest = digest("chain", canonical(material))
 	}
 	// The generation is derived from all semantic and byte digests, not wall time.
@@ -614,6 +629,9 @@ func validateManifestStructure(m Manifest) error {
 		if !digestRE.MatchString(e.SQLDigest) || !digestRE.MatchString(e.DirectiveDigest) || !digestRE.MatchString(e.BoundaryDigest) || !digestRE.MatchString(e.ChainDigest) {
 			return ErrInvalid
 		}
+		if (e.ArtifactFile == "") != (e.ArtifactDigest == "") || e.ArtifactFile != "" && (e.ArtifactFile != e.File+".artifact.json" || !digestRE.MatchString(e.ArtifactDigest)) {
+			return ErrInvalid
+		}
 		if e.Directives.Transaction != TransactionAuto && e.Directives.Transaction != TransactionRequired && e.Directives.Transaction != TransactionForbidden {
 			return ErrInvalid
 		}
@@ -660,7 +678,7 @@ func validateManifestStructure(m Manifest) error {
 		if linear == e.NonLinear {
 			return ErrInvalid
 		}
-		material := chainMaterial{e.Version, e.File, e.SQLDigest, e.DirectiveDigest, e.BoundaryDigest, append([]string(nil), e.Parents...), parentChains, e.NonLinear}
+		material := chainMaterial{Version: e.Version, File: e.File, SQL: e.SQLDigest, Directives: e.DirectiveDigest, Boundaries: e.BoundaryDigest, Artifact: e.ArtifactDigest, Parents: append([]string(nil), e.Parents...), ParentChains: parentChains, NonLinear: e.NonLinear}
 		if digest("chain", canonical(material)) != e.ChainDigest {
 			return conflict("chain_digest", e.File, "restore the canonical ancestry chain")
 		}
@@ -826,6 +844,9 @@ func verifyGenerationAt(root int, m Manifest) (map[string][]byte, error) {
 	expected := map[string]bool{}
 	for _, entry := range m.Entries {
 		expected[entry.File] = true
+		if entry.ArtifactFile != "" {
+			expected[entry.ArtifactFile] = true
+		}
 	}
 	names, e := namesAt(g)
 	if e != nil {
@@ -844,7 +865,19 @@ func verifyGenerationAt(root int, m Manifest) (map[string][]byte, error) {
 			return nil, e
 		}
 		out[entry.File] = b
-		candidate = append(candidate, File{Name: entry.File, SQL: b, Parents: append([]string(nil), entry.Parents...), NonLinear: entry.NonLinear})
+		f := File{Name: entry.File, SQL: b, Parents: append([]string(nil), entry.Parents...), NonLinear: entry.NonLinear}
+		if entry.ArtifactFile != "" {
+			ab, re := readAt(g, entry.ArtifactFile, maxFile)
+			if re != nil {
+				return nil, re
+			}
+			if digest("artifact", ab) != entry.ArtifactDigest {
+				return nil, conflict("artifact_changed", entry.ArtifactFile, "restore the byte-exact signed artifact")
+			}
+			f.ArtifactName, f.Artifact = entry.ArtifactFile, ab
+			out[entry.ArtifactFile] = ab
+		}
+		candidate = append(candidate, f)
 	}
 	actual, e := build(candidate)
 	if e != nil {
@@ -1155,18 +1188,31 @@ func updateLocked(root int, dir string, req UpdateRequest, ops Ops, allowLegacy 
 			if !bytes.Equal(existing, f.SQL) {
 				return Manifest{}, conflict("generation_collision", f.Name, "restore the deterministic generation")
 			}
-			continue
-		}
-		if !errors.Is(re, unix.ENOENT) {
+		} else if !errors.Is(re, unix.ENOENT) {
 			return Manifest{}, re
-		}
-		if e = writeAt(g, f.Name, f.SQL, 0600, ops); e != nil {
+		} else if e = writeAt(g, f.Name, f.SQL, 0600, ops); e != nil {
 			return Manifest{}, e
+		}
+		if f.ArtifactName != "" {
+			existingArtifact, readArtifactErr := readAt(g, f.ArtifactName, maxFile)
+			if readArtifactErr == nil && !bytes.Equal(existingArtifact, f.Artifact) {
+				return Manifest{}, conflict("generation_collision", f.ArtifactName, "restore the deterministic artifact")
+			}
+			if errors.Is(readArtifactErr, unix.ENOENT) {
+				if e = writeAt(g, f.ArtifactName, f.Artifact, 0600, ops); e != nil {
+					return Manifest{}, e
+				}
+			} else if readArtifactErr != nil {
+				return Manifest{}, readArtifactErr
+			}
 		}
 	}
 	want := map[string]bool{}
 	for _, f := range req.Files {
 		want[f.Name] = true
+		if f.ArtifactName != "" {
+			want[f.ArtifactName] = true
+		}
 	}
 	gnames, e := namesAt(g)
 	if e != nil {
@@ -1361,7 +1407,7 @@ func MigrateManifestWithOps(dir, from string, ops Ops) (Manifest, error) {
 		if e != nil {
 			return Manifest{}, e
 		}
-		files[i] = File{x.File, b, x.Parents, x.NonLinear}
+		files[i] = File{Name: x.File, SQL: b, Parents: x.Parents, NonLinear: x.NonLinear}
 	}
 	// Preserve an immutable fixture before publishing; the active v0 manifest
 	// remains continuously readable until the single v1 rename.
