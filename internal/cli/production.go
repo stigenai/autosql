@@ -37,6 +37,12 @@ type applyConfig struct {
 	ExpectedValidationAttestations                                                                                                                                            map[string]artifact.ValidationAttestation
 	EditorIdentity, EditSigningKeyID, EditSigningKeyReference, DevelopmentURLReference, FreshApprovalIdentity, FreshApprovalProofDigest                                       string
 	FreshApprovalAt, EditReleaseCreatedAt, EditReleaseExpiresAt                                                                                                               time.Time
+	TrustedMigrations                                                                                                                                                         map[string]migrationTrust
+}
+type migrationTrust struct {
+	Expected                 artifact.ExpectedBindings
+	ValidationContextDigests map[string]string
+	ValidationAttestations   map[string]artifact.ValidationAttestation
 }
 type staticAuthority struct{ actors map[string]approval.Identity }
 
@@ -88,13 +94,22 @@ func productionServices(connector executor.Connector) (Services, error) {
 	ap := approval.Policy{Environments: map[string]approval.EnvironmentPolicy{c.Environment: {Allowed: true}}}
 	g := guardrail.Guardrail{Config: guardrail.Config{Environment: c.Environment, FailOn: safety.SeverityError, Risk: guardrail.RiskConfig{Baseline: approval.RiskLow}}, Safety: safety.Runner{Analyzers: safety.Builtins()}, Policy: policy.Evaluator{}, Approval: approval.Gate{Policy: ap, Authority: authority, Audit: &approval.Chain{Sink: &approval.FileSink{Path: c.ApprovalAuditPath}}}}
 	policyFor := func(a artifact.Artifact) (artifact.VerifyPolicy, error) {
-		if c.ExpectedPlanDigest == "" || c.ExpectedChecksDigest == "" || c.ExpectedGuardrailDigest == "" || c.ExpectedApprovalIdentity == "" || c.KeyStatus == "" || c.KeyPurpose == "" || c.KeyNotBefore.IsZero() || c.KeyNotAfter.IsZero() {
+		expected := artifact.ExpectedBindings{PlanDigest: c.ExpectedPlanDigest, GeneratedPlanDigest: c.ExpectedPlanDigest, ChecksDigest: c.ExpectedChecksDigest, GuardrailDigest: c.ExpectedGuardrailDigest, SourceRevision: c.SourceRevision, Environment: c.Environment, DatabaseIdentity: c.DatabaseIdentity, ApprovalIdentity: c.ExpectedApprovalIdentity, ApprovalProofDigest: c.ExpectedApprovalProofDigest}
+		contexts, attestations := c.ExpectedValidationContextDigests, c.ExpectedValidationAttestations
+		if len(c.TrustedMigrations) > 0 {
+			trusted, ok := c.TrustedMigrations[a.Digest]
+			if !ok {
+				return artifact.VerifyPolicy{}, errors.New("artifact absent from trusted migration release manifest")
+			}
+			expected = trusted.Expected
+			contexts, attestations = trusted.ValidationContextDigests, trusted.ValidationAttestations
+		}
+		if expected.PlanDigest == "" || expected.ChecksDigest == "" || expected.GuardrailDigest == "" || expected.ApprovalIdentity == "" || expected.SourceRevision == "" || expected.Environment == "" || expected.DatabaseIdentity == "" || c.KeyStatus == "" || c.KeyPurpose == "" || c.KeyNotBefore.IsZero() || c.KeyNotAfter.IsZero() {
 			return artifact.VerifyPolicy{}, errors.New("trusted release manifest bindings required")
 		}
-		vp := artifact.VerifyPolicy{Now: time.Now, NoEdits: c.NoEdits, Expected: artifact.ExpectedBindings{PlanDigest: c.ExpectedPlanDigest, GeneratedPlanDigest: c.ExpectedPlanDigest, ChecksDigest: c.ExpectedChecksDigest, GuardrailDigest: c.ExpectedGuardrailDigest, SourceRevision: c.SourceRevision, Environment: c.Environment, DatabaseIdentity: c.DatabaseIdentity, ApprovalIdentity: c.ExpectedApprovalIdentity}, Keys: map[string]artifact.KeyRecord{c.KeyID: {PublicKey: ed25519.PublicKey(pub), Issuer: c.Issuer, Identity: c.Signer, Environment: c.Environment, Purpose: c.KeyPurpose, Status: c.KeyStatus, NotBefore: c.KeyNotBefore.UTC(), NotAfter: c.KeyNotAfter.UTC()}}, Issuer: c.Issuer, Identity: c.Signer, Purpose: c.KeyPurpose}
-		vp.ExpectedValidationContextDigests = c.ExpectedValidationContextDigests
-		vp.Expected.ApprovalProofDigest = c.ExpectedApprovalProofDigest
-		vp.ExpectedValidationAttestations = c.ExpectedValidationAttestations
+		vp := artifact.VerifyPolicy{Now: time.Now, NoEdits: c.NoEdits, Expected: expected, Keys: map[string]artifact.KeyRecord{c.KeyID: {PublicKey: ed25519.PublicKey(pub), Issuer: c.Issuer, Identity: c.Signer, Environment: expected.Environment, Purpose: c.KeyPurpose, Status: c.KeyStatus, NotBefore: c.KeyNotBefore.UTC(), NotAfter: c.KeyNotAfter.UTC()}}, Issuer: c.Issuer, Identity: c.Signer, Purpose: c.KeyPurpose}
+		vp.ExpectedValidationContextDigests = contexts
+		vp.ExpectedValidationAttestations = attestations
 		if c.GeneratorKeyID != "" || c.GeneratorPublicKey != "" || c.GeneratorPurpose != "" {
 			generatorPub, decodeErr := base64.RawStdEncoding.Strict().DecodeString(c.GeneratorPublicKey)
 			if decodeErr != nil || len(generatorPub) != ed25519.PublicKeySize || c.GeneratorKeyID == "" || c.GeneratorPurpose == "" {

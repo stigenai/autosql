@@ -27,13 +27,13 @@ func runMigrateApply(ctx context.Context, args []string, o output, services Serv
 	dry := fs.Bool("dry-run", false, "select without mutation")
 	transaction := fs.String("transaction", "file", "file or all")
 	operator := fs.String("operator", "", "trusted operator identity")
-	mode := fs.String("approval-mode", "artifact", "artifact or digest")
+	mode := fs.String("approval-mode", "artifact", "artifact (signed release only)")
 	timeout := fs.Duration("timeout", 5*time.Minute, "operation timeout")
 	jsonFlag := fs.Bool("json", false, "JSON")
 	if e := fs.Parse(args); e != nil {
 		return usageError(e)
 	}
-	if fs.NArg() != 0 || *operator == "" || *count < -1 || (*transaction != "file" && *transaction != "all") || (*mode != "artifact" && *mode != "digest") || *timeout <= 0 {
+	if fs.NArg() != 0 || *operator == "" || *count < -1 || (*transaction != "file" && *transaction != "all") || *mode != "artifact" || *timeout <= 0 {
 		return usageError(errors.New("invalid migrate apply arguments"))
 	}
 	if *configPath == "" && (*urlRef == "" || *dir == "") {
@@ -84,39 +84,16 @@ func runMigrateApply(ctx context.Context, args []string, o output, services Serv
 	if *count >= 0 {
 		max = count
 	}
-	engine := migrateapply.Engine{Store: store, Apply: func(callCtx context.Context, entry migrate.Migration, raw []byte) (migrateapply.ArtifactResult, error) {
-		if services.Apply == nil {
-			return migrateapply.ArtifactResult{}, errors.New("guarded artifact apply service is not configured")
-		}
-		a, pe := artifact.Parse(raw)
-		if pe != nil {
-			return migrateapply.ArtifactResult{}, pe
-		}
-		start := time.Now()
-		req := ApplyRequest{ApprovalMode: *mode, AssertedDigest: a.Plan.Digest}
-		tmp := ""
-		if *mode == "artifact" {
-			f, fe := os.CreateTemp("", "autosql-migration-artifact-*.json")
-			if fe != nil {
-				return migrateapply.ArtifactResult{}, fe
-			}
-			tmp = f.Name()
-			if _, fe = f.Write(raw); fe == nil {
-				fe = f.Sync()
-			}
-			_ = f.Close()
-			defer os.Remove(tmp)
-			if fe != nil {
-				return migrateapply.ArtifactResult{}, fe
-			}
-			req.ArtifactPath = tmp
-		}
-		result, ae := services.Apply.Apply(callCtx, req)
-		return migrateapply.ArtifactResult{Statements: result.AppliedSteps, Duration: time.Since(start), Status: result.Status}, ae
-	}}
+	verifier, ok := services.Apply.(interface {
+		VerifyArtifact(artifact.Artifact) (artifact.VerifiedArtifact, error)
+	})
+	if !ok {
+		return &Error{Kind: "config", Message: "trusted migration artifact verifier is not configured", Code: ExitConfig}
+	}
+	engine := migrateapply.Engine{Store: store, Verify: verifier.VerifyArtifact}
 	callCtx, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()
-	result, e := engine.Run(callCtx, migrateapply.Request{Snapshot: snapshot, From: *from, To: *to, Count: max, DryRun: *dry, Baseline: baseline, Transaction: *transaction, Operator: *operator})
+	result, e := engine.Run(callCtx, migrateapply.Request{Directory: *dir, Snapshot: snapshot, From: *from, To: *to, Count: max, DryRun: *dry, Baseline: baseline, Transaction: *transaction, Operator: *operator, TargetIdentity: "revision/" + *schema})
 	if e != nil {
 		return &Error{Kind: "migration", Message: "versioned migration operation failed", Code: ExitMigration, Cause: e, Status: result.Status, RecoveryGuidance: func() string {
 			if result.Failure != nil {

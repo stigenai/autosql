@@ -933,6 +933,11 @@ func LoadSnapshot(dir string) (Snapshot, error) {
 	defer closeLock(l)
 	return snapshotAt(root)
 }
+
+// ArtifactDigest returns the manifest's byte-domain digest for an artifact.
+// It intentionally differs from Artifact.Digest, which authenticates the
+// canonical artifact payload rather than the exact directory bytes.
+func ArtifactDigest(raw []byte) string { return digest("artifact", raw) }
 func Verify(dir string) (Manifest, error) {
 	s, e := LoadSnapshot(dir)
 	if e != nil {

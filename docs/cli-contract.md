@@ -43,17 +43,22 @@ entries. Executor rows in an incomplete state add reconciliation guidance but
 never promote a revision to applied. JSON uses the standard output envelope and
 contains `manifest_digest`, ordered `entries`, `counts`, `dirty`, and `drift`.
 
-`migrate apply` and `migrate baseline` use that verified snapshot and revision
-placement. `--count`, `--from`, and inclusive `--to` select only a contiguous
-pending prefix; gaps, unknown revisions, drift, dirty/partial state, or missing
-artifact bindings refuse before mutation. `--dry-run` reports without changing
-the target. Apply delegates each file to the configured signed-artifact
-guardrail/executor boundary. Baseline atomically records distinct
-`baseline_recorded` events and executes no SQL. `--transaction=all` is allowed
-only for `transaction=required` files and a configured atomic batch executor;
-otherwise it fails closed. Output includes ordered files, statements, duration,
-final version, failure position, and recovery guidance. Artifact and digest
-approval modes use the existing trusted resolution paths.
+`migrate apply` and `migrate baseline` acquire one target advisory lock on one
+pinned PostgreSQL session, then reload the directory snapshot, revision rows,
+and exact artifact bytes under that lock. `--count`, `--from`, and inclusive
+`--to` select only a contiguous pending prefix; gaps, unknown revisions, drift,
+dirty/partial state, missing raw-byte bindings, or any untrusted signed artifact
+refuse before pending writes. Dry run performs the same locked trust and
+selection checks without mutation. Baseline verifies every artifact and records
+the prefix atomically with distinct `baseline_recorded` events and zero SQL.
+Per-file transactional execution commits DDL, revision state, statement
+evidence, executor history, and events together. `--transaction=all` places all
+selected transaction-safe files and evidence in one database transaction.
+Nontransactional statements durably record intended and confirmed evidence;
+an ambiguous execution or confirmation boundary is reported as uncertain and
+cannot be retried until reconciled. Only signed artifact approval is accepted.
+Output includes ordered file results, exact file/statement/line/column failure
+position, durations, final version, backend session, and recovery guidance.
 
 ## Schema commands
 

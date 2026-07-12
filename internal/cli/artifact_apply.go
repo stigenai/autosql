@@ -23,6 +23,23 @@ type VerifiedArtifactApplyService struct {
 	NoEdits   bool
 }
 
+// VerifyArtifact exposes exactly the same trusted release-manifest policy used
+// by the single-artifact path, without granting a mutation capability.
+func (s VerifiedArtifactApplyService) VerifyArtifact(a artifact.Artifact) (artifact.VerifiedArtifact, error) {
+	p := s.Policy
+	var err error
+	if s.PolicyFor != nil {
+		p, err = s.PolicyFor(a)
+		if err != nil {
+			return artifact.VerifiedArtifact{}, err
+		}
+	}
+	if s.NoEdits {
+		p.NoEdits = true
+	}
+	return a.VerifyTrusted(p)
+}
+
 func (s VerifiedArtifactApplyService) Apply(ctx context.Context, request ApplyRequest) (ApplyResult, error) {
 	if request.ApprovalMode != "artifact" || request.ArtifactPath == "" || s.Input == nil || s.Mutation == nil {
 		return ApplyResult{Status: "refused"}, errors.New("verified artifact apply configuration required")
