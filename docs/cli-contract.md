@@ -60,6 +60,33 @@ cannot be retried until reconciled. Only signed artifact approval is accepted.
 Output includes ordered file results, exact file/statement/line/column failure
 position, durations, final version, backend session, and recovery guidance.
 
+## Diagnose and repair
+
+`migrate diagnose --url env://DATABASE --migration-dir PATH` acquires the same
+canonical target lock as apply and compares the verified manifest and signed
+artifacts with revision rows, target-scoped executor history, and the canonical
+live schema fingerprint. It reports only the first divergence and a root cause:
+dirty/partial evidence, an unknown revision, checksum drift, or manual schema
+drift. Suggested commands retain secret references and never contain resolved
+credentials.
+
+`migrate repair mark|remove|reconcile` requires a byte-immutable
+`autosql.repair-proposal/v1`, a trusted operator Ed25519 signature, bounded
+reason, expected before digest/state, exact action and expected after state,
+manifest/guardrail/approval bindings, and an unexpired target environment and
+database identity. Repairs run under the canonical lock with a database CAS.
+Requested and applied audit records must be durable before mutation; an audit
+failure leaves revision state unchanged. Remove requires a distinct destructive
+approval and appends a reversal tombstone that supersedes the original row—it
+never deletes history. Stale or tampered proposals are refused and audited.
+Repair authorization uses a separately configured, digest-bound repair policy
+and distinct normal/destructive approval evidence. Schema-plan safety analyzers
+are intentionally not rerun: mark/reconcile/tombstone actions execute no user
+DDL or data SQL. The production authorization callback instead fail-closes on
+the signed action, target/environment, before-state CAS, manifest and guardrail
+bindings, repair-policy digest, and approval digest; all of that evidence is
+copied into requested/applied/refused audit records.
+
 ## Schema commands
 
 `schema load` accepts repeatable `--source sql:path` and `--source json:path`

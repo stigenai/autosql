@@ -3,6 +3,8 @@ package revision
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -322,6 +324,23 @@ type Revision struct {
 	Duration                                                                                                                                            time.Duration
 }
 
+// Digest binds every mutable and immutable field of a revision row. Repair
+// proposals use it as their transaction-time compare-and-swap token.
+func Digest(r Revision) string {
+	if r.Supersedes == nil {
+		r.Supersedes = []string{}
+	}
+	r.StartedAt = r.StartedAt.UTC()
+	r.UpdatedAt = r.UpdatedAt.UTC()
+	if r.CompletedAt != nil {
+		done := r.CompletedAt.UTC()
+		r.CompletedAt = &done
+	}
+	raw, _ := json.Marshal(r)
+	sum := sha256.Sum256(append([]byte("autosql.repair.revision/v2\x00"), raw...))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
 // Revisions returns the authoritative rows visible on this pinned session.
 func (s *Session) Revisions(ctx context.Context) ([]Revision, error) {
 	rows, err := s.conn.Query(ctx, `select version,description,kind,file_name,file_digest,manifest_digest,manifest_generation,artifact_digest,plan_digest,checks_digest,bundle_digest,state,statement_ordinal,attempt,redacted_error,operator_identity,started_at,updated_at,completed_at,from_version,to_version,supersedes,reversal_of,duration_ns from `+q(s.config.Schema, s.config.RevisionsTable)+` order by started_at,version`)
@@ -397,6 +416,49 @@ func (s *Session) FinalizeRevision(ctx context.Context, tx pgx.Tx, version, stat
 		return errors.New("finalize transactional revision: row missing")
 	}
 	return nil
+}
+
+// Repair performs a proposal-bound CAS and always leaves append-only evidence.
+// Remove creates a reversal tombstone; it never deletes the original row.
+func (s *Session) Repair(ctx context.Context, tx pgx.Tx, version, action, before, after, expectedDigest, proposal, operator, evidence string, at time.Time) error {
+	var r Revision
+	var ns int64
+	if err := tx.QueryRow(ctx, `select version,description,kind,file_name,file_digest,manifest_digest,manifest_generation,artifact_digest,plan_digest,checks_digest,bundle_digest,state,statement_ordinal,attempt,redacted_error,operator_identity,started_at,updated_at,completed_at,from_version,to_version,supersedes,reversal_of,duration_ns from `+q(s.config.Schema, s.config.RevisionsTable)+` where version=$1 for update`, version).Scan(&r.Version, &r.Description, &r.Kind, &r.FileName, &r.FileDigest, &r.ManifestDigest, &r.ManifestGeneration, &r.ArtifactDigest, &r.PlanDigest, &r.ChecksDigest, &r.BundleDigest, &r.State, &r.StatementOrdinal, &r.Attempt, &r.RedactedError, &r.Operator, &r.StartedAt, &r.UpdatedAt, &r.CompletedAt, &r.FromVersion, &r.ToVersion, &r.Supersedes, &r.ReversalOf, &ns); err != nil {
+		return errors.New("repair stale revision")
+	}
+	r.Duration = time.Duration(ns)
+	if r.State != before || Digest(r) != expectedDigest {
+		return errors.New("repair stale revision")
+	}
+	if action == "remove" {
+		r.Version = version + "~repair~" + strings.TrimPrefix(proposal, "sha256:")[:12]
+		r.Description = "repair tombstone"
+		r.Kind = "reversal"
+		r.State = "applied"
+		r.Attempt = 1
+		r.Operator = operator
+		r.StartedAt = at.UTC()
+		r.UpdatedAt = at.UTC()
+		r.CompletedAt = &at
+		r.Supersedes = []string{version}
+		r.ReversalOf = version
+		r.Duration = 0
+		if err := s.ExecRevision(ctx, tx, r); err != nil {
+			return err
+		}
+		return s.ExecEvent(ctx, tx, Event{Version: r.Version, Attempt: 1, Type: "repair_applied", Detail: evidence, Operator: operator, At: at})
+	}
+	tag, err := tx.Exec(ctx, `update `+q(s.config.Schema, s.config.RevisionsTable)+` set state=$3,operator_identity=$4,updated_at=$5,completed_at=case when $3 in ('applied','baseline','checkpoint') then $5 else completed_at end where version=$1 and state=$2`, version, before, after, operator, at.UTC())
+	if err != nil || tag.RowsAffected() != 1 {
+		return errors.New("repair stale revision")
+	}
+	return s.ExecEvent(ctx, tx, Event{Version: version, Attempt: r.Attempt, Type: "repair_applied", Ordinal: r.StatementOrdinal, Detail: evidence, Operator: operator, At: at})
+}
+
+func (s *Session) HasRepairProposal(ctx context.Context, proposal string) (bool, error) {
+	var ok bool
+	err := s.conn.QueryRow(ctx, `select exists(select 1 from `+q(s.config.Schema, s.config.EventsTable)+` where event_type='repair_applied' and redacted_detail like $1)`, `%`+proposal+`%`).Scan(&ok)
+	return ok, err
 }
 
 func validateRevision(r Revision) error {
