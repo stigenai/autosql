@@ -189,6 +189,31 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 	if _, err = os.Stat(tamperedOutput); !os.IsNotExist(err) {
 		t.Fatalf("tampered publish created output: %v", err)
 	}
+	// A valid revalidation cannot be published by replaying the original
+	// approval identity, time, or proof.
+	freshIdentity, freshAt, freshProof := cfg.FreshApprovalIdentity, cfg.FreshApprovalAt, cfg.FreshApprovalProofDigest
+	cfg.FreshApprovalIdentity, cfg.FreshApprovalAt, cfg.FreshApprovalProofDigest = a.Approval.Identity, a.Approval.ApprovedAt, a.Approval.ProofDigest
+	replayConfig, _ := json.Marshal(cfg)
+	if err = os.WriteFile(configPath, replayConfig, 0600); err != nil {
+		t.Fatal(err)
+	}
+	replayServices, replayErr := ProductionServices()
+	if replayErr != nil {
+		t.Fatal(replayErr)
+	}
+	replayOutput := filepath.Join(dir, "replayed-approval-must-not-publish.json")
+	code, _, _ = invoke(t, []string{"plan", "publish", "--attested", attestedPath, "--output", replayOutput, "--json"}, "", false, replayServices)
+	if code == 0 {
+		t.Fatal("original approval replay published")
+	}
+	if _, statErr := os.Stat(replayOutput); !os.IsNotExist(statErr) {
+		t.Fatalf("approval replay created output: %v", statErr)
+	}
+	cfg.FreshApprovalIdentity, cfg.FreshApprovalAt, cfg.FreshApprovalProofDigest = freshIdentity, freshAt, freshProof
+	restoredConfig, _ := json.Marshal(cfg)
+	if err = os.WriteFile(configPath, restoredConfig, 0600); err != nil {
+		t.Fatal(err)
+	}
 	publishedPath := filepath.Join(dir, "published.json")
 	code, out, _ = invoke(t, []string{"plan", "publish", "--attested", attestedPath, "--output", publishedPath, "--json"}, "", false, services)
 	if code != 0 {
