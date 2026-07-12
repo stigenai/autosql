@@ -29,7 +29,7 @@ func (a *auditLog) AppendDurable(_ context.Context, r AuditRecord) error {
 }
 func proposal(t *testing.T, r revision.Revision, action, after string, key ed25519.PrivateKey, now time.Time) Proposal {
 	t.Helper()
-	p := Proposal{Version: "autosql.repair-proposal/v1", Action: action, TargetVersion: r.Version, Reason: "approved repair after incident review", Operator: "trusted-operator", DatabaseIdentity: "repair-test", Environment: "test", ExpectedBeforeDigest: RevisionDigest(r), ExpectedBeforeState: r.State, ExpectedAfterState: after, ManifestDigest: r.ManifestDigest, GuardrailDigest: r.BundleDigest, ApprovalDigest: "sha256:approval", CreatedAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour)}
+	p := Proposal{Version: "autosql.repair-proposal/v1", Action: action, TargetVersion: r.Version, Reason: "approved repair after incident review", Operator: "trusted-operator", DatabaseIdentity: "repair-test", Environment: "test", ExpectedBeforeDigest: RevisionDigest(r), ExpectedBeforeState: r.State, ExpectedAfterState: after, ManifestDigest: r.ManifestDigest, GuardrailDigest: r.BundleDigest, PolicyDigest: "sha256:policy", ApprovalDigest: "sha256:approval", CreatedAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour)}
 	if action == "remove" {
 		p.ApprovalLevel = "destructive"
 	}

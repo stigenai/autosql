@@ -79,6 +79,13 @@ Requested and applied audit records must be durable before mutation; an audit
 failure leaves revision state unchanged. Remove requires a distinct destructive
 approval and appends a reversal tombstone that supersedes the original row—it
 never deletes history. Stale or tampered proposals are refused and audited.
+Repair authorization uses a separately configured, digest-bound repair policy
+and distinct normal/destructive approval evidence. Schema-plan safety analyzers
+are intentionally not rerun: mark/reconcile/tombstone actions execute no user
+DDL or data SQL. The production authorization callback instead fail-closes on
+the signed action, target/environment, before-state CAS, manifest and guardrail
+bindings, repair-policy digest, and approval digest; all of that evidence is
+copied into requested/applied/refused audit records.
 
 ## Schema commands
 

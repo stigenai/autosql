@@ -21,9 +21,9 @@ import (
 var ErrRefused = errors.New("migration repair refused")
 
 type Proposal struct {
-	Version, Action, TargetVersion, Reason, Operator, DatabaseIdentity, Environment, ExpectedBeforeDigest, ExpectedBeforeState, ExpectedAfterState, ManifestDigest, GuardrailDigest, ApprovalDigest, ApprovalLevel, Digest string
-	CreatedAt, ExpiresAt                                                                                                                                                                                                   time.Time
-	Signature                                                                                                                                                                                                              artifact.Signature
+	Version, Action, TargetVersion, Reason, Operator, DatabaseIdentity, Environment, ExpectedBeforeDigest, ExpectedBeforeState, ExpectedAfterState, ManifestDigest, GuardrailDigest, PolicyDigest, ApprovalDigest, ApprovalLevel, Digest string
+	CreatedAt, ExpiresAt                                                                                                                                                                                                                 time.Time
+	Signature                                                                                                                                                                                                                            artifact.Signature
 }
 
 func (p Proposal) canonical() ([]byte, error) {
@@ -57,7 +57,7 @@ func (p Proposal) Verify(keys map[string]ed25519.PublicKey, now time.Time) error
 	return nil
 }
 func (p Proposal) validate() error {
-	if p.Version != "autosql.repair-proposal/v1" || p.TargetVersion == "" || p.Operator == "" || p.DatabaseIdentity == "" || p.Environment == "" || len(p.Reason) < 8 || len(p.Reason) > 500 || p.ExpectedBeforeDigest == "" || p.ExpectedBeforeState == "" || p.ExpectedAfterState == "" || p.ManifestDigest == "" || p.GuardrailDigest == "" || p.ApprovalDigest == "" || p.CreatedAt.IsZero() || !p.ExpiresAt.After(p.CreatedAt) {
+	if p.Version != "autosql.repair-proposal/v1" || p.TargetVersion == "" || p.Operator == "" || p.DatabaseIdentity == "" || p.Environment == "" || len(p.Reason) < 8 || len(p.Reason) > 500 || p.ExpectedBeforeDigest == "" || p.ExpectedBeforeState == "" || p.ExpectedAfterState == "" || p.ManifestDigest == "" || p.GuardrailDigest == "" || p.PolicyDigest == "" || p.ApprovalDigest == "" || p.CreatedAt.IsZero() || !p.ExpiresAt.After(p.CreatedAt) {
 		return ErrRefused
 	}
 	switch p.Action {
@@ -69,8 +69,8 @@ func (p Proposal) validate() error {
 }
 
 type AuditRecord struct {
-	EventID, Type, ProposalDigest, Action, TargetVersion, Operator string
-	At                                                             time.Time
+	EventID, Type, ProposalDigest, Action, TargetVersion, Operator, PolicyDigest, ApprovalDigest string
+	At                                                                                           time.Time
 }
 type Audit interface {
 	AppendDurable(context.Context, AuditRecord) error
@@ -344,7 +344,7 @@ func (s Service) Apply(ctx context.Context, p Proposal) error {
 	if e = s.Authorize(ctx, p, *before); e != nil {
 		return s.refuse(ctx, p)
 	}
-	requested := AuditRecord{EventID: "repair-requested/" + p.Digest, Type: "repair_requested", ProposalDigest: p.Digest, Action: p.Action, TargetVersion: p.TargetVersion, Operator: p.Operator, At: s.Now()}
+	requested := AuditRecord{EventID: "repair-requested/" + p.Digest, Type: "repair_requested", ProposalDigest: p.Digest, Action: p.Action, TargetVersion: p.TargetVersion, Operator: p.Operator, PolicyDigest: p.PolicyDigest, ApprovalDigest: p.ApprovalDigest, At: s.Now()}
 	if e = s.Audit.AppendDurable(ctx, requested); e != nil {
 		return e
 	}
@@ -361,7 +361,7 @@ func (s Service) Apply(ctx context.Context, p Proposal) error {
 	if e = session.Repair(ctx, tx, p.TargetVersion, p.Action, p.ExpectedBeforeState, p.ExpectedAfterState, p.Digest, p.Operator, s.Now()); e != nil {
 		return e
 	}
-	applied := AuditRecord{EventID: "repair-applied/" + p.Digest, Type: "repair_applied", ProposalDigest: p.Digest, Action: p.Action, TargetVersion: p.TargetVersion, Operator: p.Operator, At: s.Now()}
+	applied := AuditRecord{EventID: "repair-applied/" + p.Digest, Type: "repair_applied", ProposalDigest: p.Digest, Action: p.Action, TargetVersion: p.TargetVersion, Operator: p.Operator, PolicyDigest: p.PolicyDigest, ApprovalDigest: p.ApprovalDigest, At: s.Now()}
 	raw, _ := json.Marshal(applied)
 	if e = session.EnqueueOutbox(ctx, tx, applied.EventID, raw); e != nil {
 		return e
@@ -392,7 +392,7 @@ func (s Service) Apply(ctx context.Context, p Proposal) error {
 }
 func (s Service) refuse(ctx context.Context, p Proposal) error {
 	if s.Audit != nil && s.Now != nil {
-		_ = s.Audit.AppendDurable(ctx, AuditRecord{EventID: "repair-refused/" + p.Digest, Type: "repair_refused", ProposalDigest: p.Digest, Action: p.Action, TargetVersion: p.TargetVersion, Operator: p.Operator, At: s.Now()})
+		_ = s.Audit.AppendDurable(ctx, AuditRecord{EventID: "repair-refused/" + p.Digest, Type: "repair_refused", ProposalDigest: p.Digest, Action: p.Action, TargetVersion: p.TargetVersion, Operator: p.Operator, PolicyDigest: p.PolicyDigest, ApprovalDigest: p.ApprovalDigest, At: s.Now()})
 	}
 	return ErrRefused
 }

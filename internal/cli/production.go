@@ -40,7 +40,7 @@ type applyConfig struct {
 	EditorIdentity, EditSigningKeyID, EditSigningKeyReference, DevelopmentURLReference, FreshApprovalIdentity, FreshApprovalProofDigest                                       string
 	FreshApprovalAt, EditReleaseCreatedAt, EditReleaseExpiresAt                                                                                                               time.Time
 	TrustedMigrations                                                                                                                                                         map[string]migrationTrust
-	RepairApprovalDigest, RepairDestructiveApprovalDigest                                                                                                                     string
+	RepairPolicyDigest, RepairApprovalDigest, RepairDestructiveApprovalDigest                                                                                                 string
 }
 type migrationTrust struct {
 	Expected                 artifact.ExpectedBindings
@@ -173,7 +173,7 @@ func productionServices(connector executor.Connector) (Services, error) {
 		return mutationFor(v, nil, nil)
 	}
 	repairAuthorization := func(_ context.Context, p repair.Proposal, r revision.Revision) error {
-		if p.DatabaseIdentity != c.DatabaseIdentity || p.Environment != c.Environment || p.GuardrailDigest != r.BundleDigest {
+		if p.DatabaseIdentity != c.DatabaseIdentity || p.Environment != c.Environment || p.GuardrailDigest != r.BundleDigest || c.RepairPolicyDigest == "" || p.PolicyDigest != c.RepairPolicyDigest {
 			return errors.New("repair target or guardrail policy denied")
 		}
 		want := c.RepairApprovalDigest
