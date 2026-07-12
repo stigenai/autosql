@@ -202,9 +202,75 @@ type Snapshot struct {
 // Ops supports deterministic fault injection for every durability boundary.
 // Nil functions use the system implementation.
 type Ops struct {
+	Open     func(path string, flags int, mode uint32) (int, error)
+	Openat   func(dirfd int, path string, flags int, mode uint32) (int, error)
+	Close    func(fd int) error
+	Mkdirat  func(dirfd int, path string, mode uint32) error
+	Unlinkat func(dirfd int, path string, flags int) error
+	Flock    func(fd int, how int) error
 	Write    func(fd int, p []byte) (int, error)
 	Fsync    func(fd int) error
 	Renameat func(olddirfd int, oldpath string, newdirfd int, newpath string) error
+}
+
+func (o Ops) open(path string, flags int, mode uint32) (int, error) {
+	for {
+		var fd int
+		var e error
+		if o.Open != nil {
+			fd, e = o.Open(path, flags, mode)
+		} else {
+			fd, e = unix.Open(path, flags, mode)
+		}
+		if e != unix.EINTR {
+			return fd, e
+		}
+	}
+}
+func (o Ops) openat(fd int, path string, flags int, mode uint32) (int, error) {
+	for {
+		var n int
+		var e error
+		if o.Openat != nil {
+			n, e = o.Openat(fd, path, flags, mode)
+		} else {
+			n, e = unix.Openat(fd, path, flags, mode)
+		}
+		if e != unix.EINTR {
+			return n, e
+		}
+	}
+}
+func (o Ops) close(fd int) error {
+	if o.Close != nil {
+		return o.Close(fd)
+	}
+	return unix.Close(fd)
+}
+func (o Ops) mkdirat(fd int, path string, mode uint32) error {
+	if o.Mkdirat != nil {
+		return o.Mkdirat(fd, path, mode)
+	}
+	return unix.Mkdirat(fd, path, mode)
+}
+func (o Ops) unlinkat(fd int, path string, flags int) error {
+	if o.Unlinkat != nil {
+		return o.Unlinkat(fd, path, flags)
+	}
+	return unix.Unlinkat(fd, path, flags)
+}
+func (o Ops) flock(fd int, how int) error {
+	for {
+		var e error
+		if o.Flock != nil {
+			e = o.Flock(fd, how)
+		} else {
+			e = unix.Flock(fd, how)
+		}
+		if e != unix.EINTR {
+			return e
+		}
+	}
 }
 
 func (o Ops) write(fd int, p []byte) (int, error) {
@@ -214,20 +280,44 @@ func (o Ops) write(fd int, p []byte) (int, error) {
 	return unix.Write(fd, p)
 }
 func (o Ops) sync(fd int) error {
-	if o.Fsync != nil {
-		return o.Fsync(fd)
+	for {
+		var e error
+		if o.Fsync != nil {
+			e = o.Fsync(fd)
+		} else {
+			e = unix.Fsync(fd)
+		}
+		if e != unix.EINTR {
+			return e
+		}
 	}
-	return unix.Fsync(fd)
 }
 func (o Ops) rename(a int, ap string, b int, bp string) error {
 	if o.Renameat != nil {
-		return o.Renameat(a, ap, b, bp)
+		for {
+			e := o.Renameat(a, ap, b, bp)
+			if e != unix.EINTR {
+				return e
+			}
+		}
 	}
-	return unix.Renameat(a, ap, b, bp)
+	for {
+		e := unix.Renameat(a, ap, b, bp)
+		if e != unix.EINTR {
+			return e
+		}
+	}
 }
 
 var fileRE = regexp.MustCompile(`^(?:V)?([0-9]+(?:\.[0-9]+){0,2}(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?)__([-A-Za-z0-9][-.A-Za-z0-9_]*)\.sql$`)
 var digestRE = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+var generationRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+type chainMaterial struct {
+	Version, File, SQL, Directives, Boundaries string
+	Parents, ParentChains                      []string
+	NonLinear                                  bool
+}
 
 func digest(domain string, b []byte) string {
 	x := sha256.Sum256(append([]byte("autosql.migrate."+domain+"/v1\x00"), b...))
@@ -320,6 +410,7 @@ func parseFile(f File) (Migration, error) {
 	dd := digest("directives", canonical(dirs))
 	bd := digest("boundaries", canonical(stmts))
 	parents := append([]string(nil), f.Parents...)
+	sort.Strings(parents)
 	return Migration{File: name, Version: v.String(), Name: m[2], SQLDigest: digest("sql", sql), Directives: dirs, DirectiveDigest: dd, Statements: stmts, BoundaryDigest: bd, Parents: parents, NonLinear: f.NonLinear}, nil
 }
 func build(files []File) (Manifest, error) {
@@ -391,11 +482,7 @@ func build(files []File) (Manifest, error) {
 			parentChains[j] = entries[byVersion[p]].ChainDigest
 		}
 		sort.Strings(parentChains)
-		material := struct {
-			Version, File, SQL, Directives, Boundaries string
-			Parents, ParentChains                      []string
-			NonLinear                                  bool
-		}{e.Version, e.File, e.SQLDigest, e.DirectiveDigest, e.BoundaryDigest, append([]string(nil), e.Parents...), parentChains, e.NonLinear}
+		material := chainMaterial{e.Version, e.File, e.SQLDigest, e.DirectiveDigest, e.BoundaryDigest, append([]string(nil), e.Parents...), parentChains, e.NonLinear}
 		e.ChainDigest = digest("chain", canonical(material))
 	}
 	// The generation is derived from all semantic and byte digests, not wall time.
@@ -478,8 +565,11 @@ func strictManifest(raw []byte) (Manifest, error) {
 	if m.Version != ManifestVersion {
 		return m, conflict("manifest_version", m.Version, "run MigrateManifest explicitly")
 	}
-	if m.Generation == "" || strings.ContainsAny(m.Generation, "/\\") || len(m.Generation) != 64 {
+	if !generationRE.MatchString(m.Generation) {
 		return m, ErrInvalid
+	}
+	if e := validateManifestStructure(m); e != nil {
+		return m, e
 	}
 	copy := m
 	copy.Digest = ""
@@ -492,18 +582,114 @@ func strictManifest(raw []byte) (Manifest, error) {
 	return m, nil
 }
 
+func validateManifestStructure(m Manifest) error {
+	seenFile, seenVersion := map[string]bool{}, map[string]bool{}
+	byVersion := map[string]int{}
+	for i := range m.Entries {
+		e := &m.Entries[i]
+		if filepath.Base(e.File) != e.File || strings.Contains(e.File, "..") || strings.ContainsAny(e.File, "/\\") {
+			return ErrInvalid
+		}
+		fm := fileRE.FindStringSubmatch(e.File)
+		if fm == nil {
+			return ErrInvalid
+		}
+		v, err := ParseVersion(fm[1])
+		if err != nil || v.String() != e.Version || fm[2] != e.Name {
+			return ErrInvalid
+		}
+		fold := strings.ToLower(e.File)
+		if seenFile[fold] || seenVersion[e.Version] {
+			return conflict("duplicate_entry", e.File, "restore unique sorted manifest entries")
+		}
+		seenFile[fold] = true
+		seenVersion[e.Version] = true
+		byVersion[e.Version] = i
+		if i > 0 {
+			pv, _ := ParseVersion(m.Entries[i-1].Version)
+			if pv.Compare(v) >= 0 {
+				return conflict("entry_order", e.File, "restore canonical version ordering")
+			}
+		}
+		if !digestRE.MatchString(e.SQLDigest) || !digestRE.MatchString(e.DirectiveDigest) || !digestRE.MatchString(e.BoundaryDigest) || !digestRE.MatchString(e.ChainDigest) {
+			return ErrInvalid
+		}
+		if e.Directives.Transaction != TransactionAuto && e.Directives.Transaction != TransactionRequired && e.Directives.Transaction != TransactionForbidden {
+			return ErrInvalid
+		}
+		if !validDigest(e.Directives.PlanDigest) || !validDigest(e.Directives.CheckDigest) || !validDigest(e.Directives.BundleDigest) || !validDigest(e.Directives.CheckBundleDigest) {
+			return ErrInvalid
+		}
+		if digest("directives", canonical(e.Directives)) != e.DirectiveDigest {
+			return conflict("directive_digest", e.File, "restore canonical directive metadata")
+		}
+		for j, s := range e.Statements {
+			if s.Ordinal != j+1 || s.Line < 1 || s.Column < 1 || !digestRE.MatchString(s.Digest) {
+				return ErrInvalid
+			}
+		}
+		if digest("boundaries", canonical(e.Statements)) != e.BoundaryDigest {
+			return conflict("boundary_digest", e.File, "restore canonical statement boundaries")
+		}
+		for j, p := range e.Parents {
+			if _, err := ParseVersion(p); err != nil {
+				return ErrInvalid
+			}
+			if j > 0 && e.Parents[j-1] >= p {
+				return conflict("parent_order", e.File, "sort and deduplicate parent versions")
+			}
+		}
+	}
+	for i := range m.Entries {
+		e := &m.Entries[i]
+		if i == 0 && len(e.Parents) != 0 || i > 0 && len(e.Parents) == 0 {
+			return ErrInvalid
+		}
+		seen := map[string]bool{}
+		parentChains := make([]string, len(e.Parents))
+		for j, p := range e.Parents {
+			pi, ok := byVersion[p]
+			if !ok || pi >= i || seen[p] {
+				return ErrInvalid
+			}
+			seen[p] = true
+			parentChains[j] = m.Entries[pi].ChainDigest
+		}
+		sort.Strings(parentChains)
+		linear := i == 0 || len(e.Parents) == 1 && e.Parents[0] == m.Entries[i-1].Version
+		if linear == e.NonLinear {
+			return ErrInvalid
+		}
+		material := chainMaterial{e.Version, e.File, e.SQLDigest, e.DirectiveDigest, e.BoundaryDigest, append([]string(nil), e.Parents...), parentChains, e.NonLinear}
+		if digest("chain", canonical(material)) != e.ChainDigest {
+			return conflict("chain_digest", e.File, "restore the canonical ancestry chain")
+		}
+	}
+	seed := struct {
+		Version string
+		Entries []Migration
+	}{ManifestVersion, m.Entries}
+	if strings.TrimPrefix(digest("generation", canonical(seed)), "sha256:") != m.Generation {
+		return conflict("generation_digest", m.Generation, "restore the canonical generation")
+	}
+	return nil
+}
+
 func openRoot(dir string) (int, error) {
-	fd, e := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	return openRootWithOps(dir, Ops{})
+}
+func openRootWithOps(dir string, ops Ops) (int, error) {
+	fd, e := ops.open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if e != nil {
 		return -1, conflict("unsafe_directory", dir, "use a trusted non-symlink directory")
 	}
 	var st unix.Stat_t
 	if e = unix.Fstat(fd, &st); e != nil {
-		unix.Close(fd)
+		_ = ops.close(fd)
 		return -1, e
 	}
 	if st.Mode&unix.S_IFMT != unix.S_IFDIR || st.Mode&0022 != 0 || int(st.Uid) != os.Geteuid() {
-		unix.Close(fd)
+		_ = ops.close(fd)
 		return -1, conflict("unsafe_directory", dir, "use an owner-controlled directory without group/world write")
 	}
 	return fd, nil
@@ -545,26 +731,30 @@ func readAt(parent int, name string, limit int) ([]byte, error) {
 	return readFD(fd, limit)
 }
 func openLock(root int, exclusive bool) (int, error) {
-	fd, e := unix.Openat(root, lockFile, unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0600)
+	return openLockWithOps(root, exclusive, Ops{})
+}
+func openLockWithOps(root int, exclusive bool, ops Ops) (int, error) {
+	fd, e := ops.openat(root, lockFile, unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0600)
 	if e != nil {
 		return -1, e
 	}
 	var st unix.Stat_t
 	if e = unix.Fstat(fd, &st); e != nil || st.Mode&unix.S_IFMT != unix.S_IFREG || st.Mode&0077 != 0 || st.Nlink != 1 || int(st.Uid) != os.Geteuid() {
-		unix.Close(fd)
+		_ = ops.close(fd)
 		return -1, conflict("unsafe_lock", lockFile, "restore the private owner-controlled lock")
 	}
 	how := unix.LOCK_SH
 	if exclusive {
 		how = unix.LOCK_EX
 	}
-	if e = unix.Flock(fd, how); e != nil {
-		unix.Close(fd)
+	if e = ops.flock(fd, how); e != nil {
+		_ = ops.close(fd)
 		return -1, e
 	}
 	return fd, nil
 }
-func closeLock(fd int) { _ = unix.Flock(fd, unix.LOCK_UN); _ = unix.Close(fd) }
+func closeLock(fd int)                 { _ = unix.Flock(fd, unix.LOCK_UN); _ = unix.Close(fd) }
+func closeLockWithOps(fd int, ops Ops) { _ = ops.flock(fd, unix.LOCK_UN); _ = ops.close(fd) }
 func loadAt(root int) (Manifest, []byte, error) {
 	raw, e := readAt(root, ManifestFile, maxManifest)
 	if e != nil {
@@ -609,11 +799,10 @@ func snapshotAt(root int) (Snapshot, error) {
 	if e != nil {
 		return Snapshot{}, e
 	}
-	g, e := openGeneration(root, m.Generation)
+	files, e := verifyGenerationAt(root, m)
 	if e != nil {
 		return Snapshot{}, e
 	}
-	defer unix.Close(g)
 	// SQL outside the published generation is ambiguous/tampered input. Within
 	// the generation, every regular SQL file must be represented exactly once.
 	if names, er := namesAt(root); er != nil {
@@ -625,26 +814,44 @@ func snapshotAt(root int) (Snapshot, error) {
 			}
 		}
 	}
+	return Snapshot{Manifest: m, ManifestBytes: append([]byte(nil), raw...), Files: files}, nil
+}
+
+func verifyGenerationAt(root int, m Manifest) (map[string][]byte, error) {
+	g, e := openGeneration(root, m.Generation)
+	if e != nil {
+		return nil, e
+	}
+	defer unix.Close(g)
 	expected := map[string]bool{}
 	for _, entry := range m.Entries {
 		expected[entry.File] = true
 	}
-	if names, er := namesAt(g); er != nil {
-		return Snapshot{}, er
-	} else {
-		for _, name := range names {
-			if strings.HasSuffix(strings.ToLower(name), ".sql") && !expected[name] {
-				return Snapshot{}, conflict("untracked_file", name, "restore the exact published generation")
-			}
+	names, e := namesAt(g)
+	if e != nil {
+		return nil, e
+	}
+	for _, name := range names {
+		if !expected[name] {
+			return nil, conflict("untracked_file", name, "restore the exact published generation")
 		}
 	}
-	out := Snapshot{Manifest: m, ManifestBytes: append([]byte(nil), raw...), Files: map[string][]byte{}}
+	out := map[string][]byte{}
+	candidate := make([]File, 0, len(m.Entries))
 	for _, entry := range m.Entries {
 		b, e := readAt(g, entry.File, maxFile)
 		if e != nil {
-			return Snapshot{}, e
+			return nil, e
 		}
-		out.Files[entry.File] = b
+		out[entry.File] = b
+		candidate = append(candidate, File{Name: entry.File, SQL: b, Parents: append([]string(nil), entry.Parents...), NonLinear: entry.NonLinear})
+	}
+	actual, e := build(candidate)
+	if e != nil {
+		return nil, e
+	}
+	if !bytes.Equal(canonical(m), canonical(actual)) {
+		return nil, conflict("content_changed", m.Generation, "restore the byte-exact migration generation or perform an authorized update")
 	}
 	return out, nil
 }
@@ -698,24 +905,84 @@ func Verify(dir string) (Manifest, error) {
 	if e != nil {
 		return Manifest{}, e
 	}
-	files := make([]File, 0, len(s.Manifest.Entries))
-	for _, entry := range s.Manifest.Entries {
-		files = append(files, File{Name: entry.File, SQL: s.Files[entry.File], Parents: append([]string(nil), entry.Parents...), NonLinear: entry.NonLinear})
-	}
-	actual, e := build(files)
-	if e != nil {
-		return Manifest{}, e
-	}
-	if !bytes.Equal(canonical(s.Manifest), canonical(actual)) {
-		return Manifest{}, conflict("content_changed", dir, "restore the byte-exact migration generation or perform an authorized update")
-	}
 	return s.Manifest, nil
 }
 
 type journal struct {
-	Version        int    `json:"version"`
-	Generation     string `json:"generation"`
-	ManifestDigest string `json:"manifest_digest"`
+	Version        int      `json:"version"`
+	Kind           string   `json:"kind"`
+	ExpectedDigest string   `json:"expected_digest"`
+	Manifest       Manifest `json:"manifest"`
+	Cleanup        []string `json:"cleanup"`
+}
+type legacyEntry struct {
+	File      string   `json:"file"`
+	Parents   []string `json:"parents,omitempty"`
+	NonLinear bool     `json:"nonlinear,omitempty"`
+}
+type legacyManifest struct {
+	Version string        `json:"version"`
+	Entries []legacyEntry `json:"entries"`
+	Digest  string        `json:"digest"`
+}
+
+func parseLegacyManifest(raw []byte) (legacyManifest, error) {
+	if e := rejectDuplicates(raw); e != nil {
+		return legacyManifest{}, e
+	}
+	var old legacyManifest
+	d := json.NewDecoder(bytes.NewReader(raw))
+	d.DisallowUnknownFields()
+	if e := d.Decode(&old); e != nil || old.Version != LegacyVersion || !bytes.Equal(raw, canonical(old)) {
+		return old, ErrInvalid
+	}
+	c := old
+	c.Digest = ""
+	if digest("manifest-v0", canonical(c)) != old.Digest {
+		return old, conflict("manifest_digest", ManifestFile, "restore the canonical legacy manifest")
+	}
+	seen := map[string]bool{}
+	for _, x := range old.Entries {
+		if filepath.Base(x.File) != x.File || !fileRE.MatchString(x.File) || seen[strings.ToLower(x.File)] {
+			return old, ErrInvalid
+		}
+		seen[strings.ToLower(x.File)] = true
+	}
+	return old, nil
+}
+
+func parseJournal(raw []byte) (journal, error) {
+	if e := rejectDuplicates(raw); e != nil {
+		return journal{}, e
+	}
+	var j journal
+	d := json.NewDecoder(bytes.NewReader(raw))
+	d.DisallowUnknownFields()
+	if e := d.Decode(&j); e != nil {
+		return j, e
+	}
+	if j.Version != 2 || (j.Kind != "update" && j.Kind != "v0-migration") || !bytes.Equal(raw, canonical(j)) {
+		return j, ErrInvalid
+	}
+	if j.ExpectedDigest != "" && !digestRE.MatchString(j.ExpectedDigest) {
+		return j, ErrInvalid
+	}
+	if e := validateManifestStructure(j.Manifest); e != nil {
+		return j, e
+	}
+	c := j.Manifest
+	c.Digest = ""
+	if digest("manifest", canonical(c)) != j.Manifest.Digest {
+		return j, ErrInvalid
+	}
+	seen := map[string]bool{}
+	for _, p := range j.Cleanup {
+		if filepath.Base(p) != p || strings.Contains(p, "..") || seen[p] {
+			return j, ErrInvalid
+		}
+		seen[p] = true
+	}
+	return j, nil
 }
 
 func writeAll(fd int, p []byte, ops Ops) error {
@@ -725,6 +992,9 @@ func writeAll(fd int, p []byte, ops Ops) error {
 			p = p[n:]
 		}
 		if e != nil {
+			if errors.Is(e, unix.EINTR) {
+				continue
+			}
 			return e
 		}
 		if n == 0 {
@@ -734,17 +1004,17 @@ func writeAll(fd int, p []byte, ops Ops) error {
 	return nil
 }
 func writeAt(parent int, name string, p []byte, mode uint32, ops Ops) error {
-	fd, e := unix.Openat(parent, name, unix.O_CREAT|unix.O_EXCL|unix.O_WRONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, mode)
+	fd, e := ops.openat(parent, name, unix.O_CREAT|unix.O_EXCL|unix.O_WRONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, mode)
 	if e != nil {
 		return e
 	}
 	ok := false
 	defer func() {
 		if fd >= 0 {
-			_ = unix.Close(fd)
+			_ = ops.close(fd)
 		}
 		if !ok {
-			_ = unix.Unlinkat(parent, name, 0)
+			_ = ops.unlinkat(parent, name, 0)
 		}
 	}()
 	if e = writeAll(fd, p, ops); e != nil {
@@ -753,7 +1023,7 @@ func writeAt(parent int, name string, p []byte, mode uint32, ops Ops) error {
 	if e = ops.sync(fd); e != nil {
 		return e
 	}
-	if e = unix.Close(fd); e != nil {
+	if e = ops.close(fd); e != nil {
 		fd = -1
 		return e
 	}
@@ -779,8 +1049,8 @@ func ensureFileAt(parent int, name string, p []byte, mode uint32, ops Ops) error
 	}
 	return nil
 }
-func mkdirAt(parent int, name string, mode uint32) error {
-	e := unix.Mkdirat(parent, name, mode)
+func mkdirAt(parent int, name string, mode uint32, ops Ops) error {
+	e := ops.mkdirat(parent, name, mode)
 	if e == unix.EEXIST {
 		return nil
 	}
@@ -794,24 +1064,46 @@ func UpdateWithOps(dir string, req UpdateRequest, ops Ops) (Manifest, error) {
 	if req.ManifestVersion != "" && req.ManifestVersion != ManifestVersion {
 		return Manifest{}, conflict("manifest_version", req.ManifestVersion, "migrate explicitly")
 	}
-	root, e := openRoot(dir)
+	root, e := openRootWithOps(dir, ops)
 	if e != nil {
 		return Manifest{}, e
 	}
-	defer unix.Close(root)
-	lock, e := openLock(root, true)
+	defer ops.close(root)
+	lock, e := openLockWithOps(root, true, ops)
 	if e != nil {
 		return Manifest{}, e
 	}
-	defer closeLock(lock)
-	return updateLocked(root, dir, req, ops, false)
+	defer closeLockWithOps(lock, ops)
+	return updateLocked(root, dir, req, ops, false, nil)
 }
 
-func updateLocked(root int, dir string, req UpdateRequest, ops Ops, allowLegacy bool) (Manifest, error) {
-	if _, je := readAt(root, journalFile, maxFile); je == nil {
-		if e := recoverLocked(root); e != nil {
+func updateLocked(root int, dir string, req UpdateRequest, ops Ops, allowLegacy bool, cleanup []string) (Manifest, error) {
+	man, e := build(req.Files)
+	if e != nil {
+		return Manifest{}, e
+	}
+	if len(canonical(man)) > maxManifest {
+		return Manifest{}, fmt.Errorf("%w: manifest size", ErrInvalid)
+	}
+	if jr, je := readAt(root, journalFile, maxManifest); je == nil {
+		j, pe := parseJournal(jr)
+		if pe != nil {
+			return Manifest{}, conflict("dirty_journal", journalFile, "retain and inspect the exact journal")
+		}
+		kind := "update"
+		if allowLegacy {
+			kind = "v0-migration"
+		}
+		if j.Manifest.Digest != man.Digest || j.ExpectedDigest != req.ExpectedManifestDigest || j.Kind != kind {
+			return Manifest{}, conflict("pending_transaction", journalFile, "resume with the exact authorized candidate and expected digest")
+		}
+		if e = recoverLockedWithOps(root, ops); e != nil {
 			return Manifest{}, e
 		}
+		if _, e = verifyGenerationAt(root, man); e != nil {
+			return Manifest{}, e
+		}
+		return man, nil
 	} else if !errors.Is(je, unix.ENOENT) {
 		return Manifest{}, je
 	}
@@ -822,6 +1114,9 @@ func updateLocked(root int, dir string, req UpdateRequest, ops Ops, allowLegacy 
 		return Manifest{}, ce
 	}
 	if exists {
+		if _, e = snapshotAt(root); e != nil {
+			return Manifest{}, conflict("current_snapshot_invalid", dir, "restore the trusted current snapshot before updating")
+		}
 		if req.ExpectedManifestDigest == "" {
 			return Manifest{}, conflict("compare_and_swap_required", dir, "reload the snapshot and provide its digest")
 		}
@@ -831,32 +1126,25 @@ func updateLocked(root int, dir string, req UpdateRequest, ops Ops, allowLegacy 
 	} else if req.ExpectedManifestDigest != "" && !legacy {
 		return Manifest{}, conflict("compare_and_swap", dir, "the directory has no published manifest")
 	}
-	man, e := build(req.Files)
+	if e = mkdirAt(root, genDir, 0700, ops); e != nil {
+		return Manifest{}, e
+	}
+	base, e := ops.openat(root, genDir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if e != nil {
 		return Manifest{}, e
 	}
-	if len(canonical(man)) > maxManifest {
-		return Manifest{}, fmt.Errorf("%w: manifest size", ErrInvalid)
-	}
-	if e = mkdirAt(root, genDir, 0700); e != nil {
-		return Manifest{}, e
-	}
-	base, e := unix.Openat(root, genDir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-	if e != nil {
-		return Manifest{}, e
-	}
-	defer unix.Close(base)
+	defer ops.close(base)
 	if e = validateDirFD(base, genDir); e != nil {
 		return Manifest{}, e
 	}
-	if e = unix.Mkdirat(base, man.Generation, 0700); e != nil && e != unix.EEXIST {
+	if e = ops.mkdirat(base, man.Generation, 0700); e != nil && e != unix.EEXIST {
 		return Manifest{}, e
 	}
-	g, e := unix.Openat(base, man.Generation, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	g, e := ops.openat(base, man.Generation, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if e != nil {
 		return Manifest{}, e
 	}
-	defer unix.Close(g)
+	defer ops.close(g)
 	if e = validateDirFD(g, man.Generation); e != nil {
 		return Manifest{}, e
 	}
@@ -895,16 +1183,20 @@ func updateLocked(root int, dir string, req UpdateRequest, ops Ops, allowLegacy 
 	if e = ops.sync(base); e != nil {
 		return Manifest{}, e
 	}
-	j := journal{1, man.Generation, man.Digest}
+	kind := "update"
+	if allowLegacy {
+		kind = "v0-migration"
+	}
+	j := journal{2, kind, req.ExpectedManifestDigest, man, append([]string(nil), cleanup...)}
 	jr := canonical(j)
+	tmp := ManifestFile + "." + man.Generation + ".new"
+	if e = ensureFileAt(root, tmp, canonical(man), 0600, ops); e != nil {
+		return Manifest{}, e
+	}
 	if e = writeAt(root, journalFile, jr, 0600, ops); e != nil {
 		return Manifest{}, e
 	}
 	if e = ops.sync(root); e != nil {
-		return Manifest{}, e
-	}
-	tmp := ManifestFile + "." + man.Generation + ".new"
-	if e = ensureFileAt(root, tmp, canonical(man), 0600, ops); e != nil {
 		return Manifest{}, e
 	}
 	if e = ops.rename(root, tmp, root, ManifestFile); e != nil {
@@ -913,7 +1205,15 @@ func updateLocked(root int, dir string, req UpdateRequest, ops Ops, allowLegacy 
 	if e = ops.sync(root); e != nil {
 		return Manifest{}, e
 	}
-	if e = unix.Unlinkat(root, journalFile, 0); e != nil {
+	for _, p := range cleanup {
+		if e = ops.unlinkat(root, p, 0); e != nil && !errors.Is(e, unix.ENOENT) {
+			return Manifest{}, e
+		}
+	}
+	if e = ops.sync(root); e != nil {
+		return Manifest{}, e
+	}
+	if e = ops.unlinkat(root, journalFile, 0); e != nil {
 		return Manifest{}, e
 	}
 	if e = ops.sync(root); e != nil {
@@ -926,20 +1226,23 @@ func updateLocked(root int, dir string, req UpdateRequest, ops Ops, allowLegacy 
 // manifest are demonstrably published. An unpublished valid generation is
 // retained for forensic inspection and retry; no migration bytes are deleted.
 func Recover(dir string) error {
-	root, e := openRoot(dir)
+	return RecoverWithOps(dir, Ops{})
+}
+func RecoverWithOps(dir string, ops Ops) error {
+	root, e := openRootWithOps(dir, ops)
 	if e != nil {
 		return e
 	}
-	defer unix.Close(root)
-	lock, e := openLock(root, true)
+	defer ops.close(root)
+	lock, e := openLockWithOps(root, true, ops)
 	if e != nil {
 		return e
 	}
-	defer closeLock(lock)
-	return recoverLocked(root)
+	defer closeLockWithOps(lock, ops)
+	return recoverLockedWithOps(root, ops)
 }
 
-func recoverLocked(root int) error {
+func recoverLockedWithOps(root int, ops Ops) error {
 	raw, e := readAt(root, journalFile, maxFile)
 	if errors.Is(e, unix.ENOENT) {
 		return nil
@@ -947,70 +1250,110 @@ func recoverLocked(root int) error {
 	if e != nil {
 		return e
 	}
-	if e = rejectDuplicates(raw); e != nil {
-		return conflict("dirty_journal", journalFile, "inspect and restore the last trusted snapshot")
+	j, e := parseJournal(raw)
+	if e != nil {
+		return conflict("dirty_journal", journalFile, "inspect and retain the exact journal")
 	}
-	var j journal
-	if json.Unmarshal(raw, &j) != nil || j.Version != 1 || len(j.Generation) != 64 || !digestRE.MatchString(j.ManifestDigest) || !bytes.Equal(raw, canonical(j)) {
-		return conflict("dirty_journal", journalFile, "inspect and restore the last trusted snapshot")
-	}
-	m, _, me := loadAt(root)
-	if me != nil || m.Digest != j.ManifestDigest || m.Generation != j.Generation {
-		return conflict("unpublished_generation", j.Generation, "retry the authorized update or retain the generation for forensic recovery")
-	}
-	if e = unix.Unlinkat(root, journalFile, 0); e != nil {
+	if _, e = verifyGenerationAt(root, j.Manifest); e != nil {
 		return e
 	}
-	return unix.Fsync(root)
+	published := false
+	if m, _, me := loadAt(root); me == nil {
+		if m.Digest == j.Manifest.Digest {
+			published = true
+		} else if m.Digest != j.ExpectedDigest {
+			return conflict("recovery_cas", ManifestFile, "current manifest no longer matches the journal precondition")
+		} else if _, e = snapshotAt(root); e != nil {
+			return conflict("current_snapshot_invalid", ManifestFile, "restore the journal's trusted precondition snapshot")
+		}
+	} else if j.Kind == "v0-migration" {
+		oldRaw, re := readAt(root, ManifestFile, maxManifest)
+		if re != nil {
+			return re
+		}
+		old, pe := parseLegacyManifest(oldRaw)
+		if pe != nil || old.Digest != j.ExpectedDigest {
+			return conflict("recovery_cas", ManifestFile, "legacy manifest no longer matches the journal precondition")
+		}
+	} else if !(errors.Is(me, unix.ENOENT) && j.ExpectedDigest == "") {
+		return conflict("recovery_cas", ManifestFile, "current manifest no longer matches the journal precondition")
+	}
+	if !published { // The durable journal is the exact authorization to finish its manifest-last rename.
+		tmp := ManifestFile + "." + j.Manifest.Generation + ".new"
+		tr, e := readAt(root, tmp, maxManifest)
+		if e != nil || !bytes.Equal(tr, canonical(j.Manifest)) {
+			return conflict("missing_staged_manifest", tmp, "restore the exact staged manifest from the journal candidate")
+		}
+		if e = ops.rename(root, tmp, root, ManifestFile); e != nil {
+			return e
+		}
+		if e = ops.sync(root); e != nil {
+			return e
+		}
+	}
+	for _, p := range j.Cleanup {
+		if e = ops.unlinkat(root, p, 0); e != nil && !errors.Is(e, unix.ENOENT) {
+			return e
+		}
+	}
+	if e = ops.sync(root); e != nil {
+		return e
+	}
+	if e = ops.unlinkat(root, journalFile, 0); e != nil {
+		return e
+	}
+	return ops.sync(root)
 }
 
 // MigrateManifest upgrades the explicit legacy v0 root-file format atomically.
 // The v0 manifest uses {version,entries:[{file,parents,nonlinear}],digest}; its
 // digest is sha256 over the canonical object with an empty digest field.
 func MigrateManifest(dir, from string) (Manifest, error) {
+	return MigrateManifestWithOps(dir, from, Ops{})
+}
+func MigrateManifestWithOps(dir, from string, ops Ops) (Manifest, error) {
 	if from == ManifestVersion {
 		return Verify(dir)
 	}
 	if from != LegacyVersion {
 		return Manifest{}, conflict("unsupported_manifest_migration", from, "only explicit supported migrations may change manifest versions")
 	}
-	root, e := openRoot(dir)
+	root, e := openRootWithOps(dir, ops)
 	if e != nil {
 		return Manifest{}, e
 	}
-	defer unix.Close(root)
-	lock, e := openLock(root, true)
+	defer ops.close(root)
+	lock, e := openLockWithOps(root, true, ops)
 	if e != nil {
 		return Manifest{}, e
 	}
-	defer closeLock(lock)
+	defer closeLockWithOps(lock, ops)
+	if _, je := readAt(root, journalFile, maxManifest); je == nil {
+		if e = recoverLockedWithOps(root, ops); e != nil {
+			return Manifest{}, e
+		}
+		s, e := snapshotAt(root)
+		if e != nil {
+			return Manifest{}, e
+		}
+		return s.Manifest, nil
+	} else if !errors.Is(je, unix.ENOENT) {
+		return Manifest{}, je
+	}
+	if _, _, me := loadAt(root); me == nil {
+		s, e := snapshotAt(root)
+		if e != nil {
+			return Manifest{}, e
+		}
+		return s.Manifest, nil
+	}
 	raw, e := readAt(root, ManifestFile, maxManifest)
 	if e != nil {
 		return Manifest{}, e
 	}
-	type le struct {
-		File      string   `json:"file"`
-		Parents   []string `json:"parents,omitempty"`
-		NonLinear bool     `json:"nonlinear,omitempty"`
-	}
-	type lm struct {
-		Version string `json:"version"`
-		Entries []le   `json:"entries"`
-		Digest  string `json:"digest"`
-	}
-	if e = rejectDuplicates(raw); e != nil {
+	old, e := parseLegacyManifest(raw)
+	if e != nil {
 		return Manifest{}, e
-	}
-	var old lm
-	d := json.NewDecoder(bytes.NewReader(raw))
-	d.DisallowUnknownFields()
-	if d.Decode(&old) != nil || old.Version != LegacyVersion || !bytes.Equal(raw, canonical(old)) {
-		return Manifest{}, ErrInvalid
-	}
-	oc := old
-	oc.Digest = ""
-	if digest("manifest-v0", canonical(oc)) != old.Digest {
-		return Manifest{}, conflict("manifest_digest", ManifestFile, "restore the legacy manifest")
 	}
 	files := make([]File, len(old.Entries))
 	for i, x := range old.Entries {
@@ -1022,21 +1365,15 @@ func MigrateManifest(dir, from string) (Manifest, error) {
 	}
 	// Preserve an immutable fixture before publishing; the active v0 manifest
 	// remains continuously readable until the single v1 rename.
-	if e = ensureFileAt(root, ManifestFile+".v0", raw, 0600, Ops{}); e != nil {
+	if e = ensureFileAt(root, ManifestFile+".v0", raw, 0600, ops); e != nil {
 		return Manifest{}, e
 	}
-	man, e := updateLocked(root, dir, UpdateRequest{Files: files}, Ops{}, true)
+	cleanup := make([]string, len(old.Entries))
+	for i := range old.Entries {
+		cleanup[i] = old.Entries[i].File
+	}
+	man, e := updateLocked(root, dir, UpdateRequest{Files: files, ExpectedManifestDigest: old.Digest}, ops, true, cleanup)
 	if e != nil {
-		return Manifest{}, e
-	}
-	// Readers take the same lock, so legacy root files disappear as part of the
-	// same logical publication and cannot be mistaken for a mixed generation.
-	for _, x := range old.Entries {
-		if e = unix.Unlinkat(root, x.File, 0); e != nil {
-			return Manifest{}, e
-		}
-	}
-	if e = unix.Fsync(root); e != nil {
 		return Manifest{}, e
 	}
 	return man, nil

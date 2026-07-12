@@ -37,9 +37,13 @@ files must be owner-controlled; linked, writable-by-others, non-regular, and
 oversized inputs are rejected.
 
 An update writes and synchronizes every migration, the generation directory,
-the generation parent, a canonical journal, and a temporary manifest. The
-manifest rename occurs last and its directory is synchronized before the
-journal is retired. `Recover` removes only a journal that refers to the already
-published manifest. It never guesses at or deletes an unpublished generation.
-`MigrateManifest` provides an explicit, checked `v0` to `v1` conversion while
-retaining the canonical legacy manifest as `.autosql-manifest.json.v0`.
+the generation parent, and the candidate manifest before writing its canonical
+authorization journal. The manifest rename occurs last and its directory is
+synchronized before the journal is retired. The journal contains the exact
+candidate, compare-and-swap precondition, and any legacy cleanup. `Recover` can
+therefore finish that exact unpublished transition, or finish cleanup after a
+published transition, without guessing or deleting a generation. A retry must
+present the same candidate and precondition; unrelated work cannot adopt a
+pending journal. `MigrateManifest` uses the same crash-recoverable transaction
+for its checked `v0` to `v1` conversion while retaining the canonical legacy
+manifest as `.autosql-manifest.json.v0`.

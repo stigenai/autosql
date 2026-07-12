@@ -5,10 +5,12 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -190,6 +192,57 @@ func TestGraphValidationAndChainBinding(t *testing.T) {
 	if m.Entries[2].ChainDigest == m2.Entries[2].ChainDigest {
 		t.Fatal("ancestor tamper absent from chain")
 	}
+	merge := append([]File(nil), linear...)
+	merge[2].Parents = []string{"2.0.0", "1.0.0"}
+	merge[2].NonLinear = true
+	a, e := build(merge)
+	if e != nil {
+		t.Fatal(e)
+	}
+	merge[2].Parents = []string{"1.0.0", "2.0.0"}
+	b, e := build(merge)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if !bytes.Equal(canonical(a), canonical(b)) {
+		t.Fatal("parent input order changed canonical history")
+	}
+}
+
+func TestStrictManifestRejectsStructurallyRehashedTamper(t *testing.T) {
+	m, e := build(baseFiles())
+	if e != nil {
+		t.Fatal(e)
+	}
+	cases := []func(*Manifest){func(x *Manifest) { x.Generation = strings.Repeat("A", 64) }, func(x *Manifest) { x.Entries[0].SQLDigest = "sha256:" + strings.Repeat("0", 64) }, func(x *Manifest) { x.Entries[0].Statements[0].Ordinal = 2 }, func(x *Manifest) { x.Entries[1].Parents = []string{"1.0.0", "1.0.0"} }, func(x *Manifest) { x.Entries[0], x.Entries[1] = x.Entries[1], x.Entries[0] }}
+	for i, mut := range cases {
+		x := m
+		x.Entries = append([]Migration(nil), m.Entries...)
+		mut(&x)
+		c := x
+		c.Digest = ""
+		x.Digest = digest("manifest", canonical(c))
+		if _, e := strictManifest(canonical(x)); e == nil {
+			t.Fatalf("structural tamper %d accepted", i)
+		}
+	}
+}
+
+func TestUpdateRejectsTamperedCurrentBeforeChangedCandidate(t *testing.T) {
+	d := trustedDir(t)
+	files := baseFiles()
+	m, e := Update(d, UpdateRequest{Files: files})
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e = os.WriteFile(filepath.Join(d, genDir, m.Generation, files[0].Name), []byte("SELECT 404"), 0600); e != nil {
+		t.Fatal(e)
+	}
+	next := append([]File(nil), files...)
+	next = append(next, File{Name: "V2__next.sql", SQL: []byte("SELECT 2")})
+	if _, e = Update(d, UpdateRequest{Files: next, ExpectedManifestDigest: m.Digest}); e == nil {
+		t.Fatal("changed candidate concealed current tamper")
+	}
 }
 
 func TestDirectiveValidationAndDigestBoundaries(t *testing.T) {
@@ -327,10 +380,12 @@ func TestCheckedWriteAndFsyncFailuresNeverExposeMixedSnapshot(t *testing.T) {
 			next := baseFiles()
 			next = append(next, File{Name: "V2__next.sql", SQL: []byte("SELECT 3;")})
 			calls := 0
+			hit := false
 			boom := errors.New("injected")
 			ops := Ops{Write: func(fd int, p []byte) (int, error) {
 				calls++
 				if calls == fail {
+					hit = true
 					return 0, boom
 				}
 				if len(p) > 1 {
@@ -340,23 +395,34 @@ func TestCheckedWriteAndFsyncFailuresNeverExposeMixedSnapshot(t *testing.T) {
 			}, Fsync: func(fd int) error {
 				calls++
 				if calls == fail {
+					hit = true
 					return boom
 				}
 				return unix.Fsync(fd)
 			}, Renameat: func(a int, ap string, b int, bp string) error {
 				calls++
 				if calls == fail {
+					hit = true
 					return boom
 				}
 				return unix.Renameat(a, ap, b, bp)
 			}}
 			_, _ = UpdateWithOps(d, UpdateRequest{Files: next, ExpectedManifestDigest: old.Digest}, ops)
+			if !hit {
+				t.Fatalf("fault boundary %d was not reached", fail)
+			}
 			s, e := LoadSnapshot(d)
 			if e != nil {
 				t.Fatalf("mixed/unreadable state after boundary %d: %v", fail, e)
 			}
 			if s.Manifest.Digest != old.Digest && len(s.Manifest.Entries) != 3 {
 				t.Fatalf("neither old nor new: %+v", s.Manifest)
+			}
+			if _, e = Update(d, UpdateRequest{Files: next, ExpectedManifestDigest: old.Digest}); e != nil {
+				t.Fatalf("authorized resume %d: %v", fail, e)
+			}
+			if s, e = LoadSnapshot(d); e != nil || len(s.Manifest.Entries) != 3 {
+				t.Fatalf("resume not new: %v %+v", e, s.Manifest)
 			}
 		})
 	}
@@ -375,16 +441,40 @@ func TestRecoveryPreservesUnpublishedGeneration(t *testing.T) {
 	if e == nil {
 		t.Fatal("fault did not fire")
 	}
-	if e = Recover(d); e == nil {
-		t.Fatal("unpublished transaction silently discarded")
+	if e = Recover(d); e != nil {
+		t.Fatal(e)
 	}
 	s, e := LoadSnapshot(d)
-	if e != nil || s.Manifest.Digest != old.Digest {
-		t.Fatalf("old snapshot lost: %v %+v", e, s.Manifest)
+	if e != nil || len(s.Manifest.Entries) != 3 {
+		t.Fatalf("authorized candidate not recovered: %v %+v", e, s.Manifest)
 	}
 }
 
 func TestV0ToV1AtomicMigration(t *testing.T) {
+	d := legacyFixture(t)
+	m, e := MigrateManifest(d, LegacyVersion)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if m.Version != ManifestVersion {
+		t.Fatal("not upgraded")
+	}
+	if _, e = Verify(d); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = os.Stat(filepath.Join(d, "V1__legacy.sql")); !os.IsNotExist(e) {
+		t.Fatal("legacy root SQL was not atomically retired")
+	}
+	if _, e = os.Stat(filepath.Join(d, ManifestFile+".v0")); e != nil {
+		t.Fatal("legacy fixture not retained")
+	}
+	if again, e := MigrateManifest(d, LegacyVersion); e != nil || again.Digest != m.Digest {
+		t.Fatalf("idempotent reentry: %v", e)
+	}
+}
+
+func legacyFixture(t *testing.T) string {
+	t.Helper()
 	d := trustedDir(t)
 	sql := []byte("SELECT 1;\n")
 	if e := os.WriteFile(filepath.Join(d, "V1__legacy.sql"), sql, 0600); e != nil {
@@ -407,21 +497,58 @@ func TestV0ToV1AtomicMigration(t *testing.T) {
 	if e := os.WriteFile(filepath.Join(d, ManifestFile), canonical(old), 0600); e != nil {
 		t.Fatal(e)
 	}
-	m, e := MigrateManifest(d, LegacyVersion)
-	if e != nil {
-		t.Fatal(e)
+	return d
+}
+
+func TestV0MigrationCrashBoundariesRecoverAndReenter(t *testing.T) {
+	cases := []struct {
+		name string
+		ops  func(*bool) Ops
+	}{
+		{"publish", func(hit *bool) Ops {
+			return Ops{Renameat: func(a int, ap string, b int, bp string) error { *hit = true; return errors.New("publish") }}
+		}},
+		{"cleanup", func(hit *bool) Ops {
+			n := 0
+			return Ops{Unlinkat: func(fd int, p string, f int) error {
+				n++
+				if strings.HasSuffix(p, ".sql") {
+					*hit = true
+					return errors.New("cleanup")
+				}
+				return unix.Unlinkat(fd, p, f)
+			}}
+		}},
+		{"fsync", func(hit *bool) Ops {
+			n := 0
+			return Ops{Fsync: func(fd int) error {
+				n++
+				if n == 7 {
+					*hit = true
+					return errors.New("fsync")
+				}
+				return unix.Fsync(fd)
+			}}
+		}},
 	}
-	if m.Version != ManifestVersion {
-		t.Fatal("not upgraded")
-	}
-	if _, e = Verify(d); e != nil {
-		t.Fatal(e)
-	}
-	if _, e = os.Stat(filepath.Join(d, "V1__legacy.sql")); !os.IsNotExist(e) {
-		t.Fatal("legacy root SQL was not atomically retired")
-	}
-	if _, e = os.Stat(filepath.Join(d, ManifestFile+".v0")); e != nil {
-		t.Fatal("legacy fixture not retained")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := legacyFixture(t)
+			hit := false
+			_, e := MigrateManifestWithOps(d, LegacyVersion, tc.ops(&hit))
+			if e == nil || !hit {
+				t.Fatalf("fault not reached: %v", e)
+			}
+			if _, e = MigrateManifest(d, LegacyVersion); e != nil {
+				t.Fatalf("reentry: %v", e)
+			}
+			if _, e = LoadSnapshot(d); e != nil {
+				t.Fatal(e)
+			}
+			if _, e = os.Stat(filepath.Join(d, "V1__legacy.sql")); !os.IsNotExist(e) {
+				t.Fatal("legacy cleanup incomplete")
+			}
+		})
 	}
 }
 
@@ -433,5 +560,221 @@ func TestConflictIsTyped(t *testing.T) {
 	var c *ConflictError
 	if errors.As(e, &c) && c.Guidance == "" {
 		t.Fatal("missing guidance")
+	}
+}
+
+func TestMigrationSubprocessHelper(t *testing.T) {
+	mode := os.Getenv("AUTOSQL_MIGRATE_HELPER")
+	if mode == "" {
+		return
+	}
+	d := os.Getenv("AUTOSQL_MIGRATE_DIR")
+	switch mode {
+	case "writer":
+		next := baseFiles()
+		next = append(next, File{Name: "V2__winner.sql", SQL: []byte("SELECT 2")})
+		if _, e := Update(d, UpdateRequest{Files: next, ExpectedManifestDigest: os.Getenv("AUTOSQL_MIGRATE_EXPECTED")}); e != nil {
+			os.Exit(3)
+		}
+		os.Exit(0)
+	case "holder":
+		fd, e := unix.Open(filepath.Join(d, lockFile), unix.O_RDWR, 0)
+		if e != nil {
+			os.Exit(4)
+		}
+		if unix.Flock(fd, unix.LOCK_EX) != nil {
+			os.Exit(5)
+		}
+		_ = os.WriteFile(os.Getenv("AUTOSQL_MIGRATE_READY"), []byte("ready"), 0600)
+		time.Sleep(time.Minute)
+	case "reader":
+		for i := 0; i < 200; i++ {
+			s, e := LoadSnapshot(d)
+			if e != nil || (len(s.Manifest.Entries) != 2 && len(s.Manifest.Entries) != 3) {
+				os.Exit(6)
+			}
+		}
+		os.Exit(0)
+	}
+}
+
+func helperCommand(mode, dir string, extra ...string) *exec.Cmd {
+	args := []string{"-test.run=TestMigrationSubprocessHelper"}
+	c := exec.Command(os.Args[0], args...)
+	c.Env = append(os.Environ(), "AUTOSQL_MIGRATE_HELPER="+mode, "AUTOSQL_MIGRATE_DIR="+dir)
+	c.Env = append(c.Env, extra...)
+	return c
+}
+
+func TestSubprocessCASWinnerLoser(t *testing.T) {
+	d := trustedDir(t)
+	m, e := Update(d, UpdateRequest{Files: baseFiles()})
+	if e != nil {
+		t.Fatal(e)
+	}
+	env := "AUTOSQL_MIGRATE_EXPECTED=" + m.Digest
+	a, b := helperCommand("writer", d, env), helperCommand("writer", d, env)
+	if e = a.Start(); e != nil {
+		t.Fatal(e)
+	}
+	if e = b.Start(); e != nil {
+		t.Fatal(e)
+	}
+	ea, eb := a.Wait(), b.Wait()
+	wins := 0
+	if ea == nil {
+		wins++
+	}
+	if eb == nil {
+		wins++
+	}
+	if wins != 1 {
+		t.Fatalf("wins=%d errors=%v,%v", wins, ea, eb)
+	}
+	if _, e = Verify(d); e != nil {
+		t.Fatal(e)
+	}
+}
+
+func TestKilledLockHolderReleasesKernelLock(t *testing.T) {
+	d := trustedDir(t)
+	m, e := Update(d, UpdateRequest{Files: baseFiles()})
+	if e != nil {
+		t.Fatal(e)
+	}
+	ready := filepath.Join(t.TempDir(), "ready")
+	c := helperCommand("holder", d, "AUTOSQL_MIGRATE_READY="+ready)
+	if e = c.Start(); e != nil {
+		t.Fatal(e)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, e = os.Stat(ready); e == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = c.Process.Kill()
+			t.Fatal("holder not ready")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if e = c.Process.Kill(); e != nil {
+		t.Fatal(e)
+	}
+	_ = c.Wait()
+	next := baseFiles()
+	next = append(next, File{Name: "V2__after_kill.sql", SQL: []byte("SELECT 2")})
+	if _, e = Update(d, UpdateRequest{Files: next, ExpectedManifestDigest: m.Digest}); e != nil {
+		t.Fatal(e)
+	}
+}
+
+func TestSubprocessSharedReadersSeeOnlyOldOrNew(t *testing.T) {
+	d := trustedDir(t)
+	m, e := Update(d, UpdateRequest{Files: baseFiles()})
+	if e != nil {
+		t.Fatal(e)
+	}
+	readers := make([]*exec.Cmd, 4)
+	for i := range readers {
+		readers[i] = helperCommand("reader", d)
+		if e = readers[i].Start(); e != nil {
+			t.Fatal(e)
+		}
+	}
+	next := baseFiles()
+	next = append(next, File{Name: "V2__new.sql", SQL: []byte("SELECT 2")})
+	if _, e = Update(d, UpdateRequest{Files: next, ExpectedManifestDigest: m.Digest}); e != nil {
+		t.Fatal(e)
+	}
+	for _, c := range readers {
+		if e = c.Wait(); e != nil {
+			t.Fatal(e)
+		}
+	}
+}
+
+func TestEveryInjectedStorageOperationIsReachedAndRecoverable(t *testing.T) {
+	boom := errors.New("injected")
+	makers := map[string]func(*bool) Ops{
+		"open": func(h *bool) Ops {
+			return Ops{Open: func(string, int, uint32) (int, error) { *h = true; return -1, boom }}
+		},
+		"openat": func(h *bool) Ops {
+			return Ops{Openat: func(int, string, int, uint32) (int, error) { *h = true; return -1, boom }}
+		},
+		"close": func(h *bool) Ops {
+			return Ops{Close: func(fd int) error {
+				e := unix.Close(fd)
+				if !*h {
+					*h = true
+					return boom
+				}
+				return e
+			}}
+		},
+		"mkdir":  func(h *bool) Ops { return Ops{Mkdirat: func(int, string, uint32) error { *h = true; return boom }} },
+		"unlink": func(h *bool) Ops { return Ops{Unlinkat: func(int, string, int) error { *h = true; return boom }} },
+		"lock":   func(h *bool) Ops { return Ops{Flock: func(int, int) error { *h = true; return boom }} },
+		"write":  func(h *bool) Ops { return Ops{Write: func(int, []byte) (int, error) { *h = true; return 0, boom }} },
+		"fsync":  func(h *bool) Ops { return Ops{Fsync: func(int) error { *h = true; return boom }} },
+		"rename": func(h *bool) Ops {
+			return Ops{Renameat: func(int, string, int, string) error { *h = true; return boom }}
+		},
+	}
+	for name, mk := range makers {
+		t.Run(name, func(t *testing.T) {
+			d := trustedDir(t)
+			old, e := Update(d, UpdateRequest{Files: baseFiles()})
+			if e != nil {
+				t.Fatal(e)
+			}
+			next := baseFiles()
+			next = append(next, File{Name: "V2__next.sql", SQL: []byte("SELECT 2")})
+			hit := false
+			_, _ = UpdateWithOps(d, UpdateRequest{Files: next, ExpectedManifestDigest: old.Digest}, mk(&hit))
+			if !hit {
+				t.Fatal("fault not reached")
+			}
+			_ = Recover(d)
+			s, e := LoadSnapshot(d)
+			if e != nil {
+				t.Fatal(e)
+			}
+			if len(s.Manifest.Entries) == 2 {
+				if _, e = Update(d, UpdateRequest{Files: next, ExpectedManifestDigest: old.Digest}); e != nil {
+					t.Fatal(e)
+				}
+			} else if len(s.Manifest.Entries) != 3 {
+				t.Fatalf("mixed entries=%d", len(s.Manifest.Entries))
+			}
+			if _, e = Verify(d); e != nil {
+				t.Fatal(e)
+			}
+		})
+	}
+}
+
+func TestEINTRWriteAndFsyncAreRetried(t *testing.T) {
+	d := trustedDir(t)
+	wc, sc := 0, 0
+	ops := Ops{Write: func(fd int, p []byte) (int, error) {
+		wc++
+		if wc == 1 {
+			return 0, unix.EINTR
+		}
+		return unix.Write(fd, p)
+	}, Fsync: func(fd int) error {
+		sc++
+		if sc == 1 {
+			return unix.EINTR
+		}
+		return unix.Fsync(fd)
+	}}
+	if _, e := UpdateWithOps(d, UpdateRequest{Files: baseFiles()}, ops); e != nil {
+		t.Fatal(e)
+	}
+	if wc < 2 || sc < 2 {
+		t.Fatal("EINTR not retried")
 	}
 }
