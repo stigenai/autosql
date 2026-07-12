@@ -63,8 +63,52 @@ func (e *snapshotRollbackError) Error() string {
 func (e *snapshotRollbackError) Unwrap() error { return e.cause }
 
 func inspectTransactions(ctx context.Context, req plugin.InspectRequest, begin snapshotBegin, run snapshotInspect) (schema.Document, error) {
+	return inspectTransactionsWithRetry(ctx, req, begin, run, catalogRetryPolicy{
+		maxAttempts: 12,
+		maxBackoff:  2 * time.Second,
+		delay: func(retry int) time.Duration {
+			d := 5 * time.Millisecond * time.Duration(1<<min(retry, 6))
+			return min(d, 250*time.Millisecond)
+		},
+		sleep: sleepCatalogRetry,
+	})
+}
+
+type catalogRetryPolicy struct {
+	maxAttempts int
+	maxBackoff  time.Duration
+	delay       func(int) time.Duration
+	sleep       func(context.Context, time.Duration) error
+}
+
+type catalogRetryExhaustedError struct {
+	attempts int
+	cause    error
+}
+
+func (e *catalogRetryExhaustedError) Error() string {
+	return fmt.Sprintf("PostgreSQL catalog remained unstable after %d inspection attempts: %v", e.attempts, e.cause)
+}
+func (e *catalogRetryExhaustedError) Unwrap() error { return e.cause }
+
+func sleepCatalogRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func inspectTransactionsWithRetry(ctx context.Context, req plugin.InspectRequest, begin snapshotBegin, run snapshotInspect, retry catalogRetryPolicy) (schema.Document, error) {
+	if retry.maxAttempts < 1 || retry.maxBackoff < 0 || retry.delay == nil || retry.sleep == nil {
+		return schema.Document{}, errors.New("inspect PostgreSQL database: invalid catalog retry policy")
+	}
 	var last error
-	for attempt := 0; attempt < 5; attempt++ {
+	var backoff time.Duration
+	for attempt := 0; attempt < retry.maxAttempts; attempt++ {
 		queryer, rollback, err := begin(ctx)
 		if err != nil {
 			return schema.Document{}, err
@@ -82,18 +126,22 @@ func inspectTransactions(ctx context.Context, req plugin.InspectRequest, begin s
 			return doc, nil
 		}
 		last = inspectErr
-		if !transientCatalogOID(inspectErr) || attempt == 4 {
+		if !transientCatalogOID(inspectErr) {
 			return schema.Document{}, inspectErr
 		}
-		timer := time.NewTimer(time.Duration(attempt+1) * 5 * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return schema.Document{}, ctx.Err()
-		case <-timer.C:
+		if attempt+1 == retry.maxAttempts {
+			return schema.Document{}, &catalogRetryExhaustedError{attempts: attempt + 1, cause: inspectErr}
+		}
+		delay := retry.delay(attempt)
+		if delay < 0 || backoff+delay > retry.maxBackoff {
+			return schema.Document{}, &catalogRetryExhaustedError{attempts: attempt + 1, cause: inspectErr}
+		}
+		backoff += delay
+		if err = retry.sleep(ctx, delay); err != nil {
+			return schema.Document{}, err
 		}
 	}
-	return schema.Document{}, last
+	return schema.Document{}, &catalogRetryExhaustedError{attempts: retry.maxAttempts, cause: last}
 }
 
 func transientCatalogOID(err error) bool {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"autosql/pkg/plugin"
 	"autosql/pkg/schema"
@@ -113,9 +114,17 @@ func TestInspectTransactionsPersistentCatalogDisappearanceExhaustsRetries(t *tes
 		inspections++
 		return schema.Document{}, classify("indexes", "catalog metadata", "postgres://user:secret@db/app", disappeared)
 	}
-	_, err := inspectTransactions(context.Background(), plugin.InspectRequest{}, begin, run)
+	var delays []time.Duration
+	retry := catalogRetryPolicy{maxAttempts: 5, maxBackoff: time.Second, delay: func(attempt int) time.Duration {
+		return time.Duration(attempt+1) * time.Millisecond
+	}, sleep: func(_ context.Context, delay time.Duration) error {
+		delays = append(delays, delay)
+		return nil
+	}}
+	_, err := inspectTransactionsWithRetry(context.Background(), plugin.InspectRequest{}, begin, run, retry)
 	var got *catalogDisappearanceError
-	if !errors.As(err, &got) || !transientCatalogOID(err) || begins != 5 || inspections != 5 {
+	var exhausted *catalogRetryExhaustedError
+	if !errors.As(err, &got) || !errors.As(err, &exhausted) || !transientCatalogOID(err) || begins != 5 || inspections != 5 || len(delays) != 4 {
 		t.Fatalf("persistent disappearance err=%v begins=%d inspections=%d", err, begins, inspections)
 	}
 	if strings.Contains(err.Error(), "secret") || !strings.Contains(err.Error(), "OID 42") {
