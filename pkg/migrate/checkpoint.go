@@ -127,10 +127,10 @@ func (s GenerateService) CreateCheckpoint(ctx context.Context, r CheckpointReque
 	}
 	defer workspace.Close()
 	schemas, err := checkpointSchemas(ctx, workspace.URL)
-	if err != nil || len(schemas) == 0 {
+	if err != nil {
 		return out, generationFailure("inspect", ErrGenerateStage)
 	}
-	inspected, err := postgres.InspectURL(ctx, workspace.URL, postgres.Options{Schemas: schemas})
+	inspected, err := inspectCheckpointDocument(ctx, workspace.URL, schemas)
 	if err != nil {
 		return out, generationFailure("inspect", ErrGenerateStage)
 	}
@@ -204,7 +204,11 @@ func (s GenerateService) CreateCheckpoint(ctx context.Context, r CheckpointReque
 	if err != nil || len(violations) != 0 {
 		return out, generationFailure("policy", ErrGenerateStage)
 	}
-	bindings, err := guardrail.BuildStatementBindings(p.Changes, si.Statements)
+	replayBindings := map[string][]string(nil)
+	if len(p.Replay) > 0 {
+		replayBindings = map[string][]string{plan.ReplayChangeID: append([]string(nil), p.Replay...)}
+	}
+	bindings, err := guardrail.BuildStatementBindingsWithReplay(p.Changes, si.Statements, replayBindings)
 	if err != nil {
 		return out, generationFailure("guardrail_bindings", ErrGenerateStage)
 	}
@@ -213,7 +217,7 @@ func (s GenerateService) CreateCheckpoint(ctx context.Context, r CheckpointReque
 		return out, generationFailure("guardrail_database", ErrGenerateStage)
 	}
 	defer guardWorkspace.Close()
-	in := guardrail.Input{Changes: p.Changes, Safety: si, Policy: r.Policy, PolicyIdentity: r.PolicyIdentity, SchemaResources: schemaPolicyResources(doc), MigrationResources: migrationPolicyResources(p), Precheck: checks, Approval: approval.Request{Plan: approval.Plan{Environment: r.Environment, Author: r.Author, ExpiresAt: r.ExpiresAt}, Approvals: append([]approval.Approval(nil), r.Approvals...), RequestedBy: r.Requester}, StatementBindings: bindings, Database: replayDB{url: guardWorkspace.URL}}
+	in := guardrail.Input{Changes: p.Changes, Safety: si, Policy: r.Policy, PolicyIdentity: r.PolicyIdentity, SchemaResources: schemaPolicyResources(doc), MigrationResources: migrationPolicyResources(p), Precheck: checks, Approval: approval.Request{Plan: approval.Plan{Environment: r.Environment, Author: r.Author, ExpiresAt: r.ExpiresAt}, Approvals: append([]approval.Approval(nil), r.Approvals...), RequestedBy: r.Requester}, StatementBindings: bindings, ApprovedReplay: replayBindings, Database: replayDB{url: guardWorkspace.URL}}
 	if err = s.checkpoint(r.GenerateRequest, "guardrail"); err != nil {
 		return out, err
 	}
@@ -306,6 +310,24 @@ func checkpointSchemas(ctx context.Context, databaseURL string) ([]string, error
 		out = append(out, n)
 	}
 	return out, rows.Err()
+}
+
+// inspectCheckpointDocument preserves the distinction between an unrestricted
+// inspection and an intentionally empty user-schema selection. An empty slice
+// passed to the PostgreSQL inspector means "all schemas", which would pull in
+// built-in/public metadata instead of the canonical empty user schema.
+func inspectCheckpointDocument(ctx context.Context, databaseURL string, schemas []string) (schema.Document, error) {
+	if len(schemas) > 0 {
+		return postgres.InspectURL(ctx, databaseURL, postgres.Options{Schemas: schemas})
+	}
+	actual, err := checkpointSchemas(ctx, databaseURL)
+	if err != nil {
+		return schema.Document{}, err
+	}
+	if len(actual) != 0 {
+		return schema.Document{}, fmt.Errorf("%w: unexpected user schema", ErrInvalid)
+	}
+	return schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{}}, Annotations: map[string]string{"dialect": "postgresql"}}, nil
 }
 
 func validateCheckpointData(s Snapshot, r CheckpointRequest) error {
@@ -460,7 +482,7 @@ func simulateCheckpoint(ctx context.Context, r GenerateRequest, want schema.Docu
 		}
 	}
 	sort.Strings(schemas)
-	doc, err := postgres.InspectURL(ctx, du.String(), postgres.Options{Schemas: schemas})
+	doc, err := inspectCheckpointDocument(ctx, du.String(), schemas)
 	if err != nil {
 		return "", err
 	}
@@ -518,7 +540,7 @@ func simulateCheckpointPlan(ctx context.Context, r GenerateRequest, want schema.
 		}
 	}
 	c.Close(context.Background())
-	doc, err := postgres.InspectURL(ctx, w.URL, postgres.Options{Schemas: schemas})
+	doc, err := inspectCheckpointDocument(ctx, w.URL, schemas)
 	if err != nil {
 		return "", "", err
 	}

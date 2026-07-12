@@ -18,6 +18,29 @@ import (
 
 type eventLog struct{ values []string }
 
+func TestApprovedReplayStatementBindingsRequireExactCoverage(t *testing.T) {
+	changes := schema.ChangeSet{Version: schema.ChangeVersion, Changes: []schema.Change{}}
+	subject := "autosql:approved-replay"
+	sql := "SELECT set_config('application_name','checkpoint',false)"
+	statements := []safety.Statement{{SQL: sql, ChangeID: subject}}
+	replay := map[string][]string{subject: {sql}}
+	bindings, err := BuildStatementBindingsWithReplay(changes, statements, replay)
+	if err != nil || len(bindings) != 1 || !strings.HasPrefix(bindings[0].ChangeHash, "sha256:") || len(bindings[0].ChangeHash) != 71 {
+		t.Fatalf("bindings=%+v err=%v", bindings, err)
+	}
+	for name, mutated := range map[string][]safety.Statement{
+		"sql":     {{SQL: sql + " ", ChangeID: subject}},
+		"subject": {{SQL: sql, ChangeID: "unknown"}},
+		"missing": {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := BuildStatementBindingsWithReplay(changes, mutated, replay); !errors.Is(err, ErrBinding) {
+				t.Fatalf("mutated replay binding accepted: %v", err)
+			}
+		})
+	}
+}
+
 func (l *eventLog) add(v string) { l.values = append(l.values, v) }
 
 var currentAnalyzerLog *eventLog

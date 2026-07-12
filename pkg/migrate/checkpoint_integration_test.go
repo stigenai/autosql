@@ -270,3 +270,65 @@ func TestCheckpointLiveLongHistoryEquivalenceCASPolicyAndFaults(t *testing.T) {
 		})
 	}
 }
+
+func TestCheckpointLiveCanonicalEmptyTerminalSchema(t *testing.T) {
+	dev, prod := checkpointLiveURLs(t)
+	for _, tc := range []struct {
+		name     string
+		files    []File
+		policy   string
+		declared []string
+	}{
+		{
+			name: "schema_only",
+			files: []File{
+				{Name: "V1__create.sql", SQL: []byte("CREATE SCHEMA checkpoint_empty;")},
+				{Name: "V2__drop.sql", SQL: []byte("DROP SCHEMA checkpoint_empty;")},
+			},
+			policy: "schema_only",
+		},
+		{
+			name: "declared_replay",
+			files: []File{
+				{Name: "V1__create.sql", SQL: []byte("CREATE SCHEMA checkpoint_empty;")},
+				{Name: "V2__approved_session_evidence.sql", SQL: []byte("SELECT set_config('application_name','checkpoint-empty',false);")},
+				{Name: "V3__drop.sql", SQL: []byte("DROP SCHEMA checkpoint_empty;")},
+			},
+			policy:   "declared_replay",
+			declared: []string{"2.0.0"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := t.TempDir()
+			if err := os.Chmod(d, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Update(d, UpdateRequest{Files: tc.files}); err != nil {
+				t.Fatal(err)
+			}
+			r := generationFixture(t, d, dev, prod)
+			r.Version = fmt.Sprint(len(tc.files) + 1)
+			r.Label = "empty_checkpoint"
+			r.Desired = schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{}}}
+			result, err := (GenerateService{}).CreateCheckpoint(context.Background(), CheckpointRequest{
+				GenerateRequest: r,
+				DataPolicy:      tc.policy,
+				DeclaredReplay:  tc.declared,
+				PolicyApproved:  len(tc.declared) > 0,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			snap, err := LoadSnapshot(d)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.SchemaFingerprint == "" || result.DataPolicy != tc.policy || len(snap.Files[result.File]) == 0 {
+				t.Fatalf("incomplete empty checkpoint result=%+v", result)
+			}
+			if _, err = VerifyCheckpoints(d); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}

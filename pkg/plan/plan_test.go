@@ -199,3 +199,36 @@ func TestDocumentAndGraphMetadataMismatchCannotProduceZeroStepPlan(t *testing.T)
 		})
 	}
 }
+
+func TestAppendReplayBindsDigestCoveredSQLWithoutSchemaChanges(t *testing.T) {
+	empty := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{}}}
+	p, err := plan.Build(context.Background(), postgres.New(), empty, empty, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err = plan.AppendReplay(p, []string{"SELECT set_config('application_name','checkpoint',false)"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Changes.Changes) != 0 || len(p.Replay) != 1 || len(p.Steps) != 1 || p.Steps[0].SQL != p.Replay[0] {
+		t.Fatalf("replay plan not exactly bound: %+v", p)
+	}
+	if err = p.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*plan.Plan){
+		"replay evidence": func(p *plan.Plan) { p.Replay[0] += " " },
+		"step sql":        func(p *plan.Plan) { p.Steps[0].SQL += " " },
+		"step binding":    func(p *plan.Plan) { p.Steps[0].ChangeID = "change:wrong" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			copy := p
+			copy.Replay = append([]string(nil), p.Replay...)
+			copy.Steps = append([]plan.Step(nil), p.Steps...)
+			mutate(&copy)
+			if !errors.Is(copy.Validate(), plan.ErrInvalidPlan) {
+				t.Fatal("tampered replay plan validated")
+			}
+		})
+	}
+}
