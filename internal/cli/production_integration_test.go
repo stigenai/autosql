@@ -34,7 +34,7 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 	pub := priv.Public().(ed25519.PublicKey)
 	dir := t.TempDir()
 	name := "autosql_prod_" + strings.ToLower(time.Now().Format("150405000000"))
-	cfg := applyConfig{DatabaseURL: "env://AUTOSQL_PROD_TEST_URL", Environment: "test", DatabaseIdentity: "prod-test", SourceRevision: "test-rev", KeyID: "test-key", PublicKey: base64.RawStdEncoding.EncodeToString(pub), Issuer: "test-issuer", Signer: "test-signer", Author: "author", Requester: "requester", ApprovalAuditPath: filepath.Join(dir, "approval.jsonl"), LifecycleAuditPath: filepath.Join(dir, "lifecycle.jsonl"), ArtifactDirectory: dir, PostgresVersion: 15, Schemas: []string{name}}
+	cfg := applyConfig{DatabaseURL: "env://AUTOSQL_PROD_TEST_URL", Environment: "test", DatabaseIdentity: "prod-test", SourceRevision: "test-rev", KeyID: "test-key", PublicKey: base64.RawStdEncoding.EncodeToString(pub), Issuer: "test-issuer", Signer: "test-signer", Author: "author", Requester: "requester", ApprovalAuditPath: filepath.Join(dir, "approval.jsonl"), LifecycleAuditPath: filepath.Join(dir, "lifecycle.jsonl"), ArtifactDirectory: dir, PostgresVersion: 15, Schemas: []string{name}, ExpectedPlanDigest: "pending", ExpectedChecksDigest: "pending", ExpectedGuardrailDigest: "pending", ExpectedApprovalIdentity: "release", KeyStatus: "active", KeyPurpose: "plan-artifact", KeyNotBefore: time.Now().UTC().Add(-time.Hour), KeyNotAfter: time.Now().UTC().Add(2 * time.Hour)}
 	raw, _ := json.Marshal(cfg)
 	configPath := filepath.Join(dir, "apply.json")
 	if err = os.WriteFile(configPath, raw, 0600); err != nil {
@@ -101,6 +101,17 @@ func TestProductionServicesVerifiedArtifactApplyAndNoOp(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err = a.Sign(cfg.KeyID, priv); err != nil {
+		t.Fatal(err)
+	}
+	cfg.ExpectedPlanDigest = p.Digest
+	cfg.ExpectedChecksDigest = checks.Digest
+	cfg.ExpectedGuardrailDigest = bundle
+	raw, _ = json.Marshal(cfg)
+	if err = os.WriteFile(configPath, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	services, err = ProductionServices()
+	if err != nil {
 		t.Fatal(err)
 	}
 	artifactRaw, err := a.MarshalCanonical()

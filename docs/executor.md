@@ -27,3 +27,7 @@ author/requester identities, PostgreSQL version, managed schemas, durable
 approval/lifecycle audit paths, and an artifact directory. Artifact mode verifies
 the supplied file. Digest mode resolves `<artifact_directory>/<digest>.json` and
 enters the identical signature, binding, guardrail, lock, and executor boundary.
+The configuration is also the trusted release manifest: it must provide the
+expected plan, checks, guardrail, and approval-identity bindings plus immutable
+key status, validity interval, issuer, and purpose. These values are never
+derived from the artifact and are revalidated after the execution lock is held.

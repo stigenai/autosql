@@ -22,11 +22,12 @@ const (
 )
 
 type Error struct {
-	Kind    string
-	Message string
-	Code    ExitCode
-	Cause   error
-	Status  string
+	Kind                                       string
+	Message                                    string
+	Code                                       ExitCode
+	Cause                                      error
+	Status                                     string
+	PendingStep, ExecutionID, RecoveryGuidance string
 }
 
 func (e *Error) Error() string { return e.Message }

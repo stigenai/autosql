@@ -13,6 +13,7 @@ import (
 
 	"autosql/pkg/plugin"
 	"autosql/pkg/schema"
+	"github.com/jackc/pgx/v5"
 )
 
 const version = "0.1.0"
@@ -49,6 +50,16 @@ func InspectURL(ctx context.Context, url string, opts Options) (schema.Document,
 		request.Options["grants"] = "true"
 	}
 	return inspect(ctx, request)
+}
+
+// InspectConn inspects through the supplied session, preserving session locks.
+func InspectConn(ctx context.Context, conn *pgx.Conn, opts Options) (schema.Document, error) {
+	request := plugin.InspectRequest{Schemas: append([]string(nil), opts.Schemas...), Options: map[string]string{"include": strings.Join(opts.Include, ","), "exclude": strings.Join(opts.Exclude, ",")}}
+	if opts.Advanced {
+		request.Options["roles"] = "true"
+		request.Options["grants"] = "true"
+	}
+	return inspectConn(ctx, conn, request)
 }
 
 func (*Driver) Info() plugin.Info {

@@ -164,6 +164,17 @@ func TestApplySanitizesSuccessAndRejectsConflictingModes(t *testing.T) {
 		t.Fatalf("code=%d calls=%d", code, a.calls)
 	}
 }
+
+func TestApplyUncertainRecoveryFieldsSurviveFailureEnvelope(t *testing.T) {
+	r, _ := workflowFixture(t)
+	a := &fakeApply{result: ApplyResult{Status: "uncertain", PendingStep: "step-2", ExecutionID: "exec-1", RecoveryGuidance: "reconcile before retry"}, err: errors.New("unknown outcome")}
+	code, out, _ := invoke(t, []string{"apply", "--from", "from", "--to", "to", "--approve-digest", r.p.Digest, "--json"}, "", false, Services{ReadPlan: r, Apply: a})
+	for _, want := range []string{`"status":"uncertain"`, `"pending_step":"step-2"`, `"execution_id":"exec-1"`, `"recovery_guidance":"reconcile before retry"`} {
+		if code != int(ExitMigration) || !strings.Contains(out, want) {
+			t.Fatalf("code=%d out=%s", code, out)
+		}
+	}
+}
 func TestNoOpMaxLimitAndArtifactOnly(t *testing.T) {
 	r, p := workflowFixture(t)
 	p.Changes.Changes = append(p.Changes.Changes, p.Changes.Changes[0])

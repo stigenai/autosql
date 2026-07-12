@@ -31,6 +31,10 @@ func inspect(ctx context.Context, req plugin.InspectRequest) (schema.Document, e
 		return schema.Document{}, classify("database", "CONNECT", req.URL, err)
 	}
 	defer conn.Close(context.Background())
+	return inspectConn(ctx, conn, req)
+}
+
+func inspectConn(ctx context.Context, conn *pgx.Conn, req plugin.InspectRequest) (schema.Document, error) {
 	i := &inspector{conn: conn, byOID: map[uint32]string{}, schemas: map[string]string{}}
 	steps := []struct {
 		resource, privilege string

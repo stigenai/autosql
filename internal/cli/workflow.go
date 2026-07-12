@@ -346,10 +346,10 @@ func runApply(ctx context.Context, args []string, o output, s Services, tty bool
 
 func applyFailure(result ApplyResult, cause error) error {
 	status := ""
-	if result.Status == "partial_failure" {
+	if result.Status == "partial_failure" || result.Status == "uncertain" {
 		status = result.Status
 	}
-	return &Error{Kind: "migration", Message: "apply failed", Code: ExitMigration, Status: status, Cause: cause}
+	return &Error{Kind: "migration", Message: "apply failed", Code: ExitMigration, Status: status, Cause: cause, PendingStep: result.PendingStep, ExecutionID: result.ExecutionID, RecoveryGuidance: result.RecoveryGuidance}
 }
 func schemaSQL(doc schema.Document) (string, error) {
 	statements, e := postgres.RenderDocument(context.Background(), doc, nil)

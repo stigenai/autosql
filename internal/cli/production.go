@@ -29,6 +29,8 @@ type applyConfig struct {
 	DatabaseURL, Environment, DatabaseIdentity, SourceRevision, KeyID, PublicKey, Issuer, Signer, Author, Requester, ApprovalAuditPath, LifecycleAuditPath, ArtifactDirectory string
 	PostgresVersion                                                                                                                                                           int
 	Schemas                                                                                                                                                                   []string
+	ExpectedPlanDigest, ExpectedChecksDigest, ExpectedGuardrailDigest, ExpectedApprovalIdentity, KeyStatus, KeyPurpose                                                        string
+	KeyNotBefore, KeyNotAfter                                                                                                                                                 time.Time
 }
 type staticAuthority struct{ actors map[string]approval.Identity }
 
@@ -76,8 +78,10 @@ func ProductionServices() (Services, error) {
 	ap := approval.Policy{Environments: map[string]approval.EnvironmentPolicy{c.Environment: {Allowed: true}}}
 	g := guardrail.Guardrail{Config: guardrail.Config{Environment: c.Environment, FailOn: safety.SeverityError, Risk: guardrail.RiskConfig{Baseline: approval.RiskLow}}, Safety: safety.Runner{Analyzers: safety.Builtins()}, Policy: policy.Evaluator{}, Approval: approval.Gate{Policy: ap, Authority: authority, Audit: &approval.Chain{Sink: &approval.FileSink{Path: c.ApprovalAuditPath}}}}
 	policyFor := func(a artifact.Artifact) (artifact.VerifyPolicy, error) {
-		now := time.Now().UTC()
-		return artifact.VerifyPolicy{Now: time.Now, Expected: artifact.ExpectedBindings{PlanDigest: a.Plan.Digest, ChecksDigest: a.Checks.Digest, GuardrailDigest: a.GuardrailDigest, SourceRevision: c.SourceRevision, Environment: c.Environment, DatabaseIdentity: c.DatabaseIdentity, ApprovalIdentity: a.Approval.Identity}, Keys: map[string]artifact.KeyRecord{c.KeyID: {PublicKey: ed25519.PublicKey(pub), Issuer: c.Issuer, Identity: c.Signer, Environment: c.Environment, Purpose: "plan-artifact", Status: "active", NotBefore: now.Add(-365 * 24 * time.Hour), NotAfter: now.Add(365 * 24 * time.Hour)}}, Issuer: c.Issuer, Identity: c.Signer, Purpose: "plan-artifact"}, nil
+		if c.ExpectedPlanDigest == "" || c.ExpectedChecksDigest == "" || c.ExpectedGuardrailDigest == "" || c.ExpectedApprovalIdentity == "" || c.KeyStatus == "" || c.KeyPurpose == "" || c.KeyNotBefore.IsZero() || c.KeyNotAfter.IsZero() {
+			return artifact.VerifyPolicy{}, errors.New("trusted release manifest bindings required")
+		}
+		return artifact.VerifyPolicy{Now: time.Now, Expected: artifact.ExpectedBindings{PlanDigest: c.ExpectedPlanDigest, ChecksDigest: c.ExpectedChecksDigest, GuardrailDigest: c.ExpectedGuardrailDigest, SourceRevision: c.SourceRevision, Environment: c.Environment, DatabaseIdentity: c.DatabaseIdentity, ApprovalIdentity: c.ExpectedApprovalIdentity}, Keys: map[string]artifact.KeyRecord{c.KeyID: {PublicKey: ed25519.PublicKey(pub), Issuer: c.Issuer, Identity: c.Signer, Environment: c.Environment, Purpose: c.KeyPurpose, Status: c.KeyStatus, NotBefore: c.KeyNotBefore.UTC(), NotAfter: c.KeyNotAfter.UTC()}}, Issuer: c.Issuer, Identity: c.Signer, Purpose: c.KeyPurpose}, nil
 	}
 	input := func(a artifact.Artifact) (guardrail.Input, error) {
 		doc := policy.Document{Version: policy.LanguageVersion, Rules: []policy.Rule{{Name: "configured apply", Target: "all", Assert: policy.Expression{Eq: []any{true, true}}, Message: "apply allowed"}}}
@@ -90,8 +94,8 @@ func ProductionServices() (Services, error) {
 	}
 	mutation := func(v artifact.VerifiedArtifact) (guardrail.AuthorizedMutation, error) {
 		a, _ := v.Payload()
-		state := func(ctx context.Context) (executor.RuntimeState, error) {
-			doc, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: c.Schemas})
+		state := func(ctx context.Context, conn *pgx.Conn) (executor.RuntimeState, error) {
+			doc, err := postgres.InspectConn(ctx, conn, postgres.Options{Schemas: c.Schemas})
 			if err != nil {
 				return executor.RuntimeState{}, err
 			}
@@ -108,11 +112,11 @@ func ProductionServices() (Services, error) {
 			fresh, _ := policyFor(a)
 			_, err := a.VerifyTrusted(fresh)
 			return err
-		}, State: func(ctx context.Context, _ *pgx.Conn) (executor.RuntimeState, error) { return state(ctx) }, Confirm: func(ctx context.Context, _ *pgx.Conn, s plan.Step) error {
+		}, State: func(ctx context.Context, conn *pgx.Conn) (executor.RuntimeState, error) { return state(ctx, conn) }, Confirm: func(ctx context.Context, conn *pgx.Conn, s plan.Step) error {
 			if s.ID != last {
 				return nil
 			}
-			got, err := state(ctx)
+			got, err := state(ctx, conn)
 			if err != nil {
 				return err
 			}

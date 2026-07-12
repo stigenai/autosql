@@ -71,7 +71,7 @@ func TestNontransactionalIntentAndRetryRefusal(t *testing.T) {
 	p := plan.Plan{FromFingerprint: "sha256:" + string(make([]byte, 64)), Steps: []plan.Step{{ID: "one", SQL: "create table " + name + "(id int)", Kind: plan.StepExecutable, Transaction: plan.TransactionProhibited}, {ID: "two", SQL: "alter table missing_autosql_table add column x int", Kind: plan.StepExecutable, Transaction: plan.TransactionProhibited}}, Phases: []plan.Phase{{ID: "phase", Transaction: plan.TransactionProhibited, StepIDs: []string{"one", "two"}}}}
 	e := testExecutor(t, p, digest)
 	_, err := e.ApplyAuthorized(ctx, precheck.Plan{})
-	if !errors.Is(err, ErrPartial) || e.Result().LastConfirmed != "one" {
+	if !errors.Is(err, ErrReconcile) || !e.Result().Uncertain || e.Result().LastConfirmed != "one" {
 		t.Fatalf("err=%v result=%+v", err, e.Result())
 	}
 	_, err = e.ApplyAuthorized(ctx, precheck.Plan{})
