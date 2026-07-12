@@ -43,6 +43,18 @@ entries. Executor rows in an incomplete state add reconciliation guidance but
 never promote a revision to applied. JSON uses the standard output envelope and
 contains `manifest_digest`, ordered `entries`, `counts`, `dirty`, and `drift`.
 
+`migrate apply` and `migrate baseline` use that verified snapshot and revision
+placement. `--count`, `--from`, and inclusive `--to` select only a contiguous
+pending prefix; gaps, unknown revisions, drift, dirty/partial state, or missing
+artifact bindings refuse before mutation. `--dry-run` reports without changing
+the target. Apply delegates each file to the configured signed-artifact
+guardrail/executor boundary. Baseline atomically records distinct
+`baseline_recorded` events and executes no SQL. `--transaction=all` is allowed
+only for `transaction=required` files and a configured atomic batch executor;
+otherwise it fails closed. Output includes ordered files, statements, duration,
+final version, failure position, and recovery guidance. Artifact and digest
+approval modes use the existing trusted resolution paths.
+
 ## Schema commands
 
 `schema load` accepts repeatable `--source sql:path` and `--source json:path`

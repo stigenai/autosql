@@ -212,6 +212,62 @@ func (s *Store) AppendEvent(ctx context.Context, e Event) error {
 	return x
 }
 
+// InsertBatch atomically records a baseline/checkpoint prefix and its distinct events.
+func (s *Store) InsertBatch(ctx context.Context, revisions []Revision, events []Event) error {
+	c := s.config
+	conn, e := pgx.Connect(ctx, c.URL)
+	if e != nil {
+		return e
+	}
+	defer conn.Close(context.WithoutCancel(ctx))
+	tx, e := conn.Begin(ctx)
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
+	for _, r := range revisions {
+		if e = validateRevision(r); e != nil {
+			return e
+		}
+		if r.Supersedes == nil {
+			r.Supersedes = []string{}
+		}
+		_, e = tx.Exec(ctx, `insert into `+q(c.Schema, c.RevisionsTable)+`(version,description,kind,file_name,file_digest,manifest_digest,manifest_generation,artifact_digest,plan_digest,checks_digest,bundle_digest,state,statement_ordinal,attempt,redacted_error,operator_identity,started_at,updated_at,completed_at,from_version,to_version,supersedes,reversal_of,duration_ns) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`, r.Version, r.Description, r.Kind, r.FileName, r.FileDigest, r.ManifestDigest, r.ManifestGeneration, r.ArtifactDigest, r.PlanDigest, r.ChecksDigest, r.BundleDigest, r.State, r.StatementOrdinal, r.Attempt, r.RedactedError, r.Operator, r.StartedAt.UTC(), r.UpdatedAt.UTC(), r.CompletedAt, r.FromVersion, r.ToVersion, r.Supersedes, r.ReversalOf, r.Duration.Nanoseconds())
+		if e != nil {
+			return errors.New("insert revision batch")
+		}
+	}
+	for _, x := range events {
+		_, e = tx.Exec(ctx, `insert into `+q(c.Schema, c.EventsTable)+`(version,attempt,event_type,statement_ordinal,redacted_detail,operator_identity,at) values($1,$2,$3,$4,$5,$6,$7)`, x.Version, x.Attempt, x.Type, x.Ordinal, x.Detail, x.Operator, x.At.UTC())
+		if e != nil {
+			return errors.New("insert revision event batch")
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Store) UpdateState(ctx context.Context, version string, attempt int, state string, ordinal int, redacted string, duration time.Duration, event string, operator string) error {
+	c := s.config
+	conn, e := pgx.Connect(ctx, c.URL)
+	if e != nil {
+		return e
+	}
+	defer conn.Close(context.WithoutCancel(ctx))
+	tx, e := conn.Begin(ctx)
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
+	tag, e := tx.Exec(ctx, `update `+q(c.Schema, c.RevisionsTable)+` set state=$3,statement_ordinal=$4,redacted_error=$5,duration_ns=$6,updated_at=clock_timestamp(),completed_at=case when $3='pending' then null else clock_timestamp() end where version=$1 and attempt=$2`, version, attempt, state, ordinal, redacted, duration.Nanoseconds())
+	if e != nil || tag.RowsAffected() != 1 {
+		return errors.New("update revision state")
+	}
+	if _, e = tx.Exec(ctx, `insert into `+q(c.Schema, c.EventsTable)+`(version,attempt,event_type,statement_ordinal,redacted_detail,operator_identity,at) values($1,$2,$3,$4,$5,$6,clock_timestamp())`, version, attempt, event, ordinal, redacted, operator); e != nil {
+		return errors.New("insert revision state event")
+	}
+	return tx.Commit(ctx)
+}
+
 type ExecutorHistory struct{ ArtifactDigest, State string }
 type StatusEntry struct {
 	Version          string `json:"version"`
