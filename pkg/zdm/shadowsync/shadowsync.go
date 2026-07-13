@@ -343,6 +343,7 @@ func mutate(ctx context.Context, cfg Config, s Spec, p Policy, remove bool) (Sta
 func triggerBody(t Table) (string, error) {
 	var b strings.Builder
 	b.WriteString("begin\nif pg_trigger_depth() > 1 then raise exception 'recursive AutoSQL synchronization'; end if;\n")
+	b.WriteString("if pg_catalog.current_setting('autosql.zdm.backfill', true) = 'on' then return NEW; end if;\n")
 	for _, x := range t.Pairs {
 		old := "NEW." + q(x.OldColumn)
 		nw := "NEW." + q(x.NewColumn)
