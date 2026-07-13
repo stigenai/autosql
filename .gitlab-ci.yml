@@ -1,0 +1,13 @@
+stages: [review, deploy]
+autosql-review:
+  stage: review
+  image: ghcr.io/example/autosql-ci@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  script: ["autosql schema diff --json", "go test ./..."]
+  variables:
+    GIT_DEPTH: "1"
+autosql-deploy:
+  stage: deploy
+  image: ghcr.io/example/autosql-ci@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  script: ["autosql migrate apply --artifact-ref env://AUTOSQL_ARTIFACT"]

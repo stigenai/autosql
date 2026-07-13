@@ -1,0 +1,9 @@
+{
+  "protocol": "autosql.provider/v1",
+  "name": "fixture-python",
+  "version": "1.0.0",
+  "read_only": true,
+  "languages": ["python"],
+  "kinds": ["schema", "table"],
+  "request": {"source_uri": "file:///models.py", "environment": "ci", "parameters": {"dialect": "postgres"}, "timeout": "5s"}
+}

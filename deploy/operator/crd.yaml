@@ -1,0 +1,33 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: autosqlschemas.autosql.io
+spec:
+  group: autosql.io
+  scope: Namespaced
+  names:
+    plural: autosqlschemas
+    singular: autosqlschema
+    kind: AutoSQLSchema
+    shortNames: [asql]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [kind, source, databaseURL]
+              properties:
+                kind: {type: string, enum: [DeclarativeSchema, VersionedMigration]}
+                generation: {type: integer, format: int64}
+                source: {type: object, maxProperties: 1}
+                databaseURL: {type: object, required: [name, key]}
+                requireApproval: {type: boolean}
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+      subresources: {status: {}}

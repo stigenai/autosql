@@ -1,0 +1,29 @@
+name: autosql
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  changeset:
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/example/autosql-ci@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: autosql schema diff --json
+      - run: go test ./...
+  deploy:
+    if: github.event_name == 'push'
+    needs: changeset
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    environment: production
+    container:
+      image: ghcr.io/example/autosql-ci@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: autosql migrate apply --artifact-ref env://AUTOSQL_ARTIFACT

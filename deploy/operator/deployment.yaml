@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: autosql-operator
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: autosql-operator}}
+  template:
+    metadata: {labels: {app: autosql-operator}}
+    spec:
+      serviceAccountName: autosql-operator
+      containers:
+        - name: operator
+          image: ghcr.io/example/autosql-operator@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          imagePullPolicy: Always
+          args: ["operator", "--leader-election"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true

@@ -1,31 +1,31 @@
 postgres_version=15
-ok  	autosql/pkg/zdm	7.114s
-ok  	autosql/pkg/zdm/backfill	1.920s
+ok  	autosql/pkg/zdm	7.913s
+ok  	autosql/pkg/zdm/backfill	1.911s
 # autosql/pkg/zdm/compatmatrix.test
-ld: warning: '/private/var/folders/j6/8f7nf8tj271053_kq7pgq4p80000gn/T/go-link-2135101290/000086.o' has malformed LC_DYSYMTAB, expected 98 undefined symbols to start at index 1626, found 95 undefined symbols starting at index 1626
-ok  	autosql/pkg/zdm/compatmatrix	6.945s
-ok  	autosql/pkg/zdm/contract	1.372s
+ld: warning: '/private/var/folders/j6/8f7nf8tj271053_kq7pgq4p80000gn/T/go-link-2828819996/000086.o' has malformed LC_DYSYMTAB, expected 98 undefined symbols to start at index 1626, found 95 undefined symbols starting at index 1626
+ok  	autosql/pkg/zdm/compatmatrix	8.007s
+ok  	autosql/pkg/zdm/contract	1.495s
 # autosql/pkg/zdm/expandplan.test
-ld: warning: '/private/var/folders/j6/8f7nf8tj271053_kq7pgq4p80000gn/T/go-link-2578141016/000086.o' has malformed LC_DYSYMTAB, expected 98 undefined symbols to start at index 1626, found 95 undefined symbols starting at index 1626
-ok  	autosql/pkg/zdm/expandplan	2.806s
-ok  	autosql/pkg/zdm/rollback	1.369s
+ld: warning: '/private/var/folders/j6/8f7nf8tj271053_kq7pgq4p80000gn/T/go-link-965324611/000086.o' has malformed LC_DYSYMTAB, expected 98 undefined symbols to start at index 1626, found 95 undefined symbols starting at index 1626
+ok  	autosql/pkg/zdm/expandplan	3.237s
+ok  	autosql/pkg/zdm/rollback	1.434s
 # autosql/pkg/zdm/shadowsync.test
-ld: warning: '/private/var/folders/j6/8f7nf8tj271053_kq7pgq4p80000gn/T/go-link-737058974/000086.o' has malformed LC_DYSYMTAB, expected 98 undefined symbols to start at index 1626, found 95 undefined symbols starting at index 1626
-ok  	autosql/pkg/zdm/shadowsync	1.540s
+ld: warning: '/private/var/folders/j6/8f7nf8tj271053_kq7pgq4p80000gn/T/go-link-1880622989/000086.o' has malformed LC_DYSYMTAB, expected 98 undefined symbols to start at index 1626, found 95 undefined symbols starting at index 1626
+ok  	autosql/pkg/zdm/shadowsync	1.668s
 # autosql/pkg/zdm/start.test
-ld: warning: '/private/var/folders/j6/8f7nf8tj271053_kq7pgq4p80000gn/T/go-link-1893877574/000086.o' has malformed LC_DYSYMTAB, expected 98 undefined symbols to start at index 1626, found 95 undefined symbols starting at index 1626
-ok  	autosql/pkg/zdm/start	1.648s
+ld: warning: '/private/var/folders/j6/8f7nf8tj271053_kq7pgq4p80000gn/T/go-link-3134152611/000086.o' has malformed LC_DYSYMTAB, expected 98 undefined symbols to start at index 1626, found 95 undefined symbols starting at index 1626
+ok  	autosql/pkg/zdm/start	1.784s
 # autosql/pkg/zdm/virtualschema.test
-ld: warning: '/private/var/folders/j6/8f7nf8tj271053_kq7pgq4p80000gn/T/go-link-2733042928/000086.o' has malformed LC_DYSYMTAB, expected 98 undefined symbols to start at index 1626, found 95 undefined symbols starting at index 1626
-ok  	autosql/pkg/zdm/virtualschema	1.442s
+ld: warning: '/private/var/folders/j6/8f7nf8tj271053_kq7pgq4p80000gn/T/go-link-3241404226/000086.o' has malformed LC_DYSYMTAB, expected 98 undefined symbols to start at index 1626, found 95 undefined symbols starting at index 1626
+ok  	autosql/pkg/zdm/virtualschema	1.512s
 # autosql/internal/cli.test
-ld: warning: '/private/var/folders/j6/8f7nf8tj271053_kq7pgq4p80000gn/T/go-link-3167687987/000086.o' has malformed LC_DYSYMTAB, expected 98 undefined symbols to start at index 1626, found 95 undefined symbols starting at index 1626
-ok  	autosql/internal/cli	2.109s
+ld: warning: '/private/var/folders/j6/8f7nf8tj271053_kq7pgq4p80000gn/T/go-link-3574264784/000086.o' has malformed LC_DYSYMTAB, expected 98 undefined symbols to start at index 1626, found 95 undefined symbols starting at index 1626
+ok  	autosql/internal/cli	2.671s
 goos: darwin
 goarch: arm64
 pkg: autosql/pkg/zdm/compatmatrix
 cpu: Apple M5
-BenchmarkZDMTriggerWrite-10    	    1050	   1872874 ns/op	         2.000 physical-column-writes/op
-BenchmarkZDMVersionRead-10     	   11836	    101889 ns/op
+BenchmarkZDMTriggerWrite-10    	    1088	   3595362 ns/op	         2.000 physical-column-writes/op
+BenchmarkZDMVersionRead-10     	    8196	    134467 ns/op
 PASS
-ok  	autosql/pkg/zdm/compatmatrix	19.530s
+ok  	autosql/pkg/zdm/compatmatrix	21.358s

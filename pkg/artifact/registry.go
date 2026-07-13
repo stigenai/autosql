@@ -3,13 +3,17 @@ package artifact
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"golang.org/x/sys/unix"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"syscall"
+	"time"
 )
 
 var ErrCollision = errors.New("artifact digest collision")
@@ -19,6 +23,219 @@ type Registry interface {
 	Put(context.Context, VerifiedArtifact) error
 	Get(context.Context, string) (Artifact, error)
 }
+
+// Action identifies an authorization boundary in the managed registry. Read,
+// push, and promotion are intentionally separate capabilities.
+type Action string
+
+const (
+	ActionRead      Action = "artifact.read"
+	ActionPush      Action = "artifact.push"
+	ActionPromotion Action = "artifact.promote"
+)
+
+// Authorizer is called before every managed-registry operation.
+type Authorizer interface {
+	Authorize(context.Context, Action, string, string) error
+}
+
+type allowAllAuthorizer struct{}
+
+func (allowAllAuthorizer) Authorize(context.Context, Action, string, string) error { return nil }
+
+// IntegrityManifest binds exact canonical bytes to an artifact digest and
+// declares the attestations required by the receiving registry.
+type IntegrityManifest struct {
+	Version              string   `json:"version"`
+	ArtifactDigest       string   `json:"artifact_digest"`
+	CanonicalBytesDigest string   `json:"canonical_bytes_digest"`
+	RequiredAttestations []string `json:"required_attestations,omitempty"`
+}
+
+const integrityManifestVersion = "autosql.artifact.integrity/v1"
+
+func NewIntegrityManifest(v VerifiedArtifact, required []string) (IntegrityManifest, error) {
+	a, err := v.forRegistry()
+	if err != nil {
+		return IntegrityManifest{}, err
+	}
+	b, err := a.MarshalCanonical()
+	if err != nil {
+		return IntegrityManifest{}, err
+	}
+	h := sha256.Sum256(b)
+	return IntegrityManifest{Version: integrityManifestVersion, ArtifactDigest: a.Digest, CanonicalBytesDigest: "sha256:" + hex.EncodeToString(h[:]), RequiredAttestations: append([]string(nil), required...)}, nil
+}
+
+func (m IntegrityManifest) verify(v VerifiedArtifact, required []string) error {
+	if m.Version != integrityManifestVersion || !digestPattern.MatchString(m.ArtifactDigest) || !digestPattern.MatchString(m.CanonicalBytesDigest) {
+		return fail("integrity_manifest", ErrInvalid)
+	}
+	a, err := v.forRegistry()
+	if err != nil {
+		return err
+	}
+	if a.Digest != m.ArtifactDigest {
+		return fail("integrity_digest", ErrInvalid)
+	}
+	b, err := a.MarshalCanonical()
+	if err != nil {
+		return fail("integrity_bytes", ErrInvalid)
+	}
+	h := sha256.Sum256(b)
+	if "sha256:"+hex.EncodeToString(h[:]) != m.CanonicalBytesDigest {
+		return fail("integrity_bytes", ErrInvalid)
+	}
+	seen := map[string]bool{}
+	for _, s := range m.RequiredAttestations {
+		if s == "" || seen[s] {
+			return fail("integrity_attestations", ErrInvalid)
+		}
+		seen[s] = true
+	}
+	for _, s := range required {
+		if !seen[s] {
+			return fail("required_attestation", ErrInvalid)
+		}
+	}
+	attested := map[string]bool{}
+	for _, x := range a.ValidationAttestations {
+		attested[x.Stage] = true
+	}
+	if a.EditProvenance != nil {
+		for _, x := range a.EditProvenance.Attestations {
+			attested[x.Stage] = true
+		}
+	}
+	for _, s := range m.RequiredAttestations {
+		if !attested[s] {
+			return fail("required_attestation", ErrInvalid)
+		}
+	}
+	for _, s := range required {
+		if !attested[s] {
+			return fail("required_attestation", ErrInvalid)
+		}
+	}
+	return nil
+}
+
+type PushRequest struct {
+	Artifact VerifiedArtifact
+	Manifest IntegrityManifest
+	Actor    string
+}
+
+// TagRecord is an append-only record of a mutable tag pointer.
+type TagRecord struct {
+	Sequence       uint64    `json:"sequence"`
+	Tag            string    `json:"tag"`
+	PreviousDigest string    `json:"previous_digest,omitempty"`
+	Digest         string    `json:"digest"`
+	Actor          string    `json:"actor"`
+	At             time.Time `json:"at"`
+}
+
+var tagPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$`)
+
+// ManagedRegistry adds validated pushes, mutable tags, tag history, and
+// authorization boundaries to an immutable Registry implementation.
+type ManagedRegistry struct {
+	Store                Registry
+	Authorizer           Authorizer
+	RequiredAttestations []string
+	mu                   sync.RWMutex
+	tags                 map[string]TagRecord
+	history              map[string][]TagRecord
+}
+
+func NewManagedRegistry(store Registry, auth Authorizer, required []string) *ManagedRegistry {
+	if auth == nil {
+		auth = allowAllAuthorizer{}
+	}
+	return &ManagedRegistry{Store: store, Authorizer: auth, RequiredAttestations: append([]string(nil), required...), tags: map[string]TagRecord{}, history: map[string][]TagRecord{}}
+}
+
+func (r *ManagedRegistry) Push(ctx context.Context, req PushRequest) error {
+	if r == nil || r.Store == nil {
+		return fail("registry", ErrInvalid)
+	}
+	if err := r.Authorizer.Authorize(ctx, ActionPush, req.Actor, req.Manifest.ArtifactDigest); err != nil {
+		return err
+	}
+	if err := req.Manifest.verify(req.Artifact, r.RequiredAttestations); err != nil {
+		return err
+	}
+	return r.Store.Put(ctx, req.Artifact)
+}
+
+// Read enforces read authorization independently of push and promotion.
+func (r *ManagedRegistry) Read(ctx context.Context, digest, actor string) (Artifact, error) {
+	if r == nil || r.Store == nil {
+		return Artifact{}, fail("registry", ErrInvalid)
+	}
+	if err := r.Authorizer.Authorize(ctx, ActionRead, actor, digest); err != nil {
+		return Artifact{}, err
+	}
+	return r.Store.Get(ctx, digest)
+}
+
+func (r *ManagedRegistry) Promote(ctx context.Context, tag, digest, actor string) error {
+	if r == nil || r.Store == nil || !tagPattern.MatchString(tag) || !digestPattern.MatchString(digest) {
+		return fail("tag", ErrInvalid)
+	}
+	if err := r.Authorizer.Authorize(ctx, ActionPromotion, actor, tag+"@"+digest); err != nil {
+		return err
+	}
+	if _, err := r.Store.Get(ctx, digest); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	prev := r.tags[tag].Digest
+	record := TagRecord{Sequence: uint64(len(r.history[tag]) + 1), Tag: tag, PreviousDigest: prev, Digest: digest, Actor: actor, At: time.Now().UTC()}
+	r.tags[tag] = record
+	r.history[tag] = append(r.history[tag], record)
+	return nil
+}
+
+func (r *ManagedRegistry) ResolveTag(ctx context.Context, tag, actor string) (Artifact, TagRecord, error) {
+	if r == nil || !tagPattern.MatchString(tag) {
+		return Artifact{}, TagRecord{}, fail("tag", ErrInvalid)
+	}
+	if err := r.Authorizer.Authorize(ctx, ActionRead, actor, "tag:"+tag); err != nil {
+		return Artifact{}, TagRecord{}, err
+	}
+	r.mu.RLock()
+	record, ok := r.tags[tag]
+	r.mu.RUnlock()
+	if !ok {
+		return Artifact{}, TagRecord{}, ErrNotFound
+	}
+	a, err := r.Store.Get(ctx, record.Digest)
+	return a, record, err
+}
+
+func (r *ManagedRegistry) TagHistory(ctx context.Context, tag, actor string) ([]TagRecord, error) {
+	if r == nil || !tagPattern.MatchString(tag) {
+		return nil, fail("tag", ErrInvalid)
+	}
+	if err := r.Authorizer.Authorize(ctx, ActionRead, actor, "tag:"+tag); err != nil {
+		return nil, err
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if _, ok := r.tags[tag]; !ok {
+		return nil, ErrNotFound
+	}
+	return append([]TagRecord(nil), r.history[tag]...), nil
+}
+
+func (m IntegrityManifest) MarshalJSON() ([]byte, error) {
+	type alias IntegrityManifest
+	return json.Marshal(alias(m))
+}
+
 type MemoryRegistry struct {
 	mu sync.RWMutex
 	m  map[string][]byte

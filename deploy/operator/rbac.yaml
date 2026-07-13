@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: autosql-operator}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: autosql-operator}
+rules:
+  - apiGroups: [autosql.io]
+    resources: [autosqlschemas, autosqlschemas/status]
+    verbs: [get, list, watch, patch, update]
+  - apiGroups: [""]
+    resources: [secrets, configmaps]
+    verbs: [get]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, create, update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: autosql-operator}
+subjects: [{kind: ServiceAccount, name: autosql-operator}]
+roleRef: {kind: Role, name: autosql-operator, apiGroup: rbac.authorization.k8s.io}
