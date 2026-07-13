@@ -71,7 +71,7 @@ func (s *Store) validateLayout(ctx context.Context, db catalogReader) error {
 		return corrupt("reserved namespace relation set differs from trusted manifest")
 	}
 	for table, want := range metadataColumns {
-		rows, err = db.Query(ctx, `select a.attname,format_type(a.atttypid,a.atttypmod),not a.attnotnull,coalesce(pg_get_expr(d.adbin,d.adrelid),''),a.attidentity::text,coalesce(coll.collname,''),a.attstorage::text,a.attcompression::text,a.attgenerated::text,a.attstattarget,a.attoptions is null,a.attfdwoptions is null from pg_attribute a join pg_class c on c.oid=a.attrelid join pg_namespace n on n.oid=c.relnamespace left join pg_attrdef d on d.adrelid=a.attrelid and d.adnum=a.attnum left join pg_collation coll on coll.oid=a.attcollation where n.nspname=$1 and c.relname=$2 and a.attnum>0 and not a.attisdropped order by a.attnum`, s.cfg.Schema, table)
+		rows, err = db.Query(ctx, `select a.attname,format_type(a.atttypid,a.atttypmod),not a.attnotnull,coalesce(pg_get_expr(d.adbin,d.adrelid),''),a.attidentity::text,coalesce(coll.collname,''),a.attstorage::text,a.attcompression::text,a.attgenerated::text,coalesce(a.attstattarget,-1),a.attoptions is null,a.attfdwoptions is null from pg_attribute a join pg_class c on c.oid=a.attrelid join pg_namespace n on n.oid=c.relnamespace left join pg_attrdef d on d.adrelid=a.attrelid and d.adnum=a.attnum left join pg_collation coll on coll.oid=a.attcollation where n.nspname=$1 and c.relname=$2 and a.attnum>0 and not a.attisdropped order by a.attnum`, s.cfg.Schema, table)
 		if err != nil {
 			return err
 		}
@@ -117,7 +117,10 @@ func (s *Store) validateLayout(ctx context.Context, db catalogReader) error {
 				return corrupt("table %s column %s contract differs", table, name)
 			}
 		}
-		rows, err = db.Query(ctx, `select conname,contype::text,condeferrable,condeferred,convalidated,conislocal,coninhcount,connoinherit,pg_get_constraintdef(oid,false) from pg_constraint where conrelid=$1::regclass order by conname`, s.cfg.Schema+"."+table)
+		// PostgreSQL 18 represents NOT NULL constraints in pg_constraint in
+		// addition to pg_attribute.attnotnull. Nullability is validated above;
+		// exclude the redundant version-specific catalog representation here.
+		rows, err = db.Query(ctx, `select conname,contype::text,condeferrable,condeferred,convalidated,conislocal,coninhcount,connoinherit,pg_get_constraintdef(oid,false) from pg_constraint where conrelid=$1::regclass and contype<>'n' order by conname`, s.cfg.Schema+"."+table)
 		if err != nil {
 			return err
 		}

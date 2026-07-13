@@ -400,11 +400,71 @@ func inspectVersion(ctx context.Context, c *pgx.Conn, spec Spec, v SchemaVersion
 		if viewComment == nil || *viewComment != "autosql:zdm:view:"+scope+":"+spec.Digest+":"+t.Comment {
 			r.Exact = false
 		}
-		wantFP, e1 := pg_query.Fingerprint(expectedViewSQL(spec.PhysicalSchema, t))
-		gotFP, e2 := pg_query.Fingerprint(def)
+		wantFP, e1 := semanticViewFingerprint(expectedViewSQL(spec.PhysicalSchema, t))
+		gotFP, e2 := semanticViewFingerprint(def)
 		if e1 != nil || e2 != nil || wantFP != gotFP {
 			r.Exact = false
 		}
 	}
 	return r, rows.Err()
+}
+
+// PostgreSQL 14 qualifies simple-view column references in pg_get_viewdef,
+// while newer releases may omit those redundant qualifiers. Normalize only
+// the AST differences that are semantically irrelevant for our deliberately
+// simple one-relation views; aliases that rename a column remain significant.
+func semanticViewFingerprint(sql string) (string, error) {
+	raw, err := pg_query.ParseToJSON(sql)
+	if err != nil {
+		return "", err
+	}
+	var tree any
+	if err = json.Unmarshal([]byte(raw), &tree); err != nil {
+		return "", err
+	}
+	fieldName := func(v any) string {
+		m, _ := v.(map[string]any)
+		s, _ := m["String"].(map[string]any)
+		x, _ := s["sval"].(string)
+		return x
+	}
+	var walk func(any)
+	walk = func(v any) {
+		switch x := v.(type) {
+		case map[string]any:
+			delete(x, "location")
+			delete(x, "stmt_len")
+			if c, ok := x["ColumnRef"].(map[string]any); ok {
+				if f, ok := c["fields"].([]any); ok && len(f) > 1 {
+					c["fields"] = f[len(f)-1:]
+				}
+			}
+			if r, ok := x["ResTarget"].(map[string]any); ok {
+				name, has := r["name"].(string)
+				if !has || name == "" {
+					if val, ok := r["val"].(map[string]any); ok {
+						if c, ok := val["ColumnRef"].(map[string]any); ok {
+							if f, ok := c["fields"].([]any); ok && len(f) > 0 {
+								r["name"] = fieldName(f[len(f)-1])
+							}
+						}
+					}
+				}
+			}
+			for _, child := range x {
+				walk(child)
+			}
+		case []any:
+			for _, child := range x {
+				walk(child)
+			}
+		}
+	}
+	walk(tree)
+	b, err := json.Marshal(tree)
+	if err != nil {
+		return "", err
+	}
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:]), nil
 }
