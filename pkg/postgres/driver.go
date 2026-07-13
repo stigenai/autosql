@@ -85,6 +85,7 @@ func (*Driver) Info() plugin.Info {
 		schema.KindCheckConstraint, schema.KindForeignKey, schema.KindIndex, schema.KindView,
 		schema.KindMaterializedView, schema.KindFunction, schema.KindProcedure,
 		schema.KindTrigger, schema.KindPolicy, schema.KindRole, schema.KindGrant,
+		schema.KindMembership, schema.KindDefaultPrivilege,
 	}
 	caps := make([]plugin.Capability, 0, len(kinds))
 	all := []schema.Operation{schema.OperationCreate, schema.OperationAlter, schema.OperationDrop, schema.OperationRename}

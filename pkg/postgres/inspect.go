@@ -191,12 +191,20 @@ func inspectSnapshot(ctx context.Context, conn catalogQueryer, req plugin.Inspec
 			resource, privilege string
 			fn                  func(context.Context) error
 		}{"roles", "pg_read_all_settings or CREATEROLE", i.inspectRoles})
+		steps = append(steps, struct {
+			resource, privilege string
+			fn                  func(context.Context) error
+		}{"role memberships", "visibility of pg_auth_members and pg_roles", i.inspectMemberships})
 	}
 	if enabled(req.Options, "grants", false) {
 		steps = append(steps, struct {
 			resource, privilege string
 			fn                  func(context.Context) error
 		}{"grants", "USAGE on schemas and visibility of information_schema grants", i.inspectGrants})
+		steps = append(steps, struct {
+			resource, privilege string
+			fn                  func(context.Context) error
+		}{"default privileges", "visibility of pg_default_acl", i.inspectDefaultPrivileges})
 	}
 	for _, step := range steps {
 		if err := step.fn(ctx); err != nil {
@@ -810,6 +818,57 @@ order by target_oid,grantor_role.rolname,coalesce(grantee_role.rolname,'PUBLIC')
 			deps = append(deps, schema.Dependency{Target: rid, Type: schema.DependencyReferences})
 		}
 		i.add(schema.KindGrant, i.name(parent.Name.Schema, name, p), map[string]any{"grantor": grantor, "grantee": grantee, "privilege": privilege, "grantable": grantable}, deps, nil)
+	}
+	return rows.Err()
+}
+
+func (i *inspector) inspectMemberships(ctx context.Context) error {
+	rows, err := i.conn.Query(ctx, `select m.roleid,m.member,coalesce(m.admin_option,false),parent.rolname,member.rolname from pg_auth_members m join pg_roles parent on parent.oid=m.roleid join pg_roles member on member.oid=m.member order by parent.rolname,member.rolname`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var parentOID, memberOID uint32
+		var admin bool
+		var parent, member string
+		if err := rows.Scan(&parentOID, &memberOID, &admin, &parent, &member); err != nil {
+			return err
+		}
+		parentID, memberID := i.byOID[parentOID], i.byOID[memberOID]
+		if parentID == "" || memberID == "" {
+			continue
+		}
+		name := member + "->" + parent
+		i.add(schema.KindMembership, schema.Name{Name: name}, map[string]any{"parent": parent, "member": member, "admin": admin}, []schema.Dependency{{Target: parentID, Type: schema.DependencyReferences}, {Target: memberID, Type: schema.DependencyReferences}}, nil)
+	}
+	return rows.Err()
+}
+
+func (i *inspector) inspectDefaultPrivileges(ctx context.Context) error {
+	rows, err := i.conn.Query(ctx, `select d.defaclrole,d.defaclnamespace,d.defaclobjtype,grantor.rolname,coalesce(grantee.rolname,'PUBLIC'),a.privilege_type,a.is_grantable,coalesce(n.nspname,'') from pg_default_acl d join pg_roles grantor on grantor.oid=d.defaclrole left join pg_namespace n on n.oid=d.defaclnamespace cross join lateral aclexplode(d.defaclacl) a left join pg_roles grantee on grantee.oid=nullif(a.grantee,0) order by grantor.rolname,n.nspname,d.defaclobjtype,coalesce(grantee.rolname,'PUBLIC'),a.privilege_type`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var ownerOID, namespaceOID uint32
+		var objType, owner, grantee, privilege, ns string
+		var grantable bool
+		if err := rows.Scan(&ownerOID, &namespaceOID, &objType, &owner, &grantee, &privilege, &grantable, &ns); err != nil {
+			return err
+		}
+		ownerID := i.byOID[ownerOID]
+		if ownerID == "" {
+			continue
+		}
+		name := owner + ":" + ns + ":" + objType + ":" + grantee + ":" + strings.ToLower(privilege)
+		spec := map[string]any{"owner": owner, "object_type": objType, "schema": ns, "grantee": grantee, "privilege": privilege, "grantable": grantable}
+		deps := []schema.Dependency{{Target: ownerID, Type: schema.DependencyReferences}}
+		if rid := findKindName(i.resources, schema.KindRole, grantee); rid != "" {
+			deps = append(deps, schema.Dependency{Target: rid, Type: schema.DependencyReferences})
+		}
+		i.add(schema.KindDefaultPrivilege, schema.Name{Name: name}, spec, deps, nil)
 	}
 	return rows.Err()
 }

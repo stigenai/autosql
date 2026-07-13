@@ -46,6 +46,8 @@ const (
 	KindPolicy           Kind = "policy"
 	KindRole             Kind = "role"
 	KindGrant            Kind = "grant"
+	KindMembership       Kind = "membership"
+	KindDefaultPrivilege Kind = "default_privilege"
 	KindReferenceData    Kind = "reference_data"
 )
 
@@ -54,7 +56,7 @@ var knownKinds = map[Kind]struct{}{
 	KindComposite: {}, KindSequence: {}, KindTable: {}, KindColumn: {}, KindPrimaryKey: {},
 	KindUniqueConstraint: {}, KindCheckConstraint: {}, KindForeignKey: {}, KindIndex: {},
 	KindView: {}, KindMaterializedView: {}, KindFunction: {}, KindProcedure: {}, KindTrigger: {},
-	KindPolicy: {}, KindRole: {}, KindGrant: {}, KindReferenceData: {},
+	KindPolicy: {}, KindRole: {}, KindGrant: {}, KindMembership: {}, KindDefaultPrivilege: {}, KindReferenceData: {},
 }
 
 // IsKnownKind reports whether this library can safely interpret kind.

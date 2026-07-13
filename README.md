@@ -24,6 +24,9 @@ database changes through stable CLI and JSON contracts.
   changeset checks and signed attestations, pinned CI/CD packaging, Kubernetes
   reconciliation, Terraform-style deployment contracts, webhooks, and
   editor-neutral local workflows.
+- **Security and reference data:** managed versus external principals, grants,
+  memberships, row-level policies, short-lived credentials, and bounded
+  INSERT/UPSERT/SYNC reconciliation for application-owned rows.
 
 AutoSQL is explicit about database capabilities and refuses unsafe operations.
 Secrets are passed by reference, resolved only at runtime, and excluded from
@@ -68,3 +71,5 @@ output. See [the CLI contract](docs/cli-contract.md) and
 - [Provider and CI contracts](docs/schema-provider-protocol.md) · [CI changesets](docs/ci-changeset-contract.md)
 - [CI/CD packaging and Kubernetes](docs/ci-cd-integrations.md) · [operator](docs/kubernetes-operator.md)
 - [ORM, deployment, and developer integrations](docs/integrations.md)
+- [Terraform/OpenTofu provider contract](docs/terraform-provider.md)
+- [Database security as code](docs/database-security.md) · [reference data](docs/reference-data.md)
