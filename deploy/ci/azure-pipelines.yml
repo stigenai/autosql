@@ -1,0 +1,12 @@
+stages:
+- stage: Review
+  jobs:
+  - job: AutoSQLReview
+    steps:
+    - script: autosql verify --contract-ref env://AUTOSQL_CONTRACT --mode review
+- stage: Deploy
+  dependsOn: Review
+  jobs:
+  - job: AutoSQLDeploy
+    steps:
+    - script: autosql verify --contract-ref env://AUTOSQL_CONTRACT --mode deploy --oidc

@@ -1,12 +1,12 @@
-# BuildKit syntax is pinned by the CI workflow. The runtime image contains no
-# credentials and executes the same autosql CLI used locally.
-FROM golang:1.24.5@sha256:6a2c4f9e2e8f52b4384e3d7c2e6bfb12d72a3b0ed7f4a4f811aa54a18ac5f5b2 AS build
+# The runtime image contains no credentials and executes the same autosql CLI
+# used locally. BuildKit/buildx selects the matching base image per platform.
+FROM golang:1.24.5 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/autosql ./cmd/autosql
-FROM gcr.io/distroless/static:nonroot@sha256:9e2e0e7c2f3aa58f8ff44b0f9d1b9bf8b3e71c7f9e3e7ef35c0b2e8f3c8a8b0
+FROM gcr.io/distroless/static:nonroot
 COPY --from=build /out/autosql /autosql
 USER nonroot:nonroot
 ENTRYPOINT ["/autosql"]

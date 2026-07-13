@@ -1,0 +1,6 @@
+.git
+.beads
+.spec-workflow
+artifacts
+*.audit
+*.log

@@ -1,0 +1,11 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: autosql-schema
+  annotations:
+    autosql.io/artifact-ref: env://AUTOSQL_ARTIFACT
+    autosql.io/policy-digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+    autosql.io/target-snapshot: sha256:0000000000000000000000000000000000000000000000000000000000000000
+spec:
+  syncPolicy:
+    automated: null

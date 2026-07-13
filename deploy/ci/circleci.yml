@@ -1,0 +1,14 @@
+version: 2.1
+jobs:
+  autosql-review:
+    docker:
+      - image: ghcr.io/example/autosql-ci@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    steps:
+      - checkout
+      - run: autosql verify --contract-ref env://AUTOSQL_CONTRACT --mode review
+  autosql-deploy:
+    docker:
+      - image: ghcr.io/example/autosql-ci@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    steps:
+      - checkout
+      - run: autosql verify --contract-ref env://AUTOSQL_CONTRACT --mode deploy --oidc

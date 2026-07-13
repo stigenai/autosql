@@ -29,6 +29,12 @@ const (
 
 func Builtins() []Analyzer { return []Analyzer{CompatibilityAnalyzer{}, PostgreSQLAnalyzer{}} }
 
+// AllBuiltins includes the compatibility and engine analyzers plus the
+// provider-neutral advanced lint and provenance checks.
+func AllBuiltins() []Analyzer {
+	return []Analyzer{CompatibilityAnalyzer{}, PostgreSQLAnalyzer{}, AdvancedAnalyzer{}}
+}
+
 type CompatibilityAnalyzer struct{}
 
 func (CompatibilityAnalyzer) Name() string { return "compatibility" }

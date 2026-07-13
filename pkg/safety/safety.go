@@ -116,6 +116,18 @@ type Input struct {
 	Statements []Statement
 	Target     Target
 	Thresholds Thresholds
+	Provenance Provenance
+}
+
+// Provenance identifies generated or assistant-authored changes. Such changes
+// remain untrusted and are always subject to the same analyzer and approval
+// gates as human-authored changes.
+type Provenance struct {
+	Agent        string `json:"agent,omitempty"`
+	AgentVersion string `json:"agent_version,omitempty"`
+	PromptDigest string `json:"prompt_digest,omitempty"`
+	OutputDigest string `json:"output_digest,omitempty"`
+	Untrusted    bool   `json:"untrusted,omitempty"`
 }
 
 type Analyzer interface {
@@ -268,6 +280,7 @@ func cloneInput(in Input) (Input, error) {
 		}
 	}
 	out.Thresholds = in.Thresholds
+	out.Provenance = in.Provenance
 	return out, nil
 }
 

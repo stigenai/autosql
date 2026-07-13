@@ -1,0 +1,15 @@
+pipelines:
+  default:
+    - step:
+        name: AutoSQL review
+        image: ghcr.io/example/autosql-ci@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+        script:
+          - autosql verify --contract-ref env://AUTOSQL_CONTRACT --mode review
+  branches:
+    main:
+      - step:
+          name: AutoSQL deploy
+          oidc: true
+          image: ghcr.io/example/autosql-ci@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          script:
+            - autosql verify --contract-ref env://AUTOSQL_CONTRACT --mode deploy --oidc
