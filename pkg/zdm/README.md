@@ -31,3 +31,14 @@ target advisory lock to be ordered with adoption.
 CLI entry points are `migrate metadata-init`, `migrate metadata-status`, and
 `migrate metadata-baseline`. Database URLs must be secret references and are
 never included in human or JSON results.
+
+## Live test gate
+
+PostgreSQL catalog-mutating tests must use `scripts/test-live-serial.sh`. The
+gate enforces race detection and `-p 1`, preventing package-parallel catalog
+DDL from invalidating another package's snapshot. With a disposable database:
+
+```sh
+AUTOSQL_TEST_POSTGRES_URL=... AUTOSQL_LIVE_COUNT=5 scripts/test-live-serial.sh ./pkg/zdm/expandplan ./internal/cli
+AUTOSQL_TEST_POSTGRES_URL=... scripts/test-live-serial.sh
+```

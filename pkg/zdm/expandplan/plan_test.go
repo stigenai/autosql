@@ -248,7 +248,10 @@ func TestMetadataSchemaBindsAdvisoryDomainAndPlanIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := PlanningAdvisoryDomain("autosql_zdm", "primary", "prod")
+	want, err := PlanningAdvisoryDomain("autosql_zdm", "primary", "prod")
+	if err != nil {
+		t.Fatal(err)
+	}
 	found := false
 	for _, l := range p.PlanningLocks {
 		if l.Kind == "advisory" {
@@ -274,6 +277,33 @@ func TestMetadataSchemaBindsAdvisoryDomainAndPlanIdentity(t *testing.T) {
 	}
 	if p2.Digest == p.Digest || p2.BindingsDigest == p.BindingsDigest {
 		t.Fatal("metadata schema is not bound into plan identity")
+	}
+}
+
+func TestPlanningAdvisoryDomainCanonicalAdversarialInputs(t *testing.T) {
+	a, err := PlanningAdvisoryDomain("a/b", "c", "d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := PlanningAdvisoryDomain("a", "b/c", "d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a == b {
+		t.Fatal("delimiter collision")
+	}
+	u, err := PlanningAdvisoryDomain("元数据", "目标/α", "生产")
+	if err != nil || !strings.HasPrefix(u, "autosql.zdm.expand-plan-lock/v1/sha256:") {
+		t.Fatalf("unicode=%q err=%v", u, err)
+	}
+	boundary := strings.Repeat("x", 4096)
+	if _, err = PlanningAdvisoryDomain(boundary, "t", "e"); err != nil {
+		t.Fatal(err)
+	}
+	for _, parts := range [][3]string{{"", "t", "e"}, {"m", "", "e"}, {"m", "t", ""}, {strings.Repeat("x", 4097), "t", "e"}, {string([]byte{0xff}), "t", "e"}} {
+		if _, err = PlanningAdvisoryDomain(parts[0], parts[1], parts[2]); !errors.Is(err, ErrRefused) {
+			t.Fatalf("invalid accepted %#v err=%v", parts, err)
+		}
 	}
 }
 

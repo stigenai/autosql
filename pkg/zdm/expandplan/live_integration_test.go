@@ -92,7 +92,10 @@ func TestLivePlanningIsReadOnlyAndFencedToBaseline(t *testing.T) {
 	if err != nil || len(p.Steps) != 1 {
 		t.Fatalf("plan=%+v err=%v", p, err)
 	}
-	domain := expandplan.PlanningAdvisoryDomain(meta, "primary", "test")
+	domain, err := expandplan.PlanningAdvisoryDomain(meta, "primary", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if p.MetadataSchema != meta {
 		t.Fatalf("metadata binding=%q", p.MetadataSchema)
 	}
@@ -133,7 +136,10 @@ func TestLiveAdvisoryDomainExactlyCoordinatesMetadataSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(ctx)
-	domain := expandplan.PlanningAdvisoryDomain(meta, "primary", "test")
+	domain, err := expandplan.PlanningAdvisoryDomain(meta, "primary", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err = tx.Exec(ctx, `select pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended($1,0::bigint))`, domain); err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +149,11 @@ func TestLiveAdvisoryDomainExactlyCoordinatesMetadataSchema(t *testing.T) {
 	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "lock timeout") {
 		t.Fatalf("canonical advisory domain did not coordinate: %v", err)
 	}
-	if expandplan.PlanningAdvisoryDomain(meta+"_other", "primary", "test") == domain {
+	otherDomain, e := expandplan.PlanningAdvisoryDomain(meta+"_other", "primary", "test")
+	if e != nil {
+		t.Fatal(e)
+	}
+	if otherDomain == domain {
 		t.Fatal("metadata domains collide")
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"autosql/pkg/zerodowntime"
 	"github.com/jackc/pgx/v5"
@@ -208,7 +209,11 @@ func Build(r Request) (Plan, error) {
 		PostgresMajor int `json:"postgres_major"`
 	}{r.Snapshot.PostgresMajor}), PolicyDigest: digest(r.Policy)}
 	p.BindingsDigest = digest(bindings{p.ArtifactDigest, p.FromFingerprint, p.Target, p.Environment, p.MetadataSchema, p.CapabilityDigest, p.PolicyDigest})
-	p.PlanningLocks = append(p.PlanningLocks, LockEvidence{Object: PlanningAdvisoryDomain(p.MetadataSchema, r.Target, r.Environment), Kind: "advisory", Mode: "SHARED", AcquisitionTimeoutMS: r.Policy.MaxLockMS, Phase: "planning", EstimatedHoldMS: 0, MaximumHoldMS: r.Policy.MaxLockHoldMS, TransactionBoundary: "read-only-repeatable-read"})
+	advisoryDomain, err := PlanningAdvisoryDomain(p.MetadataSchema, r.Target, r.Environment)
+	if err != nil {
+		return Plan{}, err
+	}
+	p.PlanningLocks = append(p.PlanningLocks, LockEvidence{Object: advisoryDomain, Kind: "advisory", Mode: "SHARED", AcquisitionTimeoutMS: r.Policy.MaxLockMS, Phase: "planning", EstimatedHoldMS: 0, MaximumHoldMS: r.Policy.MaxLockHoldMS, TransactionBoundary: "read-only-repeatable-read"})
 	for _, t := range r.Snapshot.Tables {
 		p.PlanningLocks = append(p.PlanningLocks, LockEvidence{Schema: t.Schema, Object: t.Name, Kind: "relation", Mode: "ACCESS SHARE", AcquisitionTimeoutMS: r.Policy.MaxLockMS, Phase: "planning", EstimatedHoldMS: 0, MaximumHoldMS: r.Policy.MaxLockHoldMS, TransactionBoundary: "read-only-repeatable-read"})
 	}
@@ -637,8 +642,25 @@ func mappingScope(target, environment, artifact string) string {
 		Artifact    string `json:"artifact"`
 	}{target, environment, artifact})
 }
-func PlanningAdvisoryDomain(metadataSchema, target, environment string) string {
-	return "autosql.zdm.expand-plan/v1/" + metadataSchema + "/" + target + "/" + environment
+func PlanningAdvisoryDomain(metadataSchema, target, environment string) (string, error) {
+	parts := []string{metadataSchema, target, environment}
+	for _, v := range parts {
+		if v == "" || len(v) > 4096 || !utf8.ValidString(v) {
+			return "", refuse("advisory domain components must be nonempty valid UTF-8 up to 4096 bytes")
+		}
+	}
+	payload := struct {
+		Version        string `json:"version"`
+		MetadataSchema string `json:"metadata_schema"`
+		Target         string `json:"target"`
+		Environment    string `json:"environment"`
+	}{"autosql.zdm.expand-plan-lock/v1", metadataSchema, target, environment}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return "", refuse("canonical advisory domain: %v", err)
+	}
+	h := sha256.Sum256(b)
+	return "autosql.zdm.expand-plan-lock/v1/sha256:" + hex.EncodeToString(h[:]), nil
 }
 func validateUnique(s Snapshot, op zerodowntime.Operation, table Table) error {
 	want := op.Ordering.Unique

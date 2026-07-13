@@ -51,7 +51,11 @@ func InspectLive(ctx context.Context, r InspectRequest) (Snapshot, error) {
 	// through this context; rollback then releases all transaction locks.
 	holdCtx, cancelHold := context.WithTimeout(ctx, time.Duration(r.Policy.MaxLockHoldMS)*time.Millisecond)
 	defer cancelHold()
-	if _, err = tx.Exec(holdCtx, `select pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtextextended($1,0::bigint))`, PlanningAdvisoryDomain(r.MetadataSchema, r.Target, r.Environment)); err != nil {
+	advisoryDomain, err := PlanningAdvisoryDomain(r.MetadataSchema, r.Target, r.Environment)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	if _, err = tx.Exec(holdCtx, `select pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtextextended($1,0::bigint))`, advisoryDomain); err != nil {
 		return Snapshot{}, err
 	}
 	var major int
