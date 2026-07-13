@@ -91,6 +91,20 @@ The PostgreSQL integration test is opt-in:
 AUTOSQL_TEST_POSTGRES_URL='postgres://…' go test ./pkg/postgres -run Integration
 ```
 
+## Container image
+
+The published CLI image is public at
+`ghcr.io/stigenai/autosql:latest`. It is built with the repository's
+multi-platform BuildKit builder and includes both `linux/amd64` and
+`linux/arm64` variants. The image is nonroot and contains no credentials:
+
+```sh
+docker run --rm ghcr.io/stigenai/autosql:latest version --json
+```
+
+Pin a release or commit tag for deployments instead of `latest`:
+`ghcr.io/stigenai/autosql:bced640`.
+
 ## CLI
 
 ```sh
