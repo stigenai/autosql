@@ -1,0 +1,31 @@
+postgres_version=16
+ok  	autosql/pkg/zdm	9.893s
+ok  	autosql/pkg/zdm/backfill	2.824s
+# autosql/pkg/zdm/compatmatrix.test
+ld: warning: '/private/var/folders/j6/8f7nf8tj271053_kq7pgq4p80000gn/T/go-link-2094743166/000086.o' has malformed LC_DYSYMTAB, expected 98 undefined symbols to start at index 1626, found 95 undefined symbols starting at index 1626
+ok  	autosql/pkg/zdm/compatmatrix	11.448s
+ok  	autosql/pkg/zdm/contract	1.448s
+# autosql/pkg/zdm/expandplan.test
+ld: warning: '/private/var/folders/j6/8f7nf8tj271053_kq7pgq4p80000gn/T/go-link-2382803837/000086.o' has malformed LC_DYSYMTAB, expected 98 undefined symbols to start at index 1626, found 95 undefined symbols starting at index 1626
+ok  	autosql/pkg/zdm/expandplan	3.190s
+ok  	autosql/pkg/zdm/rollback	1.460s
+# autosql/pkg/zdm/shadowsync.test
+ld: warning: '/private/var/folders/j6/8f7nf8tj271053_kq7pgq4p80000gn/T/go-link-3482375986/000086.o' has malformed LC_DYSYMTAB, expected 98 undefined symbols to start at index 1626, found 95 undefined symbols starting at index 1626
+ok  	autosql/pkg/zdm/shadowsync	1.646s
+# autosql/pkg/zdm/start.test
+ld: warning: '/private/var/folders/j6/8f7nf8tj271053_kq7pgq4p80000gn/T/go-link-1230342810/000086.o' has malformed LC_DYSYMTAB, expected 98 undefined symbols to start at index 1626, found 95 undefined symbols starting at index 1626
+ok  	autosql/pkg/zdm/start	1.809s
+# autosql/pkg/zdm/virtualschema.test
+ld: warning: '/private/var/folders/j6/8f7nf8tj271053_kq7pgq4p80000gn/T/go-link-3405614936/000086.o' has malformed LC_DYSYMTAB, expected 98 undefined symbols to start at index 1626, found 95 undefined symbols starting at index 1626
+ok  	autosql/pkg/zdm/virtualschema	1.465s
+# autosql/internal/cli.test
+ld: warning: '/private/var/folders/j6/8f7nf8tj271053_kq7pgq4p80000gn/T/go-link-1751696576/000086.o' has malformed LC_DYSYMTAB, expected 98 undefined symbols to start at index 1626, found 95 undefined symbols starting at index 1626
+ok  	autosql/internal/cli	2.450s
+goos: darwin
+goarch: arm64
+pkg: autosql/pkg/zdm/compatmatrix
+cpu: Apple M5
+BenchmarkZDMTriggerWrite-10    	    1596	    815840 ns/op	         2.000 physical-column-writes/op
+BenchmarkZDMVersionRead-10     	   11492	    156714 ns/op
+PASS
+ok  	autosql/pkg/zdm/compatmatrix	18.091s
