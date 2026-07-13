@@ -92,6 +92,22 @@ func TestLivePlanningIsReadOnlyAndFencedToBaseline(t *testing.T) {
 	if err != nil || len(p.Steps) != 1 {
 		t.Fatalf("plan=%+v err=%v", p, err)
 	}
+	domain := expandplan.PlanningAdvisoryDomain(meta, "primary", "test")
+	if p.MetadataSchema != meta {
+		t.Fatalf("metadata binding=%q", p.MetadataSchema)
+	}
+	matched := false
+	for _, l := range p.PlanningLocks {
+		if l.Kind == "advisory" {
+			matched = true
+			if l.Object != domain {
+				t.Fatalf("reported advisory=%q acquired=%q", l.Object, domain)
+			}
+		}
+	}
+	if !matched {
+		t.Fatal("reported advisory lock missing")
+	}
 	var exists bool
 	if err = c.QueryRow(ctx, `select exists(select 1 from pg_catalog.pg_attribute a join pg_catalog.pg_class c on c.oid=a.attrelid join pg_catalog.pg_namespace n on n.oid=c.relnamespace where n.nspname=$1 and c.relname='accounts' and a.attname='email')`, app).Scan(&exists); err != nil || exists {
 		t.Fatalf("dry run created column exists=%v err=%v", exists, err)
@@ -101,6 +117,34 @@ func TestLivePlanningIsReadOnlyAndFencedToBaseline(t *testing.T) {
 	}
 	if _, err = expandplan.InspectLive(ctx, expandplan.InspectRequest{URL: url, MetadataSchema: meta, Target: "primary", Environment: "test", ArtifactDigest: m.Digest, Schemas: []string{app}, Policy: livePolicy()}); err == nil {
 		t.Fatal("expected baseline drift refusal")
+	}
+}
+
+func TestLiveAdvisoryDomainExactlyCoordinatesMetadataSchema(t *testing.T) {
+	ctx, _, meta, app, _ := live(t)
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	blocker, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Close(ctx)
+	tx, err := blocker.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	domain := expandplan.PlanningAdvisoryDomain(meta, "primary", "test")
+	if _, err = tx.Exec(ctx, `select pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended($1,0::bigint))`, domain); err != nil {
+		t.Fatal(err)
+	}
+	policy := livePolicy()
+	policy.MaxLockMS = 25
+	_, err = expandplan.InspectLive(ctx, expandplan.InspectRequest{URL: url, MetadataSchema: meta, Target: "primary", Environment: "test", ArtifactDigest: "sha256:domain", Schemas: []string{app}, Policy: policy})
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "lock timeout") {
+		t.Fatalf("canonical advisory domain did not coordinate: %v", err)
+	}
+	if expandplan.PlanningAdvisoryDomain(meta+"_other", "primary", "test") == domain {
+		t.Fatal("metadata domains collide")
 	}
 }
 

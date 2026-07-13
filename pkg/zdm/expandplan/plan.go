@@ -52,6 +52,7 @@ type Index struct {
 }
 type Snapshot struct {
 	Fingerprint, Target, Environment string
+	MetadataSchema                   string
 	PostgresMajor                    int
 	Tables                           map[string]Table
 	Indexes                          map[string]Index
@@ -136,6 +137,7 @@ type Plan struct {
 	FromFingerprint  string         `json:"from_fingerprint"`
 	Target           string         `json:"target"`
 	Environment      string         `json:"environment"`
+	MetadataSchema   string         `json:"metadata_schema"`
 	PostgresMajor    int            `json:"postgres_major"`
 	CapabilityDigest string         `json:"capability_digest"`
 	BindingsDigest   string         `json:"bindings_digest"`
@@ -162,12 +164,13 @@ type Request struct {
 	PlanSigner                               ed25519.PrivateKey
 }
 type bindings struct {
-	Artifact    string `json:"artifact"`
-	From        string `json:"from"`
-	Target      string `json:"target"`
-	Environment string `json:"environment"`
-	Capability  string `json:"capability"`
-	Policy      string `json:"policy"`
+	Artifact       string `json:"artifact"`
+	From           string `json:"from"`
+	Target         string `json:"target"`
+	Environment    string `json:"environment"`
+	MetadataSchema string `json:"metadata_schema"`
+	Capability     string `json:"capability"`
+	Policy         string `json:"policy"`
 }
 
 func Build(r Request) (Plan, error) {
@@ -183,7 +186,7 @@ func Build(r Request) (Plan, error) {
 	if err := r.Migration.ValidateForPostgres(r.Snapshot.PostgresMajor); err != nil {
 		return Plan{}, refuse("capability: %v", err)
 	}
-	if r.ExpectedFingerprint == "" || r.ExpectedFingerprint != r.Snapshot.Fingerprint {
+	if r.ExpectedFingerprint == "" || r.ExpectedFingerprint != r.Snapshot.Fingerprint || r.Snapshot.MetadataSchema == "" {
 		return Plan{}, refuse("stale live schema fingerprint")
 	}
 	if r.Target == "" || r.Environment == "" || r.Target != r.Snapshot.Target || r.Environment != r.Snapshot.Environment {
@@ -201,11 +204,11 @@ func Build(r Request) (Plan, error) {
 	if r.Snapshot.ArtifactDigest != "" && r.Snapshot.ArtifactDigest != r.Migration.Digest {
 		return Plan{}, refuse("catalog snapshot is scoped to another artifact")
 	}
-	p := Plan{Version: Version, ArtifactDigest: r.Migration.Digest, FromFingerprint: r.Snapshot.Fingerprint, Target: r.Target, Environment: r.Environment, PostgresMajor: r.Snapshot.PostgresMajor, CapabilityDigest: digest(struct {
+	p := Plan{Version: Version, ArtifactDigest: r.Migration.Digest, FromFingerprint: r.Snapshot.Fingerprint, Target: r.Target, Environment: r.Environment, MetadataSchema: r.Snapshot.MetadataSchema, PostgresMajor: r.Snapshot.PostgresMajor, CapabilityDigest: digest(struct {
 		PostgresMajor int `json:"postgres_major"`
 	}{r.Snapshot.PostgresMajor}), PolicyDigest: digest(r.Policy)}
-	p.BindingsDigest = digest(bindings{p.ArtifactDigest, p.FromFingerprint, p.Target, p.Environment, p.CapabilityDigest, p.PolicyDigest})
-	p.PlanningLocks = append(p.PlanningLocks, LockEvidence{Object: "autosql.zdm.expand-plan/v1/" + r.Target + "/" + r.Environment, Kind: "advisory", Mode: "SHARED", AcquisitionTimeoutMS: r.Policy.MaxLockMS, Phase: "planning", EstimatedHoldMS: 0, MaximumHoldMS: r.Policy.MaxLockHoldMS, TransactionBoundary: "read-only-repeatable-read"})
+	p.BindingsDigest = digest(bindings{p.ArtifactDigest, p.FromFingerprint, p.Target, p.Environment, p.MetadataSchema, p.CapabilityDigest, p.PolicyDigest})
+	p.PlanningLocks = append(p.PlanningLocks, LockEvidence{Object: PlanningAdvisoryDomain(p.MetadataSchema, r.Target, r.Environment), Kind: "advisory", Mode: "SHARED", AcquisitionTimeoutMS: r.Policy.MaxLockMS, Phase: "planning", EstimatedHoldMS: 0, MaximumHoldMS: r.Policy.MaxLockHoldMS, TransactionBoundary: "read-only-repeatable-read"})
 	for _, t := range r.Snapshot.Tables {
 		p.PlanningLocks = append(p.PlanningLocks, LockEvidence{Schema: t.Schema, Object: t.Name, Kind: "relation", Mode: "ACCESS SHARE", AcquisitionTimeoutMS: r.Policy.MaxLockMS, Phase: "planning", EstimatedHoldMS: 0, MaximumHoldMS: r.Policy.MaxLockHoldMS, TransactionBoundary: "read-only-repeatable-read"})
 	}
@@ -253,10 +256,10 @@ func Build(r Request) (Plan, error) {
 
 // Validate proves that a serialized plan is canonical and has not been edited.
 func (p Plan) Validate() error {
-	if p.Version != Version || p.ArtifactDigest == "" || p.FromFingerprint == "" || p.Target == "" || p.Environment == "" || p.PostgresMajor < 14 || p.PostgresMajor > 18 || p.CapabilityDigest == "" || p.BindingsDigest == "" || p.PolicyDigest == "" || p.Digest == "" {
+	if p.Version != Version || p.ArtifactDigest == "" || p.FromFingerprint == "" || p.Target == "" || p.Environment == "" || p.MetadataSchema == "" || p.PostgresMajor < 14 || p.PostgresMajor > 18 || p.CapabilityDigest == "" || p.BindingsDigest == "" || p.PolicyDigest == "" || p.Digest == "" {
 		return refuse("incomplete plan bindings")
 	}
-	wantBindings := digest(bindings{p.ArtifactDigest, p.FromFingerprint, p.Target, p.Environment, p.CapabilityDigest, p.PolicyDigest})
+	wantBindings := digest(bindings{p.ArtifactDigest, p.FromFingerprint, p.Target, p.Environment, p.MetadataSchema, p.CapabilityDigest, p.PolicyDigest})
 	if wantBindings != p.BindingsDigest {
 		return refuse("bindings digest mismatch")
 	}
@@ -633,6 +636,9 @@ func mappingScope(target, environment, artifact string) string {
 		Environment string `json:"environment"`
 		Artifact    string `json:"artifact"`
 	}{target, environment, artifact})
+}
+func PlanningAdvisoryDomain(metadataSchema, target, environment string) string {
+	return "autosql.zdm.expand-plan/v1/" + metadataSchema + "/" + target + "/" + environment
 }
 func validateUnique(s Snapshot, op zerodowntime.Operation, table Table) error {
 	want := op.Ordering.Unique

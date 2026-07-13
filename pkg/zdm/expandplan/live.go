@@ -51,7 +51,7 @@ func InspectLive(ctx context.Context, r InspectRequest) (Snapshot, error) {
 	// through this context; rollback then releases all transaction locks.
 	holdCtx, cancelHold := context.WithTimeout(ctx, time.Duration(r.Policy.MaxLockHoldMS)*time.Millisecond)
 	defer cancelHold()
-	if _, err = tx.Exec(holdCtx, `select pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtextextended($1,0::bigint))`, "autosql.zdm.expand-plan/v1/"+r.MetadataSchema+"/"+r.Target+"/"+r.Environment); err != nil {
+	if _, err = tx.Exec(holdCtx, `select pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtextextended($1,0::bigint))`, PlanningAdvisoryDomain(r.MetadataSchema, r.Target, r.Environment)); err != nil {
 		return Snapshot{}, err
 	}
 	var major int
@@ -70,7 +70,7 @@ func InspectLive(ctx context.Context, r InspectRequest) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, err
 	}
-	s := Snapshot{Fingerprint: fp, Target: r.Target, Environment: r.Environment, ArtifactDigest: r.ArtifactDigest, PostgresMajor: major, Tables: map[string]Table{}, Indexes: map[string]Index{}, Mappings: map[string]Mapping{}, Schemas: append([]string(nil), r.Schemas...), UniqueEvidence: map[string]UniqueEvidence{}, Constraints: map[string]bool{}, SchemaCreate: map[string]bool{}, ExistingObjects: map[string]string{}}
+	s := Snapshot{Fingerprint: fp, Target: r.Target, Environment: r.Environment, MetadataSchema: r.MetadataSchema, ArtifactDigest: r.ArtifactDigest, PostgresMajor: major, Tables: map[string]Table{}, Indexes: map[string]Index{}, Mappings: map[string]Mapping{}, Schemas: append([]string(nil), r.Schemas...), UniqueEvidence: map[string]UniqueEvidence{}, Constraints: map[string]bool{}, SchemaCreate: map[string]bool{}, ExistingObjects: map[string]string{}}
 	for _, ns := range r.Schemas {
 		var ok bool
 		if err = tx.QueryRow(holdCtx, `select pg_catalog.has_schema_privilege(current_user,$1,'CREATE')`, ns).Scan(&ok); err != nil {

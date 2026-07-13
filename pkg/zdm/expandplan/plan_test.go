@@ -27,7 +27,7 @@ func addNoneEffects() zerodowntime.PhaseEffect {
 	return e
 }
 func base(m zerodowntime.Migration) Request {
-	return Request{Migration: m, ExpectedFingerprint: "sha256:live", Target: "primary", Environment: "prod", Snapshot: Snapshot{Fingerprint: "sha256:live", Target: "primary", Environment: "prod", PostgresMajor: 16, Tables: map[string]Table{"users": {Schema: "public", Name: "users", Owner: "app", CanAlter: true, Columns: map[string]Column{"id": {Name: "id", Type: "bigint"}, "name": {Name: "name", Type: "text", Nullable: true}}}}, Indexes: map[string]Index{}, Mappings: map[string]Mapping{}, Schemas: []string{"public"}, SchemaCreate: map[string]bool{"public": true}, ExistingObjects: map[string]string{}, UniqueEvidence: map[string]UniqueEvidence{"users_pkey": {Name: "users_pkey", Table: "users", Columns: []string{"id"}, Constraint: true, Valid: true, Ready: true}}}, Policy: Policy{MaxLockMS: 100, MaxLockHoldMS: 10000, MaxStatementMS: 10000, MaxTransactionMS: 10000, AllowTableScan: true, AllowValidationScan: true, AllowNonTransactional: true}, Verify: func(zerodowntime.Migration) error { return nil }}
+	return Request{Migration: m, ExpectedFingerprint: "sha256:live", Target: "primary", Environment: "prod", Snapshot: Snapshot{Fingerprint: "sha256:live", Target: "primary", Environment: "prod", MetadataSchema: "autosql_zdm", PostgresMajor: 16, Tables: map[string]Table{"users": {Schema: "public", Name: "users", Owner: "app", CanAlter: true, Columns: map[string]Column{"id": {Name: "id", Type: "bigint"}, "name": {Name: "name", Type: "text", Nullable: true}}}}, Indexes: map[string]Index{}, Mappings: map[string]Mapping{}, Schemas: []string{"public"}, SchemaCreate: map[string]bool{"public": true}, ExistingObjects: map[string]string{}, UniqueEvidence: map[string]UniqueEvidence{"users_pkey": {Name: "users_pkey", Table: "users", Columns: []string{"id"}, Constraint: true, Valid: true, Ready: true}}}, Policy: Policy{MaxLockMS: 100, MaxLockHoldMS: 10000, MaxStatementMS: 10000, MaxTransactionMS: 10000, AllowTableScan: true, AllowValidationScan: true, AllowNonTransactional: true}, Verify: func(zerodowntime.Migration) error { return nil }}
 }
 
 func TestBuildAdditiveAndBreakingPlans(t *testing.T) {
@@ -238,6 +238,42 @@ func TestDeferredLockHoldBoundaries(t *testing.T) {
 		if _, err := Build(r); err != nil {
 			t.Fatalf("%s exact boundary refused: %v", op.Kind, err)
 		}
+	}
+}
+
+func TestMetadataSchemaBindsAdvisoryDomainAndPlanIdentity(t *testing.T) {
+	op := zerodowntime.Operation{ID: "01", Kind: zerodowntime.AddColumn, Table: "users", Column: "email", DataType: "text", SynchronizationMode: "none", Effects: addNoneEffects(), Reversal: zerodowntime.Reversal{Mode: "automatic"}}
+	r := base(migration(t, []zerodowntime.Operation{op}))
+	p, err := Build(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := PlanningAdvisoryDomain("autosql_zdm", "primary", "prod")
+	found := false
+	for _, l := range p.PlanningLocks {
+		if l.Kind == "advisory" {
+			found = true
+			if l.Object != want {
+				t.Fatalf("reported=%q want=%q", l.Object, want)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("advisory evidence missing")
+	}
+	tampered := p
+	tampered.MetadataSchema = "evil"
+	if err = tampered.Validate(); !errors.Is(err, ErrRefused) {
+		t.Fatal("metadata tamper accepted")
+	}
+	other := r
+	other.Snapshot.MetadataSchema = "other_zdm"
+	p2, err := Build(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p2.Digest == p.Digest || p2.BindingsDigest == p.BindingsDigest {
+		t.Fatal("metadata schema is not bound into plan identity")
 	}
 }
 
