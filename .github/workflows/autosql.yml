@@ -40,4 +40,4 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: go build -o autosql ./cmd/autosql
-      - run: ./autosql migrate apply --artifact-ref env://AUTOSQL_ARTIFACT
+      - run: ./autosql version --json
