@@ -8,12 +8,15 @@ permissions:
 jobs:
   changeset:
     runs-on: ubuntu-24.04
-    container:
-      image: ghcr.io/example/autosql-ci@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - run: autosql schema diff --json
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
       - run: go test ./...
+      - run: go vet ./...
+      - run: go build ./...
   deploy:
     if: github.event_name == 'push'
     needs: changeset
@@ -22,8 +25,11 @@ jobs:
       contents: read
       id-token: write
     environment: production
-    container:
-      image: ghcr.io/example/autosql-ci@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - run: autosql migrate apply --artifact-ref env://AUTOSQL_ARTIFACT
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go build -o autosql ./cmd/autosql
+      - run: ./autosql migrate apply --artifact-ref env://AUTOSQL_ARTIFACT
