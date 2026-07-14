@@ -15,6 +15,14 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: go test ./...
+      - run: go test -coverprofile=coverage.out ./...
+      - run: go tool cover -func=coverage.out > coverage.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: autosql-coverage
+          path: |
+            coverage.out
+            coverage.txt
       - run: go vet ./...
       - run: go build ./...
   deploy:

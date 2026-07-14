@@ -139,4 +139,5 @@ output. See [the CLI contract](docs/cli-contract.md) and
 - [CI/CD and GitOps ecosystem](docs/ci-gitops-ecosystem.md)
 - [Schema analytics and governance](docs/schema-analytics.md)
 - [Advanced migration lint and AI-safe review](docs/advanced-migration-lint.md)
+- [Integration testing and coverage](docs/integration-testing.md)
 - [Database security as code](docs/database-security.md) · [reference data](docs/reference-data.md)

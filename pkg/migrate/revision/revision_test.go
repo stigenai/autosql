@@ -262,10 +262,14 @@ func TestStatusAllStatesDriftAxesAndReadOnlyExecutorReconciliation(t *testing.T)
 	}
 	defer conn.Close(ctx)
 	defer conn.Exec(ctx, "drop schema if exists "+q(schema)+" cascade")
-	if _, e = conn.Exec(ctx, "create table "+q(schema, history)+"(artifact_digest text,state text)"); e != nil {
+	if _, e = conn.Exec(ctx, "create table "+q(schema, history)+"(plan_digest text,bundle_digest text,attempt integer,state text)"); e != nil {
 		t.Fatal(e)
 	}
 	m := testManifestN(t, 6)
+	for i := range m.Entries {
+		m.Entries[i].Directives.PlanDigest = fmt.Sprintf("plan-%d", i)
+		m.Entries[i].Directives.BundleDigest = fmt.Sprintf("bundle-%d", i)
+	}
 	now := time.Now().UTC()
 	states := []string{"applied", "failed", "partial", "baseline", "checkpoint"}
 	for i, state := range states {
@@ -274,7 +278,7 @@ func TestStatusAllStatesDriftAxesAndReadOnlyExecutorReconciliation(t *testing.T)
 		if state == "baseline" || state == "checkpoint" {
 			kind = state
 		}
-		r := Revision{Version: x.Version, Description: x.Name, Kind: kind, FileName: x.File, FileDigest: x.SQLDigest, ManifestDigest: "historical-manifest", ManifestGeneration: m.Generation, ArtifactDigest: fmt.Sprintf("artifact-%d", i), PlanDigest: x.Directives.PlanDigest, ChecksDigest: x.Directives.CheckDigest, BundleDigest: x.Directives.BundleDigest, State: state, Attempt: 1, Operator: "operator", StartedAt: now, UpdatedAt: now, Duration: time.Duration(i+1) * time.Second}
+		r := Revision{Version: x.Version, Description: x.Name, Kind: kind, FileName: x.File, FileDigest: x.SQLDigest, ManifestDigest: "historical-manifest", ManifestGeneration: m.Generation, ArtifactDigest: fmt.Sprintf("artifact-%d", i), PlanDigest: fmt.Sprintf("plan-%d", i), ChecksDigest: x.Directives.CheckDigest, BundleDigest: fmt.Sprintf("bundle-%d", i), State: state, Attempt: 1, Operator: "operator", StartedAt: now, UpdatedAt: now, Duration: time.Duration(i+1) * time.Second}
 		if i == len(states)-1 {
 			r.ManifestDigest = m.Digest
 		}
@@ -282,7 +286,7 @@ func TestStatusAllStatesDriftAxesAndReadOnlyExecutorReconciliation(t *testing.T)
 			t.Fatal(e)
 		}
 	}
-	if _, e = conn.Exec(ctx, "insert into "+q(schema, history)+" values('artifact-0','intended')"); e != nil {
+	if _, e = conn.Exec(ctx, "insert into "+q(schema, history)+" values('plan-0','bundle-0',1,'intended')"); e != nil {
 		t.Fatal(e)
 	}
 	first, e := s.Status(ctx, m)
@@ -338,7 +342,7 @@ func TestStatusAllStatesDriftAxesAndReadOnlyExecutorReconciliation(t *testing.T)
 	if e = mutStore.Insert(ctx, r); e != nil {
 		t.Fatal(e)
 	}
-	if _, e = conn.Exec(ctx, "create table "+q(mutSchema, "sentinel")+"(n int); create function "+q(mutSchema, "mutate")+"() returns text language plpgsql as $$begin insert into "+q(mutSchema, "sentinel")+" values(1); return 'intended'; end$$; create view "+q(mutSchema, "evil_history")+" as select 'artifact-side-effect'::text artifact_digest,"+q(mutSchema, "mutate")+"() state"); e != nil {
+	if _, e = conn.Exec(ctx, "create table "+q(mutSchema, "sentinel")+"(n int); create function "+q(mutSchema, "mutate")+"() returns text language plpgsql as $$begin insert into "+q(mutSchema, "sentinel")+" values(1); return 'intended'; end$$; create view "+q(mutSchema, "evil_history")+" as select 'plan-side-effect'::text plan_digest,'bundle-side-effect'::text bundle_digest,1::integer attempt,"+q(mutSchema, "mutate")+"() state"); e != nil {
 		t.Fatal(e)
 	}
 	if _, e = mutStore.Status(ctx, manifest); e == nil {
@@ -348,13 +352,13 @@ func TestStatusAllStatesDriftAxesAndReadOnlyExecutorReconciliation(t *testing.T)
 	if e = conn.QueryRow(ctx, "select count(*) from "+q(mutSchema, "sentinel")).Scan(&sentinel); e != nil || sentinel != 0 {
 		t.Fatalf("sentinel=%d err=%v", sentinel, e)
 	}
-	if _, e = conn.Exec(ctx, "drop view "+q(mutSchema, "evil_history")+"; create view "+q(mutSchema, "evil_history")+" as select 'artifact-side-effect'::text artifact_digest"); e != nil {
+	if _, e = conn.Exec(ctx, "drop view "+q(mutSchema, "evil_history")+"; create view "+q(mutSchema, "evil_history")+" as select 'plan-side-effect'::text plan_digest"); e != nil {
 		t.Fatal(e)
 	}
 	if _, e = mutStore.Status(ctx, manifest); e == nil {
 		t.Fatal("malformed executor history was ignored")
 	}
-	if _, e = conn.Exec(ctx, "drop view "+q(mutSchema, "evil_history")+"; create view "+q(mutSchema, "evil_history")+" as select 'artifact-side-effect'::text artifact_digest,'confirmed'::text state"); e != nil {
+	if _, e = conn.Exec(ctx, "drop view "+q(mutSchema, "evil_history")+"; create view "+q(mutSchema, "evil_history")+" as select 'plan-side-effect'::text plan_digest,'bundle-side-effect'::text bundle_digest,1::integer attempt,'confirmed'::text state"); e != nil {
 		t.Fatal(e)
 	}
 	role := "rev_reader_" + strings.TrimPrefix(testSchema(t), "autosql_rev_")
