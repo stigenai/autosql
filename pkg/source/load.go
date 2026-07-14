@@ -17,8 +17,9 @@ import (
 type Format string
 
 const (
-	FormatSQL    Format = "sql"
-	FormatNative Format = "autosql-json"
+	FormatSQL       Format = "sql"
+	FormatNative    Format = "autosql-json"
+	FormatHCLSource Format = "hcl"
 )
 
 type Input struct {
@@ -61,6 +62,8 @@ func LoadContext(ctx context.Context, inputs ...Input) (schema.Document, error) 
 			}
 		case FormatSQL:
 			part, err = parseSQL(ctx, in.URI, string(in.Data), false)
+		case FormatHCLSource:
+			part, err = ParseHCLContext(ctx, in.URI, in.Data, nil)
 		default:
 			err = fmt.Errorf("%s: unsupported schema source format %q", in.URI, in.Format)
 		}
