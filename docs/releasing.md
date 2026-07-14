@@ -9,7 +9,8 @@ The workflow builds and attaches these Linux CLI archives to the GitHub release:
 Each archive contains a version-stamped `autosql` binary and has a matching
 SHA-256 file. The workflow also publishes `ghcr.io/stigenai/autosql` for
 Linux AMD64 and ARM64 with the release tag, commit tag, and `latest` tag. The
-images include BuildKit provenance and SBOM attestations.
+images reuse the native release binaries rather than recompiling under
+emulation, and include BuildKit provenance and SBOM attestations.
 
 To cut a release after merging to `main`:
 
