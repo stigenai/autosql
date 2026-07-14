@@ -140,4 +140,5 @@ output. See [the CLI contract](docs/cli-contract.md) and
 - [Schema analytics and governance](docs/schema-analytics.md)
 - [Advanced migration lint and AI-safe review](docs/advanced-migration-lint.md)
 - [Integration testing and coverage](docs/integration-testing.md)
+- [Release binaries and container images](docs/releasing.md)
 - [Database security as code](docs/database-security.md) · [reference data](docs/reference-data.md)
