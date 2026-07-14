@@ -29,8 +29,13 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: scripts/test-live-serial.sh ./pkg/zdm/... ./internal/cli
+      - run: go test -race -p 1 -covermode=atomic -coverprofile=zdm-coverage.out -count=1 ./pkg/zdm/... ./internal/cli
+      - run: go tool cover -func=zdm-coverage.out > zdm-coverage.txt
       - run: go test -run '^$' -bench BenchmarkZDM -benchtime=1s -count=1 ./pkg/zdm/compatmatrix | tee zdm-bench.txt
       - uses: actions/upload-artifact@v4
         with:
           name: zdm-postgres-${{ matrix.version }}
-          path: zdm-bench.txt
+          path: |
+            zdm-bench.txt
+            zdm-coverage.out
+            zdm-coverage.txt
