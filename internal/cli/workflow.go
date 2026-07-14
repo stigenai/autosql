@@ -97,14 +97,17 @@ func (d DefaultReadPlan) Load(ctx context.Context, r LoadRequest) (schema.Docume
 	var doc schema.Document
 	var e error
 	switch kind {
-	case "sql", "native", "json":
+	case "sql", "native", "json", "hcl":
 		data, readErr := os.ReadFile(value)
 		if readErr != nil {
 			return doc, fmt.Errorf("read source")
 		}
 		format := source.FormatNative
-		if kind == "sql" {
+		switch kind {
+		case "sql":
 			format = source.FormatSQL
+		case "hcl":
+			format = source.FormatHCLSource
 		}
 		doc, e = source.LoadContext(ctx, source.Input{URI: value, Format: format, Data: data})
 	case "live":

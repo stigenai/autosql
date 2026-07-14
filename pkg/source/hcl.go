@@ -155,41 +155,76 @@ func hclDocument(ctx context.Context, uri string, body *hclsyntax.Body, data []b
 			if err != nil {
 				return err
 			}
-			if kind == "resource" {
+			resourceForm := kind == "resource"
+			// Resource form is a lossless escape hatch for every canonical kind
+			// (this is what FormatHCL emits). Its identity attrs — schema,
+			// parent, catalog — and its dependencies are captured verbatim so
+			// FormatHCL -> ParseHCL reproduces an identical graph. They must be
+			// read before spec_json replaces the block attribute map.
+			var rfSchema, rfParent, rfCatalog, rfDeps string
+			if resourceForm {
 				if len(b.Labels) != 2 {
 					return fmt.Errorf("%w: resource needs kind and name", ErrHCL)
 				}
 				kind = b.Labels[0]
 				name = b.Labels[1]
+				rfSchema, _ = spec["schema"].(string)
+				rfParent, _ = spec["parent"].(string)
+				rfCatalog, _ = spec["catalog"].(string)
+				rfDeps, _ = spec["deps_json"].(string)
 				if encoded, ok := spec["spec_json"].(string); ok {
 					var decoded map[string]any
 					if err := json.Unmarshal([]byte(encoded), &decoded); err != nil {
 						return fmt.Errorf("%w: resource spec_json: %v", ErrHCL, err)
 					}
 					spec = decoded
+				} else {
+					delete(spec, "schema")
+					delete(spec, "parent")
+					delete(spec, "catalog")
+					delete(spec, "deps_json")
 				}
-			}
-			if !knownHCLKind(kind) {
+				if !schema.IsKnownKind(schema.Kind(kind)) {
+					return fmt.Errorf("%w: %s", ErrUnknownHCLKind, kind)
+				}
+			} else if !knownHCLKind(kind) {
 				return fmt.Errorf("%w: %s", ErrUnknownHCLKind, kind)
 			}
 			nameObj := schema.Name{Name: name, Parent: parent}
-			if raw, ok := spec["schema"]; ok {
-				if v, ok := raw.(string); ok {
-					nameObj.Schema = strings.TrimPrefix(v, "schema.")
-				}
-			}
-			delete(spec, "schema")
 			sk := kindToSchema(kind)
-			if sk == schema.KindSchema {
-				nameObj = schema.Name{Name: name}
-			}
-			deps := []schema.Dependency{}
-			if parent != "" {
-				deps = append(deps, schema.Dependency{Target: parent, Type: schema.DependencyContains})
-			}
-			if nameObj.Schema != "" {
-				sid := schema.StableID(schema.KindSchema, schema.Name{Name: nameObj.Schema})
-				deps = append(deps, schema.Dependency{Target: sid, Type: schema.DependencyContains})
+			var deps []schema.Dependency
+			if resourceForm {
+				nameObj.Schema = strings.TrimPrefix(rfSchema, "schema.")
+				nameObj.Catalog = rfCatalog
+				if rfParent != "" {
+					nameObj.Parent = rfParent
+				}
+				if sk == schema.KindSchema {
+					nameObj = schema.Name{Name: name}
+				}
+				if rfDeps != "" {
+					if err := json.Unmarshal([]byte(rfDeps), &deps); err != nil {
+						return fmt.Errorf("%w: resource deps_json: %v", ErrHCL, err)
+					}
+				}
+			} else {
+				if raw, ok := spec["schema"]; ok {
+					if v, ok := raw.(string); ok {
+						nameObj.Schema = strings.TrimPrefix(v, "schema.")
+					}
+				}
+				delete(spec, "schema")
+				if sk == schema.KindSchema {
+					nameObj = schema.Name{Name: name}
+				}
+				deps = []schema.Dependency{}
+				if parent != "" {
+					deps = append(deps, schema.Dependency{Target: parent, Type: schema.DependencyContains})
+				}
+				if nameObj.Schema != "" {
+					sid := schema.StableID(schema.KindSchema, schema.Name{Name: nameObj.Schema})
+					deps = append(deps, schema.Dependency{Target: sid, Type: schema.DependencyContains})
+				}
 			}
 			id := schema.StableID(sk, nameObj)
 			bts, _ := json.Marshal(spec)
@@ -409,6 +444,12 @@ func FormatHCL(doc schema.Document) ([]byte, error) {
 		if r.Name.Schema != "" {
 			body.SetAttributeValue("schema", cty.StringVal(r.Name.Schema))
 		}
+		if r.Name.Catalog != "" {
+			body.SetAttributeValue("catalog", cty.StringVal(r.Name.Catalog))
+		}
+		if r.Name.Parent != "" {
+			body.SetAttributeValue("parent", cty.StringVal(r.Name.Parent))
+		}
 		var spec any
 		if len(r.Spec) > 0 {
 			if err := json.Unmarshal(r.Spec, &spec); err != nil {
@@ -416,6 +457,13 @@ func FormatHCL(doc schema.Document) ([]byte, error) {
 			}
 			raw, _ := json.Marshal(spec)
 			body.SetAttributeValue("spec_json", cty.StringVal(string(raw)))
+		}
+		if len(r.Dependencies) > 0 {
+			dj, err := json.Marshal(r.Dependencies)
+			if err != nil {
+				return nil, err
+			}
+			body.SetAttributeValue("deps_json", cty.StringVal(string(dj)))
 		}
 		root.AppendNewline()
 	}

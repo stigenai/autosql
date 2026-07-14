@@ -154,7 +154,7 @@ func TestSchemaInspectOutputFormats(t *testing.T) {
 		return schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{{ID: schema.StableID(schema.KindSchema, n), Kind: schema.KindSchema, Name: n, Spec: json.RawMessage(`{}`)}}}}, nil
 	}
 	t.Setenv("AUTOSQL_INSPECT_URL", "postgres://user:secret@db/app")
-	for _, fixture := range []struct{ format, want string }{{"native", `"version"`}, {"json", `  "graph"`}, {"sql", `CREATE SCHEMA "app"`}} {
+	for _, fixture := range []struct{ format, want string }{{"native", `"version"`}, {"json", `  "graph"`}, {"sql", `CREATE SCHEMA "app"`}, {"hcl", `resource "schema" "app"`}} {
 		t.Run(fixture.format, func(t *testing.T) {
 			var out bytes.Buffer
 			code := Run(context.Background(), []string{"schema", "inspect", "--url", "env://AUTOSQL_INSPECT_URL", "--format", fixture.format}, Streams{Out: &out, Err: &bytes.Buffer{}})
@@ -162,5 +162,22 @@ func TestSchemaInspectOutputFormats(t *testing.T) {
 				t.Fatalf("code=%d out=%s", code, out.String())
 			}
 		})
+	}
+}
+
+func TestSchemaLoadHCLSource(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "schema.hcl")
+	if err := os.WriteFile(path, []byte(`schema "app" {}
+table "users" { schema = "app" }`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var out, stderr bytes.Buffer
+	code := Run(context.Background(), []string{"schema", "load", "--source", "hcl:" + path, "--json"}, Streams{Out: &out, Err: &stderr})
+	if code != int(ExitOK) || stderr.Len() != 0 {
+		t.Fatalf("code=%d stderr=%q out=%q", code, stderr.String(), out.String())
+	}
+	var envelope Envelope
+	if err := json.Unmarshal(out.Bytes(), &envelope); err != nil || !envelope.OK || envelope.Command != "schema load" {
+		t.Fatalf("bad envelope: %s (%v)", out.String(), err)
 	}
 }

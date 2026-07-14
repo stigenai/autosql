@@ -9,6 +9,39 @@ import (
 	"autosql/pkg/schema"
 )
 
+// TestFormatHCLReloadsViaLoadContext proves the bootstrap-to-HCL flow: a SQL
+// source is loaded, emitted as HCL by FormatHCL, then reloaded through
+// LoadContext's FormatHCLSource path. The resulting graph must be identical,
+// so an operator/CI pipeline can adopt HCL as the source of truth with no drift.
+func TestFormatHCLReloadsViaLoadContext(t *testing.T) {
+	sql := `CREATE SCHEMA app;
+CREATE TABLE app.users (
+  id bigint NOT NULL,
+  email text,
+  CONSTRAINT users_pkey PRIMARY KEY (id)
+);
+CREATE INDEX users_email_idx ON app.users (email);`
+	fromSQL, err := Load(Input{URI: "schema.sql", Format: FormatSQL, Data: []byte(sql)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hcl, err := FormatHCL(fromSQL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromHCL, err := LoadContext(context.Background(), Input{URI: "schema.hcl", Format: FormatHCLSource, Data: hcl})
+	if err != nil {
+		t.Fatalf("reload via FormatHCLSource: %v", err)
+	}
+	diff, err := schema.Diff(fromSQL, fromHCL, schema.DiffOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(diff.Changes) != 0 {
+		t.Fatalf("SQL->HCL->graph drifted: %d changes", len(diff.Changes))
+	}
+}
+
 func TestSQLAndNativeProduceEquivalentGraph(t *testing.T) {
 	sql := `CREATE SCHEMA app;
 CREATE TABLE app.users (

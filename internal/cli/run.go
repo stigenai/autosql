@@ -176,7 +176,7 @@ func runSchemaInspect(parent context.Context, args []string, o output, redactor 
 		}
 		return &Error{Kind: "connection", Message: redactor.String(err.Error()), Code: ExitConnection, Cause: err}
 	}
-	if *format != "native" && *format != "json" && *format != "sql" {
+	if *format != "native" && *format != "json" && *format != "sql" && *format != "hcl" {
 		return usageError(fmt.Errorf("invalid --format"))
 	}
 	human, err := doc.MarshalCanonical()
@@ -189,6 +189,13 @@ func runSchemaInspect(parent context.Context, args []string, o output, redactor 
 		if err != nil {
 			return &Error{Kind: "validation", Message: "SQL rendering failed", Code: ExitValidation, Cause: err}
 		}
+	}
+	if *format == "hcl" {
+		hcl, herr := source.FormatHCL(doc)
+		if herr != nil {
+			return &Error{Kind: "validation", Message: "HCL rendering failed", Code: ExitValidation, Cause: herr}
+		}
+		text = strings.TrimSuffix(string(hcl), "\n")
 	}
 	if *format == "json" {
 		var pretty bytes.Buffer
@@ -232,6 +239,8 @@ func runSchemaLoad(parent context.Context, args []string, o output) error {
 			format = source.FormatSQL
 		case "json":
 			format = source.FormatNative
+		case "hcl":
+			format = source.FormatHCLSource
 		default:
 			return usageError(fmt.Errorf("invalid source format %q", formatName))
 		}
