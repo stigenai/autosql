@@ -90,13 +90,7 @@ func TestInspectURLIntegration(t *testing.T) {
 	defer conn.Close(context.Background())
 	const fixture = `
 drop schema if exists autosql_inspect cascade;
-drop schema if exists autosql_ordinal cascade;
 create schema autosql_inspect;
-create schema autosql_ordinal;
-create table autosql_ordinal.widgets (
-  id bigint not null,
-  name text
-);
 comment on schema autosql_inspect is 'integration schema';
 create extension hstore with schema autosql_inspect;
 create type autosql_inspect.status as enum ('new','done');
@@ -140,7 +134,7 @@ alter default privileges in schema autosql_inspect grant select on tables to pub
 	defer func() {
 		cleanup, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_, _ = conn.Exec(cleanup, `alter default privileges in schema autosql_inspect revoke select on tables from public; drop schema if exists autosql_inspect cascade; drop schema if exists autosql_ordinal cascade`)
+		_, _ = conn.Exec(cleanup, `alter default privileges in schema autosql_inspect revoke select on tables from public; drop schema if exists autosql_inspect cascade`)
 	}()
 
 	opts := Options{Schemas: []string{"autosql_inspect"}}
@@ -166,14 +160,10 @@ alter default privileges in schema autosql_inspect grant select on tables to pub
 			t.Fatalf("inspected column %s missing canonical ordinal: %#v", r.Name.String(), spec)
 		}
 	}
-	// Use a focused, fully managed schema for the apply-convergence contract.
-	// Rich inspection semantics have separate capability boundaries, while
-	// column ordering must be canonical for every inspection.
-	roundTrip, err := InspectURL(ctx, url, Options{Schemas: []string{"autosql_ordinal"}})
-	if err != nil {
-		t.Fatalf("inspect round-trip fixture: %v", err)
-	}
-	hcl, err := source.FormatHCL(roundTrip)
+	// The complete fixture includes comments, identity columns, types, views,
+	// policies, and read-only resources. An unchanged round-trip must still be
+	// a valid no-op even though some of those semantics cannot be mutated.
+	hcl, err := source.FormatHCL(first)
 	if err != nil {
 		t.Fatalf("FormatHCL inspected schema: %v", err)
 	}
@@ -181,7 +171,7 @@ alter default privileges in schema autosql_inspect grant select on tables to pub
 	if err != nil {
 		t.Fatalf("reload inspected HCL: %v", err)
 	}
-	current, err := New().Normalize(ctx, roundTrip)
+	current, err := New().Normalize(ctx, first)
 	if err != nil {
 		t.Fatalf("normalize inspected schema: %v", err)
 	}

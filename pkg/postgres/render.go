@@ -21,6 +21,12 @@ func (*Driver) Render(ctx context.Context, request plugin.RenderRequest) ([]plug
 	if err := request.Changes.Validate(); err != nil {
 		return nil, fmt.Errorf("render PostgreSQL changes: %w", err)
 	}
+	// A validated empty change set cannot mutate the database. Do not reject a
+	// no-op merely because unchanged inspected resources contain metadata or
+	// read-only semantics that would be unsafe to render as an actual change.
+	if len(request.Changes.Changes) == 0 {
+		return nil, nil
+	}
 	if err := validateManagedDocuments(request); err != nil {
 		return nil, fmt.Errorf("render PostgreSQL changes: %w", err)
 	}
