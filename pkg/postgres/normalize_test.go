@@ -93,6 +93,34 @@ func TestNormalizeSQLSourceMatchesInspectorManagedShapes(t *testing.T) {
 	}
 }
 
+func TestNormalizeAcceptsLegacyColumnPosition(t *testing.T) {
+	schemaResource := schema.Resource{Kind: schema.KindSchema, Name: schema.Name{Name: "app"}, Spec: json.RawMessage(`{}`)}
+	schemaResource.ID = schema.StableID(schemaResource.Kind, schemaResource.Name)
+	table := schema.Resource{Kind: schema.KindTable, Name: schema.Name{Schema: "app", Name: "widgets", Parent: schemaResource.ID}, Dependencies: []schema.Dependency{{Target: schemaResource.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{}`)}
+	table.ID = schema.StableID(table.Kind, table.Name)
+	column := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: "app", Name: "id", Parent: table.ID}, Dependencies: []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{"position":1,"type":"bigint","not_null":true}`)}
+	column.ID = schema.StableID(column.Kind, column.Name)
+
+	doc, err := New().Normalize(context.Background(), schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{schemaResource, table, column}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, resource := range doc.Graph.Resources {
+		if resource.ID != column.ID {
+			continue
+		}
+		var spec map[string]any
+		if err := json.Unmarshal(resource.Spec, &spec); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := spec["position"]; ok || spec["ordinal"] != float64(1) {
+			t.Fatalf("legacy position was not canonicalized: %#v", spec)
+		}
+		return
+	}
+	t.Fatal("normalized column not found")
+}
+
 func TestPostgresRepresentativeTransitionsGolden(t *testing.T) {
 	makeResource := func(kind schema.Kind, name schema.Name, spec string, deps ...schema.Dependency) schema.Resource {
 		r := schema.Resource{Kind: kind, Name: name, Spec: json.RawMessage(spec), Dependencies: deps}

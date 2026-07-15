@@ -8,119 +8,119 @@ resource "check_constraint" "accounts_email_check" {
 resource "column" "metadata" {
   schema    = "hcl_advanced"
   parent    = "table:0ffba3b03647679a95275fa1"
-  spec_json = "{\"default\":\"'{}'::jsonb\",\"not_null\":true,\"position\":8,\"type\":\"jsonb\"}"
+  spec_json = "{\"default\":\"'{}'::jsonb\",\"not_null\":true,\"ordinal\":8,\"type\":\"jsonb\"}"
   deps_json = "[{\"target\":\"table:0ffba3b03647679a95275fa1\",\"type\":\"contains\"}]"
 }
 
 resource "column" "email" {
   schema    = "hcl_advanced"
   parent    = "view:04f3d22ad3913bf0d5c22979"
-  spec_json = "{\"not_null\":false,\"position\":3,\"type\":\"text\"}"
+  spec_json = "{\"not_null\":false,\"ordinal\":3,\"type\":\"text\"}"
   deps_json = "[{\"target\":\"view:04f3d22ad3913bf0d5c22979\",\"type\":\"contains\"}]"
 }
 
 resource "column" "organization_id" {
   schema    = "hcl_advanced"
   parent    = "table:0ffba3b03647679a95275fa1"
-  spec_json = "{\"not_null\":true,\"position\":2,\"type\":\"bigint\"}"
+  spec_json = "{\"not_null\":true,\"ordinal\":2,\"type\":\"bigint\"}"
   deps_json = "[{\"target\":\"table:0ffba3b03647679a95275fa1\",\"type\":\"contains\"}]"
 }
 
 resource "column" "email" {
   schema    = "hcl_advanced"
   parent    = "table:0ffba3b03647679a95275fa1"
-  spec_json = "{\"not_null\":true,\"position\":3,\"type\":\"text\"}"
+  spec_json = "{\"not_null\":true,\"ordinal\":3,\"type\":\"text\"}"
   deps_json = "[{\"target\":\"table:0ffba3b03647679a95275fa1\",\"type\":\"contains\"}]"
 }
 
 resource "column" "account_count" {
   schema    = "hcl_advanced"
   parent    = "materialized_view:ea235edecb7a1a07a02b3bce"
-  spec_json = "{\"not_null\":false,\"position\":2,\"type\":\"bigint\"}"
+  spec_json = "{\"not_null\":false,\"ordinal\":2,\"type\":\"bigint\"}"
   deps_json = "[{\"target\":\"materialized_view:ea235edecb7a1a07a02b3bce\",\"type\":\"contains\"}]"
 }
 
 resource "column" "name" {
   schema    = "hcl_advanced"
   parent    = "table:3e9c73b9fd428a45efaa9c6d"
-  spec_json = "{\"not_null\":true,\"position\":2,\"type\":\"text\"}"
+  spec_json = "{\"not_null\":true,\"ordinal\":2,\"type\":\"text\"}"
   deps_json = "[{\"target\":\"table:3e9c73b9fd428a45efaa9c6d\",\"type\":\"contains\"}]"
 }
 
 resource "column" "tags" {
   schema    = "hcl_advanced"
   parent    = "table:0ffba3b03647679a95275fa1"
-  spec_json = "{\"default\":\"'{}'::text[]\",\"not_null\":true,\"position\":7,\"type\":\"text[]\"}"
+  spec_json = "{\"default\":\"'{}'::text[]\",\"not_null\":true,\"ordinal\":7,\"type\":\"text[]\"}"
   deps_json = "[{\"target\":\"table:0ffba3b03647679a95275fa1\",\"type\":\"contains\"}]"
 }
 
 resource "column" "credit" {
   schema    = "hcl_advanced"
   parent    = "table:0ffba3b03647679a95275fa1"
-  spec_json = "{\"default\":\"0\",\"not_null\":true,\"position\":5,\"type\":\"hcl_advanced.positive_amount\"}"
+  spec_json = "{\"default\":\"0\",\"not_null\":true,\"ordinal\":5,\"type\":\"hcl_advanced.positive_amount\"}"
   deps_json = "[{\"target\":\"table:0ffba3b03647679a95275fa1\",\"type\":\"contains\"},{\"target\":\"domain:6e61de9c790cada869ae0800\",\"type\":\"uses\"}]"
 }
 
 resource "column" "organization_id" {
   schema    = "hcl_advanced"
   parent    = "view:04f3d22ad3913bf0d5c22979"
-  spec_json = "{\"not_null\":false,\"position\":2,\"type\":\"bigint\"}"
+  spec_json = "{\"not_null\":false,\"ordinal\":2,\"type\":\"bigint\"}"
   deps_json = "[{\"target\":\"view:04f3d22ad3913bf0d5c22979\",\"type\":\"contains\"}]"
 }
 
 resource "column" "created_at" {
   schema    = "hcl_advanced"
   parent    = "table:0ffba3b03647679a95275fa1"
-  spec_json = "{\"default\":\"now()\",\"not_null\":true,\"position\":9,\"type\":\"timestamp with time zone\"}"
+  spec_json = "{\"default\":\"now()\",\"not_null\":true,\"ordinal\":9,\"type\":\"timestamp with time zone\"}"
   deps_json = "[{\"target\":\"table:0ffba3b03647679a95275fa1\",\"type\":\"contains\"}]"
 }
 
 resource "column" "created_at" {
   schema    = "hcl_advanced"
   parent    = "view:04f3d22ad3913bf0d5c22979"
-  spec_json = "{\"not_null\":false,\"position\":4,\"type\":\"timestamp with time zone\"}"
+  spec_json = "{\"not_null\":false,\"ordinal\":4,\"type\":\"timestamp with time zone\"}"
   deps_json = "[{\"target\":\"view:04f3d22ad3913bf0d5c22979\",\"type\":\"contains\"}]"
 }
 
 resource "column" "status" {
   schema    = "hcl_advanced"
   parent    = "table:0ffba3b03647679a95275fa1"
-  spec_json = "{\"default\":\"'pending'::hcl_advanced.account_status\",\"not_null\":true,\"position\":4,\"type\":\"hcl_advanced.account_status\"}"
+  spec_json = "{\"default\":\"'pending'::hcl_advanced.account_status\",\"not_null\":true,\"ordinal\":4,\"type\":\"hcl_advanced.account_status\"}"
   deps_json = "[{\"target\":\"table:0ffba3b03647679a95275fa1\",\"type\":\"contains\"},{\"target\":\"enum:0754d221db620adc3c60f75b\",\"type\":\"uses\"}]"
 }
 
 resource "column" "contact" {
   schema    = "hcl_advanced"
   parent    = "table:0ffba3b03647679a95275fa1"
-  spec_json = "{\"not_null\":false,\"position\":6,\"type\":\"hcl_advanced.contact_info\"}"
+  spec_json = "{\"not_null\":false,\"ordinal\":6,\"type\":\"hcl_advanced.contact_info\"}"
   deps_json = "[{\"target\":\"table:0ffba3b03647679a95275fa1\",\"type\":\"contains\"},{\"target\":\"composite_type:ae2966747af5f9f0a9af0317\",\"type\":\"uses\"}]"
 }
 
 resource "column" "id" {
   schema    = "hcl_advanced"
   parent    = "view:04f3d22ad3913bf0d5c22979"
-  spec_json = "{\"not_null\":false,\"position\":1,\"type\":\"bigint\"}"
+  spec_json = "{\"not_null\":false,\"ordinal\":1,\"type\":\"bigint\"}"
   deps_json = "[{\"target\":\"view:04f3d22ad3913bf0d5c22979\",\"type\":\"contains\"}]"
 }
 
 resource "column" "id" {
   schema    = "hcl_advanced"
   parent    = "table:0ffba3b03647679a95275fa1"
-  spec_json = "{\"default\":\"nextval('hcl_advanced.account_id_seq'::regclass)\",\"not_null\":true,\"position\":1,\"type\":\"bigint\"}"
+  spec_json = "{\"default\":\"nextval('hcl_advanced.account_id_seq'::regclass)\",\"not_null\":true,\"ordinal\":1,\"type\":\"bigint\"}"
   deps_json = "[{\"target\":\"table:0ffba3b03647679a95275fa1\",\"type\":\"contains\"}]"
 }
 
 resource "column" "id" {
   schema    = "hcl_advanced"
   parent    = "table:3e9c73b9fd428a45efaa9c6d"
-  spec_json = "{\"not_null\":true,\"position\":1,\"type\":\"bigint\"}"
+  spec_json = "{\"not_null\":true,\"ordinal\":1,\"type\":\"bigint\"}"
   deps_json = "[{\"target\":\"table:3e9c73b9fd428a45efaa9c6d\",\"type\":\"contains\"}]"
 }
 
 resource "column" "organization_id" {
   schema    = "hcl_advanced"
   parent    = "materialized_view:ea235edecb7a1a07a02b3bce"
-  spec_json = "{\"not_null\":false,\"position\":1,\"type\":\"bigint\"}"
+  spec_json = "{\"not_null\":false,\"ordinal\":1,\"type\":\"bigint\"}"
   deps_json = "[{\"target\":\"materialized_view:ea235edecb7a1a07a02b3bce\",\"type\":\"contains\"}]"
 }
 
