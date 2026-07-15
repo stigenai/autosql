@@ -126,8 +126,8 @@ func hclsyntaxParse(data []byte, uri string) (*hcl.File, hcl.Diagnostics) {
 func hclDocument(ctx context.Context, uri string, body *hclsyntax.Body, data []byte, variables HCLVariables) (schema.Document, []string, error) {
 	doc := schema.Document{Version: schema.SchemaVersion}
 	var imports []string
-	var walk func(*hclsyntax.Body, string) error
-	walk = func(current *hclsyntax.Body, parent string) error {
+	var walk func(*hclsyntax.Body, string, string) error
+	walk = func(current *hclsyntax.Body, parent, parentSchema string) error {
 		blocks := append([]*hclsyntax.Block(nil), current.Blocks...)
 		sort.SliceStable(blocks, func(i, j int) bool { return blocks[i].DefRange().Start.Byte < blocks[j].DefRange().Start.Byte })
 		for _, b := range blocks {
@@ -161,7 +161,7 @@ func hclDocument(ctx context.Context, uri string, body *hclsyntax.Body, data []b
 			// parent, catalog — and its dependencies are captured verbatim so
 			// FormatHCL -> ParseHCL reproduces an identical graph. They must be
 			// read before spec_json replaces the block attribute map.
-			var rfSchema, rfParent, rfCatalog, rfDeps string
+			var rfSchema, rfParent, rfCatalog, rfDeps, rfAnnotations string
 			if resourceForm {
 				if len(b.Labels) != 2 {
 					return fmt.Errorf("%w: resource needs kind and name", ErrHCL)
@@ -172,6 +172,7 @@ func hclDocument(ctx context.Context, uri string, body *hclsyntax.Body, data []b
 				rfParent, _ = spec["parent"].(string)
 				rfCatalog, _ = spec["catalog"].(string)
 				rfDeps, _ = spec["deps_json"].(string)
+				rfAnnotations, _ = spec["annotations_json"].(string)
 				if encoded, ok := spec["spec_json"].(string); ok {
 					var decoded map[string]any
 					if err := json.Unmarshal([]byte(encoded), &decoded); err != nil {
@@ -183,6 +184,7 @@ func hclDocument(ctx context.Context, uri string, body *hclsyntax.Body, data []b
 					delete(spec, "parent")
 					delete(spec, "catalog")
 					delete(spec, "deps_json")
+					delete(spec, "annotations_json")
 				}
 				if !schema.IsKnownKind(schema.Kind(kind)) {
 					return fmt.Errorf("%w: %s", ErrUnknownHCLKind, kind)
@@ -190,7 +192,7 @@ func hclDocument(ctx context.Context, uri string, body *hclsyntax.Body, data []b
 			} else if !knownHCLKind(kind) {
 				return fmt.Errorf("%w: %s", ErrUnknownHCLKind, kind)
 			}
-			nameObj := schema.Name{Name: name, Parent: parent}
+			nameObj := schema.Name{Name: name, Parent: parent, Schema: parentSchema}
 			sk := kindToSchema(kind)
 			var deps []schema.Dependency
 			if resourceForm {
@@ -220,9 +222,9 @@ func hclDocument(ctx context.Context, uri string, body *hclsyntax.Body, data []b
 				deps = []schema.Dependency{}
 				if parent != "" {
 					deps = append(deps, schema.Dependency{Target: parent, Type: schema.DependencyContains})
-				}
-				if nameObj.Schema != "" {
+				} else if nameObj.Schema != "" {
 					sid := schema.StableID(schema.KindSchema, schema.Name{Name: nameObj.Schema})
+					nameObj.Parent = sid
 					deps = append(deps, schema.Dependency{Target: sid, Type: schema.DependencyContains})
 				}
 			}
@@ -230,8 +232,18 @@ func hclDocument(ctx context.Context, uri string, body *hclsyntax.Body, data []b
 			bts, _ := json.Marshal(spec)
 			rng := b.DefRange()
 			loc := &schema.SourceLocation{URI: uri, Line: rng.Start.Line, Column: rng.Start.Column}
-			doc.Graph.Resources = append(doc.Graph.Resources, schema.Resource{ID: id, Kind: sk, Name: nameObj, Dependencies: deps, Source: loc, Spec: bts})
-			if err := walk(b.Body, id); err != nil {
+			var annotations map[string]string
+			if rfAnnotations != "" {
+				if err := json.Unmarshal([]byte(rfAnnotations), &annotations); err != nil {
+					return fmt.Errorf("%w: resource annotations_json: %v", ErrHCL, err)
+				}
+			}
+			doc.Graph.Resources = append(doc.Graph.Resources, schema.Resource{ID: id, Kind: sk, Name: nameObj, Dependencies: deps, Annotations: annotations, Source: loc, Spec: bts})
+			childSchema := nameObj.Schema
+			if sk == schema.KindSchema {
+				childSchema = nameObj.Name
+			}
+			if err := walk(b.Body, id, childSchema); err != nil {
 				return err
 			}
 			for _, n := range nested {
@@ -240,7 +252,7 @@ func hclDocument(ctx context.Context, uri string, body *hclsyntax.Body, data []b
 		}
 		return nil
 	}
-	if err := walk(body, ""); err != nil {
+	if err := walk(body, "", ""); err != nil {
 		return doc, imports, err
 	}
 	ensureSchemasFromHCL(&doc)
@@ -464,6 +476,13 @@ func FormatHCL(doc schema.Document) ([]byte, error) {
 				return nil, err
 			}
 			body.SetAttributeValue("deps_json", cty.StringVal(string(dj)))
+		}
+		if len(r.Annotations) > 0 {
+			aj, err := json.Marshal(r.Annotations)
+			if err != nil {
+				return nil, err
+			}
+			body.SetAttributeValue("annotations_json", cty.StringVal(string(aj)))
 		}
 		root.AppendNewline()
 	}
