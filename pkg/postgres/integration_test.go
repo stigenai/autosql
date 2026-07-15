@@ -110,10 +110,15 @@ create table autosql_inspect.teams (
   id integer primary key,
   name text not null unique
 );
+create function autosql_inspect.lifecycle_state_to_v2(value autosql_inspect.status) returns text language sql immutable as $$ select value::text $$;
+create function autosql_inspect."Lifecycle To V2"(value text) returns text language sql immutable as $$ select value $$;
 create table autosql_inspect.users (
   id integer generated always as identity,
   team_id integer references autosql_inspect.teams(id),
   state autosql_inspect.status not null default 'new',
+  state_v2 text generated always as (autosql_inspect.lifecycle_state_to_v2(state)) stored,
+  "Quoted State" text,
+  "Quoted V2" text generated always as (autosql_inspect."Lifecycle To V2"("Quoted State")) stored,
   state_history autosql_inspect.status[],
   mood autosql_inspect."Mood",
   moods autosql_inspect."Mood"[],
@@ -139,6 +144,20 @@ alter default privileges in schema autosql_inspect grant select on tables to pub
 	if _, err := conn.Exec(ctx, fixture); err != nil {
 		t.Fatalf("create fixture: %v", err)
 	}
+	// hstore carries its own extension comment, so 244 explicit column comments
+	// plus the four inspected fixture comments produce the reported 248 objects.
+	columns := make([]string, 244)
+	var comments strings.Builder
+	for i := range columns {
+		name := fmt.Sprintf("comment_%03d", i+1)
+		columns[i] = pgx.Identifier{name}.Sanitize() + " text"
+		comments.WriteString("comment on column autosql_inspect.comment_inventory.")
+		comments.WriteString(pgx.Identifier{name}.Sanitize())
+		comments.WriteString(" is 'inventory';\n")
+	}
+	if _, err := conn.Exec(ctx, "create table autosql_inspect.comment_inventory ("+strings.Join(columns, ",")+");\n"+comments.String()); err != nil {
+		t.Fatalf("create complete comment inventory: %v", err)
+	}
 	defer func() {
 		cleanup, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -152,6 +171,39 @@ alter default privileges in schema autosql_inspect grant select on tables to pub
 	}
 	if err := first.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
+	}
+	commentCount := 0
+	for _, resource := range first.Graph.Resources {
+		if resource.Annotations["comment"] != "" {
+			commentCount++
+		}
+	}
+	if commentCount != 248 {
+		t.Fatalf("complete fixture has %d comments, want 248", commentCount)
+	}
+	resourceByKey := map[string]schema.Resource{}
+	for _, resource := range first.Graph.Resources {
+		resourceByKey[string(resource.Kind)+":"+resource.Name.Name] = resource
+	}
+	for generatedName, prerequisites := range map[string][]string{
+		"state_v2":  {resourceByKey["column:state"].ID, resourceByKey["function:lifecycle_state_to_v2(value autosql_inspect.status)"].ID},
+		"Quoted V2": {resourceByKey["column:Quoted State"].ID, resourceByKey["function:Lifecycle To V2(value text)"].ID},
+	} {
+		generated := resourceByKey["column:"+generatedName]
+		actual := map[string]bool{}
+		for _, dependency := range generated.Dependencies {
+			if dependency.Type == schema.DependencyReferences {
+				actual[dependency.Target] = true
+			}
+		}
+		for _, prerequisite := range prerequisites {
+			if prerequisite == "" || !actual[prerequisite] {
+				t.Errorf("generated column %q missing exact dependency %q: %+v", generatedName, prerequisite, generated.Dependencies)
+			}
+		}
+		if len(actual) != len(prerequisites) {
+			t.Errorf("generated column %q has non-exact reference dependencies: %+v", generatedName, generated.Dependencies)
+		}
 	}
 	for _, r := range first.Graph.Resources {
 		if r.Kind != schema.KindColumn {
@@ -186,6 +238,25 @@ alter default privileges in schema autosql_inspect grant select on tables to pub
 	desired, err := New().Normalize(ctx, reloaded)
 	if err != nil {
 		t.Fatalf("normalize reloaded HCL: %v", err)
+	}
+	report, err := PreflightProvisioning(ctx, desired, nil)
+	if err != nil {
+		t.Fatalf("preflight complete inspected cell: %v", err)
+	}
+	wantBlockers := map[string]bool{"external_prerequisite:": false}
+	for _, diagnostic := range report.Diagnostics {
+		key := diagnostic.Class + ":" + diagnostic.Field
+		if _, ok := wantBlockers[key]; ok {
+			wantBlockers[key] = true
+		}
+		if diagnostic.Class == "unsupported_semantic" && diagnostic.Field == "generated" {
+			t.Fatalf("complete fixture retained generated blocker: %+v", diagnostic)
+		}
+	}
+	for blocker, found := range wantBlockers {
+		if !found {
+			t.Errorf("complete inspected-cell preflight missing %s: %+v", blocker, report.Diagnostics)
+		}
 	}
 	diff, err := schema.Diff(current, desired, schema.DiffOptions{})
 	if err != nil {

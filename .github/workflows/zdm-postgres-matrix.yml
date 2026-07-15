@@ -31,6 +31,18 @@ jobs:
       - run: scripts/test-live-serial.sh ./pkg/zdm/... ./internal/cli
       - name: Test PostgreSQL default-expression matrix
         run: scripts/test-live-serial.sh ./pkg/postgres -run '^TestDefaultExpressionMatrixAdoptProvisionAndIncrement$'
+      - name: Test PostgreSQL managed-comment lifecycle
+        run: scripts/test-live-serial.sh ./pkg/postgres -run '^TestManagedCommentLifecycleCreateApplyReinspect$'
+      - name: Test PostgreSQL identity-column provisioning
+        run: scripts/test-live-serial.sh ./pkg/postgres -run '^TestIdentityColumnsCreateApplyReinspect$'
+      - name: Test PostgreSQL generated dependency inspection
+        run: scripts/test-live-serial.sh ./pkg/postgres -run '^TestInspectURLIntegration$'
+      - name: Test PostgreSQL generated routine prerequisites
+        run: scripts/test-live-serial.sh ./pkg/postgres -run '^TestGeneratedRoutinePrerequisiteVerification$'
+      - name: Test PostgreSQL stored-generated provisioning
+        run: scripts/test-live-serial.sh ./pkg/postgres -run '^TestStoredGeneratedColumnCreateApplyReinspect$'
+      - name: Test complete PostgreSQL cell provisioning parity
+        run: scripts/test-live-serial.sh ./pkg/postgres -run '^TestCompleteCellProvisioningParity$'
       - run: go test -race -p 1 -covermode=atomic -coverprofile=zdm-coverage.out -count=1 ./pkg/zdm/... ./internal/cli
       - run: go tool cover -func=zdm-coverage.out > zdm-coverage.txt
       - run: go test -run '^$' -bench BenchmarkZDM -benchtime=1s -count=1 ./pkg/zdm/compatmatrix | tee zdm-bench.txt

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"autosql/pkg/plan"
+	"autosql/pkg/plugin"
 	"autosql/pkg/postgres"
 	"autosql/pkg/schema"
 	"autosql/pkg/source"
@@ -220,6 +221,577 @@ func TestSQLSourcePlanApplyReinspectConverges(t *testing.T) {
 	noop, err := plan.Build(ctx, postgres.New(), reinspected, sameShape, plan.Options{})
 	if err != nil || len(noop.Steps) != 0 {
 		t.Fatalf("same-shape second plan=%+v err=%v", noop, err)
+	}
+}
+
+func TestManagedCommentLifecycleCreateApplyReinspect(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(context.Background()) }()
+	const namespace = "autosql_comments"
+	defer func() { _, _ = conn.Exec(context.Background(), `drop schema if exists autosql_comments cascade`) }()
+	const fixture = `
+drop schema if exists autosql_comments cascade;
+create schema autosql_comments;
+create type autosql_comments.state as enum ('new','done');
+create domain autosql_comments.positive_int as integer check (value > 0);
+create sequence autosql_comments.widget_seq start with 10 increment by 2;
+create table autosql_comments.widgets (
+  id bigint not null,
+  state autosql_comments.state not null default 'new',
+  score autosql_comments.positive_int
+);
+create view autosql_comments.widget_view as select id from autosql_comments.widgets;
+create materialized view autosql_comments.widget_mv as select 1 as value;
+`
+	if _, err = conn.Exec(ctx, fixture); err != nil {
+		t.Fatal(err)
+	}
+	desired, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err = postgres.New().Normalize(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := range desired.Graph.Resources {
+		resource := &desired.Graph.Resources[index]
+		if postgres.New().Info().Capability(resource.Kind).Mode == "managed" {
+			resource.Annotations = map[string]string{"comment": "quote ' snowman ☃\nline; DROP SCHEMA autosql_comments; --"}
+		}
+	}
+	desired.Normalize()
+	if _, err = conn.Exec(ctx, `drop schema autosql_comments cascade`); err != nil {
+		t.Fatal(err)
+	}
+	empty := schema.Document{Version: schema.SchemaVersion, Annotations: map[string]string{"dialect": "postgresql"}}
+	fresh, err := plan.Build(ctx, postgres.New(), empty, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, fresh)
+	actual, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err = postgres.New().Normalize(ctx, actual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFingerprint(t, actual, desired)
+
+	updated := cloneSchemaDocument(t, desired)
+	for index := range updated.Graph.Resources {
+		resource := &updated.Graph.Resources[index]
+		if resource.Kind == schema.KindSchema {
+			resource.Annotations = nil
+		}
+		if resource.Kind == schema.KindTable {
+			resource.Annotations = map[string]string{"comment": "changed ' safely"}
+		}
+	}
+	updated.Normalize()
+	commentOnly, err := plan.Build(ctx, postgres.New(), actual, updated, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, commentOnly)
+	actual, err = postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err = postgres.New().Normalize(ctx, actual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFingerprint(t, actual, updated)
+
+	added := cloneSchemaDocument(t, updated)
+	for index := range added.Graph.Resources {
+		if added.Graph.Resources[index].Kind == schema.KindSchema {
+			added.Graph.Resources[index].Annotations = map[string]string{"comment": "added again"}
+		}
+	}
+	added.Normalize()
+	addPlan, err := plan.Build(ctx, postgres.New(), actual, added, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, addPlan)
+	finalState, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalState, err = postgres.New().Normalize(ctx, finalState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFingerprint(t, finalState, added)
+	noop, err := plan.Build(ctx, postgres.New(), finalState, added, plan.Options{})
+	if err != nil || len(noop.Changes.Changes) != 0 || len(noop.Steps) != 0 {
+		t.Fatalf("comment lifecycle did not converge: changes=%d steps=%d err=%v", len(noop.Changes.Changes), len(noop.Steps), err)
+	}
+}
+
+func cloneSchemaDocument(t *testing.T, input schema.Document) schema.Document {
+	t.Helper()
+	raw, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output schema.Document
+	if err = json.Unmarshal(raw, &output); err != nil {
+		t.Fatal(err)
+	}
+	return output
+}
+
+func TestIdentityColumnsCreateApplyReinspect(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(context.Background()) }()
+	const namespace = "autosql_identity"
+	defer func() { _, _ = conn.Exec(context.Background(), `drop schema if exists autosql_identity cascade`) }()
+	if _, err = conn.Exec(ctx, `drop schema if exists autosql_identity cascade; create schema autosql_identity; create table autosql_identity.widgets(always_id bigint generated always as identity, default_id bigint generated by default as identity, label text);`); err != nil {
+		t.Fatal(err)
+	}
+	desired, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, resource := range desired.Graph.Resources {
+		if resource.Kind == schema.KindSequence {
+			t.Fatalf("identity-owned sequence leaked into managed graph: %s", resource.Name.String())
+		}
+	}
+	hcl, err := source.FormatHCL(desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err = source.LoadContext(ctx, source.Input{URI: "identity.hcl", Format: source.FormatHCLSource, Data: hcl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err = postgres.New().Normalize(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = conn.Exec(ctx, `drop schema autosql_identity cascade`); err != nil {
+		t.Fatal(err)
+	}
+	empty := schema.Document{Version: schema.SchemaVersion, Annotations: map[string]string{"dialect": "postgresql"}}
+	fresh, err := plan.Build(ctx, postgres.New(), empty, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, fresh)
+	actual, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err = postgres.New().Normalize(ctx, actual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFingerprint(t, actual, desired)
+	noop, err := plan.Build(ctx, postgres.New(), actual, desired, plan.Options{})
+	if err != nil || len(noop.Steps) != 0 {
+		t.Fatalf("identity lifecycle did not converge: steps=%d err=%v", len(noop.Steps), err)
+	}
+}
+
+func TestGeneratedRoutinePrerequisiteVerification(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(context.Background()) }()
+	defer func() { _, _ = conn.Exec(context.Background(), `drop schema if exists autosql_routine_prereq cascade`) }()
+	const fixture = `
+drop schema if exists autosql_routine_prereq cascade;
+create schema autosql_routine_prereq;
+create function autosql_routine_prereq.to_v2(value text) returns text language sql immutable return value;
+create table autosql_routine_prereq.jobs(
+  state text,
+  state_v2 text generated always as (autosql_routine_prereq.to_v2(state)) stored
+);`
+	if _, err = conn.Exec(ctx, fixture); err != nil {
+		t.Fatal(err)
+	}
+	desired, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_routine_prereq"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := postgres.VerifyGeneratedRoutinePrerequisites(ctx, url, desired)
+	if err != nil || !report.Satisfied || len(report.Prerequisites) != 1 || report.Prerequisites[0].Status != "satisfied" {
+		t.Fatalf("satisfied report=%+v err=%v", report, err)
+	}
+	if _, err = conn.Exec(ctx, `create or replace function autosql_routine_prereq.to_v2(value text) returns text language sql immutable return upper(value)`); err != nil {
+		t.Fatal(err)
+	}
+	report, err = postgres.VerifyGeneratedRoutinePrerequisites(ctx, url, desired)
+	if err != nil || report.Satisfied || len(report.Prerequisites) != 1 || report.Prerequisites[0].Status != "version_mismatch" {
+		t.Fatalf("mismatch report=%+v err=%v", report, err)
+	}
+	if _, err = conn.Exec(ctx, `drop table autosql_routine_prereq.jobs; drop function autosql_routine_prereq.to_v2(text)`); err != nil {
+		t.Fatal(err)
+	}
+	report, err = postgres.VerifyGeneratedRoutinePrerequisites(ctx, url, desired)
+	if err != nil || report.Satisfied || len(report.Prerequisites) != 1 || report.Prerequisites[0].Status != "missing" {
+		t.Fatalf("missing report=%+v err=%v", report, err)
+	}
+}
+
+func TestStoredGeneratedColumnCreateApplyReinspect(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(context.Background()) }()
+	const namespace = "autosql_generated"
+	defer func() { _, _ = conn.Exec(context.Background(), `drop schema if exists autosql_generated cascade`) }()
+	if _, err = conn.Exec(ctx, `drop schema if exists autosql_generated cascade; create schema autosql_generated; create function autosql_generated.lifecycle_state_to_v2(value text) returns text language sql immutable return upper(value);`); err != nil {
+		t.Fatal(err)
+	}
+	current, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err = postgres.New().Normalize(ctx, current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired := cloneSchemaDocument(t, current)
+	var ns, routine schema.Resource
+	for _, resource := range desired.Graph.Resources {
+		switch resource.Kind {
+		case schema.KindSchema:
+			ns = resource
+		case schema.KindFunction:
+			routine = resource
+		}
+	}
+	table := schema.Resource{Kind: schema.KindTable, Name: schema.Name{Schema: namespace, Name: "jobs", Parent: ns.ID}, Dependencies: []schema.Dependency{{Target: ns.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`)}
+	table.ID = schema.StableID(table.Kind, table.Name)
+	state := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: namespace, Name: "state", Parent: table.ID}, Dependencies: []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{"type":"text","not_null":false,"ordinal":1}`)}
+	state.ID = schema.StableID(state.Kind, state.Name)
+	generated := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: namespace, Name: "state_v2", Parent: table.ID}, Dependencies: []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}, {Target: state.ID, Type: schema.DependencyReferences}, {Target: routine.ID, Type: schema.DependencyReferences}}, Spec: json.RawMessage(`{"type":"text","not_null":false,"ordinal":2,"default":"autosql_generated.lifecycle_state_to_v2(state)","generated":"s"}`)}
+	generated.ID = schema.StableID(generated.Kind, generated.Name)
+	desired.Graph.Resources = append(desired.Graph.Resources, table, state, generated)
+	desired, err = postgres.New().Normalize(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hcl, err := source.FormatHCL(desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err = source.LoadContext(ctx, source.Input{URI: "generated.hcl", Format: source.FormatHCLSource, Data: hcl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err = postgres.New().Normalize(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prerequisites, err := postgres.VerifyGeneratedRoutinePrerequisites(ctx, url, desired)
+	if err != nil || !prerequisites.Satisfied {
+		t.Fatalf("prerequisites=%+v err=%v", prerequisites, err)
+	}
+	fresh, err := plan.Build(ctx, postgres.New(), current, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, fresh)
+	actual, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err = postgres.New().Normalize(ctx, actual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFingerprint(t, actual, desired)
+	noop, err := plan.Build(ctx, postgres.New(), actual, desired, plan.Options{})
+	if err != nil || len(noop.Steps) != 0 {
+		t.Fatalf("stored generated lifecycle did not converge: steps=%d err=%v", len(noop.Steps), err)
+	}
+}
+
+func TestCompleteCellProvisioningParity(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(context.Background()) }()
+	const namespace = "autosql_complete_cell"
+	defer func() { _, _ = conn.Exec(context.Background(), `drop schema if exists autosql_complete_cell cascade`) }()
+	const prerequisite = `
+create schema autosql_complete_cell;
+create function autosql_complete_cell.lifecycle_state_to_v2(value text)
+returns text language sql immutable security invoker
+as $$ select upper(value) $$;`
+	const fixture = `
+drop schema if exists autosql_complete_cell cascade;
+` + prerequisite + `
+comment on schema autosql_complete_cell is 'complete provisioning fixture';
+create type autosql_complete_cell.job_status as enum ('pending', 'running', 'done');
+comment on type autosql_complete_cell.job_status is 'job lifecycle';
+create domain autosql_complete_cell.positive_int as integer default 1 check (value > 0);
+comment on domain autosql_complete_cell.positive_int is 'strictly positive';
+create sequence autosql_complete_cell.ticket_seq start 100 increment 5 cache 3;
+comment on sequence autosql_complete_cell.ticket_seq is 'public ticket numbers';
+create table autosql_complete_cell.jobs (
+  always_id bigint generated always as identity,
+  default_id bigint generated by default as identity,
+  state text not null default 'pending'::text,
+  state_v2 text generated always as (autosql_complete_cell.lifecycle_state_to_v2(state)) stored,
+  title character varying(255) not null default 'untitled',
+  payload jsonb not null default '{}'::jsonb,
+  tags text[] not null default '{}'::text[],
+  created_at timestamptz not null default now(),
+  status autosql_complete_cell.job_status not null default 'pending'::autosql_complete_cell.job_status,
+  attempts autosql_complete_cell.positive_int not null default 1,
+  ticket bigint not null default nextval('autosql_complete_cell.ticket_seq'::regclass),
+  constraint jobs_pkey primary key (always_id),
+  constraint jobs_attempts_check check (attempts > 0)
+);
+comment on table autosql_complete_cell.jobs is 'jobs managed from HCL';
+comment on column autosql_complete_cell.jobs.state_v2 is 'normalized lifecycle state';
+comment on column autosql_complete_cell.jobs.payload is 'structured job payload';
+create index jobs_status_idx on autosql_complete_cell.jobs(status);`
+	if _, err = conn.Exec(ctx, fixture); err != nil {
+		t.Fatal(err)
+	}
+
+	inspected, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	formatted, err := source.FormatHCL(inspected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err := source.LoadContext(ctx, source.Input{URI: "complete-cell.hcl", Format: source.FormatHCLSource, Data: formatted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err = postgres.New().Normalize(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertCompleteCellFeatures(t, desired)
+
+	adopt, err := plan.Build(ctx, postgres.New(), desired, desired, plan.Options{})
+	if err != nil || len(adopt.Changes.Changes) != 0 || len(adopt.Steps) != 0 {
+		t.Fatalf("adoption was not a no-op: changes=%d steps=%d err=%v", len(adopt.Changes.Changes), len(adopt.Steps), err)
+	}
+	fullReport, err := postgres.PreflightProvisioning(ctx, desired, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertCompleteCellExternalInventory(t, fullReport)
+
+	managed := managedCellProjection(t, desired)
+	if _, err = conn.Exec(ctx, `drop schema autosql_complete_cell cascade; `+prerequisite); err != nil {
+		t.Fatal(err)
+	}
+	current, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err = postgres.New().Normalize(ctx, current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prerequisites, err := postgres.VerifyGeneratedRoutinePrerequisites(ctx, url, managed)
+	if err != nil || !prerequisites.Satisfied || len(prerequisites.Prerequisites) != 1 {
+		t.Fatalf("generated routine prerequisites=%+v err=%v", prerequisites, err)
+	}
+	fresh, err := plan.Build(ctx, postgres.New(), current, managed, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fresh.Steps) == 0 {
+		t.Fatal("fresh managed projection produced no steps")
+	}
+	applyTestPlan(t, ctx, conn, fresh)
+	actual, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err = postgres.New().Normalize(ctx, actual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFingerprint(t, actual, managed)
+	noop, err := plan.Build(ctx, postgres.New(), actual, managed, plan.Options{})
+	if err != nil || len(noop.Changes.Changes) != 0 || len(noop.Steps) != 0 {
+		t.Fatalf("fresh provisioning did not converge: changes=%d steps=%d err=%v", len(noop.Changes.Changes), len(noop.Steps), err)
+	}
+
+	added := cloneSchemaDocument(t, managed)
+	var table schema.Resource
+	for _, resource := range added.Graph.Resources {
+		if resource.Kind == schema.KindTable && resource.Name.Name == "jobs" {
+			table = resource
+		}
+	}
+	column := schema.Resource{
+		Kind:         schema.KindColumn,
+		Name:         schema.Name{Schema: namespace, Name: "trace_id", Parent: table.ID},
+		Dependencies: []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}},
+		Spec:         json.RawMessage(`{"type":"text","not_null":false,"ordinal":12}`),
+	}
+	column.ID = schema.StableID(column.Kind, column.Name)
+	added.Graph.Resources = append(added.Graph.Resources, column)
+	added, err = postgres.New().Normalize(ctx, added)
+	if err != nil {
+		t.Fatal(err)
+	}
+	incremental, err := plan.Build(ctx, postgres.New(), actual, added, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, incremental)
+	finalState, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalState, err = postgres.New().Normalize(ctx, finalState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFingerprint(t, finalState, added)
+	finalNoop, err := plan.Build(ctx, postgres.New(), finalState, added, plan.Options{})
+	if err != nil || len(finalNoop.Changes.Changes) != 0 || len(finalNoop.Steps) != 0 {
+		t.Fatalf("incremental change did not converge: changes=%d steps=%d err=%v", len(finalNoop.Changes.Changes), len(finalNoop.Steps), err)
+	}
+}
+
+func managedCellProjection(t *testing.T, input schema.Document) schema.Document {
+	t.Helper()
+	out := cloneSchemaDocument(t, input)
+	keep := map[string]bool{}
+	for _, resource := range out.Graph.Resources {
+		if postgres.New().Info().Capability(resource.Kind).Mode == plugin.Managed || resource.Kind == schema.KindFunction {
+			keep[resource.ID] = true
+		}
+	}
+	resources := out.Graph.Resources[:0]
+	for _, resource := range out.Graph.Resources {
+		if !keep[resource.ID] {
+			continue
+		}
+		dependencies := resource.Dependencies[:0]
+		for _, dependency := range resource.Dependencies {
+			if keep[dependency.Target] {
+				dependencies = append(dependencies, dependency)
+			}
+		}
+		resource.Dependencies = dependencies
+		resources = append(resources, resource)
+	}
+	out.Graph.Resources = resources
+	var err error
+	out, err = postgres.New().Normalize(context.Background(), out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = out.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func assertCompleteCellFeatures(t *testing.T, doc schema.Document) {
+	t.Helper()
+	comments := 0
+	identities := map[string]bool{}
+	found := map[schema.Kind]bool{}
+	for _, resource := range doc.Graph.Resources {
+		found[resource.Kind] = true
+		if resource.Annotations["comment"] != "" {
+			comments++
+		}
+		if resource.Kind != schema.KindColumn {
+			continue
+		}
+		var values map[string]any
+		if err := json.Unmarshal(resource.Spec, &values); err != nil {
+			t.Fatal(err)
+		}
+		if identity, _ := values["identity"].(string); identity != "" {
+			identities[identity] = true
+		}
+		if resource.Name.Name == "state_v2" {
+			if values["generated"] != "s" || values["default"] != "autosql_complete_cell.lifecycle_state_to_v2(state)" {
+				t.Fatalf("stored generated spec=%s", resource.Spec)
+			}
+			references := 0
+			for _, dependency := range resource.Dependencies {
+				if dependency.Type == schema.DependencyReferences {
+					references++
+				}
+			}
+			if references != 2 {
+				t.Fatalf("stored generated references=%d dependencies=%+v", references, resource.Dependencies)
+			}
+		}
+	}
+	if comments < 7 || !identities["a"] || !identities["d"] || !found[schema.KindEnum] || !found[schema.KindDomain] || !found[schema.KindSequence] {
+		t.Fatalf("incomplete fixture: comments=%d identities=%v kinds=%v", comments, identities, found)
+	}
+}
+
+func assertCompleteCellExternalInventory(t *testing.T, report postgres.ProvisioningReport) {
+	t.Helper()
+	if report.Supported {
+		t.Fatal("full inspected cell unexpectedly reported as wholly managed")
+	}
+	kinds := map[schema.Kind]bool{}
+	external := false
+	for _, diagnostic := range report.Diagnostics {
+		kinds[diagnostic.Kind] = true
+		external = external || diagnostic.External
+	}
+	if !external || !kinds[schema.KindFunction] || !kinds[schema.KindIndex] || (!kinds[schema.KindPrimaryKey] && !kinds[schema.KindCheckConstraint]) {
+		t.Fatalf("incomplete aggregate external/read-only inventory: %+v", report.Diagnostics)
 	}
 }
 

@@ -95,12 +95,13 @@ func (*Driver) Info() plugin.Info {
 		schema.KindDomain:           {Kind: schema.KindDomain, Mode: plugin.Managed, Operations: []schema.Operation{schema.OperationCreate, schema.OperationDrop, schema.OperationRename}, Features: []string{"domain.lifecycle", "domain.core_base_type", "domain.literal_check"}},
 		schema.KindSequence:         {Kind: schema.KindSequence, Mode: plugin.Managed, Operations: all, Features: []string{"sequence.lifecycle", "sequence.options"}},
 		schema.KindTable:            {Kind: schema.KindTable, Mode: plugin.Managed, Operations: all, Features: []string{"table.permanent_nonpartitioned", "table.rls", "table.child_columns"}},
-		schema.KindColumn:           {Kind: schema.KindColumn, Mode: plugin.Managed, Operations: all, Features: []string{"column.type_safe_casts", "column.default", "column.not_null", "column.ordinal_metadata"}},
+		schema.KindColumn:           {Kind: schema.KindColumn, Mode: plugin.Managed, Operations: all, Features: []string{"column.type_safe_casts", "column.default", "column.not_null", "column.ordinal_metadata", "column.identity_create", "column.generated_external_routines", "column.generated_stored_create"}},
 		schema.KindView:             {Kind: schema.KindView, Mode: plugin.Managed, Operations: all, Features: []string{"view.provable_projection"}},
 		schema.KindMaterializedView: {Kind: schema.KindMaterializedView, Mode: plugin.Managed, Operations: all, Features: []string{"materialized_view.provable_projection", "alter.explicit_rebuild"}},
 	}
 	for _, kind := range kinds {
 		if capability, ok := profiles[kind]; ok {
+			capability.Features = append(capability.Features, "metadata.comment")
 			caps = append(caps, capability)
 		} else {
 			caps = append(caps, plugin.Capability{Kind: kind, Mode: plugin.ReadOnly})
@@ -454,6 +455,14 @@ func normalizePostgresSpecForKind(kind schema.Kind, spec map[string]any) {
 		if position, ok := spec["position"]; ok {
 			spec["ordinal"] = position
 			delete(spec, "position")
+		}
+		if identity, ok := spec["identity"].(string); ok {
+			switch identity {
+			case "always":
+				spec["identity"] = "a"
+			case "by_default":
+				spec["identity"] = "d"
+			}
 		}
 	}
 	if kind == schema.KindTable {
