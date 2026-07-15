@@ -21,6 +21,31 @@ func projection(parent schema.Resource, name, typ string) schema.Resource {
 	return renderResource(schema.KindColumn, schema.Name{Schema: parent.Name.Schema, Name: name, Parent: parent.ID}, `{"not_null":false,"ordinal":1,"type":"`+typ+`"}`, schema.Dependency{Target: parent.ID, Type: schema.DependencyContains})
 }
 
+func TestRenderNoopAllowsRichInspectedMetadataButChangesFailClosed(t *testing.T) {
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
+	ns.Annotations = map[string]string{"comment": "inspected schema"}
+	table := renderResource(schema.KindTable, schema.Name{Schema: "app", Name: "widgets", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	column := renderResource(schema.KindColumn, schema.Name{Schema: "app", Name: "id", Parent: table.ID}, `{"identity":"a","not_null":true,"ordinal":1,"type":"bigint"}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains})
+	rich := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, column}}, Annotations: map[string]string{"dialect": "postgresql"}}
+	rich.Normalize()
+
+	changes := schema.ChangeSet{Version: schema.ChangeVersion}
+	out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Current: rich, Desired: rich})
+	if err != nil || len(out) != 0 {
+		t.Fatalf("no-op rich inspection out=%+v err=%v", out, err)
+	}
+
+	empty := schema.Document{Version: schema.SchemaVersion, Annotations: map[string]string{"dialect": "postgresql"}}
+	changes, err = schema.Diff(empty, rich, schema.DiffOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err = New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Current: empty, Desired: rich})
+	if err == nil || len(out) != 0 {
+		t.Fatalf("metadata-bearing mutation did not fail closed: out=%+v err=%v", out, err)
+	}
+}
+
 func TestRenderDocumentQuotesAndOrders(t *testing.T) {
 	s := renderResource(schema.KindSchema, schema.Name{Name: `Odd"Schema`}, `{}`)
 	view := renderResource(schema.KindView, schema.Name{Schema: s.Name.Name, Name: `a"b`, Parent: s.ID}, `{"definition":"SELECT 1 AS value"}`, schema.Dependency{Target: s.ID, Type: schema.DependencyContains})
