@@ -47,7 +47,10 @@ func ParseHCLContext(ctx context.Context, uri string, data []byte, variables HCL
 		return schema.Document{}, err
 	}
 	if len(imports) > 0 {
-		doc.Annotations = map[string]string{"hcl_imports": strings.Join(imports, ",")}
+		if doc.Annotations == nil {
+			doc.Annotations = map[string]string{}
+		}
+		doc.Annotations["hcl_imports"] = strings.Join(imports, ",")
 	}
 	doc.Normalize()
 	if err := doc.Validate(); err != nil {
@@ -147,6 +150,21 @@ func hclDocument(ctx context.Context, uri string, body *hclsyntax.Body, data []b
 				continue
 			}
 			if b.Type == "variable" {
+				continue
+			}
+			// Document-level metadata (e.g. the dialect annotation that
+			// schema inspect stamps). FormatHCL emits this so a round-tripped
+			// document compares equal in plan.Build's documentMetadataEqual.
+			if b.Type == "document" {
+				aj, e := stringAttr(b.Body, "annotations_json", data, variables)
+				if e != nil {
+					return e
+				}
+				if aj != "" {
+					if err := json.Unmarshal([]byte(aj), &doc.Annotations); err != nil {
+						return fmt.Errorf("%w: document annotations_json: %v", ErrHCL, err)
+					}
+				}
 				continue
 			}
 			kind, name, err := blockIdentity(b)
@@ -520,6 +538,24 @@ func ensureSchemasFromHCL(doc *schema.Document) {
 	}
 }
 
+// withoutKey returns a copy of m with key removed, or nil if that leaves it
+// empty. Used to drop parser-internal annotations before emitting HCL.
+func withoutKey(m map[string]string, key string) map[string]string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		if k != key {
+			out[k] = v
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // FormatHCL produces deterministic resource-form HCL. Resource form is a
 // lossless escape hatch for every canonical kind and can be converted to more
 // ergonomic blocks by a formatter later.
@@ -529,6 +565,19 @@ func FormatHCL(doc schema.Document) ([]byte, error) {
 	}
 	f := hclwrite.NewEmptyFile()
 	root := f.Body()
+	// Document-level metadata (e.g. the dialect annotation stamped by schema
+	// inspect) must round-trip, or plan.Build rejects the transition even when
+	// every resource matches. hcl_imports is a parser-internal marker, not
+	// source state, so it is not emitted.
+	if docAnnotations := withoutKey(doc.Annotations, "hcl_imports"); len(docAnnotations) > 0 {
+		aj, err := json.Marshal(docAnnotations)
+		if err != nil {
+			return nil, err
+		}
+		db := root.AppendNewBlock("document", nil)
+		db.Body().SetAttributeValue("annotations_json", cty.StringVal(string(aj)))
+		root.AppendNewline()
+	}
 	rs := append([]schema.Resource(nil), doc.Graph.Resources...)
 	sort.Slice(rs, func(i, j int) bool { return rs[i].ID < rs[j].ID })
 	for _, r := range rs {

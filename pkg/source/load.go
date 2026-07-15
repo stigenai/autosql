@@ -70,6 +70,19 @@ func LoadContext(ctx context.Context, inputs ...Input) (schema.Document, error) 
 		if err != nil {
 			return doc, err
 		}
+		// Carry document-level metadata (e.g. the dialect annotation) so a
+		// single inspected source round-trips through plan.Build, which
+		// requires document metadata to match. hcl_imports is a parser-internal
+		// marker and is not treated as composed source state.
+		for k, v := range part.Annotations {
+			if k == "hcl_imports" {
+				continue
+			}
+			if doc.Annotations == nil {
+				doc.Annotations = map[string]string{}
+			}
+			doc.Annotations[k] = v
+		}
 		for _, r := range part.Graph.Resources {
 			if r.Source == nil {
 				r.Source = &schema.SourceLocation{URI: in.URI}
