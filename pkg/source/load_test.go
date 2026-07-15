@@ -42,6 +42,36 @@ CREATE INDEX users_email_idx ON app.users (email);`
 	}
 }
 
+// TestFormatHCLPreservesAnnotations proves that resource annotations (e.g.
+// column/table comments captured by schema inspect) survive FormatHCL ->
+// ParseHCL. Without this, inspecting a commented database and re-applying its
+// HCL would plan a diff for every comment.
+func TestFormatHCLPreservesAnnotations(t *testing.T) {
+	doc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{
+		manualResource(schema.KindSchema, schema.Name{Name: "app"}, `{}`, nil),
+	}}}
+	table := manualResource(schema.KindTable, schema.Name{Schema: "app", Name: "users", Parent: doc.Graph.Resources[0].ID}, `{"options":""}`, []schema.Dependency{{Target: doc.Graph.Resources[0].ID, Type: schema.DependencyContains}})
+	table.Annotations = map[string]string{"comment": "primary user table"}
+	doc.Graph.Resources = append(doc.Graph.Resources, table)
+	doc.Normalize()
+
+	hcl, err := FormatHCL(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := LoadContext(context.Background(), Input{URI: "s.hcl", Format: FormatHCLSource, Data: hcl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	diff, err := schema.Diff(doc, reloaded, schema.DiffOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(diff.Changes) != 0 {
+		t.Fatalf("annotations dropped on round-trip: %d changes", len(diff.Changes))
+	}
+}
+
 func TestSQLAndNativeProduceEquivalentGraph(t *testing.T) {
 	sql := `CREATE SCHEMA app;
 CREATE TABLE app.users (
