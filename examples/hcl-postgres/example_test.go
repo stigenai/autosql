@@ -83,6 +83,58 @@ func TestFriendlyAdvancedHCLUsesHelpersWithoutEscapedJSONOrLiteralIDs(t *testing
 	}
 }
 
+func TestDocumentedDefaultExpressionHCLBuildsFreshPlan(t *testing.T) {
+	ctx := context.Background()
+	driver := postgres.New()
+	desired, err := driver.Normalize(ctx, loadHCL(t, ctx, "defaults.hcl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty, err := driver.Normalize(ctx, schema.Document{Version: schema.SchemaVersion})
+	if err != nil {
+		t.Fatal(err)
+	}
+	migration, err := plan.Build(ctx, driver, empty, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(migration.Steps) == 0 {
+		t.Fatal("documented default-expression catalog produced an empty plan")
+	}
+
+	sequenceStep, idStep := -1, -1
+	var sql strings.Builder
+	for index, step := range migration.Steps {
+		sql.WriteString(step.SQL)
+		sql.WriteByte('\n')
+		if strings.Contains(step.SQL, `CREATE SEQUENCE "defaults_demo"."widget_id_seq"`) {
+			sequenceStep = index
+		}
+		if strings.Contains(step.SQL, `ADD COLUMN "id"`) {
+			idStep = index
+		}
+	}
+	if sequenceStep < 0 || idStep < 0 || sequenceStep >= idStep {
+		t.Fatalf("sequence dependency order is not documented by the plan: sequence=%d id=%d", sequenceStep, idStep)
+	}
+	for _, want := range []string{
+		`DEFAULT nextval('defaults_demo.widget_id_seq'::regclass)`,
+		`DEFAULT 0.00`,
+		`DEFAULT '{}'::jsonb`,
+		`DEFAULT '550e8400-e29b-41d4-a716-446655440000'::uuid`,
+		`DEFAULT pg_catalog.gen_random_uuid()`,
+		`DEFAULT 'pending'::defaults_demo.job_status`,
+		`DEFAULT '{}'::text[]`,
+		`DEFAULT CURRENT_DATE`,
+		`DEFAULT CURRENT_TIMESTAMP`,
+		`DEFAULT pg_catalog.timezone('utc'::text, CURRENT_TIMESTAMP)`,
+	} {
+		if !strings.Contains(sql.String(), want) {
+			t.Errorf("documented plan is missing %q", want)
+		}
+	}
+}
+
 func loadHCL(t *testing.T, ctx context.Context, path string) schema.Document {
 	t.Helper()
 	data, err := os.ReadFile(path)

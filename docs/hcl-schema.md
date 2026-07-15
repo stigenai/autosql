@@ -36,3 +36,9 @@ PostgreSQL-to-HCL round-trip, see the
 advanced catalog is automatically checked against every resource kind exposed
 by the PostgreSQL driver, including constraints, types, routines, triggers,
 row-level security, roles, grants, memberships, and default privileges.
+
+PostgreSQL defaults use a typed, fail-closed expression grammar rather than an
+arbitrary SQL string escape hatch. See
+[PostgreSQL default expressions](postgresql-default-expressions.md) for the
+supported literal, cast, generated, enum/domain, array, temporal, and sequence
+forms, their dependency requirements, and the executable HCL catalog.
