@@ -1163,12 +1163,16 @@ func validateCoreDefault(r schema.Resource, value string) error {
 	if !validType || typ.array {
 		return unsupported(r, "array defaults are not modeled")
 	}
+	expr, err := classifyDefaultExpression(value)
+	if err != nil {
+		return unsupported(r, "column default is outside canonical core grammar")
+	}
 	integer := regexp.MustCompile(`^-?[0-9]+$`)
 	quoted := regexp.MustCompile(`^'(?:''|[^'])*'$`)
 	ok := false
 	switch typ.base {
 	case "smallint", "integer", "bigint":
-		if integer.MatchString(value) && (value == "0" || !strings.HasPrefix(value, "0")) && !strings.HasPrefix(value, "-0") {
+		if expr.Kind == defaultExpressionLiteral && expr.Literal != nil && (expr.Literal.Kind == defaultLiteralInteger || expr.Literal.Kind == defaultLiteralFloat) && integer.MatchString(value) && expr.Literal.Text == value && (value == "0" || !strings.HasPrefix(value, "0")) && !strings.HasPrefix(value, "-0") {
 			bits := 64
 			if typ.base == "smallint" {
 				bits = 16
@@ -1182,11 +1186,11 @@ func validateCoreDefault(r schema.Resource, value string) error {
 	case "real", "double precision", "numeric":
 		ok = false
 	case "boolean":
-		ok = value == "true" || value == "false"
+		ok = expr.Kind == defaultExpressionLiteral && expr.Literal != nil && expr.Literal.Kind == defaultLiteralBoolean && (value == "true" || value == "false") && expr.Literal.Boolean == (value == "true")
 	case "text", "character varying":
-		ok = quoted.MatchString(value)
+		ok = expr.Kind == defaultExpressionLiteral && expr.Literal != nil && expr.Literal.Kind == defaultLiteralString && quoted.MatchString(value)
 	case "timestamp", "timestamptz":
-		ok = value == "CURRENT_TIMESTAMP" || regexp.MustCompile(`^CURRENT_TIMESTAMP\([0-6]\)$`).MatchString(value)
+		ok = expr.Kind == defaultExpressionFunction && expr.Function != nil && (value == "CURRENT_TIMESTAMP" || regexp.MustCompile(`^CURRENT_TIMESTAMP\([0-6]\)$`).MatchString(value))
 	}
 	if !ok {
 		return unsupported(r, "column default is outside canonical core grammar")
