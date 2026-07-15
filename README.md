@@ -47,6 +47,11 @@ AutoSQL is explicit about database capabilities and refuses unsafe operations.
 Secrets are passed by reference, resolved only at runtime, and excluded from
 artifacts, state, status, and diagnostics.
 
+The [AutoSQL Constitution](CONSTITUTION.md) makes examples and demos part of
+feature completeness. The machine-checked [feature example and demo
+catalog](examples/README.md) maps every production package and advertised
+PostgreSQL capability to user documentation and executable evidence.
+
 ## How AutoSQL works
 
 1. **Author or import desired state.** Load SQL, native schema files, HCL, or
@@ -122,6 +127,7 @@ output. See [the CLI contract](docs/cli-contract.md) and
 
 ## Documentation
 
+- [Project constitution](CONSTITUTION.md) · [feature examples and demos](examples/README.md)
 - [How AutoSQL works: architecture and feature guide](docs/overview.md)
 - [Schema planning and safety](docs/planning.md) · [guardrails](docs/guardrail.md)
 - [Migration lifecycle](docs/migration-generation.md) · [controlled down](docs/controlled-down.md)
