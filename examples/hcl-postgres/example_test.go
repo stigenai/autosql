@@ -135,6 +135,37 @@ func TestDocumentedDefaultExpressionHCLBuildsFreshPlan(t *testing.T) {
 	}
 }
 
+func TestDocumentedStoredGeneratedHCLPlansWithExternalRoutine(t *testing.T) {
+	ctx := context.Background()
+	driver := postgres.New()
+	desired, err := driver.Normalize(ctx, loadHCL(t, ctx, "generated.hcl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := schema.Document{Version: schema.SchemaVersion}
+	for _, resource := range desired.Graph.Resources {
+		if resource.Kind == schema.KindSchema || resource.Kind == schema.KindFunction {
+			current.Graph.Resources = append(current.Graph.Resources, resource)
+		}
+	}
+	current, err = driver.Normalize(ctx, current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	migration, err := plan.Build(ctx, driver, current, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sql strings.Builder
+	for _, step := range migration.Steps {
+		sql.WriteString(step.SQL)
+		sql.WriteByte('\n')
+	}
+	if !strings.Contains(sql.String(), `GENERATED ALWAYS AS (generated_demo.lifecycle_state_to_v2(state)) STORED`) {
+		t.Fatalf("documented generated-column plan is missing its bounded expression:\n%s", sql.String())
+	}
+}
+
 func loadHCL(t *testing.T, ctx context.Context, path string) schema.Document {
 	t.Helper()
 	data, err := os.ReadFile(path)

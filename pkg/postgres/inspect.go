@@ -21,6 +21,12 @@ type inspector struct {
 	resources []schema.Resource
 	byOID     map[uint32]string
 	schemas   map[string]string
+	columns   map[columnCatalogKey]string
+}
+
+type columnCatalogKey struct {
+	relation uint32
+	position int16
 }
 
 func inspect(ctx context.Context, req plugin.InspectRequest) (schema.Document, error) {
@@ -163,7 +169,7 @@ func (e *catalogDisappearanceError) Error() string {
 }
 
 func inspectSnapshot(ctx context.Context, conn catalogQueryer, req plugin.InspectRequest) (schema.Document, error) {
-	i := &inspector{conn: conn, byOID: map[uint32]string{}, schemas: map[string]string{}}
+	i := &inspector{conn: conn, byOID: map[uint32]string{}, schemas: map[string]string{}, columns: map[columnCatalogKey]string{}}
 	steps := []struct {
 		resource, privilege string
 		fn                  func(context.Context) error
@@ -179,6 +185,7 @@ func inspectSnapshot(ctx context.Context, conn catalogQueryer, req plugin.Inspec
 		{"constraints", "USAGE on schemas and SELECT on catalog metadata", i.inspectConstraints},
 		{"indexes", "USAGE on schemas and SELECT on catalog metadata", i.inspectIndexes},
 		{"routines", "USAGE on schemas and routines", i.inspectRoutines},
+		{"generated column dependencies", "USAGE on schemas, columns, and routines", i.inspectGeneratedColumnDependencies},
 		{"triggers", "USAGE on schemas and tables", i.inspectTriggers},
 	}
 	if enabled(req.Options, "policies", true) {
@@ -490,7 +497,7 @@ func (i *inspector) compositeAttrs(ctx context.Context, oid uint32) ([]map[strin
 }
 
 func (i *inspector) inspectSequences(ctx context.Context) error {
-	rows, err := i.conn.Query(ctx, `select c.oid,n.nspname,c.relname,s.seqstart,s.seqincrement,s.seqmin,s.seqmax,s.seqcache,s.seqcycle,obj_description(c.oid,'pg_class') from pg_class c join pg_namespace n on n.oid=c.relnamespace join pg_sequence s on s.seqrelid=c.oid where c.relkind='S' and n.nspname <> 'information_schema' and n.nspname !~ '^pg_' order by n.nspname,c.relname`)
+	rows, err := i.conn.Query(ctx, `select c.oid,n.nspname,c.relname,s.seqstart,s.seqincrement,s.seqmin,s.seqmax,s.seqcache,s.seqcycle,obj_description(c.oid,'pg_class') from pg_class c join pg_namespace n on n.oid=c.relnamespace join pg_sequence s on s.seqrelid=c.oid where c.relkind='S' and n.nspname <> 'information_schema' and n.nspname !~ '^pg_' and not exists (select 1 from pg_depend d where d.classid='pg_class'::regclass and d.objid=c.oid and d.refclassid='pg_class'::regclass and d.deptype='i' and d.refobjsubid>0) order by n.nspname,c.relname`)
 	if err != nil {
 		return err
 	}
@@ -587,7 +594,8 @@ func (i *inspector) inspectColumns(ctx context.Context) error {
 		if tid := i.byOID[typeoid]; tid != "" {
 			deps = append(deps, schema.Dependency{Target: tid, Type: schema.DependencyUses})
 		}
-		i.add(schema.KindColumn, i.name(ns, name, p), spec, deps, comment)
+		id := i.add(schema.KindColumn, i.name(ns, name, p), spec, deps, comment)
+		i.columns[columnCatalogKey{relation: rel, position: pos}] = id
 	}
 	return rows.Err()
 }
@@ -627,6 +635,86 @@ order by ad.adrelid,ad.adnum,d.refobjid`)
 		}
 	}
 	return rows.Err()
+}
+
+func (i *inspector) inspectGeneratedColumnDependencies(ctx context.Context) error {
+	rows, err := i.conn.Query(ctx, `
+select ad.adrelid,ad.adnum,'column',d.refobjid,d.refobjsubid
+from pg_attrdef ad
+join pg_attribute a on a.attrelid=ad.adrelid and a.attnum=ad.adnum
+join pg_depend d on d.classid='pg_attrdef'::regclass and d.objid=ad.oid
+where a.attgenerated='s' and d.refclassid='pg_class'::regclass and d.refobjsubid>0
+  and not (d.refobjid=ad.adrelid and d.refobjsubid=ad.adnum)
+union all
+select ad.adrelid,ad.adnum,'routine',d.refobjid,0
+from pg_attrdef ad
+join pg_attribute a on a.attrelid=ad.adrelid and a.attnum=ad.adnum
+join pg_depend d on d.classid='pg_attrdef'::regclass and d.objid=ad.oid
+join pg_proc p on p.oid=d.refobjid
+join pg_namespace n on n.oid=p.pronamespace
+where a.attgenerated='s' and d.refclassid='pg_proc'::regclass
+  and n.nspname <> 'information_schema' and n.nspname !~ '^pg_'
+order by 1,2,3,4,5`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var relation, targetOID uint32
+		var position, targetPosition int16
+		var targetKind string
+		if err := rows.Scan(&relation, &position, &targetKind, &targetOID, &targetPosition); err != nil {
+			return err
+		}
+		from := i.columns[columnCatalogKey{relation: relation, position: position}]
+		to := ""
+		switch targetKind {
+		case "column":
+			to = i.columns[columnCatalogKey{relation: targetOID, position: targetPosition}]
+		case "routine":
+			to = i.byOID[targetOID]
+		}
+		if from == "" || to == "" {
+			return &catalogDisappearanceError{resource: "generated column dependency", oid: targetOID}
+		}
+		for index := range i.resources {
+			if i.resources[index].ID != from {
+				continue
+			}
+			exists := false
+			for _, dependency := range i.resources[index].Dependencies {
+				exists = exists || dependency.Target == to && dependency.Type == schema.DependencyReferences
+			}
+			if !exists {
+				i.resources[index].Dependencies = append(i.resources[index].Dependencies, schema.Dependency{Target: to, Type: schema.DependencyReferences})
+			}
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	resources := resourceMapForRender(schema.Document{Graph: schema.Graph{Resources: i.resources}})
+	for index := range i.resources {
+		resource := &i.resources[index]
+		if resource.Kind != schema.KindColumn || stringValue(spec(*resource), "generated") != "s" {
+			continue
+		}
+		expected, err := expectedGeneratedDependencies(*resource, resources)
+		if err != nil {
+			return err
+		}
+		for target := range expected {
+			exists := false
+			for _, dependency := range resource.Dependencies {
+				exists = exists || dependency.Target == target && dependency.Type == schema.DependencyReferences
+			}
+			if !exists {
+				resource.Dependencies = append(resource.Dependencies, schema.Dependency{Target: target, Type: schema.DependencyReferences})
+			}
+		}
+	}
+	return nil
 }
 
 func (i *inspector) inspectConstraints(ctx context.Context) error {
@@ -695,17 +783,17 @@ func (i *inspector) inspectIndexes(ctx context.Context) error {
 }
 
 func (i *inspector) inspectRoutines(ctx context.Context) error {
-	rows, err := i.conn.Query(ctx, `select p.oid,n.nspname,p.proname,p.prokind::text,pg_get_function_identity_arguments(p.oid),coalesce(pg_get_function_result(p.oid),''),l.lanname,p.provolatile::text,p.prosecdef,p.proleakproof,p.proparallel::text,pg_get_functiondef(p.oid),obj_description(p.oid,'pg_proc') from pg_proc p join pg_namespace n on n.oid=p.pronamespace join pg_language l on l.oid=p.prolang where p.prokind in ('f','p') and n.nspname <> 'information_schema' and n.nspname !~ '^pg_' order by n.nspname,p.proname,pg_get_function_identity_arguments(p.oid)`)
+	rows, err := i.conn.Query(ctx, `select p.oid,n.nspname,p.proname,p.prokind::text,pg_get_function_identity_arguments(p.oid),coalesce(pg_get_function_result(p.oid),''),l.lanname,p.provolatile::text,p.prosecdef,p.proleakproof,p.proparallel::text,pg_get_functiondef(p.oid),obj_description(p.oid,'pg_proc'),coalesce((select e.extname from pg_depend d join pg_extension e on e.oid=d.refobjid where d.classid='pg_proc'::regclass and d.objid=p.oid and d.refclassid='pg_extension'::regclass and d.deptype='e' limit 1),'') from pg_proc p join pg_namespace n on n.oid=p.pronamespace join pg_language l on l.oid=p.prolang where p.prokind in ('f','p') and n.nspname <> 'information_schema' and n.nspname !~ '^pg_' order by n.nspname,p.proname,pg_get_function_identity_arguments(p.oid)`)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var oid uint32
-		var ns, name, kind, args, result, language, volatility, parallel, definition string
+		var ns, name, kind, args, result, language, volatility, parallel, definition, extension string
 		var security, leakproof bool
 		var comment *string
-		if err := rows.Scan(&oid, &ns, &name, &kind, &args, &result, &language, &volatility, &security, &leakproof, &parallel, &definition, &comment); err != nil {
+		if err := rows.Scan(&oid, &ns, &name, &kind, &args, &result, &language, &volatility, &security, &leakproof, &parallel, &definition, &comment, &extension); err != nil {
 			return err
 		}
 		p := i.schemas[ns]
@@ -717,7 +805,11 @@ func (i *inspector) inspectRoutines(ctx context.Context) error {
 			k = schema.KindProcedure
 		}
 		logical := name + "(" + args + ")"
-		id := i.add(k, i.name(ns, logical, p), map[string]any{"name": name, "identity_arguments": args, "result": result, "language": language, "volatility": volatility, "security_definer": security, "leakproof": leakproof, "parallel": parallel, "definition": definition}, dep(p, schema.DependencyContains), comment)
+		specification := map[string]any{"name": name, "identity_arguments": args, "result": result, "language": language, "volatility": volatility, "security_definer": security, "leakproof": leakproof, "parallel": parallel, "definition": definition}
+		if extension != "" {
+			specification["extension"] = extension
+		}
+		id := i.add(k, i.name(ns, logical, p), specification, dep(p, schema.DependencyContains), comment)
 		i.byOID[oid] = id
 	}
 	return rows.Err()

@@ -35,6 +35,12 @@ The PostgreSQL version matrix is defined in
 and CLI live suites on PostgreSQL 14 through 18. `AUTOSQL_LIVE_COUNT` repeats
 the live suite when investigating flakes.
 
+The same matrix runs `TestCompleteCellProvisioningParity`, which adopts a rich
+inspected cell, provisions its managed projection from empty, applies and
+reinspects it, proves a second-plan no-op, and applies an unrelated incremental
+change. See [PostgreSQL fresh-provisioning compatibility](postgresql-provisioning-compatibility.md)
+for the exact managed and external/read-only boundary.
+
 ## Current audit baseline
 
 The repository contains live tests for PostgreSQL inspection/planning,

@@ -27,6 +27,9 @@ func (*Driver) Render(ctx context.Context, request plugin.RenderRequest) ([]plug
 	if len(request.Changes.Changes) == 0 {
 		return nil, nil
 	}
+	if err := validateExternalGeneratedRoutineChanges(request); err != nil {
+		return nil, fmt.Errorf("render PostgreSQL changes: %w", err)
+	}
 	if err := validateManagedDocuments(request); err != nil {
 		return nil, fmt.Errorf("render PostgreSQL changes: %w", err)
 	}
@@ -65,6 +68,37 @@ func (*Driver) Render(ctx context.Context, request plugin.RenderRequest) ([]plug
 	return output, nil
 }
 
+func validateExternalGeneratedRoutineChanges(request plugin.RenderRequest) error {
+	required := map[string]bool{}
+	for _, document := range []schema.Document{request.Current, request.Desired} {
+		resources := resourceMapForRender(document)
+		for _, resource := range document.Graph.Resources {
+			if resource.Kind != schema.KindColumn || stringValue(spec(resource), "generated") != "s" {
+				continue
+			}
+			for _, dependency := range resource.Dependencies {
+				if target, ok := resources[dependency.Target]; ok && dependency.Type == schema.DependencyReferences && target.Kind == schema.KindFunction {
+					required[target.ID] = true
+				}
+			}
+		}
+	}
+	for _, change := range request.Changes.Changes {
+		resource := change.After
+		if resource == nil {
+			resource = change.Before
+		}
+		if resource != nil && resource.Kind == schema.KindFunction && required[resource.ID] {
+			classification := "application-owned"
+			if stringValue(spec(*resource), "extension") != "" {
+				classification = "extension-owned"
+			}
+			return unsupported(*resource, classification+" generated-routine prerequisite must already exist with the exact inspected fingerprint")
+		}
+	}
+	return nil
+}
+
 // RenderDocument renders a complete desired graph from an empty database
 // projection. It only renders managed kinds and never executes SQL.
 func RenderDocument(ctx context.Context, doc schema.Document, options map[string]string) ([]plugin.Statement, error) {
@@ -94,16 +128,33 @@ func renderChange(change schema.Change, resources map[string]schema.Resource, op
 	}
 	parentOnlyRename := change.Operation == schema.OperationRename && change.Before != nil && change.After != nil && change.Before.Name.Name == change.After.Name.Name && change.Before.Name.Parent != change.After.Name.Parent
 	projectionChild := r.Kind == schema.KindColumn && isManagedProjectionParent(r.Name.Parent, resources)
-	if !parentOnlyRename && !projectionChild {
+	commentOnlyAlter := change.Operation == schema.OperationAlter && change.Before != nil && change.After != nil && !resourceSQLSemanticsChanged(*change.Before, *change.After) && change.Before.Annotations["comment"] != change.After.Annotations["comment"]
+	if !parentOnlyRename && !projectionChild && !commentOnlyAlter {
 		if err := plugin.RequireManagedOperation(New().Info(), r.Kind, change.Operation); err != nil {
 			return nil, err
 		}
 	}
 	if parentOnlyRename || projectionChild {
-		return []plugin.Statement{{ChangeID: change.ID, Transactional: true, Kind: plugin.StatementTopology}}, nil
+		out := []plugin.Statement{{ChangeID: change.ID, Transactional: true, Kind: plugin.StatementTopology}}
+		comments, err := renderCommentChange(change, resources)
+		if err != nil {
+			return nil, err
+		}
+		for _, sql := range comments {
+			out = append(out, plugin.Statement{SQL: terminate(sql), ChangeID: change.ID, Transactional: true, Kind: plugin.StatementExecutable})
+		}
+		return out, nil
 	}
 	if change.Operation == schema.OperationAlter && r.Kind == schema.KindColumn && columnOrdinalOnly(*change.Before, *change.After) {
-		return []plugin.Statement{{ChangeID: change.ID, Transactional: true, Kind: plugin.StatementTopology}}, nil
+		out := []plugin.Statement{{ChangeID: change.ID, Transactional: true, Kind: plugin.StatementTopology}}
+		comments, err := renderCommentChange(change, resources)
+		if err != nil {
+			return nil, err
+		}
+		for _, sql := range comments {
+			out = append(out, plugin.Statement{SQL: terminate(sql), ChangeID: change.ID, Transactional: true, Kind: plugin.StatementExecutable})
+		}
+		return out, nil
 	}
 	var sqls []string
 	var err error
@@ -115,12 +166,22 @@ func renderChange(change schema.Change, resources map[string]schema.Resource, op
 	case schema.OperationRename:
 		sqls, err = renderRename(*change.Before, *change.After, resources)
 	case schema.OperationAlter:
-		sqls, err = renderAlter(*change.Before, *change.After, resources, options)
+		if resourceSQLSemanticsChanged(*change.Before, *change.After) {
+			sqls, err = renderAlter(*change.Before, *change.After, resources, options)
+		}
 	default:
 		err = fmt.Errorf("%w: operation %s", plugin.ErrUnsupported, change.Operation)
 	}
 	if err != nil {
 		return nil, err
+	}
+	comments, err := renderCommentChange(change, resources)
+	if err != nil {
+		return nil, err
+	}
+	sqls = append(sqls, comments...)
+	if len(sqls) == 0 {
+		return nil, unsupported(*r, "alteration has no renderable semantics")
 	}
 	out := make([]plugin.Statement, len(sqls))
 	for i, sql := range sqls {
@@ -360,6 +421,9 @@ func renderAlter(before, after schema.Resource, resources map[string]schema.Reso
 			return nil, err
 		}
 		var out []string
+		if stringValue(bs, "generated") != "" || stringValue(as, "generated") != "" {
+			return nil, unsupported(after, "generated-column alteration")
+		}
 		btype, atype := stringValue(bs, "type"), stringValue(as, "type")
 		if btype != atype {
 			if atype == "" {
@@ -694,6 +758,79 @@ func terminate(sql string) string {
 func unsupported(r schema.Resource, what string) error {
 	return fmt.Errorf("%w: %s %s %s", plugin.ErrUnsupported, r.Kind, r.Name.String(), what)
 }
+
+func resourceSQLSemanticsChanged(before, after schema.Resource) bool {
+	strip := func(resource schema.Resource) schema.Resource {
+		resource.Source = nil
+		if len(resource.Annotations) > 0 {
+			annotations := make(map[string]string, len(resource.Annotations))
+			for key, value := range resource.Annotations {
+				if key != "comment" {
+					annotations[key] = value
+				}
+			}
+			resource.Annotations = annotations
+		}
+		return resource
+	}
+	left, leftErr := schema.ResourceFingerprint(strip(before))
+	right, rightErr := schema.ResourceFingerprint(strip(after))
+	return leftErr != nil || rightErr != nil || left != right
+}
+
+func renderCommentChange(change schema.Change, resources map[string]schema.Resource) ([]string, error) {
+	if change.Operation == schema.OperationDrop || change.After == nil {
+		return nil, nil
+	}
+	beforeComment := ""
+	if change.Before != nil {
+		beforeComment = change.Before.Annotations["comment"]
+	}
+	afterComment := change.After.Annotations["comment"]
+	if change.Operation != schema.OperationCreate && beforeComment == afterComment {
+		return nil, nil
+	}
+	if change.Operation == schema.OperationCreate && afterComment == "" {
+		return nil, nil
+	}
+	target, err := commentTarget(*change.After, resources)
+	if err != nil {
+		return nil, err
+	}
+	value := "NULL"
+	if afterComment != "" {
+		value = literal(afterComment)
+	}
+	return []string{"COMMENT ON " + target + " IS " + value}, nil
+}
+
+func commentTarget(resource schema.Resource, resources map[string]schema.Resource) (string, error) {
+	name := qualified(resource.Name)
+	switch resource.Kind {
+	case schema.KindSchema:
+		return "SCHEMA " + quote(resource.Name.Name), nil
+	case schema.KindEnum:
+		return "TYPE " + name, nil
+	case schema.KindDomain:
+		return "DOMAIN " + name, nil
+	case schema.KindSequence:
+		return "SEQUENCE " + name, nil
+	case schema.KindTable:
+		return "TABLE " + name, nil
+	case schema.KindView:
+		return "VIEW " + name, nil
+	case schema.KindMaterializedView:
+		return "MATERIALIZED VIEW " + name, nil
+	case schema.KindColumn:
+		parent, err := parentName(resource, resources)
+		if err != nil {
+			return "", err
+		}
+		return "COLUMN " + parent + "." + quote(resource.Name.Name), nil
+	default:
+		return "", unsupported(resource, "comments are not managed for this resource kind")
+	}
+}
 func isManagedProjectionParent(id string, resources map[string]schema.Resource) bool {
 	r, ok := resources[id]
 	return ok && (r.Kind == schema.KindView || r.Kind == schema.KindMaterializedView)
@@ -760,8 +897,13 @@ func validateManagedMetadata(r schema.Resource) error {
 	if r.Name.Catalog != "" {
 		return unsupported(r, "PostgreSQL catalog qualification is not renderable")
 	}
-	if len(r.Annotations) > 0 || len(r.Extra) > 0 || len(r.Name.Extra) > 0 {
-		return unsupported(r, "annotations, comments, and extension metadata are not renderable")
+	for key := range r.Annotations {
+		if key != "comment" {
+			return unsupported(r, "annotation "+key+" is not renderable")
+		}
+	}
+	if len(r.Extra) > 0 || len(r.Name.Extra) > 0 {
+		return unsupported(r, "extension metadata is not renderable")
 	}
 	for _, dep := range r.Dependencies {
 		if len(dep.Extra) > 0 {
@@ -1021,8 +1163,10 @@ func validateManagedDocuments(request plugin.RenderRequest) error {
 		for _, r := range doc.Graph.Resources {
 			mode := New().Info().Capability(r.Kind).Mode
 			if mode == plugin.Managed {
-				if e := validateManagedMetadata(r); e != nil {
-					return e
+				if scope[r.ID] {
+					if e := validateManagedMetadata(r); e != nil {
+						return e
+					}
 				}
 				if e := validateCanonicalIdentity(r, resources); e != nil {
 					return e
@@ -1073,7 +1217,7 @@ func validateManagedDocuments(request plugin.RenderRequest) error {
 						return unsupported(r, e.Error())
 					}
 				case schema.KindColumn:
-					if !allowedKeys(s, "type", "default", "not_null", "ordinal") {
+					if !allowedKeys(s, "type", "default", "not_null", "ordinal", "identity", "generated") {
 						return unsupported(r, "unknown column semantics")
 					}
 					if _, ok := s["type"].(string); !ok {
@@ -1089,10 +1233,17 @@ func validateManagedDocuments(request plugin.RenderRequest) error {
 					// context, not SQL inputs. Validate default renderability only for
 					// the desired mutation/dependency closure.
 					if docIndex == 1 && scope[r.ID] {
+						if e := validateIdentityColumn(r); e != nil {
+							return e
+						}
 						if e := validateCoreColumnType(r, resources); e != nil {
 							return e
 						}
-						if d := stringValue(s, "default"); d != "" {
+						if stringValue(s, "generated") != "" {
+							if e := validateGeneratedColumnCreate(r, resources); e != nil {
+								return e
+							}
+						} else if d := stringValue(s, "default"); d != "" {
 							if e := validateColumnDefault(r, d, resources); e != nil {
 								return e
 							}
@@ -1100,14 +1251,31 @@ func validateManagedDocuments(request plugin.RenderRequest) error {
 					}
 				}
 			} else if r.Kind == schema.KindColumn && isManagedProjectionParent(r.Name.Parent, resources) {
-				if e := validateManagedMetadata(r); e != nil {
-					return e
+				if scope[r.ID] {
+					if e := validateManagedMetadata(r); e != nil {
+						return e
+					}
 				}
 				if e := validateProjectionResource(r, r.Name.Parent); e != nil {
 					return e
 				}
 			}
 		}
+	}
+	return nil
+}
+
+func validateIdentityColumn(resource schema.Resource) error {
+	values := spec(resource)
+	identity := stringValue(values, "identity")
+	if identity == "" {
+		return nil
+	}
+	if identity != "a" && identity != "d" {
+		return unsupported(resource, "identity must normalize to a or d")
+	}
+	if stringValue(values, "default") != "" || stringValue(values, "generated") != "" {
+		return unsupported(resource, "identity cannot be combined with default or generated semantics")
 	}
 	return nil
 }
@@ -1457,6 +1625,11 @@ func validateSemanticDependencies(r schema.Resource, resources map[string]schema
 		if parent := resources[r.Name.Parent]; parent.Kind != schema.KindTable {
 			return nil
 		}
+		if stringValue(spec(r), "generated") != "" {
+			if err := validateGeneratedDependencies(r, resources); err != nil {
+				return err
+			}
+		}
 		typ := stringValue(spec(r), "type")
 		for id, candidate := range resources {
 			switch candidate.Kind {
@@ -1552,8 +1725,13 @@ func validateCanonicalIdentity(r schema.Resource, resources map[string]schema.Re
 				}
 			}
 			if dep.Type == schema.DependencyReferences {
-				if target, ok := resources[dep.Target]; ok && target.Kind == schema.KindSequence {
-					continue
+				if target, ok := resources[dep.Target]; ok {
+					if target.Kind == schema.KindSequence {
+						continue
+					}
+					if stringValue(spec(r), "generated") == "s" && (target.Kind == schema.KindFunction || target.Kind == schema.KindColumn && target.Name.Parent == r.Name.Parent) {
+						continue
+					}
 				}
 			}
 			return unsupported(r, "column dependencies are noncanonical")

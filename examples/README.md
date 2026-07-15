@@ -8,7 +8,7 @@ constitution for their exact meaning.
 | Feature area | Documentation | Executable demo/evidence |
 | --- | --- | --- |
 | <!-- feature:schema-authoring-and-planning --> Schema authoring, providers, semantic diff, and planning | [Sources](../docs/schema-sources.md), [planning](../docs/planning.md), [HCL](../docs/hcl-schema.md) | `go test ./examples/hcl-postgres`; [`hcl-postgres/run.sh`](hcl-postgres/run.sh) |
-| <!-- feature:postgresql-schema-management --> PostgreSQL inspection and managed schema changes | [Planning](../docs/planning.md), [defaults](../docs/postgresql-default-expressions.md) | `go test ./pkg/postgres`; [`hcl-postgres/run.sh`](hcl-postgres/run.sh) against disposable PostgreSQL |
+| <!-- feature:postgresql-schema-management --> PostgreSQL inspection and managed schema changes | [Planning](../docs/planning.md), [defaults](../docs/postgresql-default-expressions.md), [fresh provisioning](../docs/postgresql-provisioning-compatibility.md) | `go test ./pkg/postgres`; [`hcl-postgres/run.sh`](hcl-postgres/run.sh) against disposable PostgreSQL |
 | <!-- feature:cli-configuration-and-secrets --> CLI, configuration, and secret references | [CLI contract](../docs/cli-contract.md) | `go test ./internal/cli` |
 | <!-- feature:migration-artifacts-and-recovery --> Artifacts, revisions, apply, down, and repair | [Migration generation](../docs/migration-generation.md), [recovery](../docs/migration-start-recovery.md) | `go test ./pkg/artifact ./pkg/migrate/...` |
 | <!-- feature:approval-policy-and-safety --> Approval, policy, prechecks, simulation, and safety | [Guardrails](../docs/guardrail.md), [safety analysis](../docs/safety-analysis.md) | `go test ./pkg/approval ./pkg/guardrail ./pkg/policy ./pkg/precheck ./pkg/safety ./pkg/simulate` |

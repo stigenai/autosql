@@ -18,7 +18,8 @@ jobs:
         run: go install sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.24.0
       - name: Test operator against Kubernetes 1.35
         run: |
-          export KUBEBUILDER_ASSETS="$(setup-envtest use -p path 1.35.x)"
+          KUBEBUILDER_ASSETS="$(setup-envtest use -p path 1.35.x)"
+          export KUBEBUILDER_ASSETS
           AUTOSQL_OPERATOR_ENVTEST=1 go test -count=1 ./internal/operatorcontroller \
             -run TestEnvtestReconcilesCRAndWritesStatus
   changeset:

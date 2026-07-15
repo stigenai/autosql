@@ -141,6 +141,7 @@ output. See [the CLI contract](docs/cli-contract.md) and
 - [Dynamic and composite sources](docs/dynamic-sources.md)
 - [Declarative HCL authoring](docs/hcl-schema.md)
 - [PostgreSQL default-expression support and safety](docs/postgresql-default-expressions.md)
+- [PostgreSQL fresh-provisioning compatibility](docs/postgresql-provisioning-compatibility.md)
 - [Cloud discovery and monitoring](docs/cloud-monitoring.md)
 - [Tenant-scale fleet rollout](docs/tenant-fleet.md) · [multi-dialect contracts](docs/multi-dialect.md)
 - [CI/CD and GitOps ecosystem](docs/ci-gitops-ecosystem.md)

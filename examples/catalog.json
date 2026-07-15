@@ -43,6 +43,7 @@
       "docs": [
         "docs/planning.md",
         "docs/postgresql-default-expressions.md",
+        "docs/postgresql-provisioning-compatibility.md",
         "docs/database-security.md",
         "examples/hcl-postgres/README.md"
       ],
@@ -99,6 +100,10 @@
         "column.default",
         "column.not_null",
         "column.ordinal_metadata",
+        "column.identity_create",
+        "column.generated_external_routines",
+        "column.generated_stored_create",
+        "metadata.comment",
         "view.provable_projection",
         "materialized_view.provable_projection",
         "alter.explicit_rebuild"

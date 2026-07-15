@@ -112,6 +112,17 @@ creation precedes the dependent column. The complete grammar and its explicit
 rejection boundaries are documented in
 [PostgreSQL default expressions](../../docs/postgresql-default-expressions.md).
 
+Stored generated columns may reference an inspected application- or
+extension-owned routine through exact `references(...)` dependencies. Those
+routines remain external prerequisites: produce their fingerprinted manifest
+with `postgres.GeneratedRoutinePrerequisites`, verify the target with
+`postgres.VerifyGeneratedRoutinePrerequisites`, and only then plan the column.
+Verification distinguishes exact matches, missing routines, and definition or
+extension-version mismatches without rendering arbitrary routine bodies.
+[`generated.hcl`](generated.hcl) is the executable lifecycle-style example: it
+declares the external routine, exact source-column/routine edges, and the
+creation-only `generated = "s"` expression.
+
 | PostgreSQL area | HCL resource kinds demonstrated | Example configuration |
 | --- | --- | --- |
 | Namespaces and extensions | `schema`, `extension` | Dedicated schema and `uuid-ossp` extension |
