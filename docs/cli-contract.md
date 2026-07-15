@@ -89,8 +89,8 @@ copied into requested/applied/refused audit records.
 
 ## Schema commands
 
-`schema load` accepts repeatable `--source sql:path` and `--source json:path`
-arguments. It parses and composes desired state without opening a database.
+`schema load` accepts repeatable `--source sql:path`, `--source json:path`, and
+`--source hcl:path` arguments. It parses and composes desired state without opening a database.
 The default output is the canonical schema document; `--json` wraps that
 document in the standard output envelope.
 
