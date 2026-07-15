@@ -72,6 +72,30 @@ func TestFormatHCLPreservesAnnotations(t *testing.T) {
 	}
 }
 
+// TestFormatHCLPreservesDocumentAnnotations proves document-level metadata (the
+// dialect annotation stamped by schema inspect) survives FormatHCL -> LoadContext.
+// Without it, plan.Build rejects an inspected-then-reloaded schema as an
+// unsupported transition even though every resource matches.
+func TestFormatHCLPreservesDocumentAnnotations(t *testing.T) {
+	doc := schema.Document{
+		Version:     schema.SchemaVersion,
+		Annotations: map[string]string{"dialect": "postgresql"},
+		Graph:       schema.Graph{Resources: []schema.Resource{manualResource(schema.KindSchema, schema.Name{Name: "app"}, `{}`, nil)}},
+	}
+	doc.Normalize()
+	hcl, err := FormatHCL(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := LoadContext(context.Background(), Input{URI: "s.hcl", Format: FormatHCLSource, Data: hcl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Annotations["dialect"] != "postgresql" {
+		t.Fatalf("document annotations dropped on round-trip: %#v", reloaded.Annotations)
+	}
+}
+
 func TestSQLAndNativeProduceEquivalentGraph(t *testing.T) {
 	sql := `CREATE SCHEMA app;
 CREATE TABLE app.users (
