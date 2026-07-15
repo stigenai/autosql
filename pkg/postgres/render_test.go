@@ -454,7 +454,8 @@ func TestCoreColumnGrammarRejectsClauseSmugglingAndNoncanonicalForms(t *testing.
 	table := renderResource(schema.KindTable, schema.Name{Schema: "app", Name: "widgets", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
 	for name, fixture := range map[string]struct{ typ, def string }{
 		"embedded not null": {"text NOT NULL", ""}, "collation": {"text COLLATE C", ""}, "constraint": {"integer CHECK (value>0)", ""},
-		"char variant": {"char(4)", ""}, "decimal variant": {"decimal(10,2)", ""}, "timestamp precision": {"timestamp(3)", ""}, "array keyword": {"integer ARRAY", ""},
+		"char variant": {"char(4)", ""}, "decimal variant": {"decimal(10,2)", ""}, "noncanonical precision": {"timestamp(03)", ""}, "precision range": {"timestamp(7)", ""},
+		"zero length": {"character varying(0)", ""}, "modifier whitespace": {"numeric(10, 2)", ""}, "scale range": {"numeric(10,11)", ""}, "array keyword": {"integer ARRAY", ""},
 		"function default": {"integer", "nextval('x')"}, "cast default": {"integer", "'1'::integer"},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -470,6 +471,35 @@ func TestCoreColumnGrammarRejectsClauseSmugglingAndNoncanonicalForms(t *testing.
 				t.Fatalf("out=%+v err=%v", out, err)
 			}
 		})
+	}
+}
+
+func TestCoreColumnGrammarRendersCanonicalTypeModifiers(t *testing.T) {
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "app", Name: "widgets", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	types := []string{"character varying(255)", "character varying(8)[]", "numeric(10)", "numeric(10,2)", "timestamp(0)", "timestamp(3)", "timestamptz(6)"}
+	resources := []schema.Resource{ns, table}
+	for index, typ := range types {
+		spec := map[string]any{"type": typ, "not_null": false, "ordinal": index + 1}
+		if index == 0 {
+			spec["default"] = "'widget'"
+		}
+		raw, _ := json.Marshal(spec)
+		resources = append(resources, renderResource(schema.KindColumn, schema.Name{Schema: "app", Name: fmt.Sprintf("value_%d", index), Parent: table.ID}, string(raw), schema.Dependency{Target: table.ID, Type: schema.DependencyContains}))
+	}
+	doc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: resources}}
+	out, err := RenderDocument(context.Background(), doc, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := ""
+	for _, statement := range out {
+		joined += statement.SQL + "\n"
+	}
+	for _, typ := range types {
+		if !strings.Contains(joined, typ) {
+			t.Errorf("rendered SQL missing type %q:\n%s", typ, joined)
+		}
 	}
 }
 

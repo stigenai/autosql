@@ -1081,30 +1081,99 @@ func validateCoreColumnType(r schema.Resource, resources map[string]schema.Resou
 			return nil
 		}
 	}
-	typ := stringValue(spec(r), "type")
-	base := strings.TrimSuffix(typ, "[]")
-	allowed := map[string]bool{"smallint": true, "integer": true, "bigint": true, "real": true, "double precision": true, "numeric": true, "boolean": true, "text": true, "character varying": true, "date": true, "timestamp": true, "timestamptz": true, "uuid": true, "json": true, "jsonb": true, "bytea": true}
-	if !allowed[base] || typ != base && typ != base+"[]" {
+	if _, ok := parseCoreColumnType(stringValue(spec(r), "type")); !ok {
 		return unsupported(r, "column type is outside canonical core grammar")
 	}
 	return nil
 }
+
+type coreColumnType struct {
+	base, modifier string
+	array          bool
+}
+
+func parseCoreColumnType(value string) (coreColumnType, bool) {
+	typ := coreColumnType{}
+	if strings.HasSuffix(value, "[]") {
+		typ.array = true
+		value = strings.TrimSuffix(value, "[]")
+	}
+	if strings.Contains(value, "[]") {
+		return coreColumnType{}, false
+	}
+	if open := strings.IndexByte(value, '('); open >= 0 {
+		if !strings.HasSuffix(value, ")") || strings.Count(value, "(") != 1 || strings.Count(value, ")") != 1 {
+			return coreColumnType{}, false
+		}
+		typ.base = value[:open]
+		typ.modifier = value[open+1 : len(value)-1]
+	} else {
+		typ.base = value
+	}
+	allowed := map[string]bool{"smallint": true, "integer": true, "bigint": true, "real": true, "double precision": true, "numeric": true, "boolean": true, "text": true, "character varying": true, "date": true, "timestamp": true, "timestamptz": true, "uuid": true, "json": true, "jsonb": true, "bytea": true}
+	if !allowed[typ.base] {
+		return coreColumnType{}, false
+	}
+	if typ.modifier == "" {
+		return typ, true
+	}
+	switch typ.base {
+	case "character varying":
+		length, ok := canonicalUnsigned(typ.modifier)
+		return typ, ok && length >= 1 && length <= 10485760
+	case "numeric":
+		parts := strings.Split(typ.modifier, ",")
+		if len(parts) < 1 || len(parts) > 2 {
+			return coreColumnType{}, false
+		}
+		precision, ok := canonicalUnsigned(parts[0])
+		if !ok || precision < 1 || precision > 1000 {
+			return coreColumnType{}, false
+		}
+		if len(parts) == 2 {
+			scale, scaleOK := canonicalUnsigned(parts[1])
+			if !scaleOK || scale > precision {
+				return coreColumnType{}, false
+			}
+		}
+		return typ, true
+	case "timestamp", "timestamptz":
+		precision, ok := canonicalUnsigned(typ.modifier)
+		return typ, ok && precision <= 6
+	default:
+		return coreColumnType{}, false
+	}
+}
+
+func canonicalUnsigned(value string) (int, bool) {
+	if value == "" || len(value) > 1 && value[0] == '0' {
+		return 0, false
+	}
+	for _, ch := range value {
+		if ch < '0' || ch > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.Atoi(value)
+	return n, err == nil
+}
+
 func validateCoreDefault(r schema.Resource, value string) error {
-	typ := strings.TrimSuffix(stringValue(spec(r), "type"), "[]")
-	if strings.HasSuffix(stringValue(spec(r), "type"), "[]") {
+	typ, validType := parseCoreColumnType(stringValue(spec(r), "type"))
+	if !validType || typ.array {
 		return unsupported(r, "array defaults are not modeled")
 	}
 	integer := regexp.MustCompile(`^-?[0-9]+$`)
 	quoted := regexp.MustCompile(`^'(?:''|[^'])*'$`)
 	ok := false
-	switch typ {
+	switch typ.base {
 	case "smallint", "integer", "bigint":
 		if integer.MatchString(value) && (value == "0" || !strings.HasPrefix(value, "0")) && !strings.HasPrefix(value, "-0") {
 			bits := 64
-			if typ == "smallint" {
+			if typ.base == "smallint" {
 				bits = 16
 			}
-			if typ == "integer" {
+			if typ.base == "integer" {
 				bits = 32
 			}
 			_, err := strconv.ParseInt(value, 10, bits)
@@ -1117,7 +1186,7 @@ func validateCoreDefault(r schema.Resource, value string) error {
 	case "text", "character varying":
 		ok = quoted.MatchString(value)
 	case "timestamp", "timestamptz":
-		ok = value == "CURRENT_TIMESTAMP"
+		ok = value == "CURRENT_TIMESTAMP" || regexp.MustCompile(`^CURRENT_TIMESTAMP\([0-6]\)$`).MatchString(value)
 	}
 	if !ok {
 		return unsupported(r, "column default is outside canonical core grammar")
