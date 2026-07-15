@@ -91,6 +91,9 @@ func (*Driver) Info() plugin.Info {
 	all := []schema.Operation{schema.OperationCreate, schema.OperationAlter, schema.OperationDrop, schema.OperationRename}
 	profiles := map[schema.Kind]plugin.Capability{
 		schema.KindSchema:           {Kind: schema.KindSchema, Mode: plugin.Managed, Operations: []schema.Operation{schema.OperationCreate, schema.OperationDrop, schema.OperationRename}, Features: []string{"namespace.lifecycle"}},
+		schema.KindEnum:             {Kind: schema.KindEnum, Mode: plugin.Managed, Operations: all, Features: []string{"enum.lifecycle", "enum.append_values"}},
+		schema.KindDomain:           {Kind: schema.KindDomain, Mode: plugin.Managed, Operations: []schema.Operation{schema.OperationCreate, schema.OperationDrop, schema.OperationRename}, Features: []string{"domain.lifecycle", "domain.core_base_type", "domain.literal_check"}},
+		schema.KindSequence:         {Kind: schema.KindSequence, Mode: plugin.Managed, Operations: all, Features: []string{"sequence.lifecycle", "sequence.options"}},
 		schema.KindTable:            {Kind: schema.KindTable, Mode: plugin.Managed, Operations: all, Features: []string{"table.permanent_nonpartitioned", "table.rls", "table.child_columns"}},
 		schema.KindColumn:           {Kind: schema.KindColumn, Mode: plugin.Managed, Operations: all, Features: []string{"column.type_safe_casts", "column.default", "column.not_null", "column.ordinal_metadata"}},
 		schema.KindView:             {Kind: schema.KindView, Mode: plugin.Managed, Operations: all, Features: []string{"view.provable_projection"}},
@@ -130,8 +133,8 @@ func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Documen
 		// Serialized/public annotations are not trusted provenance.
 		delete(r.Annotations, "autosql.io/generated-name")
 		delete(r.Annotations, "autosql.io/name-origin")
-		var spec map[string]any
-		if len(r.Spec) > 0 && json.Unmarshal(r.Spec, &spec) == nil {
+		if len(r.Spec) > 0 {
+			spec := specMap(r.Spec)
 			normalizePostgresSpecForKind(r.Kind, spec)
 			normalized, e := json.Marshal(spec)
 			if e != nil {
@@ -425,12 +428,18 @@ func augmentProjectionColumns(doc *schema.Document) {
 }
 func specMap(raw json.RawMessage) map[string]any {
 	out := map[string]any{}
-	_ = json.Unmarshal(raw, &out)
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.UseNumber()
+	_ = decoder.Decode(&out)
 	return out
 }
 func numberAsInt(values map[string]any, key string) int {
-	if value, ok := values[key].(float64); ok {
+	switch value := values[key].(type) {
+	case float64:
 		return int(value)
+	case json.Number:
+		result, _ := strconv.Atoi(value.String())
+		return result
 	}
 	return 0
 }
@@ -524,7 +533,9 @@ func postgresTypeAlias(value string) string {
 	original := strings.TrimSpace(value)
 	array := ""
 	for strings.HasSuffix(original, "[]") {
-		array += "[]"
+		// PostgreSQL array bounds and declared dimensionality are not enforced
+		// by the type system and format_type reports the canonical array type.
+		array = "[]"
 		original = strings.TrimSpace(strings.TrimSuffix(original, "[]"))
 	}
 	// Quoted identifiers and user-defined names are case-sensitive. Only fold
@@ -605,6 +616,9 @@ func postgresDefault(value string) string {
 				if regexp.MustCompile(`^-?[0-9]+$`).MatchString(inner) {
 					return inner
 				}
+			}
+			if cast == "::boolean" && (base == "'true'" || base == "'false'") {
+				return base[1 : len(base)-1]
 			}
 			if strings.HasPrefix(base, "'") || base == "true" || base == "false" || base == "NULL" || base == "null" {
 				return base

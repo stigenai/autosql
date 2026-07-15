@@ -153,10 +153,18 @@ func TestCoreDefaultClassifierSupportsInspectedScalarArrayAndBuiltinForms(t *tes
 		{"time(3)", "LOCALTIME(3)"},
 		{"timestamp(2)", "LOCALTIMESTAMP(2)"},
 		{"interval", "'00:05:00'::interval"},
+		{"numeric(10,2)", "'12.30'::numeric(4,2)"},
+		{"bigint", "'12'::integer"},
+		{"boolean", "'true'::boolean"},
+		{"text", "'pending'::text"},
 		{"character(4)", "'x'::character(1)"},
 		{"character(4)", "'test'::character(4)"},
 		{"bit(4)", "'1010'::bit(4)"},
 		{"text[]", "'{}'::text[]"},
+		{"text[]", "ARRAY[]::text[]"},
+		{"text[]", `'{"a,b","NULL"}'::text[]`},
+		{"integer[]", "'{1,2}'::integer[]"},
+		{"boolean[]", "'{t,f}'::boolean[]"},
 		{"text[]", "ARRAY['a'::text, 'b'::text]"},
 		{"integer[]", "ARRAY[1, 2]"},
 		{"uuid", "pg_catalog.gen_random_uuid()"},
@@ -168,6 +176,27 @@ func TestCoreDefaultClassifierSupportsInspectedScalarArrayAndBuiltinForms(t *tes
 			if err != nil || len(out) == 0 {
 				t.Fatalf("statements=%+v err=%v", out, err)
 			}
+			desired, err := New().Normalize(context.Background(), documentWithDefault(tc.typ, tc.value))
+			if err != nil {
+				t.Fatal(err)
+			}
+			empty := desired
+			empty.Graph.Resources = nil
+			fresh, err := plan.Build(context.Background(), New(), empty, desired, plan.Options{})
+			if err != nil || len(fresh.Steps) == 0 {
+				t.Fatalf("fresh plan=%+v err=%v", fresh, err)
+			}
+			current := desired
+			current.Graph.Resources = nil
+			for _, resource := range desired.Graph.Resources {
+				if resource.Kind != schema.KindColumn {
+					current.Graph.Resources = append(current.Graph.Resources, resource)
+				}
+			}
+			incremental, err := plan.Build(context.Background(), New(), current, desired, plan.Options{})
+			if err != nil || len(incremental.Steps) == 0 {
+				t.Fatalf("incremental plan=%+v err=%v", incremental, err)
+			}
 		})
 	}
 }
@@ -175,18 +204,31 @@ func TestCoreDefaultClassifierSupportsInspectedScalarArrayAndBuiltinForms(t *tes
 func TestCoreDefaultClassifierRejectsUnsafeExtendedForms(t *testing.T) {
 	tests := []struct{ typ, value string }{
 		{"numeric(3,2)", "12.345"},
+		{"numeric(3,2)", "100"},
 		{"jsonb", "'{bad}'::jsonb"},
 		{"uuid", "'not-a-uuid'::uuid"},
 		{"date", "'2025-02-30'::date"},
+		{"interval", "'00:99:00'::interval"},
 		{"text", "'x'::integer"},
 		{"text[]", "ARRAY[lower('x')]"},
+		{"text[]", "ARRAY[]"},
+		{"text[]", "ARRAY[1]"},
 		{"text[]", "ARRAY[ARRAY['x']]"},
 		{"text[]", "'{{x}}'::text[]"},
 		{"text[]", "'{NULL}'::text[]"},
+		{"text[]", `'{"unterminated}'::text[]`},
+		{"text[]", `'{"a"junk}'::text[]`},
 		{"uuid", "gen_random_uuid()"},
 		{"uuid", "app.gen_random_uuid()"},
 		{"timestamp", "pg_catalog.timezone('est'::text, CURRENT_TIMESTAMP)"},
 		{"timestamp", "pg_catalog.timezone('utc'::text, app.clock())"},
+		{"timestamp", "pg_catalog.timezone('utc'::text, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"},
+		{"uuid", "pg_catalog.gen_random_uuid(1)"},
+		{"integer", "random()"},
+		{"text", "concat(VARIADIC ARRAY['x'])"},
+		{"date", "LOCALTIME"},
+		{"text[]", "ARRAY['x']; SELECT 1"},
+		{"text[][]", "'{}'::text[][]"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.typ+"_"+tc.value, func(t *testing.T) {
@@ -220,7 +262,6 @@ func TestCoreDefaultClassifierAdversarialInputsProduceNoStatements(t *testing.T)
 		"ARRAY[1,2]",
 		"gen_random_uuid()",
 		"app.value",
-		"'1'::integer",
 		"'unterminated",
 		"f(",
 	}

@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"reflect"
 	"testing"
@@ -290,7 +291,7 @@ func TestNormalizeTypesConservatively(t *testing.T) {
 		"time(2) with time zone":         "timetz(2)",
 		"bpchar(4)":                      "character(4)",
 		"varbit(8)":                      "bit varying(8)",
-		"pg_catalog.int4[][]":            "integer[][]",
+		"pg_catalog.int4[][]":            "integer[]",
 		`"CaseSensitiveType"`:            `"CaseSensitiveType"`,
 		"App.CustomType":                 "App.CustomType",
 	}
@@ -335,5 +336,37 @@ func TestNormalizeAliasesAndStableDefaultsCompareEqual(t *testing.T) {
 	changes, err := schema.Diff(a, b, schema.DiffOptions{})
 	if err != nil || len(changes.Changes) != 0 {
 		t.Fatalf("changes=%+v err=%v", changes, err)
+	}
+}
+
+func TestNormalizeGeneratedDefaultFormsConverge(t *testing.T) {
+	for _, fixture := range []struct{ typ, inspected, canonical string }{
+		{"timestamptz", "now()", "CURRENT_TIMESTAMP"},
+		{"timestamptz", "transaction_timestamp()", "CURRENT_TIMESTAMP"},
+		{"uuid", "gen_random_uuid()", "pg_catalog.gen_random_uuid()"},
+		{"timestamp", "timezone('utc'::text, now())", "pg_catalog.timezone('utc'::text, CURRENT_TIMESTAMP)"},
+		{"date", "current_date", "CURRENT_DATE"},
+		{"time(3)", "localtime(3)", "LOCALTIME(3)"},
+		{"timestamp(2)", "localtimestamp(2)", "LOCALTIMESTAMP(2)"},
+	} {
+		t.Run(fixture.inspected, func(t *testing.T) {
+			makeDoc := func(value string) schema.Document {
+				r := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: "public", Name: "value"}, Spec: json.RawMessage(fmt.Sprintf(`{"type":%q,"default":%q}`, fixture.typ, value))}
+				r.ID = schema.StableID(r.Kind, r.Name)
+				return schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{r}}}
+			}
+			inspected, err := New().Normalize(context.Background(), makeDoc(fixture.inspected))
+			if err != nil {
+				t.Fatal(err)
+			}
+			canonical, err := New().Normalize(context.Background(), makeDoc(fixture.canonical))
+			if err != nil {
+				t.Fatal(err)
+			}
+			changes, err := schema.Diff(inspected, canonical, schema.DiffOptions{})
+			if err != nil || len(changes.Changes) != 0 {
+				t.Fatalf("changes=%+v err=%v", changes, err)
+			}
+		})
 	}
 }

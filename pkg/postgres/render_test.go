@@ -456,7 +456,7 @@ func TestCoreColumnGrammarRejectsClauseSmugglingAndNoncanonicalForms(t *testing.
 		"embedded not null": {"text NOT NULL", ""}, "collation": {"text COLLATE C", ""}, "constraint": {"integer CHECK (value>0)", ""},
 		"char variant": {"char(4)", ""}, "decimal variant": {"decimal(10,2)", ""}, "noncanonical precision": {"timestamp(03)", ""}, "precision range": {"timestamp(7)", ""},
 		"zero length": {"character varying(0)", ""}, "modifier whitespace": {"numeric(10, 2)", ""}, "scale range": {"numeric(10,11)", ""}, "array keyword": {"integer ARRAY", ""},
-		"function default": {"integer", "nextval('x')"}, "cast default": {"integer", "'1'::integer"},
+		"function default": {"integer", "nextval('x')"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			spec := map[string]any{"type": fixture.typ, "not_null": false, "ordinal": 1}

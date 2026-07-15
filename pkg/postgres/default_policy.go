@@ -15,7 +15,7 @@ var (
 	canonicalNumericDefault = regexp.MustCompile(`^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$`)
 	uuidDefault             = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 	bitDefault              = regexp.MustCompile(`^[01]+$`)
-	intervalDefault         = regexp.MustCompile(`^-?(?:(?:[0-9]+) days? )?[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?$`)
+	intervalDefault         = regexp.MustCompile(`^-?(?:(?:[0-9]+) days? )?([0-9]+):([0-9]{2}):([0-9]{2})(?:\.[0-9]{1,6})?$`)
 )
 
 func coreDefaultAllowed(typ coreColumnType, expr defaultExpression, source string) bool {
@@ -30,7 +30,8 @@ func coreDefaultAllowed(typ coreColumnType, expr defaultExpression, source strin
 		if !ok || castType.array || !coreTypesCompatible(typ, castType) {
 			return false
 		}
-		return coreScalarLiteralAllowed(castType, expr.Cast.Expression)
+		literal, ok := coreCastLiteralExpression(castType, expr.Cast.Expression)
+		return ok && coreScalarLiteralAllowed(castType, literal) && coreScalarLiteralAllowed(typ, literal)
 	}
 	return coreScalarLiteralAllowed(typ, expr) && coreLiteralSourceCanonical(typ, expr, source)
 }
@@ -66,6 +67,9 @@ func coreTypesCompatible(column, cast coreColumnType) bool {
 			columnLimit, columnOK := canonicalUnsigned(column.modifier)
 			castLimit, castOK := canonicalUnsigned(cast.modifier)
 			return columnOK && castOK && castLimit <= columnLimit
+		}
+		if column.base == "numeric" {
+			return true
 		}
 		return false
 	}
@@ -135,7 +139,7 @@ func coreScalarLiteralAllowed(typ coreColumnType, expr defaultExpression) bool {
 	case "timestamptz":
 		return literal.Kind == defaultLiteralString && parsesAnyTime(literal.Text, "2006-01-02 15:04:05Z07:00", "2006-01-02 15:04:05.999999Z07:00")
 	default:
-		return strings.HasPrefix(typ.base, "interval") && literal.Kind == defaultLiteralString && intervalDefault.MatchString(literal.Text)
+		return strings.HasPrefix(typ.base, "interval") && literal.Kind == defaultLiteralString && validIntervalDefault(literal.Text)
 	}
 }
 
@@ -169,16 +173,30 @@ func numericDefaultFits(typ coreColumnType, value string) bool {
 		scale, _ = strconv.Atoi(parts[1])
 	}
 	digits := strings.TrimPrefix(value, "-")
+	integerPart := digits
 	fraction := 0
 	if dot := strings.IndexByte(digits, '.'); dot >= 0 {
 		fraction = len(digits) - dot - 1
+		integerPart = digits[:dot]
 		digits = digits[:dot] + digits[dot+1:]
 	}
 	digits = strings.TrimLeft(digits, "0")
 	if digits == "" {
 		digits = "0"
 	}
-	return fraction <= scale && len(digits) <= precision
+	integerPart = strings.TrimLeft(integerPart, "0")
+	integerDigits := len(integerPart)
+	return fraction <= scale && integerDigits <= precision-scale && len(digits) <= precision
+}
+
+func validIntervalDefault(value string) bool {
+	match := intervalDefault.FindStringSubmatch(value)
+	if match == nil {
+		return false
+	}
+	minutes, minuteErr := strconv.Atoi(match[2])
+	seconds, secondErr := strconv.Atoi(match[3])
+	return minuteErr == nil && secondErr == nil && minutes < 60 && seconds < 60
 }
 
 func parsesTime(layout, value string) bool {
@@ -199,12 +217,7 @@ func coreArrayDefaultAllowed(typ coreColumnType, expr defaultExpression) bool {
 	elementType := typ
 	elementType.array = false
 	if expr.Kind == defaultExpressionArray {
-		for _, element := range expr.Array {
-			if element.Kind == defaultExpressionArray || !coreArrayElementAllowed(elementType, element) {
-				return false
-			}
-		}
-		return true
+		return len(expr.Array) > 0 && coreArrayElementsAllowed(elementType, expr.Array)
 	}
 	if expr.Kind != defaultExpressionCast || expr.Cast == nil {
 		return false
@@ -214,7 +227,7 @@ func coreArrayDefaultAllowed(typ coreColumnType, expr defaultExpression) bool {
 		return false
 	}
 	if expr.Cast.Expression.Kind == defaultExpressionArray {
-		return coreArrayDefaultAllowed(castType, expr.Cast.Expression)
+		return coreArrayElementsAllowed(elementType, expr.Cast.Expression.Array)
 	}
 	if expr.Cast.Expression.Kind != defaultExpressionLiteral || expr.Cast.Expression.Literal == nil || expr.Cast.Expression.Literal.Kind != defaultLiteralString {
 		return false
@@ -224,7 +237,16 @@ func coreArrayDefaultAllowed(typ coreColumnType, expr defaultExpression) bool {
 		return false
 	}
 	for _, value := range values {
-		if !coreScalarLiteralAllowed(elementType, defaultExpression{Kind: defaultExpressionLiteral, Literal: &defaultLiteral{Kind: defaultLiteralString, Text: value}}) {
+		if !coreScalarLiteralAllowed(elementType, arrayLiteralExpression(elementType, value)) {
+			return false
+		}
+	}
+	return true
+}
+
+func coreArrayElementsAllowed(typ coreColumnType, elements []defaultExpression) bool {
+	for _, element := range elements {
+		if element.Kind == defaultExpressionArray || !coreArrayElementAllowed(typ, element) {
 			return false
 		}
 	}
@@ -234,13 +256,62 @@ func coreArrayDefaultAllowed(typ coreColumnType, expr defaultExpression) bool {
 func coreArrayElementAllowed(typ coreColumnType, expr defaultExpression) bool {
 	if expr.Kind == defaultExpressionCast && expr.Cast != nil {
 		castType, ok := coreDefaultCastType(expr.Cast.Type)
-		return ok && !castType.array && coreTypesCompatible(typ, castType) && coreScalarLiteralAllowed(castType, expr.Cast.Expression)
+		if !ok || castType.array || !coreTypesCompatible(typ, castType) {
+			return false
+		}
+		literal, ok := coreCastLiteralExpression(castType, expr.Cast.Expression)
+		return ok && coreScalarLiteralAllowed(castType, literal) && coreScalarLiteralAllowed(typ, literal)
 	}
 	return coreScalarLiteralAllowed(typ, expr)
 }
 
+func coreCastLiteralExpression(typ coreColumnType, expr defaultExpression) (defaultExpression, bool) {
+	if expr.Kind != defaultExpressionLiteral || expr.Literal == nil {
+		return defaultExpression{}, false
+	}
+	if expr.Literal.Kind != defaultLiteralString {
+		return expr, true
+	}
+	converted := expr
+	converted.Literal = &defaultLiteral{Text: expr.Literal.Text}
+	switch typ.base {
+	case "smallint", "integer", "bigint":
+		converted.Literal.Kind = defaultLiteralInteger
+	case "real", "double precision", "numeric":
+		converted.Literal.Kind = defaultLiteralFloat
+	case "boolean":
+		converted.Literal.Kind = defaultLiteralBoolean
+		if expr.Literal.Text == "true" {
+			converted.Literal.Boolean = true
+		} else if expr.Literal.Text != "false" {
+			return defaultExpression{}, false
+		}
+	default:
+		converted.Literal.Kind = defaultLiteralString
+	}
+	return converted, true
+}
+
+func arrayLiteralExpression(typ coreColumnType, value string) defaultExpression {
+	kind := defaultLiteralString
+	switch typ.base {
+	case "smallint", "integer", "bigint":
+		kind = defaultLiteralInteger
+	case "real", "double precision", "numeric":
+		kind = defaultLiteralFloat
+	case "boolean":
+		if value == "true" || value == "t" {
+			return defaultExpression{Kind: defaultExpressionLiteral, Literal: &defaultLiteral{Kind: defaultLiteralBoolean, Boolean: true}}
+		}
+		if value == "false" || value == "f" {
+			return defaultExpression{Kind: defaultExpressionLiteral, Literal: &defaultLiteral{Kind: defaultLiteralBoolean}}
+		}
+	}
+	return defaultExpression{Kind: defaultExpressionLiteral, Literal: &defaultLiteral{Kind: kind, Text: value}}
+}
+
 // parseCoreArrayLiteral accepts PostgreSQL's one-dimensional literal form and
-// deliberately rejects NULL elements, dimensions, nesting, and escapes.
+// deliberately rejects NULL elements, dimensions, and malformed escapes.
 func parseCoreArrayLiteral(value string) ([]string, bool) {
 	if len(value) < 2 || value[0] != '{' || value[len(value)-1] != '}' {
 		return nil, false
@@ -249,14 +320,59 @@ func parseCoreArrayLiteral(value string) ([]string, bool) {
 	if body == "" {
 		return []string{}, true
 	}
-	if strings.ContainsAny(body, `{}\\"`) {
-		return nil, false
+	var parts []string
+	var element strings.Builder
+	quoted, escaped, elementQuoted, quoteClosed := false, false, false, false
+	flush := func() bool {
+		part := element.String()
+		if part == "" && !elementQuoted || !elementQuoted && strings.EqualFold(part, "null") {
+			return false
+		}
+		parts = append(parts, part)
+		element.Reset()
+		elementQuoted = false
+		quoteClosed = false
+		return true
 	}
-	parts := strings.Split(body, ",")
-	for _, part := range parts {
-		if part == "" || strings.EqualFold(part, "null") {
+	for _, ch := range body {
+		if escaped {
+			element.WriteRune(ch)
+			escaped = false
+			continue
+		}
+		if quoteClosed && ch != ',' {
 			return nil, false
 		}
+		if ch == '\\' {
+			escaped = true
+			continue
+		}
+		if ch == '"' {
+			if quoted {
+				quoted = false
+				quoteClosed = true
+			} else {
+				if element.Len() != 0 || elementQuoted {
+					return nil, false
+				}
+				quoted = true
+				elementQuoted = true
+			}
+			continue
+		}
+		if !quoted && (ch == '{' || ch == '}') {
+			return nil, false
+		}
+		if !quoted && ch == ',' {
+			if !flush() {
+				return nil, false
+			}
+			continue
+		}
+		element.WriteRune(ch)
+	}
+	if quoted || escaped || !flush() {
+		return nil, false
 	}
 	return parts, true
 }

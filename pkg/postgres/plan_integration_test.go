@@ -377,7 +377,36 @@ func TestNativeDocumentCreateReinspectConverges(t *testing.T) {
 	a := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: "autosql_native", Name: "a", Parent: table.ID}, Dependencies: []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{"type":"text","not_null":false,"ordinal":2}`)}
 	a.ID = schema.StableID(a.Kind, a.Name)
 	defaults := []schema.Resource{}
-	for index, fixture := range []struct{ name, typ, value string }{{"count", "integer", "-2147483648"}, {"small", "smallint", "-32768"}, {"large", "bigint", "9223372036854775807"}, {"label", "text", "'x'"}, {"enabled", "boolean", "true"}, {"created_at", "timestamptz", "CURRENT_TIMESTAMP"}} {
+	for index, fixture := range []struct{ name, typ, value string }{
+		{"count", "integer", "-2147483648"},
+		{"small", "smallint", "-32768"},
+		{"large", "bigint", "9223372036854775807"},
+		{"label", "text", "'x'"},
+		{"enabled", "boolean", "true"},
+		{"price", "numeric(10,2)", "0.00"},
+		{"metadata", "jsonb", "'{}'::jsonb"},
+		{"items", "jsonb", "'[]'::jsonb"},
+		{"external_id", "uuid", "'550e8400-e29b-41d4-a716-446655440000'::uuid"},
+		{"generated_id", "uuid", "gen_random_uuid()"},
+		{"created_at", "timestamptz", "CURRENT_TIMESTAMP"},
+		{"now_at", "timestamptz", "now()"},
+		{"transaction_at", "timestamptz", "transaction_timestamp()"},
+		{"observed_at", "timestamp(3)", "CURRENT_TIMESTAMP(3)"},
+		{"business_date", "date", "CURRENT_DATE"},
+		{"local_clock", "time(3)", "LOCALTIME(3)"},
+		{"zoned_clock", "timetz(2)", "CURRENT_TIME(2)"},
+		{"local_stamp", "timestamp(2)", "LOCALTIMESTAMP(2)"},
+		{"utc_stamp", "timestamp", "timezone('utc'::text, now())"},
+		{"delay", "interval", "'00:05:00'::interval"},
+		{"day_delay", "interval day to second(3)", "'1 day 00:05:00'::interval"},
+		{"code", "character(4)", "'x'::character(1)"},
+		{"flags", "bit(4)", "'1010'::\"bit\""},
+		{"variable_flags", "bit varying(8)", "'101'::\"bit\""},
+		{"empty_tags", "text[]", "'{}'::text[]"},
+		{"tags", "text[]", "ARRAY['a'::text, 'b'::text]"},
+		{"numbers", "integer[]", "ARRAY[1, 2]"},
+		{"switches", "boolean[]", "ARRAY[true, false]"},
+	} {
 		column := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: "autosql_native", Name: fixture.name, Parent: table.ID}, Dependencies: []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(fmt.Sprintf(`{"type":%q,"default":%q,"not_null":false,"ordinal":%d}`, fixture.typ, fixture.value, index+3))}
 		column.ID = schema.StableID(column.Kind, column.Name)
 		defaults = append(defaults, column)
