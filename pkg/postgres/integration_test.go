@@ -123,6 +123,7 @@ create function autosql_inspect.user_count() returns bigint language sql stable 
 create procedure autosql_inspect.noop() language plpgsql as $$ begin null; end $$;
 alter table autosql_inspect.users enable row level security;
 create policy user_read on autosql_inspect.users for select to public using (true);
+alter default privileges in schema autosql_inspect grant select on tables to public;
 `
 	if _, err := conn.Exec(ctx, fixture); err != nil {
 		t.Fatalf("create fixture: %v", err)
@@ -130,7 +131,7 @@ create policy user_read on autosql_inspect.users for select to public using (tru
 	defer func() {
 		cleanup, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_, _ = conn.Exec(cleanup, `drop schema if exists autosql_inspect cascade`)
+		_, _ = conn.Exec(cleanup, `alter default privileges in schema autosql_inspect revoke select on tables from public; drop schema if exists autosql_inspect cascade`)
 	}()
 
 	opts := Options{Schemas: []string{"autosql_inspect"}}
@@ -199,8 +200,8 @@ create policy user_read on autosql_inspect.users for select to public using (tru
 	for _, r := range advanced.Graph.Resources {
 		advancedKinds[r.Kind] = true
 	}
-	if !advancedKinds[schema.KindRole] || !advancedKinds[schema.KindGrant] {
-		t.Fatalf("advanced inspection missing roles or grants: %#v", advancedKinds)
+	if !advancedKinds[schema.KindRole] || !advancedKinds[schema.KindGrant] || !advancedKinds[schema.KindDefaultPrivilege] {
+		t.Fatalf("advanced inspection missing roles, grants, or default privileges: %#v", advancedKinds)
 	}
 
 	filtered, err := InspectURL(ctx, url, Options{Schemas: []string{"autosql_inspect"}, Include: []string{"table:autosql_inspect.users"}, Exclude: []string{"column:email"}})

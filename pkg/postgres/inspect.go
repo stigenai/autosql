@@ -846,7 +846,7 @@ func (i *inspector) inspectMemberships(ctx context.Context) error {
 }
 
 func (i *inspector) inspectDefaultPrivileges(ctx context.Context) error {
-	rows, err := i.conn.Query(ctx, `select d.defaclrole,d.defaclnamespace,d.defaclobjtype,grantor.rolname,coalesce(grantee.rolname,'PUBLIC'),a.privilege_type,a.is_grantable,coalesce(n.nspname,'') from pg_default_acl d join pg_roles grantor on grantor.oid=d.defaclrole left join pg_namespace n on n.oid=d.defaclnamespace cross join lateral aclexplode(d.defaclacl) a left join pg_roles grantee on grantee.oid=nullif(a.grantee,0) order by grantor.rolname,n.nspname,d.defaclobjtype,coalesce(grantee.rolname,'PUBLIC'),a.privilege_type`)
+	rows, err := i.conn.Query(ctx, `select d.defaclrole,d.defaclnamespace,d.defaclobjtype::text,grantor.rolname,coalesce(grantee.rolname,'PUBLIC'),a.privilege_type,a.is_grantable,coalesce(n.nspname,'') from pg_default_acl d join pg_roles grantor on grantor.oid=d.defaclrole left join pg_namespace n on n.oid=d.defaclnamespace cross join lateral aclexplode(d.defaclacl) a left join pg_roles grantee on grantee.oid=nullif(a.grantee,0) order by grantor.rolname,n.nspname,d.defaclobjtype,coalesce(grantee.rolname,'PUBLIC'),a.privilege_type`)
 	if err != nil {
 		return err
 	}

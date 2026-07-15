@@ -78,3 +78,88 @@ func TestHCLVariablesAndImports(t *testing.T) {
 		t.Fatalf("cycle=%v", err)
 	}
 }
+
+func TestNestedHCLInheritsSchemaWithCanonicalContainment(t *testing.T) {
+	doc, err := ParseHCL("nested.hcl", []byte(`schema "app" {
+  table "users" {
+    column "email" {
+      type = "text"
+      nullable = false
+      ordinal = 1
+    }
+  }
+}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var table, column schema.Resource
+	for _, resource := range doc.Graph.Resources {
+		switch resource.Kind {
+		case schema.KindTable:
+			table = resource
+		case schema.KindColumn:
+			column = resource
+		}
+	}
+	if table.Name.Schema != "app" || column.Name.Schema != "app" {
+		t.Fatalf("schema inheritance failed: table=%+v column=%+v", table.Name, column.Name)
+	}
+	if column.Name.Parent != table.ID {
+		t.Fatalf("column parent=%q, want %q", column.Name.Parent, table.ID)
+	}
+	if len(column.Dependencies) != 1 || column.Dependencies[0].Target != table.ID {
+		t.Fatalf("column dependencies are noncanonical: %+v", column.Dependencies)
+	}
+}
+
+func TestHCLAuthoringHelpersProduceCanonicalIDsJSONAndDependencies(t *testing.T) {
+	doc, err := ParseHCL("helpers.hcl", []byte(`schema "app" {}
+table "users" {
+  schema = "app"
+  column "id" {
+    type = "bigint"
+    nullable = false
+    ordinal = 1
+  }
+}
+resource "primary_key" "users_pkey" {
+  schema = "app"
+  parent = table_id("app", "users")
+  spec_json = jsonencode({ definition = "PRIMARY KEY (id)" })
+  deps_json = jsonencode([
+    contains(resource_id("table", "app", schema_id("app"), "users")),
+    references(column_id("app", "users", "id")),
+    uses(column_id("app", "users", "id")),
+    owns(column_id("app", "users", "id")),
+  ])
+}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var primary schema.Resource
+	for _, resource := range doc.Graph.Resources {
+		if resource.Kind == schema.KindPrimaryKey {
+			primary = resource
+		}
+	}
+	wantTable := schema.StableID(schema.KindTable, schema.Name{Schema: "app", Parent: schema.StableID(schema.KindSchema, schema.Name{Name: "app"}), Name: "users"})
+	wantColumn := schema.StableID(schema.KindColumn, schema.Name{Schema: "app", Parent: wantTable, Name: "id"})
+	if primary.Name.Parent != wantTable || string(primary.Spec) != `{"definition":"PRIMARY KEY (id)"}` {
+		t.Fatalf("helper result is not canonical: %+v spec=%s", primary.Name, primary.Spec)
+	}
+	want := map[schema.DependencyType]string{
+		schema.DependencyContains:   wantTable,
+		schema.DependencyReferences: wantColumn,
+		schema.DependencyUses:       wantColumn,
+		schema.DependencyOwns:       wantColumn,
+	}
+	for _, dependency := range primary.Dependencies {
+		if want[dependency.Type] != dependency.Target {
+			t.Fatalf("dependency=%+v want=%+v", dependency, want)
+		}
+		delete(want, dependency.Type)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing helper dependencies: %+v", want)
+	}
+}

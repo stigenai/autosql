@@ -142,4 +142,5 @@ output. See [the CLI contract](docs/cli-contract.md) and
 - [Integration testing and coverage](docs/integration-testing.md)
 - [Release binaries and container images](docs/releasing.md)
 - [Detailed PostgreSQL lifecycle example](examples/postgres-lifecycle/README.md)
+- [HCL-managed PostgreSQL example](examples/hcl-postgres/README.md)
 - [Database security as code](docs/database-security.md) · [reference data](docs/reference-data.md)

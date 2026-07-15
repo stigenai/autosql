@@ -15,6 +15,8 @@ import (
 	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/hashicorp/hcl/v2/hclwrite"
 	"github.com/zclconf/go-cty/cty"
+	"github.com/zclconf/go-cty/cty/function"
+	"github.com/zclconf/go-cty/cty/function/stdlib"
 )
 
 var (
@@ -342,7 +344,7 @@ func stringAttr(body *hclsyntax.Body, name string, data []byte, variables HCLVar
 	return s, nil
 }
 func expressionValue(expr hcl.Expression, data []byte, variables HCLVariables) (any, error) {
-	ctx := &hcl.EvalContext{Variables: map[string]cty.Value{}}
+	ctx := &hcl.EvalContext{Variables: map[string]cty.Value{}, Functions: hclFunctions()}
 	varValues := map[string]cty.Value{}
 	for k, v := range variables {
 		cv, e := ctyValue(v)
@@ -365,6 +367,85 @@ func expressionValue(expr hcl.Expression, data []byte, variables HCLVariables) (
 		return raw, nil
 	}
 	return nil, fmt.Errorf("expression evaluation failed: %s", diags.Error())
+}
+
+func hclFunctions() map[string]function.Function {
+	return map[string]function.Function{
+		"jsonencode":  stdlib.JSONEncodeFunc,
+		"schema_id":   stableIDFunction(schema.KindSchema, false),
+		"table_id":    stableIDFunction(schema.KindTable, true),
+		"column_id":   columnIDFunction(),
+		"resource_id": resourceIDFunction(),
+		"contains":    dependencyFunction(schema.DependencyContains),
+		"references":  dependencyFunction(schema.DependencyReferences),
+		"uses":        dependencyFunction(schema.DependencyUses),
+		"owns":        dependencyFunction(schema.DependencyOwns),
+	}
+}
+
+func stableIDFunction(kind schema.Kind, schemaScoped bool) function.Function {
+	params := []function.Parameter{{Name: "name", Type: cty.String}}
+	if schemaScoped {
+		params = []function.Parameter{{Name: "schema", Type: cty.String}, {Name: "name", Type: cty.String}}
+	}
+	return function.New(&function.Spec{
+		Params: params,
+		Type:   function.StaticReturnType(cty.String),
+		Impl: func(args []cty.Value, _ cty.Type) (cty.Value, error) {
+			name := schema.Name{Name: args[len(args)-1].AsString()}
+			if schemaScoped {
+				name.Schema = args[0].AsString()
+				name.Parent = schema.StableID(schema.KindSchema, schema.Name{Name: name.Schema})
+			}
+			return cty.StringVal(schema.StableID(kind, name)), nil
+		},
+	})
+}
+
+func columnIDFunction() function.Function {
+	return function.New(&function.Spec{
+		Params: []function.Parameter{{Name: "schema", Type: cty.String}, {Name: "table", Type: cty.String}, {Name: "column", Type: cty.String}},
+		Type:   function.StaticReturnType(cty.String),
+		Impl: func(args []cty.Value, _ cty.Type) (cty.Value, error) {
+			schemaName, tableName, columnName := args[0].AsString(), args[1].AsString(), args[2].AsString()
+			parent := schema.StableID(schema.KindTable, schema.Name{Schema: schemaName, Name: tableName, Parent: schema.StableID(schema.KindSchema, schema.Name{Name: schemaName})})
+			return cty.StringVal(schema.StableID(schema.KindColumn, schema.Name{Schema: schemaName, Name: columnName, Parent: parent})), nil
+		},
+	})
+}
+
+func resourceIDFunction() function.Function {
+	return function.New(&function.Spec{
+		Params: []function.Parameter{{Name: "kind", Type: cty.String}, {Name: "schema", Type: cty.String}, {Name: "parent", Type: cty.String}, {Name: "name", Type: cty.String}},
+		Type:   function.StaticReturnType(cty.String),
+		Impl: func(args []cty.Value, _ cty.Type) (cty.Value, error) {
+			kind := schema.Kind(args[0].AsString())
+			if !schema.IsKnownKind(kind) {
+				return cty.NilVal, fmt.Errorf("unsupported resource kind %q", kind)
+			}
+			name := schema.Name{Schema: args[1].AsString(), Parent: args[2].AsString(), Name: args[3].AsString()}
+			if kind == schema.KindSchema {
+				name = schema.Name{Name: name.Name}
+			}
+			return cty.StringVal(schema.StableID(kind, name)), nil
+		},
+	})
+}
+
+func dependencyFunction(kind schema.DependencyType) function.Function {
+	return function.New(&function.Spec{
+		Params: []function.Parameter{{Name: "target", Type: cty.String}},
+		Type: function.StaticReturnType(cty.Object(map[string]cty.Type{
+			"target": cty.String,
+			"type":   cty.String,
+		})),
+		Impl: func(args []cty.Value, _ cty.Type) (cty.Value, error) {
+			return cty.ObjectVal(map[string]cty.Value{
+				"target": args[0],
+				"type":   cty.StringVal(string(kind)),
+			}), nil
+		},
+	})
 }
 func ctyValue(v any) (cty.Value, error) {
 	switch x := v.(type) {
