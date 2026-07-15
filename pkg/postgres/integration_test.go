@@ -90,7 +90,13 @@ func TestInspectURLIntegration(t *testing.T) {
 	defer conn.Close(context.Background())
 	const fixture = `
 drop schema if exists autosql_inspect cascade;
+drop schema if exists autosql_fresh_cell cascade;
 create schema autosql_inspect;
+create schema autosql_fresh_cell;
+create table autosql_fresh_cell.widgets (
+  id bigint not null,
+  label character varying(255) not null default 'widget'
+);
 comment on schema autosql_inspect is 'integration schema';
 create extension hstore with schema autosql_inspect;
 create type autosql_inspect.status as enum ('new','done');
@@ -134,7 +140,7 @@ alter default privileges in schema autosql_inspect grant select on tables to pub
 	defer func() {
 		cleanup, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_, _ = conn.Exec(cleanup, `alter default privileges in schema autosql_inspect revoke select on tables from public; drop schema if exists autosql_inspect cascade`)
+		_, _ = conn.Exec(cleanup, `alter default privileges in schema autosql_inspect revoke select on tables from public; drop schema if exists autosql_inspect cascade; drop schema if exists autosql_fresh_cell cascade`)
 	}()
 
 	opts := Options{Schemas: []string{"autosql_inspect"}}
@@ -190,6 +196,38 @@ alter default privileges in schema autosql_inspect grant select on tables to pub
 	}
 	if len(converged.Changes.Changes) != 0 || len(converged.Steps) != 0 {
 		t.Fatalf("inspected HCL did not converge: changes=%d steps=%d", len(converged.Changes.Changes), len(converged.Steps))
+	}
+	fresh, err := InspectURL(ctx, url, Options{Schemas: []string{"autosql_fresh_cell"}})
+	if err != nil {
+		t.Fatalf("inspect fresh-cell fixture: %v", err)
+	}
+	freshHCL, err := source.FormatHCL(fresh)
+	if err != nil {
+		t.Fatalf("format fresh-cell HCL: %v", err)
+	}
+	fresh, err = source.LoadContext(ctx, source.Input{URI: "fresh-cell.hcl", Format: source.FormatHCLSource, Data: freshHCL})
+	if err != nil {
+		t.Fatalf("reload fresh-cell HCL: %v", err)
+	}
+	fresh, err = New().Normalize(ctx, fresh)
+	if err != nil {
+		t.Fatalf("normalize fresh-cell fixture: %v", err)
+	}
+	empty := schema.Document{Version: schema.SchemaVersion, Annotations: map[string]string{"dialect": "postgresql"}}
+	freshPlan, err := plan.Build(ctx, New(), empty, fresh, plan.Options{})
+	if err != nil {
+		t.Fatalf("plan fresh-cell parameterized types: %v", err)
+	}
+	if len(freshPlan.Steps) == 0 {
+		t.Fatal("fresh-cell parameterized type plan has no steps")
+	}
+	var freshSQL strings.Builder
+	for _, step := range freshPlan.Steps {
+		freshSQL.WriteString(step.SQL)
+		freshSQL.WriteByte('\n')
+	}
+	if !strings.Contains(freshSQL.String(), "character varying(255)") {
+		t.Fatalf("fresh-cell plan dropped inspected type modifier:\n%s", freshSQL.String())
 	}
 	second, err := InspectURL(ctx, url, opts)
 	if err != nil {
