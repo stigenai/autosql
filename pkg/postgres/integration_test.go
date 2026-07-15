@@ -5,7 +5,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -302,6 +304,269 @@ alter default privileges in schema autosql_inspect grant select on tables to pub
 		if r.Kind == schema.KindColumn && strings.EqualFold(r.Name.Name, "email") {
 			t.Fatal("excluded column was retained")
 		}
+	}
+}
+
+func TestDefaultExpressionMatrixAdoptProvisionAndIncrement(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	const namespace = "autosql_default_matrix"
+	const fixture = `
+drop schema if exists autosql_default_matrix cascade;
+create schema autosql_default_matrix;
+create type autosql_default_matrix.job_status as enum ('pending','done');
+create domain autosql_default_matrix.positive_int as integer check (value > 0);
+create sequence autosql_default_matrix.widget_id_seq start with 10 increment by 2;
+create table autosql_default_matrix.widgets (
+  seq_id bigint default nextval('autosql_default_matrix.widget_id_seq'::regclass),
+  serial_id serial,
+  price numeric(10,2) default 0.00,
+  metadata jsonb default '{}'::jsonb,
+  items jsonb default '[]'::jsonb,
+  external_id uuid default '550e8400-e29b-41d4-a716-446655440000'::uuid,
+  generated_id uuid default gen_random_uuid(),
+  state autosql_default_matrix.job_status default 'pending'::autosql_default_matrix.job_status,
+  positive autosql_default_matrix.positive_int default 5,
+  text_state text default 'pending'::text,
+  empty_tags text[] default '{}'::text[],
+  tags text[] default array['a'::text,'b'::text],
+  numbers integer[] default array[1,2],
+  switches boolean[] default array[true,false],
+  business_date date default current_date,
+  local_clock time(3) default localtime(3),
+  zoned_clock time(2) with time zone default current_time(2),
+  created_at timestamptz default now(),
+  local_stamp timestamp(2) default localtimestamp(2),
+  utc_stamp timestamp default timezone('utc'::text,now()),
+  delay interval default '00:05:00'::interval,
+  code character(4) default 'x',
+  flags bit(4) default '1010'
+);`
+	if _, err = conn.Exec(ctx, fixture); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Exec(context.Background(), `drop schema if exists autosql_default_matrix cascade`)
+
+	inspected, err := InspectURL(ctx, url, Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedDefaults := map[string]string{
+		"seq_id":        "nextval('autosql_default_matrix.widget_id_seq'::regclass)",
+		"serial_id":     "nextval('autosql_default_matrix.widgets_serial_id_seq'::regclass)",
+		"price":         "0.00",
+		"metadata":      "'{}'::jsonb",
+		"items":         "'[]'::jsonb",
+		"external_id":   "'550e8400-e29b-41d4-a716-446655440000'::uuid",
+		"generated_id":  "gen_random_uuid()",
+		"state":         "'pending'::autosql_default_matrix.job_status",
+		"positive":      "5",
+		"text_state":    "'pending'::text",
+		"empty_tags":    "'{}'::text[]",
+		"tags":          "ARRAY['a'::text, 'b'::text]",
+		"numbers":       "ARRAY[1, 2]",
+		"switches":      "ARRAY[true, false]",
+		"business_date": "CURRENT_DATE",
+		"local_clock":   "LOCALTIME(3)",
+		"zoned_clock":   "CURRENT_TIME(2)",
+		"created_at":    "now()",
+		"local_stamp":   "LOCALTIMESTAMP(2)",
+		"utc_stamp":     "timezone('utc'::text, now())",
+		"delay":         "'00:05:00'::interval",
+		"code":          "'x'::bpchar",
+		"flags":         "'1010'::\"bit\"",
+	}
+	sequenceIDs := map[string]string{}
+	var enumID, domainID string
+	for _, resource := range inspected.Graph.Resources {
+		switch resource.Kind {
+		case schema.KindSequence:
+			sequenceIDs[resource.Name.Name] = resource.ID
+		case schema.KindEnum:
+			enumID = resource.ID
+		case schema.KindDomain:
+			domainID = resource.ID
+		}
+	}
+	seen := map[string]bool{}
+	for _, resource := range inspected.Graph.Resources {
+		if resource.Kind != schema.KindColumn {
+			continue
+		}
+		columnSpec := spec(resource)
+		if expected, ok := expectedDefaults[resource.Name.Name]; ok {
+			seen[resource.Name.Name] = true
+			if got := stringValue(columnSpec, "default"); got != expected {
+				t.Errorf("inspected default %s=%q want %q", resource.Name.Name, got, expected)
+			}
+		}
+		dependencies := map[schema.DependencyType][]string{}
+		for _, dependency := range resource.Dependencies {
+			dependencies[dependency.Type] = append(dependencies[dependency.Type], dependency.Target)
+		}
+		switch resource.Name.Name {
+		case "seq_id":
+			if !slices.Contains(dependencies[schema.DependencyReferences], sequenceIDs["widget_id_seq"]) {
+				t.Fatalf("sequence default dependency=%v want %s", dependencies, sequenceIDs["widget_id_seq"])
+			}
+		case "serial_id":
+			if !slices.Contains(dependencies[schema.DependencyReferences], sequenceIDs["widgets_serial_id_seq"]) {
+				t.Fatalf("serial default dependency=%v want %s", dependencies, sequenceIDs["widgets_serial_id_seq"])
+			}
+		case "state":
+			if !slices.Contains(dependencies[schema.DependencyUses], enumID) {
+				t.Fatalf("enum default dependency=%v want %s", dependencies, enumID)
+			}
+		case "positive":
+			if !slices.Contains(dependencies[schema.DependencyUses], domainID) {
+				t.Fatalf("domain default dependency=%v want %s", dependencies, domainID)
+			}
+		}
+	}
+	if len(seen) != len(expectedDefaults) {
+		t.Fatalf("explicit default assertions seen=%v want=%v", seen, expectedDefaults)
+	}
+
+	hcl, err := source.FormatHCL(inspected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := source.LoadContext(ctx, source.Input{URI: "default-matrix.hcl", Format: source.FormatHCLSource, Data: hcl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := New().Normalize(ctx, inspected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err := New().Normalize(ctx, reloaded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adopted, err := plan.Build(ctx, New(), current, desired, plan.Options{})
+	if err != nil || len(adopted.Steps) != 0 {
+		t.Fatalf("adopt plan=%+v err=%v", adopted, err)
+	}
+
+	if _, err = conn.Exec(ctx, `drop schema autosql_default_matrix cascade`); err != nil {
+		t.Fatal(err)
+	}
+	empty, err := InspectURL(ctx, url, Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty, err = New().Normalize(ctx, empty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := plan.Build(ctx, New(), empty, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fresh.Steps) == 0 {
+		t.Fatal("fresh default matrix plan was empty")
+	}
+	sequenceStep, sequenceColumnStep := -1, -1
+	for index, step := range fresh.Steps {
+		if strings.Contains(step.SQL, `CREATE SEQUENCE "autosql_default_matrix"."widget_id_seq"`) {
+			sequenceStep = index
+		}
+		if strings.Contains(step.SQL, `ADD COLUMN "seq_id"`) {
+			sequenceColumnStep = index
+		}
+	}
+	if sequenceStep < 0 || sequenceColumnStep < 0 || sequenceStep >= sequenceColumnStep {
+		t.Fatalf("sequence dependency order is not provable: sequence=%d column=%d plan=%+v", sequenceStep, sequenceColumnStep, fresh.Steps)
+	}
+	applyDefaultMatrixPlan(t, ctx, conn, fresh)
+	actual, err := InspectURL(ctx, url, Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err = New().Normalize(ctx, actual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertDocumentsEqual(t, actual, desired)
+
+	incremental := desired
+	incremental.Graph.Resources = append([]schema.Resource(nil), desired.Graph.Resources...)
+	var table schema.Resource
+	for _, resource := range incremental.Graph.Resources {
+		if resource.Kind == schema.KindTable && resource.Name.Name == "widgets" {
+			table = resource
+		}
+	}
+	maxOrdinal := 0
+	for _, resource := range incremental.Graph.Resources {
+		if resource.Kind == schema.KindColumn && resource.Name.Parent == table.ID {
+			maxOrdinal = max(maxOrdinal, numberAsInt(spec(resource), "ordinal"))
+		}
+	}
+	added := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: namespace, Name: "unrelated", Parent: table.ID}, Dependencies: []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(fmt.Sprintf(`{"type":"text","default":"'safe'","not_null":false,"ordinal":%d}`, maxOrdinal+1))}
+	added.ID = schema.StableID(added.Kind, added.Name)
+	incremental.Graph.Resources = append(incremental.Graph.Resources, added)
+	incremental, err = New().Normalize(ctx, incremental)
+	if err != nil {
+		t.Fatal(err)
+	}
+	increment, err := plan.Build(ctx, New(), actual, incremental, plan.Options{})
+	if err != nil || len(increment.Steps) == 0 {
+		t.Fatalf("incremental plan=%+v err=%v", increment, err)
+	}
+	applyDefaultMatrixPlan(t, ctx, conn, increment)
+	final, err := InspectURL(ctx, url, Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	final, err = New().Normalize(ctx, final)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertDocumentsEqual(t, final, incremental)
+	noop, err := plan.Build(ctx, New(), final, incremental, plan.Options{})
+	if err != nil || len(noop.Steps) != 0 {
+		t.Fatalf("final no-op plan=%+v err=%v", noop, err)
+	}
+}
+
+func applyDefaultMatrixPlan(t *testing.T, ctx context.Context, conn *pgx.Conn, migration plan.Plan) {
+	t.Helper()
+	transaction, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range migration.Steps {
+		if step.Kind == plan.StepTopology {
+			continue
+		}
+		if _, err = transaction.Exec(ctx, step.SQL); err != nil {
+			_ = transaction.Rollback(ctx)
+			t.Fatalf("apply %s: %v", step.SQL, err)
+		}
+	}
+	if err = transaction.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertDocumentsEqual(t *testing.T, actual, desired schema.Document) {
+	t.Helper()
+	actualFingerprint, actualErr := schema.SemanticFingerprint(actual)
+	desiredFingerprint, desiredErr := schema.SemanticFingerprint(desired)
+	if actualErr != nil || desiredErr != nil || actualFingerprint != desiredFingerprint {
+		actualJSON, _ := actual.MarshalCanonical()
+		desiredJSON, _ := desired.MarshalCanonical()
+		t.Fatalf("documents differ actual_err=%v desired_err=%v\nactual=%s\ndesired=%s", actualErr, desiredErr, actualJSON, desiredJSON)
 	}
 }
 

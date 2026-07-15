@@ -279,8 +279,10 @@ func renderDrop(r schema.Resource, resources map[string]schema.Resource, options
 		return []string{"DROP SCHEMA " + name}, nil
 	case schema.KindExtension:
 		return []string{"DROP EXTENSION " + quote(r.Name.Name)}, nil
-	case schema.KindEnum, schema.KindDomain, schema.KindComposite:
+	case schema.KindEnum, schema.KindComposite:
 		return []string{"DROP TYPE " + name}, nil
+	case schema.KindDomain:
+		return []string{"DROP DOMAIN " + name}, nil
 	case schema.KindSequence:
 		return []string{"DROP SEQUENCE " + name}, nil
 	case schema.KindTable:
@@ -336,8 +338,10 @@ func renderRename(before, after schema.Resource, resources map[string]schema.Res
 		return []string{"ALTER VIEW " + old + " RENAME TO " + newName}, nil
 	case schema.KindMaterializedView:
 		return []string{"ALTER MATERIALIZED VIEW " + old + " RENAME TO " + newName}, nil
-	case schema.KindEnum, schema.KindDomain, schema.KindComposite:
+	case schema.KindEnum, schema.KindComposite:
 		return []string{"ALTER TYPE " + old + " RENAME TO " + newName}, nil
+	case schema.KindDomain:
+		return []string{"ALTER DOMAIN " + old + " RENAME TO " + newName}, nil
 	default:
 		return nil, unsupported(after, "rename")
 	}
@@ -631,7 +635,9 @@ func parentName(r schema.Resource, resources map[string]schema.Resource) (string
 }
 func spec(r schema.Resource) map[string]any {
 	m := map[string]any{}
-	_ = json.Unmarshal(r.Spec, &m)
+	decoder := json.NewDecoder(strings.NewReader(string(r.Spec)))
+	decoder.UseNumber()
+	_ = decoder.Decode(&m)
 	return m
 }
 func stringValue(m map[string]any, k string) string { v, _ := m[k].(string); return v }
@@ -648,6 +654,14 @@ func numberValue(m map[string]any, k string) (string, bool) {
 		return n.String(), true
 	}
 	return "", false
+}
+func validPositiveOrdinal(values map[string]any, key string) bool {
+	value, ok := numberValue(values, key)
+	if !ok {
+		return false
+	}
+	ordinal, canonical := canonicalUnsigned(value)
+	return canonical && ordinal > 0
 }
 func stringSlice(m map[string]any, k string) []string {
 	raw, _ := m[k].([]any)
@@ -998,7 +1012,8 @@ func validateColumnOrdinalTransitions(request plugin.RenderRequest) error {
 }
 
 func validateManagedDocuments(request plugin.RenderRequest) error {
-	for _, doc := range []schema.Document{request.Current, request.Desired} {
+	scope := defaultRenderScope(request)
+	for docIndex, doc := range []schema.Document{request.Current, request.Desired} {
 		resources := resourceMapForRender(doc)
 		if e := validateCoreColumnOrdinals(resources); e != nil {
 			return e
@@ -1031,6 +1046,22 @@ func validateManagedDocuments(request plugin.RenderRequest) error {
 					if boolValue(s, "partitioned") || stringValue(s, "persistence") != "p" && stringValue(s, "persistence") != "" {
 						return unsupported(r, "table storage is outside managed matrix")
 					}
+				case schema.KindEnum:
+					if docIndex == 1 && scope[r.ID] && (!allowedKeys(s, "values") || len(stringSlice(s, "values")) == 0) {
+						return unsupported(r, "enum values must be a non-empty string list")
+					}
+				case schema.KindDomain:
+					if docIndex == 1 && scope[r.ID] {
+						if e := validateDomainSpec(r); e != nil {
+							return e
+						}
+					}
+				case schema.KindSequence:
+					if docIndex == 1 && scope[r.ID] {
+						if e := validateSequenceSpec(r); e != nil {
+							return e
+						}
+					}
 				case schema.KindView, schema.KindMaterializedView:
 					if !allowedKeys(s, "definition") {
 						return unsupported(r, "unknown view semantics")
@@ -1051,15 +1082,20 @@ func validateManagedDocuments(request plugin.RenderRequest) error {
 					if _, ok := s["not_null"].(bool); !ok {
 						return unsupported(r, "column not_null must be boolean")
 					}
-					if ordinal, ok := s["ordinal"].(float64); !ok || ordinal < 1 || ordinal != float64(int(ordinal)) {
+					if !validPositiveOrdinal(s, "ordinal") {
 						return unsupported(r, "column ordinal must be a positive integer")
 					}
-					if e := validateCoreColumnType(r, resources); e != nil {
-						return e
-					}
-					if d := stringValue(s, "default"); d != "" {
-						if e := validateCoreDefault(r, d); e != nil {
+					// Current resources and unchanged desired resources are structural
+					// context, not SQL inputs. Validate default renderability only for
+					// the desired mutation/dependency closure.
+					if docIndex == 1 && scope[r.ID] {
+						if e := validateCoreColumnType(r, resources); e != nil {
 							return e
+						}
+						if d := stringValue(s, "default"); d != "" {
+							if e := validateColumnDefault(r, d, resources); e != nil {
+								return e
+							}
 						}
 					}
 				}
@@ -1074,6 +1110,103 @@ func validateManagedDocuments(request plugin.RenderRequest) error {
 		}
 	}
 	return nil
+}
+
+var canonicalDomainCheck = regexp.MustCompile(`^CHECK \(\(*VALUE (?:=|<>|!=|<|<=|>|>=) (?:-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?|'(?:''|[^'])*')\)*\)$`)
+
+func validateDomainSpec(resource schema.Resource) error {
+	s := spec(resource)
+	if !allowedKeys(s, "base_type", "default", "not_null", "constraints") {
+		return unsupported(resource, "unknown domain semantics")
+	}
+	baseName := postgresTypeAlias(stringValue(s, "base_type"))
+	base, ok := parseCoreColumnType(baseName)
+	if !ok || base.array {
+		return unsupported(resource, "domain base_type is outside canonical core grammar")
+	}
+	if _, ok := s["not_null"].(bool); !ok {
+		return unsupported(resource, "domain not_null must be boolean")
+	}
+	if value := stringValue(s, "default"); value != "" {
+		probe := resource
+		probe.Kind = schema.KindColumn
+		probe.Spec, _ = json.Marshal(map[string]any{"type": baseName, "default": value})
+		if err := validateCoreDefault(probe, value); err != nil {
+			return unsupported(resource, "domain default is outside canonical base-type grammar")
+		}
+	}
+	constraints, present := s["constraints"]
+	if !present {
+		return nil
+	}
+	values, ok := constraints.([]any)
+	if !ok {
+		return unsupported(resource, "domain constraints must be a string list")
+	}
+	for _, raw := range values {
+		constraint, ok := raw.(string)
+		if !ok || !canonicalDomainCheck.MatchString(constraint) {
+			return unsupported(resource, "domain constraint is outside canonical literal-check grammar")
+		}
+	}
+	return nil
+}
+
+func validateSequenceSpec(resource schema.Resource) error {
+	s := spec(resource)
+	if !allowedKeys(s, "start", "increment", "min", "max", "cache", "cycle") {
+		return unsupported(resource, "unknown sequence semantics")
+	}
+	for _, key := range []string{"start", "increment", "min", "max", "cache"} {
+		if _, present := s[key]; present {
+			value, ok := numberValue(s, key)
+			number, parseErr := strconv.ParseInt(value, 10, 64)
+			if !ok || !canonicalIntegerDefault.MatchString(value) || parseErr != nil || number == 0 && key == "increment" || number <= 0 && key == "cache" {
+				return unsupported(resource, "sequence "+key+" must be a canonical integer")
+			}
+		}
+	}
+	if _, present := s["cycle"]; present {
+		if _, ok := s["cycle"].(bool); !ok {
+			return unsupported(resource, "sequence cycle must be boolean")
+		}
+	}
+	return nil
+}
+
+func defaultRenderScope(request plugin.RenderRequest) map[string]bool {
+	scope := map[string]bool{}
+	for _, change := range request.Changes.Changes {
+		scope[change.ResourceID] = true
+		if change.Before != nil {
+			scope[change.Before.ID] = true
+		}
+		if change.After != nil {
+			scope[change.After.ID] = true
+		}
+	}
+	// Type and sequence changes can require dependent columns to be copied or
+	// rebuilt. Containment edges are intentionally excluded: a schema or table
+	// change does not render every unchanged child column.
+	for changed := true; changed; {
+		changed = false
+		for _, doc := range []schema.Document{request.Current, request.Desired} {
+			for _, resource := range doc.Graph.Resources {
+				for _, dependency := range resource.Dependencies {
+					if dependency.Type != schema.DependencyUses && dependency.Type != schema.DependencyReferences {
+						continue
+					}
+					if scope[resource.ID] && !scope[dependency.Target] {
+						scope[dependency.Target], changed = true, true
+					}
+					if scope[dependency.Target] && !scope[resource.ID] {
+						scope[resource.ID], changed = true, true
+					}
+				}
+			}
+		}
+	}
+	return scope
 }
 func validateCoreColumnType(r schema.Resource, resources map[string]schema.Resource) error {
 	for _, dep := range r.Dependencies {
@@ -1110,7 +1243,16 @@ func parseCoreColumnType(value string) (coreColumnType, bool) {
 	} else {
 		typ.base = value
 	}
-	allowed := map[string]bool{"smallint": true, "integer": true, "bigint": true, "real": true, "double precision": true, "numeric": true, "boolean": true, "text": true, "character varying": true, "date": true, "timestamp": true, "timestamptz": true, "uuid": true, "json": true, "jsonb": true, "bytea": true}
+	allowed := map[string]bool{
+		"smallint": true, "integer": true, "bigint": true, "real": true, "double precision": true, "numeric": true,
+		"boolean": true, "text": true, "character": true, "character varying": true, "bit": true, "bit varying": true,
+		"date": true, "time": true, "timetz": true, "timestamp": true, "timestamptz": true,
+		"interval": true, "interval year": true, "interval month": true, "interval day": true, "interval hour": true,
+		"interval minute": true, "interval second": true, "interval year to month": true, "interval day to hour": true,
+		"interval day to minute": true, "interval day to second": true, "interval hour to minute": true,
+		"interval hour to second": true, "interval minute to second": true,
+		"uuid": true, "json": true, "jsonb": true, "bytea": true,
+	}
 	if !allowed[typ.base] {
 		return coreColumnType{}, false
 	}
@@ -1118,9 +1260,12 @@ func parseCoreColumnType(value string) (coreColumnType, bool) {
 		return typ, true
 	}
 	switch typ.base {
-	case "character varying":
+	case "character", "character varying":
 		length, ok := canonicalUnsigned(typ.modifier)
 		return typ, ok && length >= 1 && length <= 10485760
+	case "bit", "bit varying":
+		length, ok := canonicalUnsigned(typ.modifier)
+		return typ, ok && length >= 1 && length <= 83886080
 	case "numeric":
 		parts := strings.Split(typ.modifier, ",")
 		if len(parts) < 1 || len(parts) > 2 {
@@ -1137,10 +1282,14 @@ func parseCoreColumnType(value string) (coreColumnType, bool) {
 			}
 		}
 		return typ, true
-	case "timestamp", "timestamptz":
+	case "time", "timetz", "timestamp", "timestamptz":
 		precision, ok := canonicalUnsigned(typ.modifier)
 		return typ, ok && precision <= 6
 	default:
+		if typ.base == "interval" || strings.HasSuffix(typ.base, "second") {
+			precision, ok := canonicalUnsigned(typ.modifier)
+			return typ, ok && precision <= 6
+		}
 		return coreColumnType{}, false
 	}
 }
@@ -1160,38 +1309,40 @@ func canonicalUnsigned(value string) (int, bool) {
 
 func validateCoreDefault(r schema.Resource, value string) error {
 	typ, validType := parseCoreColumnType(stringValue(spec(r), "type"))
-	if !validType || typ.array {
-		return unsupported(r, "array defaults are not modeled")
+	if !validType {
+		return unsupported(r, fmt.Sprintf("default rejected: normalized type %q is outside canonical core grammar", stringValue(spec(r), "type")))
 	}
-	integer := regexp.MustCompile(`^-?[0-9]+$`)
-	quoted := regexp.MustCompile(`^'(?:''|[^'])*'$`)
-	ok := false
-	switch typ.base {
-	case "smallint", "integer", "bigint":
-		if integer.MatchString(value) && (value == "0" || !strings.HasPrefix(value, "0")) && !strings.HasPrefix(value, "-0") {
-			bits := 64
-			if typ.base == "smallint" {
-				bits = 16
-			}
-			if typ.base == "integer" {
-				bits = 32
-			}
-			_, err := strconv.ParseInt(value, 10, bits)
-			ok = err == nil
-		}
-	case "real", "double precision", "numeric":
-		ok = false
-	case "boolean":
-		ok = value == "true" || value == "false"
-	case "text", "character varying":
-		ok = quoted.MatchString(value)
-	case "timestamp", "timestamptz":
-		ok = value == "CURRENT_TIMESTAMP" || regexp.MustCompile(`^CURRENT_TIMESTAMP\([0-6]\)$`).MatchString(value)
+	expr, err := classifyDefaultExpression(value)
+	if err != nil {
+		return unsupported(r, fmt.Sprintf("default rejected for normalized type %q: %s", stringValue(spec(r), "type"), err.Error()))
 	}
-	if !ok {
-		return unsupported(r, "column default is outside canonical core grammar")
+	if !coreDefaultAllowed(typ, expr, value) {
+		return unsupported(r, fmt.Sprintf("default rejected for normalized type %q: %s is not allowlisted", stringValue(spec(r), "type"), defaultExpressionClass(expr)))
 	}
 	return nil
+}
+
+func defaultExpressionClass(expr defaultExpression) string {
+	switch expr.Kind {
+	case defaultExpressionLiteral:
+		return "literal"
+	case defaultExpressionCast:
+		if expr.Cast != nil {
+			return "cast to " + strings.Join(expr.Cast.Type.Name.Parts, ".")
+		}
+		return "cast"
+	case defaultExpressionFunction:
+		if expr.Function != nil {
+			return "function " + strings.Join(expr.Function.Name.Parts, ".")
+		}
+		return "function"
+	case defaultExpressionReference:
+		return "reference"
+	case defaultExpressionArray:
+		return "array expression"
+	default:
+		return "expression"
+	}
 }
 func validateParentRenameDependents(request plugin.RenderRequest) error {
 	current := resourceMapForRender(request.Current)
@@ -1363,7 +1514,7 @@ func validateCanonicalIdentity(r schema.Resource, resources map[string]schema.Re
 		if r.Name.Schema != "" || r.Name.Parent != "" || len(r.Dependencies) != 0 {
 			return unsupported(r, "schema name/parent/dependencies are noncanonical")
 		}
-	case schema.KindTable, schema.KindView, schema.KindMaterializedView:
+	case schema.KindTable, schema.KindView, schema.KindMaterializedView, schema.KindEnum, schema.KindDomain, schema.KindComposite, schema.KindSequence:
 		parent, ok := resources[r.Name.Parent]
 		if !ok || parent.Kind != schema.KindSchema || parent.Name.Name != r.Name.Schema || r.Name.Schema == "" {
 			return unsupported(r, "schema parent is noncanonical")
@@ -1397,6 +1548,11 @@ func validateCanonicalIdentity(r schema.Resource, resources map[string]schema.Re
 			}
 			if dep.Type == schema.DependencyUses {
 				if _, ok := resources[dep.Target]; ok {
+					continue
+				}
+			}
+			if dep.Type == schema.DependencyReferences {
+				if target, ok := resources[dep.Target]; ok && target.Kind == schema.KindSequence {
 					continue
 				}
 			}
@@ -1460,8 +1616,7 @@ func validateProjectionResource(r schema.Resource, parent string) error {
 	if _, ok := s["not_null"].(bool); !ok {
 		return unsupported(r, "projection not_null must be boolean")
 	}
-	ordinal, ok := s["ordinal"].(float64)
-	if !ok || ordinal < 1 || ordinal != float64(int(ordinal)) {
+	if !validPositiveOrdinal(s, "ordinal") {
 		return unsupported(r, "projection ordinal must be a positive integer")
 	}
 	if len(r.Dependencies) != 1 || r.Dependencies[0].Target != parent || r.Dependencies[0].Type != schema.DependencyContains || len(r.Dependencies[0].Extra) > 0 {

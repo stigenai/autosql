@@ -234,7 +234,7 @@ func runPlan(ctx context.Context, args []string, o output, r ReadPlanService) er
 	}
 	_, _, p, e := loadPlanInputs(ctx, *from, *to, filter, r)
 	if e != nil {
-		return &Error{Kind: "migration", Message: "planning failed", Code: ExitMigration, Cause: e}
+		return planningFailure(e)
 	}
 	if max.set && len(p.Changes.Changes) > max.value {
 		return &Error{Kind: "validation", Message: "maximum change count exceeded", Code: ExitValidation}
@@ -306,7 +306,7 @@ func runApply(ctx context.Context, args []string, o output, s Services, tty bool
 	}
 	_, _, p, e := loadPlanInputs(ctx, *from, *to, filter, s.ReadPlan)
 	if e != nil {
-		return &Error{Kind: "migration", Message: "planning failed", Code: ExitMigration, Cause: e}
+		return planningFailure(e)
 	}
 	if max.set && len(p.Changes.Changes) > max.value {
 		return &Error{Kind: "validation", Message: "maximum change count exceeded", Code: ExitValidation}
@@ -357,6 +357,10 @@ func runApply(ctx context.Context, args []string, o output, s Services, tty bool
 		result.Status = "success"
 	}
 	return o.success(result, result.Status)
+}
+
+func planningFailure(cause error) *Error {
+	return &Error{Kind: "migration", Message: "planning failed: " + cause.Error(), Code: ExitMigration, Cause: cause}
 }
 
 func applyFailure(result ApplyResult, cause error) error {

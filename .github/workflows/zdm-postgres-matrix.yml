@@ -29,6 +29,8 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: scripts/test-live-serial.sh ./pkg/zdm/... ./internal/cli
+      - name: Test PostgreSQL default-expression matrix
+        run: scripts/test-live-serial.sh ./pkg/postgres -run '^TestDefaultExpressionMatrixAdoptProvisionAndIncrement$'
       - run: go test -race -p 1 -covermode=atomic -coverprofile=zdm-coverage.out -count=1 ./pkg/zdm/... ./internal/cli
       - run: go tool cover -func=zdm-coverage.out > zdm-coverage.txt
       - run: go test -run '^$' -bench BenchmarkZDM -benchtime=1s -count=1 ./pkg/zdm/compatmatrix | tee zdm-bench.txt

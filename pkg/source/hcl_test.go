@@ -3,6 +3,7 @@ package source
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"autosql/pkg/schema"
@@ -41,6 +42,31 @@ func TestParseHCLAndFormatRoundTrip(t *testing.T) {
 			t.Fatalf("orders spec changed: %s", resource.Spec)
 		}
 	}
+}
+
+func TestFormatHCLRoundTripsExactLargeIntegers(t *testing.T) {
+	namespace := schema.Resource{Kind: schema.KindSchema, Name: schema.Name{Name: "app"}, Spec: []byte(`{}`)}
+	namespace.ID = schema.StableID(namespace.Kind, namespace.Name)
+	sequence := schema.Resource{Kind: schema.KindSequence, Name: schema.Name{Schema: "app", Name: "ids", Parent: namespace.ID}, Dependencies: []schema.Dependency{{Target: namespace.ID, Type: schema.DependencyContains}}, Spec: []byte(`{"start":1,"increment":1,"min":1,"max":9223372036854775807,"cache":1,"cycle":false}`)}
+	sequence.ID = schema.StableID(sequence.Kind, sequence.Name)
+	doc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{namespace, sequence}}}
+	formatted, err := FormatHCL(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := ParseHCL("large-integer.hcl", formatted, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, resource := range reloaded.Graph.Resources {
+		if resource.ID == sequence.ID {
+			if !strings.Contains(string(resource.Spec), `"max":9223372036854775807`) || strings.Contains(string(resource.Spec), `9223372036854776000`) {
+				t.Fatalf("large integer changed across HCL round-trip: got=%s", resource.Spec)
+			}
+			return
+		}
+	}
+	t.Fatal("sequence missing after HCL round-trip")
 }
 
 func TestHCLVariablesAndImports(t *testing.T) {

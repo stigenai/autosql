@@ -15,6 +15,7 @@ import (
 type fakeRead struct {
 	from, to schema.Document
 	p        plan.Plan
+	planErr  error
 	loads    int
 }
 
@@ -29,7 +30,7 @@ func (f *fakeRead) Diff(_ context.Context, a, b schema.Document) (schema.ChangeS
 	return schema.Diff(a, b, schema.DiffOptions{})
 }
 func (f *fakeRead) Plan(context.Context, schema.Document, schema.Document) (plan.Plan, error) {
-	return f.p, nil
+	return f.p, f.planErr
 }
 
 type fakeApply struct {
@@ -71,6 +72,27 @@ func TestReadPlanDryRunNeverReceiveMutationCapability(t *testing.T) {
 	}
 	if a.calls != 0 {
 		t.Fatalf("mutation called %d", a.calls)
+	}
+}
+
+func TestPlanFailureSurfacesActionableReasonInHumanAndJSONOutput(t *testing.T) {
+	for _, jsonMode := range []bool{false, true} {
+		r, _ := workflowFixture(t)
+		r.planErr = errors.New(`unsupported schema transition: column app.widgets.state default rejected for normalized type "integer": function lower is not allowlisted password=hidden`)
+		args := []string{"plan", "--from", "from", "--to", "to"}
+		if jsonMode {
+			args = append(args, "--json")
+		}
+		code, stdout, stderr := invoke(t, args, "", false, Services{ReadPlan: r})
+		combined := stdout + stderr
+		for _, want := range []string{"app.widgets.state", "normalized type", "function lower"} {
+			if code != int(ExitMigration) || !strings.Contains(combined, want) {
+				t.Fatalf("json=%v code=%d output=%s", jsonMode, code, combined)
+			}
+		}
+		if strings.Contains(combined, "hidden") || !strings.Contains(combined, "password=[REDACTED]") {
+			t.Fatalf("json=%v output was not redacted: %s", jsonMode, combined)
+		}
 	}
 }
 func TestApplyPromptsAndExplicitModes(t *testing.T) {

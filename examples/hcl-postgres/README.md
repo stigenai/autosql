@@ -16,6 +16,8 @@ checks the result against a real PostgreSQL database:
    kind advertised by the AutoSQL PostgreSQL driver.
 9. Create the same advanced objects in PostgreSQL, inspect them with advanced
    security metadata enabled, render them to HCL, and load that HCL again.
+10. Load and plan a focused catalog covering every managed PostgreSQL default
+    expression family and its enum, domain, and sequence dependencies.
 
 The example uses `psql` for mutation so it stays runnable without production
 signing keys. In a release pipeline, feed the same HCL sources into AutoSQL's
@@ -101,6 +103,15 @@ Available pure helpers are `jsonencode(value)`, `schema_id(name)`,
 filesystem, network, environment, or secret access, keeping HCL evaluation
 deterministic and safe for CI.
 
+[`defaults.hcl`](defaults.hcl) is the executable default-expression reference.
+It provisions scalar and cast literals, JSONB, UUIDs, the generated-function
+allowlist, enum and domain defaults, one-dimensional arrays, temporal and
+interval forms, and an exactly qualified sequence-backed `nextval`. The
+automated example test builds a clean-database plan and checks that sequence
+creation precedes the dependent column. The complete grammar and its explicit
+rejection boundaries are documented in
+[PostgreSQL default expressions](../../docs/postgresql-default-expressions.md).
+
 | PostgreSQL area | HCL resource kinds demonstrated | Example configuration |
 | --- | --- | --- |
 | Namespaces and extensions | `schema`, `extension` | Dedicated schema and `uuid-ossp` extension |
@@ -113,13 +124,13 @@ deterministic and safe for CI.
 | Row security | `policy` | Forced RLS with a role-scoped `SELECT` policy |
 | Identities and access | `role`, `grant`, `membership`, `default_privilege` | NOLOGIN roles, inheritance, object grants, future-table grants |
 
-The capability mode matters. AutoSQL currently manages schema, table, column,
-view, and materialized-view transitions through its PostgreSQL planner. The
-other PostgreSQL kinds are losslessly inspected and represented as read-only
-catalog resources, allowing drift detection, policy review, and signed evidence
-without pretending AutoSQL can safely synthesize every mutation. The example
-uses explicit SQL to create those advanced objects, then proves their HCL
-representation round-trips.
+The capability mode matters. AutoSQL manages schema, enum, domain, sequence,
+table, column, view, and materialized-view transitions within their advertised
+operation matrices. Other PostgreSQL kinds are losslessly inspected and
+represented as read-only catalog resources, allowing drift detection, policy
+review, and signed evidence without pretending AutoSQL can safely synthesize
+every mutation. The example uses explicit SQL for those read-only advanced
+objects, then proves their HCL representation round-trips.
 
 ## Useful commands
 

@@ -91,6 +91,9 @@ func (*Driver) Info() plugin.Info {
 	all := []schema.Operation{schema.OperationCreate, schema.OperationAlter, schema.OperationDrop, schema.OperationRename}
 	profiles := map[schema.Kind]plugin.Capability{
 		schema.KindSchema:           {Kind: schema.KindSchema, Mode: plugin.Managed, Operations: []schema.Operation{schema.OperationCreate, schema.OperationDrop, schema.OperationRename}, Features: []string{"namespace.lifecycle"}},
+		schema.KindEnum:             {Kind: schema.KindEnum, Mode: plugin.Managed, Operations: all, Features: []string{"enum.lifecycle", "enum.append_values"}},
+		schema.KindDomain:           {Kind: schema.KindDomain, Mode: plugin.Managed, Operations: []schema.Operation{schema.OperationCreate, schema.OperationDrop, schema.OperationRename}, Features: []string{"domain.lifecycle", "domain.core_base_type", "domain.literal_check"}},
+		schema.KindSequence:         {Kind: schema.KindSequence, Mode: plugin.Managed, Operations: all, Features: []string{"sequence.lifecycle", "sequence.options"}},
 		schema.KindTable:            {Kind: schema.KindTable, Mode: plugin.Managed, Operations: all, Features: []string{"table.permanent_nonpartitioned", "table.rls", "table.child_columns"}},
 		schema.KindColumn:           {Kind: schema.KindColumn, Mode: plugin.Managed, Operations: all, Features: []string{"column.type_safe_casts", "column.default", "column.not_null", "column.ordinal_metadata"}},
 		schema.KindView:             {Kind: schema.KindView, Mode: plugin.Managed, Operations: all, Features: []string{"view.provable_projection"}},
@@ -130,8 +133,8 @@ func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Documen
 		// Serialized/public annotations are not trusted provenance.
 		delete(r.Annotations, "autosql.io/generated-name")
 		delete(r.Annotations, "autosql.io/name-origin")
-		var spec map[string]any
-		if len(r.Spec) > 0 && json.Unmarshal(r.Spec, &spec) == nil {
+		if len(r.Spec) > 0 {
+			spec := specMap(r.Spec)
 			normalizePostgresSpecForKind(r.Kind, spec)
 			normalized, e := json.Marshal(spec)
 			if e != nil {
@@ -425,12 +428,18 @@ func augmentProjectionColumns(doc *schema.Document) {
 }
 func specMap(raw json.RawMessage) map[string]any {
 	out := map[string]any{}
-	_ = json.Unmarshal(raw, &out)
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.UseNumber()
+	_ = decoder.Decode(&out)
 	return out
 }
 func numberAsInt(values map[string]any, key string) int {
-	if value, ok := values[key].(float64); ok {
+	switch value := values[key].(type) {
+	case float64:
 		return int(value)
+	case json.Number:
+		result, _ := strconv.Atoi(value.String())
+		return result
 	}
 	return 0
 }
@@ -524,6 +533,8 @@ func postgresTypeAlias(value string) string {
 	original := strings.TrimSpace(value)
 	array := ""
 	for strings.HasSuffix(original, "[]") {
+		// PostgreSQL array bounds and declared dimensionality are not enforced
+		// by the type system and format_type reports the canonical array type.
 		array = "[]"
 		original = strings.TrimSpace(strings.TrimSuffix(original, "[]"))
 	}
@@ -534,6 +545,15 @@ func postgresTypeAlias(value string) string {
 	}
 	s := strings.ToLower(original)
 	s = strings.TrimPrefix(s, "pg_catalog.")
+	for _, qualified := range []struct{ prefix, suffix, canonical string }{
+		{"timestamp", " without time zone", "timestamp"}, {"timestamp", " with time zone", "timestamptz"},
+		{"time", " without time zone", "time"}, {"time", " with time zone", "timetz"},
+	} {
+		if strings.HasPrefix(s, qualified.prefix+"(") && strings.HasSuffix(s, qualified.suffix) {
+			modifier := strings.TrimSuffix(strings.TrimPrefix(s, qualified.prefix), qualified.suffix)
+			return qualified.canonical + modifier + array
+		}
+	}
 	suffix := ""
 	if i := strings.IndexByte(s, '('); i >= 0 && strings.HasSuffix(s, ")") {
 		suffix = s[i:]
@@ -543,8 +563,12 @@ func postgresTypeAlias(value string) string {
 		"int2": "smallint", "smallint": "smallint", "int4": "integer", "int": "integer", "integer": "integer",
 		"int8": "bigint", "bigint": "bigint", "float4": "real", "real": "real", "float8": "double precision",
 		"double precision": "double precision", "bool": "boolean", "boolean": "boolean", "varchar": "character varying",
-		"character varying": "character varying", "timestamp without time zone": "timestamp", "timestamp": "timestamp",
-		"timestamp with time zone": "timestamptz", "timestamptz": "timestamptz",
+		"character varying": "character varying", "bpchar": "character", "char": "character", "character": "character",
+		"bit": "bit", "varbit": "bit varying", "bit varying": "bit varying",
+		"timestamp without time zone": "timestamp", "timestamp": "timestamp", "timestamp with time zone": "timestamptz", "timestamptz": "timestamptz",
+		"time without time zone": "time", "time": "time", "time with time zone": "timetz", "timetz": "timetz",
+		"numeric": "numeric", "decimal": "numeric", "date": "date", "interval": "interval", "text": "text",
+		"uuid": "uuid", "json": "json", "jsonb": "jsonb", "bytea": "bytea",
 	}
 	if normalized, ok := aliases[s]; ok {
 		return normalized + suffix + array
@@ -563,6 +587,24 @@ func postgresDefault(value string) string {
 	if strings.HasPrefix(lower, "current_timestamp(") && strings.HasSuffix(lower, ")") {
 		return "CURRENT_TIMESTAMP" + lower[len("current_timestamp"):]
 	}
+	for _, temporal := range []struct{ lower, canonical string }{
+		{"current_date", "CURRENT_DATE"}, {"current_time", "CURRENT_TIME"}, {"localtime", "LOCALTIME"}, {"localtimestamp", "LOCALTIMESTAMP"},
+	} {
+		if lower == temporal.lower {
+			return temporal.canonical
+		}
+		if strings.HasPrefix(lower, temporal.lower+"(") && strings.HasSuffix(lower, ")") {
+			return temporal.canonical + lower[len(temporal.lower):]
+		}
+	}
+	if lower == "gen_random_uuid()" || lower == "pg_catalog.gen_random_uuid()" {
+		return "pg_catalog.gen_random_uuid()"
+	}
+	for _, clock := range []string{"now()", "transaction_timestamp()", "current_timestamp", "current_timestamp()"} {
+		if lower == "timezone('utc'::text, "+clock+")" || lower == "pg_catalog.timezone('utc'::text, "+clock+")" {
+			return "pg_catalog.timezone('utc'::text, CURRENT_TIMESTAMP)"
+		}
+	}
 	if lower == "null" || strings.HasPrefix(lower, "null::") {
 		return "NULL"
 	}
@@ -574,6 +616,9 @@ func postgresDefault(value string) string {
 				if regexp.MustCompile(`^-?[0-9]+$`).MatchString(inner) {
 					return inner
 				}
+			}
+			if cast == "::boolean" && (base == "'true'" || base == "'false'") {
+				return base[1 : len(base)-1]
 			}
 			if strings.HasPrefix(base, "'") || base == "true" || base == "false" || base == "NULL" || base == "null" {
 				return base

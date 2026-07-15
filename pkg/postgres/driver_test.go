@@ -16,7 +16,7 @@ func TestDriverMetadata(t *testing.T) {
 	if err := plugin.ValidateDriver(d); err != nil {
 		t.Fatalf("ValidateDriver: %v", err)
 	}
-	for kind, want := range map[schema.Kind]plugin.Mode{schema.KindSchema: plugin.Managed, schema.KindView: plugin.Managed, schema.KindMaterializedView: plugin.Managed, schema.KindTable: plugin.Managed, schema.KindColumn: plugin.Managed, schema.KindIndex: plugin.ReadOnly, schema.KindEnum: plugin.ReadOnly, schema.KindPolicy: plugin.ReadOnly, schema.KindRole: plugin.ReadOnly, schema.KindGrant: plugin.ReadOnly} {
+	for kind, want := range map[schema.Kind]plugin.Mode{schema.KindSchema: plugin.Managed, schema.KindView: plugin.Managed, schema.KindMaterializedView: plugin.Managed, schema.KindTable: plugin.Managed, schema.KindColumn: plugin.Managed, schema.KindEnum: plugin.Managed, schema.KindDomain: plugin.Managed, schema.KindSequence: plugin.Managed, schema.KindIndex: plugin.ReadOnly, schema.KindPolicy: plugin.ReadOnly, schema.KindRole: plugin.ReadOnly, schema.KindGrant: plugin.ReadOnly} {
 		if got := d.Info().Capability(kind).Mode; got != want {
 			t.Errorf("capability %s = %s, want %s", kind, got, want)
 		}
@@ -24,6 +24,9 @@ func TestDriverMetadata(t *testing.T) {
 	all := []schema.Operation{schema.OperationCreate, schema.OperationAlter, schema.OperationDrop, schema.OperationRename}
 	for kind, want := range map[schema.Kind][]schema.Operation{
 		schema.KindSchema:           {schema.OperationCreate, schema.OperationDrop, schema.OperationRename},
+		schema.KindEnum:             all,
+		schema.KindDomain:           {schema.OperationCreate, schema.OperationDrop, schema.OperationRename},
+		schema.KindSequence:         all,
 		schema.KindTable:            all,
 		schema.KindColumn:           all,
 		schema.KindView:             all,

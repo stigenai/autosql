@@ -175,6 +175,7 @@ func inspectSnapshot(ctx context.Context, conn catalogQueryer, req plugin.Inspec
 		{"relations", "USAGE on schemas and SELECT on catalog metadata", i.inspectRelations},
 		{"relation dependencies", "USAGE on schemas and SELECT on catalog dependency metadata", i.inspectRelationDependencies},
 		{"columns", "USAGE on schemas and SELECT on catalog metadata", i.inspectColumns},
+		{"column default dependencies", "USAGE on schemas and SELECT on catalog dependency metadata", i.inspectColumnDefaultDependencies},
 		{"constraints", "USAGE on schemas and SELECT on catalog metadata", i.inspectConstraints},
 		{"indexes", "USAGE on schemas and SELECT on catalog metadata", i.inspectIndexes},
 		{"routines", "USAGE on schemas and routines", i.inspectRoutines},
@@ -587,6 +588,43 @@ func (i *inspector) inspectColumns(ctx context.Context) error {
 			deps = append(deps, schema.Dependency{Target: tid, Type: schema.DependencyUses})
 		}
 		i.add(schema.KindColumn, i.name(ns, name, p), spec, deps, comment)
+	}
+	return rows.Err()
+}
+
+func (i *inspector) inspectColumnDefaultDependencies(ctx context.Context) error {
+	rows, err := i.conn.Query(ctx, `
+select distinct ad.adrelid,ad.adnum,n.nspname,c.relname,a.attname,d.refobjid
+from pg_attrdef ad
+join pg_attribute a on a.attrelid=ad.adrelid and a.attnum=ad.adnum
+join pg_class c on c.oid=ad.adrelid
+join pg_namespace n on n.oid=c.relnamespace
+join pg_depend d on d.classid='pg_attrdef'::regclass and d.objid=ad.oid and d.refclassid='pg_class'::regclass
+join pg_class sequence on sequence.oid=d.refobjid and sequence.relkind='S'
+where n.nspname <> 'information_schema' and n.nspname !~ '^pg_'
+order by ad.adrelid,ad.adnum,d.refobjid`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var relation, sequenceOID uint32
+		var position int16
+		var namespace, table, column string
+		if err := rows.Scan(&relation, &position, &namespace, &table, &column, &sequenceOID); err != nil {
+			return err
+		}
+		parent, target := i.byOID[relation], i.byOID[sequenceOID]
+		if parent == "" || target == "" {
+			continue
+		}
+		columnID := schema.StableID(schema.KindColumn, i.name(namespace, column, parent))
+		for index := range i.resources {
+			if i.resources[index].ID == columnID {
+				i.resources[index].Dependencies = append(i.resources[index].Dependencies, schema.Dependency{Target: target, Type: schema.DependencyReferences})
+				break
+			}
+		}
 	}
 	return rows.Err()
 }

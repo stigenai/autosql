@@ -1,0 +1,325 @@
+{
+  "version": 1,
+  "constitution": "CONSTITUTION.md",
+  "features": [
+    {
+      "id": "schema-authoring-and-planning",
+      "title": "Schema authoring, providers, semantic diff, and planning",
+      "packages": [
+        "pkg/plan",
+        "pkg/planedit",
+        "pkg/plugin",
+        "pkg/plugin/plugintest",
+        "pkg/plugin/sample",
+        "pkg/provider",
+        "pkg/schema",
+        "pkg/source"
+      ],
+      "docs": [
+        "docs/schema-sources.md",
+        "docs/semantic-diff.md",
+        "docs/planning.md",
+        "docs/controlled-plan-editing.md",
+        "docs/schema-provider-protocol.md",
+        "docs/hcl-schema.md"
+      ],
+      "evidence": [
+        {
+          "level": "example",
+          "path": "examples/hcl-postgres/run.sh",
+          "command": "AUTOSQL_DATABASE_URL='postgres://user:password@127.0.0.1:5432/disposable?sslmode=disable' ./examples/hcl-postgres/run.sh"
+        },
+        {
+          "level": "contract",
+          "path": "examples/hcl-postgres/example_test.go",
+          "command": "go test ./examples/hcl-postgres"
+        }
+      ]
+    },
+    {
+      "id": "postgresql-schema-management",
+      "title": "PostgreSQL inspection, normalization, and managed schema changes",
+      "packages": ["pkg/postgres"],
+      "docs": [
+        "docs/planning.md",
+        "docs/postgresql-default-expressions.md",
+        "docs/database-security.md",
+        "examples/hcl-postgres/README.md"
+      ],
+      "evidence": [
+        {
+          "level": "live",
+          "path": "examples/hcl-postgres/run.sh",
+          "command": "AUTOSQL_DATABASE_URL='postgres://user:password@127.0.0.1:5432/disposable?sslmode=disable' ./examples/hcl-postgres/run.sh"
+        },
+        {
+          "level": "integration",
+          "path": "pkg/postgres/integration_test.go",
+          "command": "AUTOSQL_TEST_POSTGRES_URL='postgres://user:password@127.0.0.1:5432/disposable?sslmode=disable' go test ./pkg/postgres -run Integration"
+        }
+      ],
+      "postgres_kinds": [
+        "schema",
+        "extension",
+        "enum",
+        "domain",
+        "composite_type",
+        "sequence",
+        "table",
+        "column",
+        "primary_key",
+        "unique_constraint",
+        "check_constraint",
+        "foreign_key",
+        "index",
+        "view",
+        "materialized_view",
+        "function",
+        "procedure",
+        "trigger",
+        "policy",
+        "role",
+        "grant",
+        "membership",
+        "default_privilege"
+      ],
+      "postgres_features": [
+        "namespace.lifecycle",
+        "enum.lifecycle",
+        "enum.append_values",
+        "domain.lifecycle",
+        "domain.core_base_type",
+        "domain.literal_check",
+        "sequence.lifecycle",
+        "sequence.options",
+        "table.permanent_nonpartitioned",
+        "table.rls",
+        "table.child_columns",
+        "column.type_safe_casts",
+        "column.default",
+        "column.not_null",
+        "column.ordinal_metadata",
+        "view.provable_projection",
+        "materialized_view.provable_projection",
+        "alter.explicit_rebuild"
+      ]
+    },
+    {
+      "id": "cli-configuration-and-secrets",
+      "title": "CLI contracts, configuration, and secret references",
+      "packages": ["cmd/autosql", "internal/cli", "pkg/config", "pkg/secret"],
+      "docs": ["docs/cli-contract.md", "docs/schema-sources.md"],
+      "evidence": [
+        {
+          "level": "integration",
+          "path": "internal/cli/migrate_apply_e2e_test.go",
+          "command": "go test ./internal/cli"
+        }
+      ]
+    },
+    {
+      "id": "migration-artifacts-and-recovery",
+      "title": "Migration artifacts, revisions, apply, down, and repair",
+      "packages": [
+        "pkg/artifact",
+        "pkg/migrate",
+        "pkg/migrate/apply",
+        "pkg/migrate/down",
+        "pkg/migrate/repair",
+        "pkg/migrate/revision"
+      ],
+      "docs": [
+        "docs/artifact-registry.md",
+        "docs/migration-generation.md",
+        "docs/migration-start-recovery.md",
+        "docs/controlled-down.md"
+      ],
+      "evidence": [
+        {
+          "level": "integration",
+          "path": "pkg/migrate/apply/apply_integration_test.go",
+          "command": "go test ./pkg/artifact ./pkg/migrate/..."
+        }
+      ]
+    },
+    {
+      "id": "approval-policy-and-safety",
+      "title": "Approvals, policy, prechecks, simulation, guardrails, and safety analysis",
+      "packages": [
+        "pkg/approval",
+        "pkg/guardrail",
+        "pkg/policy",
+        "pkg/precheck",
+        "pkg/safety",
+        "pkg/simulate"
+      ],
+      "docs": [
+        "docs/guardrail.md",
+        "docs/safety-analysis.md",
+        "docs/advanced-migration-lint.md",
+        "docs/database-testing.md"
+      ],
+      "evidence": [
+        {
+          "level": "contract",
+          "path": "pkg/guardrail/guardrail_test.go",
+          "command": "go test ./pkg/approval ./pkg/guardrail ./pkg/policy ./pkg/precheck ./pkg/safety ./pkg/simulate"
+        }
+      ]
+    },
+    {
+      "id": "execution-audit-and-backup",
+      "title": "Guarded execution, audit durability, and customer-owned backup",
+      "packages": ["pkg/auditlog", "pkg/backup", "pkg/executor"],
+      "docs": ["docs/executor.md", "docs/artifact-backup.md"],
+      "evidence": [
+        {
+          "level": "integration",
+          "path": "pkg/executor/executor_integration_test.go",
+          "command": "go test ./pkg/auditlog ./pkg/backup ./pkg/executor"
+        }
+      ]
+    },
+    {
+      "id": "inventory-observability-and-analytics",
+      "title": "Inventory, drift, monitoring, schema docs, and analytics",
+      "packages": ["pkg/analytics", "pkg/drift", "pkg/inventory", "pkg/monitor", "pkg/schemadoc"],
+      "docs": [
+        "docs/inventory.md",
+        "docs/schema-registry-observability.md",
+        "docs/cloud-monitoring.md",
+        "docs/schema-analytics.md"
+      ],
+      "evidence": [
+        {
+          "level": "contract",
+          "path": "pkg/analytics/analytics_test.go",
+          "command": "go test ./pkg/analytics ./pkg/drift ./pkg/inventory ./pkg/monitor ./pkg/schemadoc"
+        }
+      ]
+    },
+    {
+      "id": "fleet-and-tenant-rollouts",
+      "title": "Fleet orchestration and tenant-scale rollouts",
+      "packages": ["pkg/fleet", "pkg/tenantfleet"],
+      "docs": ["docs/fleet-orchestration.md", "docs/tenant-fleet.md"],
+      "evidence": [
+        {
+          "level": "contract",
+          "path": "pkg/fleet/fleet_test.go",
+          "command": "go test ./pkg/fleet ./pkg/tenantfleet"
+        }
+      ]
+    },
+    {
+      "id": "database-security-and-reference-data",
+      "title": "Database security as code and bounded reference-data reconciliation",
+      "packages": ["pkg/reference", "pkg/security"],
+      "docs": ["docs/database-security.md", "docs/reference-data.md"],
+      "evidence": [
+        {
+          "level": "contract",
+          "path": "pkg/security/security_test.go",
+          "command": "go test ./pkg/reference ./pkg/security"
+        }
+      ]
+    },
+    {
+      "id": "delivery-and-developer-integrations",
+      "title": "CI, GitOps, ORM, IDE, deployment, and Terraform integrations",
+      "packages": [
+        "pkg/ci",
+        "pkg/integration",
+        "pkg/integrations/deploy",
+        "pkg/integrations/devflow",
+        "pkg/integrations/gitops",
+        "pkg/integrations/ide",
+        "pkg/integrations/orm",
+        "pkg/integrations/terraform"
+      ],
+      "docs": [
+        "docs/ci-changeset-contract.md",
+        "docs/ci-cd-integrations.md",
+        "docs/ci-gitops-ecosystem.md",
+        "docs/integrations.md",
+        "docs/terraform-provider.md"
+      ],
+      "evidence": [
+        {
+          "level": "integration",
+          "path": "pkg/integration/conformance_integration_test.go",
+          "command": "go test ./pkg/ci ./pkg/integration ./pkg/integrations/..."
+        }
+      ]
+    },
+    {
+      "id": "database-test-environments",
+      "title": "Disposable database tests and reproducible test evidence",
+      "packages": ["pkg/dbtest"],
+      "docs": ["docs/database-testing.md", "docs/integration-testing.md"],
+      "evidence": [
+        {
+          "level": "integration",
+          "path": "pkg/dbtest/postgres_integration_test.go",
+          "command": "go test ./pkg/dbtest"
+        }
+      ]
+    },
+    {
+      "id": "kubernetes-operator",
+      "title": "Kubernetes CRDs, CEL validation, and reconciliation",
+      "packages": ["internal/operatorcontroller", "pkg/operator"],
+      "docs": ["docs/kubernetes-operator.md"],
+      "evidence": [
+        {
+          "level": "integration",
+          "path": "internal/operatorcontroller/controller_test.go",
+          "command": "go test ./pkg/operator ./internal/operatorcontroller"
+        }
+      ]
+    },
+    {
+      "id": "zero-downtime-migrations",
+      "title": "Expand/contract, backfill, shadow sync, rollback, and compatibility",
+      "packages": [
+        "pkg/zdm",
+        "pkg/zdm/backfill",
+        "pkg/zdm/contract",
+        "pkg/zdm/expandplan",
+        "pkg/zdm/rollback",
+        "pkg/zdm/shadowsync",
+        "pkg/zdm/start",
+        "pkg/zdm/virtualschema",
+        "pkg/zerodowntime"
+      ],
+      "docs": [
+        "docs/zero-downtime-format.md",
+        "docs/postgresql-zero-downtime-compatibility.md",
+        "docs/online-backfills.md",
+        "docs/shadow-column-synchronization.md",
+        "docs/zero-downtime-rollback-repair.md",
+        "docs/virtual-version-schemas.md"
+      ],
+      "evidence": [
+        {
+          "level": "integration",
+          "path": "pkg/zdm/backfill/backfill_integration_test.go",
+          "command": "go test ./pkg/zdm/... ./pkg/zerodowntime"
+        }
+      ]
+    },
+    {
+      "id": "multi-dialect-contracts",
+      "title": "Multi-dialect capability contracts",
+      "packages": ["pkg/dialect"],
+      "docs": ["docs/multi-dialect.md"],
+      "evidence": [
+        {
+          "level": "contract",
+          "path": "pkg/dialect/dialect_test.go",
+          "command": "go test ./pkg/dialect"
+        }
+      ]
+    }
+  ]
+}

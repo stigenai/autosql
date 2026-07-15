@@ -195,7 +195,9 @@ func hclDocument(ctx context.Context, uri string, body *hclsyntax.Body, data []b
 				rfAnnotations, _ = spec["annotations_json"].(string)
 				if encoded, ok := spec["spec_json"].(string); ok {
 					var decoded map[string]any
-					if err := json.Unmarshal([]byte(encoded), &decoded); err != nil {
+					decoder := json.NewDecoder(strings.NewReader(encoded))
+					decoder.UseNumber()
+					if err := decoder.Decode(&decoded); err != nil {
 						return fmt.Errorf("%w: resource spec_json: %v", ErrHCL, err)
 					}
 					spec = decoded
@@ -594,7 +596,9 @@ func FormatHCL(doc schema.Document) ([]byte, error) {
 		}
 		var spec any
 		if len(r.Spec) > 0 {
-			if err := json.Unmarshal(r.Spec, &spec); err != nil {
+			decoder := json.NewDecoder(strings.NewReader(string(r.Spec)))
+			decoder.UseNumber()
+			if err := decoder.Decode(&spec); err != nil {
 				return nil, err
 			}
 			raw, _ := json.Marshal(spec)
