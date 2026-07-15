@@ -11,10 +11,19 @@ spec:
       serviceAccountName: autosql-operator
       containers:
         - name: operator
-          image: ghcr.io/example/autosql-operator@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-          imagePullPolicy: Always
+          image: ghcr.io/stigenai/autosql:latest
+          imagePullPolicy: IfNotPresent
           args: ["operator", "--leader-election"]
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             runAsNonRoot: true
+          env:
+            - name: AUTOSQL_OPERATOR_STATE_FILE
+              value: /var/lib/autosql/operator/state.json
+          volumeMounts:
+            - name: operator-state
+              mountPath: /var/lib/autosql
+      volumes:
+        - name: operator-state
+          emptyDir: {}

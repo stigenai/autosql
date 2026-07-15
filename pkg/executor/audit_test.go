@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestFileAuditRejectsTamperedChain(t *testing.T) {
@@ -23,6 +24,27 @@ func TestFileAuditRejectsTamperedChain(t *testing.T) {
 	_ = f.Close()
 	if err = a.AppendDurable(context.Background(), LifecycleEvent{Type: "lock"}); err == nil {
 		t.Fatal("tampered audit accepted")
+	}
+}
+
+func TestFileAuditRetryIgnoresWallClockTimestamp(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "audit.jsonl")
+	a := &FileAudit{Path: p}
+	first := LifecycleEvent{EventID: "event-1", Type: "requested", ExecutionID: "exec-1", At: time.Unix(1, 0).UTC(), Attempt: 1}
+	if err := a.AppendDurable(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.At = time.Unix(2, 0).UTC()
+	if err := a.AppendDurable(context.Background(), second); err != nil {
+		t.Fatalf("retry with new timestamp: %v", err)
+	}
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := bytes.Count(raw, []byte("\n")); got != 1 {
+		t.Fatalf("records=%d, want one idempotent record", got)
 	}
 }
 

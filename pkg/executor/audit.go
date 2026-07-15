@@ -9,6 +9,7 @@ import (
 	"errors"
 	"os"
 	"syscall"
+	"time"
 )
 
 type lifecycleRecord struct {
@@ -54,8 +55,15 @@ func (a *FileAudit) AppendDurable(ctx context.Context, event LifecycleEvent) err
 		}
 		tail = r
 		if event.EventID != "" && r.Event.EventID == event.EventID {
-			a, _ := json.Marshal(r.Event)
-			b, _ := json.Marshal(event)
+			// Event IDs intentionally exclude wall-clock time so retries can
+			// safely replay the same lifecycle transition. Compare the stable
+			// event identity rather than treating a new timestamp as a conflict.
+			previous := r.Event
+			previous.At = time.Time{}
+			current := event
+			current.At = time.Time{}
+			a, _ := json.Marshal(previous)
+			b, _ := json.Marshal(current)
 			if string(a) != string(b) {
 				return errors.New("lifecycle audit event identity conflict")
 			}

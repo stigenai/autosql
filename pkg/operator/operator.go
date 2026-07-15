@@ -5,6 +5,9 @@ package operator
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -66,12 +69,24 @@ type Status struct {
 	Conditions         []Condition `json:"conditions,omitempty"`
 	ObservedGeneration int64       `json:"observedGeneration"`
 	AppliedDigest      string      `json:"appliedDigest,omitempty"`
+	PlanDigest         string      `json:"planDigest,omitempty"`
+	TargetIdentity     string      `json:"targetIdentity,omitempty"`
+	OperationID        string      `json:"operationID,omitempty"`
+	RecoveryState      string      `json:"recoveryState,omitempty"`
+	ExecutionID        string      `json:"executionID,omitempty"`
+	PendingStep        string      `json:"pendingStep,omitempty"`
+	RecoveryGuidance   string      `json:"recoveryGuidance,omitempty"`
+	AppliedSteps       int         `json:"appliedSteps,omitempty"`
 	RetryCount         int         `json:"retryCount,omitempty"`
 }
 type Resource struct {
 	Name   string
 	Spec   Spec
 	Status Status
+	// ResolvedDatabaseURL is transient controller input. It is never written
+	// to a record or Kubernetes status.
+	ResolvedDatabaseURL string `json:"-"`
+	ResolvedSource      string `json:"-"`
 }
 type Record struct {
 	Status                  Status
@@ -107,7 +122,19 @@ type AlwaysLeader struct{}
 
 func (AlwaysLeader) Acquire(context.Context, string) (bool, error) { return true, nil }
 
-type ApplyFunc func(context.Context, Resource, string) error
+// ApplyResult carries the non-secret execution identifiers that a controller
+// can persist in status for recovery and audit correlation.
+type ApplyResult struct {
+	Status           string
+	PlanDigest       string
+	TargetIdentity   string
+	ExecutionID      string
+	PendingStep      string
+	RecoveryGuidance string
+	AppliedSteps     int
+}
+
+type ApplyFunc func(context.Context, Resource, string) (ApplyResult, error)
 type Reconciler struct {
 	Store  Store
 	Leader Leader
@@ -132,9 +159,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, obj Resource, approved bool)
 	if r.Now != nil {
 		now = r.Now().UTC()
 	}
-	old, _ := r.Store.Load(obj.Name)
+	key := applyKey(obj)
+	old, found := r.Store.Load(obj.Name)
+	if !found && obj.Status.ObservedGeneration == obj.Spec.Generation && obj.Status.AppliedDigest == obj.Spec.ArtifactDigest && obj.Status.RecoveryState == "none" {
+		// Kubernetes status is the durable cross-pod checkpoint. Rehydrate a
+		// fresh local store after pod replacement or leader movement so a
+		// successfully applied generation is never executed twice.
+		old = Record{Status: obj.Status, ApplyingKey: key, AppliedKey: key}
+		_ = r.Store.Save(obj.Name, old)
+	}
 	st := old.Status
-	key := fmt.Sprintf("%s/%d/%s", obj.Spec.Kind, obj.Spec.Generation, obj.Spec.ArtifactDigest)
 	if old.AppliedKey == key {
 		return st, nil
 	}
@@ -150,8 +184,20 @@ func (r *Reconciler) Reconcile(ctx context.Context, obj Resource, approved bool)
 		return st, nil
 	}
 	st = condition(st, Applying, "ApplyStarted", "applying artifact", obj.Spec.Generation, now)
+	st.OperationID = operationID(key)
+	st.RecoveryState = "pending"
 	_ = r.Store.Save(obj.Name, Record{Status: st, ApplyingKey: key})
-	if err := r.Apply(ctx, obj, obj.Spec.ArtifactDigest); err != nil {
+	outcome, err := r.Apply(ctx, obj, obj.Spec.ArtifactDigest)
+	st.PlanDigest = outcome.PlanDigest
+	st.TargetIdentity = outcome.TargetIdentity
+	st.ExecutionID = outcome.ExecutionID
+	st.PendingStep = outcome.PendingStep
+	st.RecoveryGuidance = outcome.RecoveryGuidance
+	st.AppliedSteps = outcome.AppliedSteps
+	if outcome.Status == "uncertain" {
+		st.RecoveryState = "uncertain"
+	}
+	if err != nil {
 		st.RetryCount++
 		st = condition(st, Failed, "ApplyFailed", err.Error(), obj.Spec.Generation, now)
 		_ = r.Store.Save(obj.Name, Record{Status: st, ApplyingKey: key})
@@ -159,9 +205,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, obj Resource, approved bool)
 	}
 	st.ObservedGeneration = obj.Spec.Generation
 	st.AppliedDigest = obj.Spec.ArtifactDigest
+	if st.PlanDigest == "" {
+		st.PlanDigest = obj.Spec.ArtifactDigest
+	}
+	st.RecoveryState = "none"
 	st = condition(st, Ready, "Applied", "resource is converged", obj.Spec.Generation, now)
 	_ = r.Store.Save(obj.Name, Record{Status: st, AppliedKey: key, ApplyingKey: key})
 	return st, nil
+}
+
+func operationID(key string) string {
+	digest := sha256.Sum256([]byte("autosql.operator.operation/v1\x00" + key))
+	return "autosql-op-" + hex.EncodeToString(digest[:16])
 }
 func validate(s Spec) error {
 	if s.Kind != Declarative && s.Kind != Versioned {
@@ -192,7 +247,28 @@ func validate(s Spec) error {
 	if s.DatabaseURL == nil || s.DatabaseURL.Name == "" || s.DatabaseURL.Key == "" {
 		return errors.New("databaseURL secret reference is required")
 	}
+	if s.Generation < 1 {
+		return errors.New("generation must be at least 1")
+	}
+	if s.ArtifactDigest == "" {
+		return errors.New("operator migration requires an artifact digest")
+	}
+	if s.Source.RegistryDigest != "" && s.Source.RegistryDigest != s.ArtifactDigest {
+		return errors.New("registryDigest must equal artifactDigest")
+	}
 	return nil
+}
+
+func applyKey(obj Resource) string {
+	raw, _ := json.Marshal(struct {
+		Kind           ResourceKind  `json:"kind"`
+		Generation     int64         `json:"generation"`
+		Source         Source        `json:"source"`
+		ArtifactDigest string        `json:"artifact_digest"`
+		DatabaseURL    *SecretKeyRef `json:"database_url"`
+	}{obj.Spec.Kind, obj.Spec.Generation, obj.Spec.Source, obj.Spec.ArtifactDigest, obj.Spec.DatabaseURL})
+	digest := sha256.Sum256(raw)
+	return fmt.Sprintf("%s/%d/%s/%s", obj.Spec.Kind, obj.Spec.Generation, obj.Spec.ArtifactDigest, hex.EncodeToString(digest[:]))
 }
 func condition(s Status, typ ConditionType, reason, msg string, g int64, at time.Time) Status {
 	for i := range s.Conditions {

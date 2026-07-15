@@ -141,4 +141,5 @@ output. See [the CLI contract](docs/cli-contract.md) and
 - [Advanced migration lint and AI-safe review](docs/advanced-migration-lint.md)
 - [Integration testing and coverage](docs/integration-testing.md)
 - [Release binaries and container images](docs/releasing.md)
+- [Detailed PostgreSQL lifecycle example](examples/postgres-lifecycle/README.md)
 - [Database security as code](docs/database-security.md) · [reference data](docs/reference-data.md)

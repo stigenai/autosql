@@ -14,6 +14,16 @@ spec:
     - name: v1alpha1
       served: true
       storage: true
+      additionalPrinterColumns:
+        - name: Kind
+          type: string
+          jsonPath: .spec.kind
+        - name: Ready
+          type: string
+          jsonPath: .status.conditions[?(@.type=="Ready")].status
+        - name: Digest
+          type: string
+          jsonPath: .status.appliedDigest
       schema:
         openAPIV3Schema:
           type: object
@@ -23,11 +33,73 @@ spec:
               required: [kind, source, databaseURL]
               properties:
                 kind: {type: string, enum: [DeclarativeSchema, VersionedMigration]}
-                generation: {type: integer, format: int64}
-                source: {type: object, maxProperties: 1}
-                databaseURL: {type: object, required: [name, key]}
+                generation: {type: integer, format: int64, minimum: 1, default: 1}
+                source:
+                  type: object
+                  minProperties: 1
+                  maxProperties: 1
+                  properties:
+                    inline:
+                      type: string
+                      minLength: 1
+                    secretRef:
+                      type: object
+                      required: [name, key]
+                      properties:
+                        name: {type: string, minLength: 1, pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'}
+                        key: {type: string, minLength: 1, pattern: '^[A-Za-z0-9._-]+$'}
+                    configMapRef:
+                      type: object
+                      required: [name, key]
+                      properties:
+                        name: {type: string, minLength: 1, pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'}
+                        key: {type: string, minLength: 1, pattern: '^[A-Za-z0-9._-]+$'}
+                    url: {type: string, minLength: 1, format: uri}
+                    registryDigest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+                  x-kubernetes-validations:
+                    - rule: "(has(self.inline) ? 1 : 0) + (has(self.secretRef) ? 1 : 0) + (has(self.configMapRef) ? 1 : 0) + (has(self.url) ? 1 : 0) + (has(self.registryDigest) ? 1 : 0) == 1"
+                      message: exactly one source variant must be set
+                artifactDigest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+                databaseURL:
+                  type: object
+                  required: [name, key]
+                  properties:
+                    name: {type: string, minLength: 1, pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'}
+                    key: {type: string, minLength: 1, pattern: '^[A-Za-z0-9._-]+$'}
                 requireApproval: {type: boolean}
+              x-kubernetes-validations:
+                - rule: "self.generation >= 1"
+                  message: generation must be at least 1
+                - rule: "has(self.artifactDigest)"
+                  message: operator migrations require artifactDigest
+                - rule: "!has(self.source.registryDigest) || self.source.registryDigest == self.artifactDigest"
+                  message: registryDigest must equal artifactDigest
             status:
               type: object
-              x-kubernetes-preserve-unknown-fields: true
+              properties:
+                observedGeneration: {type: integer, format: int64, minimum: 0}
+                appliedDigest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+                planDigest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+                targetIdentity: {type: string, minLength: 1}
+                operationID: {type: string, minLength: 1}
+                recoveryState: {type: string, enum: [none, pending, uncertain, recovered]}
+                executionID: {type: string, minLength: 1}
+                pendingStep: {type: string, minLength: 1}
+                recoveryGuidance: {type: string, minLength: 1}
+                appliedSteps: {type: integer, minimum: 0}
+                retryCount: {type: integer, minimum: 0}
+                conditions:
+                  type: array
+                  x-kubernetes-list-type: map
+                  x-kubernetes-list-map-keys: [type]
+                  items:
+                    type: object
+                    required: [type, status, observedGeneration, lastTransitionTime]
+                    properties:
+                      type: {type: string, enum: [Planning, ApprovalRequired, Applying, Ready, Failed]}
+                      status: {type: string, enum: ["True", "False", Unknown]}
+                      reason: {type: string}
+                      message: {type: string}
+                      observedGeneration: {type: integer, format: int64, minimum: 0}
+                      lastTransitionTime: {type: string, format: date-time}
       subresources: {status: {}}

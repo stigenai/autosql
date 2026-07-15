@@ -6,6 +6,21 @@ on:
 permissions:
   contents: read
 jobs:
+  operator-kubernetes:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install envtest asset manager
+        run: go install sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.24.0
+      - name: Test operator against Kubernetes 1.35
+        run: |
+          export KUBEBUILDER_ASSETS="$(setup-envtest use -p path 1.35.x)"
+          AUTOSQL_OPERATOR_ENVTEST=1 go test -count=1 ./internal/operatorcontroller \
+            -run TestEnvtestReconcilesCRAndWritesStatus
   changeset:
     runs-on: ubuntu-24.04
     steps:

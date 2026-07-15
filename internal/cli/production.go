@@ -67,7 +67,21 @@ func ProductionServices() (Services, error) {
 	return productionServices(executor.PGXConnector{})
 }
 
+// ProductionServicesForURL uses the same signed-artifact guardrail and
+// lifecycle audit configuration as ProductionServices, while targeting a
+// controller-resolved database URL for this invocation.
+func ProductionServicesForURL(databaseURL string) (Services, error) {
+	if strings.TrimSpace(databaseURL) == "" {
+		return Services{}, errors.New("database URL is required")
+	}
+	return productionServicesWithURL(executor.PGXConnector{}, databaseURL)
+}
+
 func productionServices(connector executor.Connector) (Services, error) {
+	return productionServicesWithURL(connector, "")
+}
+
+func productionServicesWithURL(connector executor.Connector, databaseURLOverride string) (Services, error) {
 	path := os.Getenv("AUTOSQL_APPLY_CONFIG")
 	if path == "" {
 		return Services{ReadPlan: DefaultReadPlan{}, Apply: refusingApply{}}, nil
@@ -94,6 +108,9 @@ func productionServices(connector executor.Connector) (Services, error) {
 	url, err := resolver.Resolve(context.Background(), ref)
 	if err != nil {
 		return Services{}, errors.New("resolve database URL")
+	}
+	if databaseURLOverride != "" {
+		url = databaseURLOverride
 	}
 	authority := staticAuthority{actors: map[string]approval.Identity{c.Author: {ID: c.Author}, c.Requester: {ID: c.Requester}}}
 	ap := approval.Policy{Environments: map[string]approval.EnvironmentPolicy{c.Environment: {Allowed: true}}}
