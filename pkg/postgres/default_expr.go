@@ -17,6 +17,7 @@ type defaultExpression struct {
 	Cast      *defaultCast
 	Function  *defaultFunction
 	Reference *defaultReference
+	Array     []defaultExpression
 }
 
 type defaultExpressionKind uint8
@@ -27,6 +28,7 @@ const (
 	defaultExpressionCast
 	defaultExpressionFunction
 	defaultExpressionReference
+	defaultExpressionArray
 )
 
 type defaultLiteralKind uint8
@@ -240,6 +242,20 @@ func classifyDefaultNode(node *pg_query.Node, depth int, nodes *int) (defaultExp
 		}
 		return defaultExpression{Kind: defaultExpressionReference, Reference: &name}, nil
 	}
+	if array := node.GetAArrayExpr(); array != nil {
+		if len(array.GetElements()) > maxDefaultFunctionArgs {
+			return defaultExpression{}, errors.New("default array exceeds element limit")
+		}
+		elements := make([]defaultExpression, 0, len(array.GetElements()))
+		for _, rawElement := range array.GetElements() {
+			element, err := classifyDefaultNode(rawElement, depth+1, nodes)
+			if err != nil {
+				return defaultExpression{}, fmt.Errorf("default array element: %w", err)
+			}
+			elements = append(elements, element)
+		}
+		return defaultExpression{Kind: defaultExpressionArray, Array: elements}, nil
+	}
 	if sqlValue := node.GetSqlvalueFunction(); sqlValue != nil {
 		if sqlValue.GetXpr() != nil {
 			return defaultExpression{}, errors.New("SQL value function has an unexpected expression")
@@ -247,10 +263,30 @@ func classifyDefaultNode(node *pg_query.Node, depth int, nodes *int) (defaultExp
 		name := ""
 		var precision *int
 		switch sqlValue.GetOp() {
+		case pg_query.SQLValueFunctionOp_SVFOP_CURRENT_DATE:
+			name = "current_date"
+		case pg_query.SQLValueFunctionOp_SVFOP_CURRENT_TIME:
+			name = "current_time"
+		case pg_query.SQLValueFunctionOp_SVFOP_CURRENT_TIME_N:
+			name = "current_time_n"
+			value := int(sqlValue.GetTypmod())
+			precision = &value
 		case pg_query.SQLValueFunctionOp_SVFOP_CURRENT_TIMESTAMP:
 			name = "current_timestamp"
 		case pg_query.SQLValueFunctionOp_SVFOP_CURRENT_TIMESTAMP_N:
 			name = "current_timestamp_n"
+			value := int(sqlValue.GetTypmod())
+			precision = &value
+		case pg_query.SQLValueFunctionOp_SVFOP_LOCALTIME:
+			name = "localtime"
+		case pg_query.SQLValueFunctionOp_SVFOP_LOCALTIME_N:
+			name = "localtime_n"
+			value := int(sqlValue.GetTypmod())
+			precision = &value
+		case pg_query.SQLValueFunctionOp_SVFOP_LOCALTIMESTAMP:
+			name = "localtimestamp"
+		case pg_query.SQLValueFunctionOp_SVFOP_LOCALTIMESTAMP_N:
+			name = "localtimestamp_n"
 			value := int(sqlValue.GetTypmod())
 			precision = &value
 		default:

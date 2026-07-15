@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -1110,7 +1109,16 @@ func parseCoreColumnType(value string) (coreColumnType, bool) {
 	} else {
 		typ.base = value
 	}
-	allowed := map[string]bool{"smallint": true, "integer": true, "bigint": true, "real": true, "double precision": true, "numeric": true, "boolean": true, "text": true, "character varying": true, "date": true, "timestamp": true, "timestamptz": true, "uuid": true, "json": true, "jsonb": true, "bytea": true}
+	allowed := map[string]bool{
+		"smallint": true, "integer": true, "bigint": true, "real": true, "double precision": true, "numeric": true,
+		"boolean": true, "text": true, "character": true, "character varying": true, "bit": true, "bit varying": true,
+		"date": true, "time": true, "timetz": true, "timestamp": true, "timestamptz": true,
+		"interval": true, "interval year": true, "interval month": true, "interval day": true, "interval hour": true,
+		"interval minute": true, "interval second": true, "interval year to month": true, "interval day to hour": true,
+		"interval day to minute": true, "interval day to second": true, "interval hour to minute": true,
+		"interval hour to second": true, "interval minute to second": true,
+		"uuid": true, "json": true, "jsonb": true, "bytea": true,
+	}
 	if !allowed[typ.base] {
 		return coreColumnType{}, false
 	}
@@ -1118,9 +1126,12 @@ func parseCoreColumnType(value string) (coreColumnType, bool) {
 		return typ, true
 	}
 	switch typ.base {
-	case "character varying":
+	case "character", "character varying":
 		length, ok := canonicalUnsigned(typ.modifier)
 		return typ, ok && length >= 1 && length <= 10485760
+	case "bit", "bit varying":
+		length, ok := canonicalUnsigned(typ.modifier)
+		return typ, ok && length >= 1 && length <= 83886080
 	case "numeric":
 		parts := strings.Split(typ.modifier, ",")
 		if len(parts) < 1 || len(parts) > 2 {
@@ -1137,10 +1148,14 @@ func parseCoreColumnType(value string) (coreColumnType, bool) {
 			}
 		}
 		return typ, true
-	case "timestamp", "timestamptz":
+	case "time", "timetz", "timestamp", "timestamptz":
 		precision, ok := canonicalUnsigned(typ.modifier)
 		return typ, ok && precision <= 6
 	default:
+		if typ.base == "interval" || strings.HasSuffix(typ.base, "second") {
+			precision, ok := canonicalUnsigned(typ.modifier)
+			return typ, ok && precision <= 6
+		}
 		return coreColumnType{}, false
 	}
 }
@@ -1160,39 +1175,11 @@ func canonicalUnsigned(value string) (int, bool) {
 
 func validateCoreDefault(r schema.Resource, value string) error {
 	typ, validType := parseCoreColumnType(stringValue(spec(r), "type"))
-	if !validType || typ.array {
-		return unsupported(r, "array defaults are not modeled")
+	if !validType {
+		return unsupported(r, "column default type is outside canonical core grammar")
 	}
 	expr, err := classifyDefaultExpression(value)
-	if err != nil {
-		return unsupported(r, "column default is outside canonical core grammar")
-	}
-	integer := regexp.MustCompile(`^-?[0-9]+$`)
-	quoted := regexp.MustCompile(`^'(?:''|[^'])*'$`)
-	ok := false
-	switch typ.base {
-	case "smallint", "integer", "bigint":
-		if expr.Kind == defaultExpressionLiteral && expr.Literal != nil && (expr.Literal.Kind == defaultLiteralInteger || expr.Literal.Kind == defaultLiteralFloat) && integer.MatchString(value) && expr.Literal.Text == value && (value == "0" || !strings.HasPrefix(value, "0")) && !strings.HasPrefix(value, "-0") {
-			bits := 64
-			if typ.base == "smallint" {
-				bits = 16
-			}
-			if typ.base == "integer" {
-				bits = 32
-			}
-			_, err := strconv.ParseInt(value, 10, bits)
-			ok = err == nil
-		}
-	case "real", "double precision", "numeric":
-		ok = false
-	case "boolean":
-		ok = expr.Kind == defaultExpressionLiteral && expr.Literal != nil && expr.Literal.Kind == defaultLiteralBoolean && (value == "true" || value == "false") && expr.Literal.Boolean == (value == "true")
-	case "text", "character varying":
-		ok = expr.Kind == defaultExpressionLiteral && expr.Literal != nil && expr.Literal.Kind == defaultLiteralString && quoted.MatchString(value)
-	case "timestamp", "timestamptz":
-		ok = expr.Kind == defaultExpressionFunction && expr.Function != nil && (value == "CURRENT_TIMESTAMP" || regexp.MustCompile(`^CURRENT_TIMESTAMP\([0-6]\)$`).MatchString(value))
-	}
-	if !ok {
+	if err != nil || !coreDefaultAllowed(typ, expr, value) {
 		return unsupported(r, "column default is outside canonical core grammar")
 	}
 	return nil

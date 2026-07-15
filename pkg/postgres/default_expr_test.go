@@ -88,7 +88,6 @@ func TestClassifyDefaultExpressionRejectsStatementAndUnknownShapes(t *testing.T)
 		"1 + 2",
 		"(SELECT 1)",
 		"CASE WHEN true THEN 1 ELSE 2 END",
-		"ARRAY[1,2]",
 		"current_user",
 	}
 	for _, input := range inputs {
@@ -128,8 +127,6 @@ func TestCoreDefaultClassifierPreservesLegacyGrammar(t *testing.T) {
 
 func TestCoreDefaultClassifierPolicyDeniesRecognizedFutureForms(t *testing.T) {
 	for _, fixture := range []struct{ typ, value string }{
-		{"uuid", "gen_random_uuid()"},
-		{"jsonb", "'{}'::jsonb"},
 		{"text", "lower('VALUE')"},
 		{"integer", "nextval('app.seq'::regclass)"},
 		{"text", "app.value"},
@@ -141,6 +138,61 @@ func TestCoreDefaultClassifierPolicyDeniesRecognizedFutureForms(t *testing.T) {
 			out, err := renderDocumentWithDefault(fixture.typ, fixture.value)
 			if err == nil || len(out) != 0 {
 				t.Fatalf("out=%+v err=%v", out, err)
+			}
+		})
+	}
+}
+
+func TestCoreDefaultClassifierSupportsInspectedScalarArrayAndBuiltinForms(t *testing.T) {
+	tests := []struct{ typ, value string }{
+		{"numeric(10,2)", "0.00"},
+		{"jsonb", "'{}'::jsonb"},
+		{"jsonb", "'[]'::jsonb"},
+		{"uuid", "'550e8400-e29b-41d4-a716-446655440000'::uuid"},
+		{"date", "CURRENT_DATE"},
+		{"time(3)", "LOCALTIME(3)"},
+		{"timestamp(2)", "LOCALTIMESTAMP(2)"},
+		{"interval", "'00:05:00'::interval"},
+		{"character(4)", "'x'::character(1)"},
+		{"character(4)", "'test'::character(4)"},
+		{"bit(4)", "'1010'::bit(4)"},
+		{"text[]", "'{}'::text[]"},
+		{"text[]", "ARRAY['a'::text, 'b'::text]"},
+		{"integer[]", "ARRAY[1, 2]"},
+		{"uuid", "pg_catalog.gen_random_uuid()"},
+		{"timestamp", "pg_catalog.timezone('utc'::text, CURRENT_TIMESTAMP)"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.typ+"_"+tc.value, func(t *testing.T) {
+			out, err := renderDocumentWithDefault(tc.typ, tc.value)
+			if err != nil || len(out) == 0 {
+				t.Fatalf("statements=%+v err=%v", out, err)
+			}
+		})
+	}
+}
+
+func TestCoreDefaultClassifierRejectsUnsafeExtendedForms(t *testing.T) {
+	tests := []struct{ typ, value string }{
+		{"numeric(3,2)", "12.345"},
+		{"jsonb", "'{bad}'::jsonb"},
+		{"uuid", "'not-a-uuid'::uuid"},
+		{"date", "'2025-02-30'::date"},
+		{"text", "'x'::integer"},
+		{"text[]", "ARRAY[lower('x')]"},
+		{"text[]", "ARRAY[ARRAY['x']]"},
+		{"text[]", "'{{x}}'::text[]"},
+		{"text[]", "'{NULL}'::text[]"},
+		{"uuid", "gen_random_uuid()"},
+		{"uuid", "app.gen_random_uuid()"},
+		{"timestamp", "pg_catalog.timezone('est'::text, CURRENT_TIMESTAMP)"},
+		{"timestamp", "pg_catalog.timezone('utc'::text, app.clock())"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.typ+"_"+tc.value, func(t *testing.T) {
+			out, err := renderDocumentWithDefault(tc.typ, tc.value)
+			if err == nil || len(out) != 0 {
+				t.Fatalf("statements=%+v err=%v", out, err)
 			}
 		})
 	}
@@ -255,11 +307,11 @@ func validDefaultExpressionShape(expr defaultExpression, depth int) bool {
 	}
 	switch expr.Kind {
 	case defaultExpressionLiteral:
-		return expr.Literal != nil && expr.Cast == nil && expr.Function == nil && expr.Reference == nil && expr.Literal.Kind != defaultLiteralInvalid
+		return expr.Literal != nil && expr.Cast == nil && expr.Function == nil && expr.Reference == nil && expr.Array == nil && expr.Literal.Kind != defaultLiteralInvalid
 	case defaultExpressionCast:
-		return expr.Literal == nil && expr.Cast != nil && expr.Function == nil && expr.Reference == nil && len(expr.Cast.Type.Name.Parts) > 0 && validDefaultExpressionShape(expr.Cast.Expression, depth+1)
+		return expr.Literal == nil && expr.Cast != nil && expr.Function == nil && expr.Reference == nil && expr.Array == nil && len(expr.Cast.Type.Name.Parts) > 0 && validDefaultExpressionShape(expr.Cast.Expression, depth+1)
 	case defaultExpressionFunction:
-		if expr.Literal != nil || expr.Cast != nil || expr.Function == nil || expr.Reference != nil || len(expr.Function.Name.Parts) == 0 {
+		if expr.Literal != nil || expr.Cast != nil || expr.Function == nil || expr.Reference != nil || expr.Array != nil || len(expr.Function.Name.Parts) == 0 {
 			return false
 		}
 		for _, arg := range expr.Function.Arguments {
@@ -269,7 +321,17 @@ func validDefaultExpressionShape(expr defaultExpression, depth int) bool {
 		}
 		return true
 	case defaultExpressionReference:
-		return expr.Literal == nil && expr.Cast == nil && expr.Function == nil && expr.Reference != nil && len(expr.Reference.Parts) > 0
+		return expr.Literal == nil && expr.Cast == nil && expr.Function == nil && expr.Reference != nil && expr.Array == nil && len(expr.Reference.Parts) > 0
+	case defaultExpressionArray:
+		if expr.Literal != nil || expr.Cast != nil || expr.Function != nil || expr.Reference != nil || expr.Array == nil {
+			return false
+		}
+		for _, element := range expr.Array {
+			if !validDefaultExpressionShape(element, depth+1) {
+				return false
+			}
+		}
+		return true
 	default:
 		return false
 	}

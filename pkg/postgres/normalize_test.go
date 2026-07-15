@@ -284,14 +284,33 @@ func TestNormalizeDefaultEquivalence(t *testing.T) {
 
 func TestNormalizeTypesConservatively(t *testing.T) {
 	cases := map[string]string{
-		"varchar(42)":             "character varying(42)",
-		"pg_catalog.varchar(8)[]": "character varying(8)[]",
-		`"CaseSensitiveType"`:     `"CaseSensitiveType"`,
-		"App.CustomType":          "App.CustomType",
+		"varchar(42)":                    "character varying(42)",
+		"pg_catalog.varchar(8)[]":        "character varying(8)[]",
+		"timestamp(3) without time zone": "timestamp(3)",
+		"time(2) with time zone":         "timetz(2)",
+		"bpchar(4)":                      "character(4)",
+		"varbit(8)":                      "bit varying(8)",
+		"pg_catalog.int4[][]":            "integer[][]",
+		`"CaseSensitiveType"`:            `"CaseSensitiveType"`,
+		"App.CustomType":                 "App.CustomType",
 	}
 	for input, want := range cases {
 		if got := postgresTypeAlias(input); got != want {
 			t.Errorf("postgresTypeAlias(%q)=%q want %q", input, got, want)
+		}
+	}
+	defaults := map[string]string{
+		"now()":                                   "CURRENT_TIMESTAMP",
+		"transaction_timestamp()":                 "CURRENT_TIMESTAMP",
+		"current_date":                            "CURRENT_DATE",
+		"localtime(3)":                            "LOCALTIME(3)",
+		"gen_random_uuid()":                       "pg_catalog.gen_random_uuid()",
+		"timezone('utc'::text, now())":            "pg_catalog.timezone('utc'::text, CURRENT_TIMESTAMP)",
+		"pg_catalog.timezone('utc'::text, now())": "pg_catalog.timezone('utc'::text, CURRENT_TIMESTAMP)",
+	}
+	for input, want := range defaults {
+		if got := postgresDefault(input); got != want {
+			t.Errorf("postgresDefault(%q)=%q want %q", input, got, want)
 		}
 	}
 	manual := schema.Resource{Kind: schema.KindIndex, Name: schema.Name{Schema: "public", Name: "users_idx"}, Spec: json.RawMessage(`{}`)}
