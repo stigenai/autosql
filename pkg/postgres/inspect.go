@@ -572,7 +572,7 @@ func (i *inspector) inspectColumns(ctx context.Context) error {
 			continue
 		}
 		ordinals[rel]++
-		spec := map[string]any{"position": ordinals[rel], "type": typ, "not_null": nn}
+		spec := map[string]any{"ordinal": ordinals[rel], "type": typ, "not_null": nn}
 		if def != nil {
 			spec["default"] = *def
 		}

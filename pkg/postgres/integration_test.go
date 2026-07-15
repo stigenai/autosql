@@ -4,12 +4,15 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"autosql/pkg/plan"
 	"autosql/pkg/schema"
+	"autosql/pkg/source"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -87,7 +90,13 @@ func TestInspectURLIntegration(t *testing.T) {
 	defer conn.Close(context.Background())
 	const fixture = `
 drop schema if exists autosql_inspect cascade;
+drop schema if exists autosql_ordinal cascade;
 create schema autosql_inspect;
+create schema autosql_ordinal;
+create table autosql_ordinal.widgets (
+  id bigint not null,
+  name text
+);
 comment on schema autosql_inspect is 'integration schema';
 create extension hstore with schema autosql_inspect;
 create type autosql_inspect.status as enum ('new','done');
@@ -131,7 +140,7 @@ alter default privileges in schema autosql_inspect grant select on tables to pub
 	defer func() {
 		cleanup, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_, _ = conn.Exec(cleanup, `alter default privileges in schema autosql_inspect revoke select on tables from public; drop schema if exists autosql_inspect cascade`)
+		_, _ = conn.Exec(cleanup, `alter default privileges in schema autosql_inspect revoke select on tables from public; drop schema if exists autosql_inspect cascade; drop schema if exists autosql_ordinal cascade`)
 	}()
 
 	opts := Options{Schemas: []string{"autosql_inspect"}}
@@ -141,6 +150,56 @@ alter default privileges in schema autosql_inspect grant select on tables to pub
 	}
 	if err := first.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
+	}
+	for _, r := range first.Graph.Resources {
+		if r.Kind != schema.KindColumn {
+			continue
+		}
+		var spec map[string]any
+		if err := json.Unmarshal(r.Spec, &spec); err != nil {
+			t.Fatalf("decode inspected column %s: %v", r.Name.String(), err)
+		}
+		if _, ok := spec["position"]; ok {
+			t.Fatalf("inspected column %s emitted legacy position: %#v", r.Name.String(), spec)
+		}
+		if ordinal, ok := spec["ordinal"].(float64); !ok || ordinal < 1 {
+			t.Fatalf("inspected column %s missing canonical ordinal: %#v", r.Name.String(), spec)
+		}
+	}
+	// Use a focused, fully managed schema for the apply-convergence contract.
+	// Rich inspection semantics have separate capability boundaries, while
+	// column ordering must be canonical for every inspection.
+	roundTrip, err := InspectURL(ctx, url, Options{Schemas: []string{"autosql_ordinal"}})
+	if err != nil {
+		t.Fatalf("inspect round-trip fixture: %v", err)
+	}
+	hcl, err := source.FormatHCL(roundTrip)
+	if err != nil {
+		t.Fatalf("FormatHCL inspected schema: %v", err)
+	}
+	reloaded, err := source.LoadContext(ctx, source.Input{URI: "inspected.hcl", Format: source.FormatHCLSource, Data: hcl})
+	if err != nil {
+		t.Fatalf("reload inspected HCL: %v", err)
+	}
+	current, err := New().Normalize(ctx, roundTrip)
+	if err != nil {
+		t.Fatalf("normalize inspected schema: %v", err)
+	}
+	desired, err := New().Normalize(ctx, reloaded)
+	if err != nil {
+		t.Fatalf("normalize reloaded HCL: %v", err)
+	}
+	diff, err := schema.Diff(current, desired, schema.DiffOptions{})
+	if err != nil {
+		t.Fatalf("diff inspected HCL: %v", err)
+	}
+	converged, err := plan.Build(ctx, New(), current, desired, plan.Options{})
+	if err != nil {
+		encoded, _ := diff.MarshalCanonical()
+		t.Fatalf("plan inspected HCL convergence: %v\n%s", err, encoded)
+	}
+	if len(converged.Changes.Changes) != 0 || len(converged.Steps) != 0 {
+		t.Fatalf("inspected HCL did not converge: changes=%d steps=%d", len(converged.Changes.Changes), len(converged.Steps))
 	}
 	second, err := InspectURL(ctx, url, opts)
 	if err != nil {
