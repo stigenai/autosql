@@ -96,8 +96,9 @@ func TestEnvtestReconcilesCRAndWritesStatus(t *testing.T) {
 		if err := mgr.GetAPIReader().Get(ctx, key, fresh); err != nil {
 			return err
 		}
+		base := fresh.DeepCopy()
 		fresh.SetAnnotations(map[string]string{"autosql.io/approved": "true"})
-		if err := mgr.GetClient().Update(ctx, fresh); err != nil {
+		if err := mgr.GetClient().Patch(ctx, fresh, client.MergeFrom(base)); err != nil {
 			return err
 		}
 		current = fresh
