@@ -23,8 +23,8 @@ jobs:
     env:
       AUTOSQL_TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/autosql?sslmode=disable
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
@@ -82,14 +82,14 @@ jobs:
         run: go test ./pkg/postgres -run '^$' -bench '^BenchmarkCompleteBootstrapPipeline$' -benchtime=3x -count=1 | tee bootstrap-bench.txt
       - name: Upload complete bootstrap benchmark
         if: matrix.version == 16
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: complete-bootstrap-postgres-16
           path: bootstrap-bench.txt
       - run: go test -race -p 1 -covermode=atomic -coverprofile=zdm-coverage.out -count=1 ./pkg/zdm/... ./internal/cli
       - run: go tool cover -func=zdm-coverage.out > zdm-coverage.txt
       - run: go test -run '^$' -bench BenchmarkZDM -benchtime=1s -count=1 ./pkg/zdm/compatmatrix | tee zdm-bench.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: zdm-postgres-${{ matrix.version }}
           path: |
