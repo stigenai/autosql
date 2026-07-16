@@ -687,6 +687,11 @@ func postgresDefault(value string) string {
 			}
 		}
 	}
+	if expression, err := classifyDefaultExpression(s); err == nil && containsDefaultOperator(expression) {
+		if canonical, err := canonicalOperatorDefault(expression); err == nil {
+			return canonical
+		}
+	}
 	return s
 }
 func balancedOuter(s string) bool {

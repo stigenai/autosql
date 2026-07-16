@@ -77,6 +77,24 @@ func ProductionServicesForURL(databaseURL string) (Services, error) {
 	return productionServicesWithURL(executor.PGXConnector{}, databaseURL)
 }
 
+// VerifyProductionArtifactForApply verifies a release artifact through the
+// exact production service policy without resolving or opening a database
+// credential. This is used by controllers that must authenticate immutable
+// release input before reading runtime Secrets.
+func VerifyProductionArtifactForApply(a artifact.Artifact, mandatoryNoEdits bool) (artifact.VerifiedArtifact, error) {
+	services, err := ProductionServicesForURL("postgres://autosql-verification.invalid/postgres")
+	if err != nil {
+		return artifact.VerifiedArtifact{}, err
+	}
+	verifier, ok := services.Apply.(interface {
+		VerifyArtifactForApply(artifact.Artifact, bool) (artifact.VerifiedArtifact, error)
+	})
+	if !ok {
+		return artifact.VerifiedArtifact{}, errors.New("production artifact verification service is unavailable")
+	}
+	return verifier.VerifyArtifactForApply(a, mandatoryNoEdits)
+}
+
 func productionServices(connector executor.Connector) (Services, error) {
 	return productionServicesWithURL(connector, "")
 }
@@ -100,17 +118,17 @@ func productionServicesWithURL(connector executor.Connector, databaseURLOverride
 	if err != nil || len(pub) != ed25519.PublicKeySize {
 		return Services{}, errors.New("invalid apply public key")
 	}
-	ref := secret.Reference(c.DatabaseURL)
-	if err = ref.Validate(); err != nil {
-		return Services{}, errors.New("invalid database URL reference")
-	}
 	resolver := secret.NewResolver()
-	url, err := resolver.Resolve(context.Background(), ref)
-	if err != nil {
-		return Services{}, errors.New("resolve database URL")
-	}
-	if databaseURLOverride != "" {
-		url = databaseURLOverride
+	url := databaseURLOverride
+	if url == "" {
+		ref := secret.Reference(c.DatabaseURL)
+		if err = ref.Validate(); err != nil {
+			return Services{}, errors.New("invalid database URL reference")
+		}
+		url, err = resolver.Resolve(context.Background(), ref)
+		if err != nil {
+			return Services{}, errors.New("resolve database URL")
+		}
 	}
 	authority := staticAuthority{actors: map[string]approval.Identity{c.Author: {ID: c.Author}, c.Requester: {ID: c.Requester}}}
 	ap := approval.Policy{Environments: map[string]approval.EnvironmentPolicy{c.Environment: {Allowed: true}}}
@@ -274,6 +292,9 @@ type resolvingApply struct {
 
 func (s resolvingApply) VerifyArtifact(a artifact.Artifact) (artifact.VerifiedArtifact, error) {
 	return s.verified.VerifyArtifact(a)
+}
+func (s resolvingApply) VerifyArtifactForApply(a artifact.Artifact, mandatoryNoEdits bool) (artifact.VerifiedArtifact, error) {
+	return s.verified.VerifyArtifactForApply(a, mandatoryNoEdits)
 }
 func (s resolvingApply) ApplyVersioned(ctx context.Context, v artifact.VerifiedArtifact, session executor.Session, tx executor.Tx) (executor.ExternalExecution, error) {
 	return s.verified.ApplyVersioned(ctx, v, session, tx)

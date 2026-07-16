@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"autosql/pkg/bootstrap"
 )
@@ -62,17 +64,17 @@ func TestRestartUsesPersistentRecord(t *testing.T) {
 	}
 }
 
-func TestPodReplacementRehydratesFromKubernetesStatus(t *testing.T) {
+func TestPodReplacementReverifiesInsteadOfTrustingKubernetesStatus(t *testing.T) {
 	obj := resource()
-	obj.Status = Status{ObservedGeneration: obj.Spec.Generation, AppliedDigest: obj.Spec.ArtifactDigest, PlanDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", RecoveryState: "none", ExecutionID: "exec-1"}
+	obj.Status = Status{ObservedGeneration: obj.Spec.Generation, AppliedDigest: obj.Spec.ArtifactDigest, PlanDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", RecoveryState: "none", ExecutionID: "exec-1", AppliedFingerprint: "sha256:" + strings.Repeat("f", 64), AuthorizationExpiresAt: time.Now().Add(time.Hour)}
 	calls := 0
 	r := Reconciler{Store: NewMemoryStore(), Apply: func(context.Context, Resource, string) (ApplyResult, error) {
 		calls++
 		return ApplyResult{}, nil
 	}}
 	status, err := r.Reconcile(context.Background(), obj, true)
-	if err != nil || calls != 0 || status.ExecutionID != "exec-1" {
-		t.Fatalf("rehydrated status=%#v calls=%d err=%v", status, calls, err)
+	if err != nil || calls != 1 || status.AppliedFingerprint == "" {
+		t.Fatalf("reverified status=%#v calls=%d err=%v", status, calls, err)
 	}
 }
 
@@ -91,6 +93,73 @@ func TestSourceChangeInvalidatesApplyKey(t *testing.T) {
 	}
 	if calls != 2 {
 		t.Fatalf("source change was treated as idempotent: calls=%d", calls)
+	}
+}
+
+func TestMetadataAndRuntimeReferenceBindingsInvalidateApplyKey(t *testing.T) {
+	store := NewMemoryStore()
+	calls := 0
+	r := Reconciler{Store: store, Apply: func(context.Context, Resource, string) (ApplyResult, error) {
+		calls++
+		return ApplyResult{SourceDigest: "sha256:" + strings.Repeat("a", 64)}, nil
+	}}
+	obj := resource()
+	obj.Spec.RequireApproval = false
+	obj.MetadataGeneration = 1
+	obj.AuthorizationManifestBinding = RuntimeReferenceBinding{ResourceVersion: "1", ContentDigest: "sha256:" + strings.Repeat("b", 64)}
+	if _, err := r.Reconcile(context.Background(), obj, true); err != nil {
+		t.Fatal(err)
+	}
+	obj.AuthorizationManifestBinding.ResourceVersion = "2"
+	obj.AuthorizationManifestBinding.ContentDigest = "sha256:" + strings.Repeat("c", 64)
+	if _, err := r.Reconcile(context.Background(), obj, true); err != nil {
+		t.Fatal(err)
+	}
+	obj.MetadataGeneration = 2
+	if _, err := r.Reconcile(context.Background(), obj, true); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 3 {
+		t.Fatalf("binding changes did not force verification: calls=%d", calls)
+	}
+}
+
+func TestPostgresRenderContractInvalidatesApplyKey(t *testing.T) {
+	obj := resource()
+	base := applyKey(obj)
+	obj.Spec.PostgresVersion = 16
+	if got := applyKey(obj); got == base {
+		t.Fatal("postgresVersion did not invalidate apply key")
+	}
+	versioned := applyKey(obj)
+	obj.Spec.ConcurrentIndexes = true
+	if got := applyKey(obj); got == versioned {
+		t.Fatal("concurrentIndexes did not invalidate apply key")
+	}
+}
+
+func TestAuthorizationExpiryForcesReverification(t *testing.T) {
+	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+	calls := 0
+	r := Reconciler{Store: NewMemoryStore(), Now: func() time.Time { return now }, Apply: func(context.Context, Resource, string) (ApplyResult, error) {
+		calls++
+		return ApplyResult{AuthorizationState: AuthorizationAccepted, AuthorizationExpiresAt: now.Add(time.Minute)}, nil
+	}}
+	obj := resource()
+	obj.Spec.RequireApproval = false
+	if _, err := r.Reconcile(context.Background(), obj, true); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(30 * time.Second)
+	if _, err := r.Reconcile(context.Background(), obj, true); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(31 * time.Second)
+	if _, err := r.Reconcile(context.Background(), obj, true); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("expired authorization was not reverified: calls=%d", calls)
 	}
 }
 
@@ -116,6 +185,26 @@ func TestApplyFailureIsRetryable(t *testing.T) {
 	status, err := r.Reconcile(context.Background(), obj, true)
 	if err != nil || status.Conditions[len(status.Conditions)-1].Type != Ready || calls != 2 {
 		t.Fatalf("retry status=%#v calls=%d err=%v", status, calls, err)
+	}
+}
+
+func TestAcceptedBootstrapAuthorizationRemainsVisibleWhenApplyFails(t *testing.T) {
+	obj := resource()
+	obj.Spec.RequireApproval = false
+	r := Reconciler{Store: NewMemoryStore(), Apply: func(context.Context, Resource, string) (ApplyResult, error) {
+		return ApplyResult{AuthorizationState: AuthorizationAccepted}, errors.New("database unavailable")
+	}}
+	status, err := r.Reconcile(context.Background(), obj, true)
+	if err == nil {
+		t.Fatal("apply failure was ignored")
+	}
+	accepted, applyFailed := false, false
+	for _, condition := range status.Conditions {
+		accepted = accepted || (condition.Type == Authorization && condition.Status == "True" && condition.Reason == string(AuthorizationAccepted))
+		applyFailed = applyFailed || (condition.Type == Failed && condition.Status == "True")
+	}
+	if !accepted || !applyFailed {
+		t.Fatalf("accepted authorization and apply failure were not independently reported: %#v", status.Conditions)
 	}
 }
 

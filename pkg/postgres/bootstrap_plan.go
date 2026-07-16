@@ -61,7 +61,14 @@ func PlanDatabaseTransition(ctx context.Context, target bootstrap.DatabaseTarget
 	if err != nil {
 		return bootstrap.Plan{}, err
 	}
-	return bootstrap.ComposePlan(target, schemaPlan)
+	whole, err := bootstrap.ComposePlan(target, schemaPlan)
+	if err != nil {
+		return bootstrap.Plan{}, err
+	}
+	if enabled(options.Render, "allow_untrusted_extensions", false) {
+		whole = whole.WithRuntimeAuthorization(sealBootstrapExtensionAuthorization(whole.Digest, "*"))
+	}
+	return whole, nil
 }
 
 func schemaDocumentWithoutDatabase(document schema.Document, target bootstrap.DatabaseTarget) (schema.Document, error) {

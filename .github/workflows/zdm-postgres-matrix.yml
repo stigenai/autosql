@@ -68,15 +68,17 @@ jobs:
       - name: Test PostgreSQL future-object default privileges
         run: scripts/test-live-serial.sh ./pkg/postgres -run '^TestDefaultPrivilegeFutureObjectParity$'
       - name: Test PostgreSQL extension catalog and lifecycle parity
-        run: scripts/test-live-serial.sh ./pkg/postgres -run '^(TestInspectExtensionCatalogURL|TestExtensionCreateUpdateSchemaMoveAndGuardedDrop|TestExtensionOwnedMembersDoNotProduceDuplicateLifecycle)$'
+        run: scripts/test-live-serial.sh ./pkg/postgres -run '^(TestInspectExtensionCatalogURL|TestExtensionReadinessURLIsReadOnlyAndVersionAware|TestExtensionReadinessDetectsTrustedMemberOwnershipRelocationBlock|TestExtensionReadinessAcceptsInheritedOwnerUpdateAndMovePG18|TestBootstrapExtensionReadinessUsesServerTrustAndExplicitAuthority|TestExtensionCreateUpdateSchemaMoveAndGuardedDrop|TestExtensionOwnedMembersDoNotProduceDuplicateLifecycle|TestWholeDatabaseBootstrapExtensionReadinessFailsBeforeTargetMutation)$'
       - name: Test PostgreSQL composite-type model and lifecycle parity
         run: scripts/test-live-serial.sh ./pkg/postgres -run '^(TestCompositeInspectHCLRoundTripPreservesOrderTypesAndCollation|TestCompositeCreateAttributeLifecycleRenameAndGuardedDrop)$'
       - name: Test managed and external database-target lifecycle
         run: scripts/test-live-serial.sh ./pkg/postgres -run '^TestManagedAndExternalDatabaseTargetLifecycle$'
-      - name: Test complete empty-database bootstrap and phase recovery
-        run: scripts/test-live-serial.sh ./pkg/postgres -run '^(TestCanonicalCompleteBootstrapInventoryManifest|TestWholeDatabaseBootstrap)'
+      - name: Test semantic bootstrap fidelity and synthetic scale recovery
+        run: scripts/test-live-serial.sh ./pkg/postgres -run '^(TestSyntheticScaleBootstrapInventoryManifest|TestSemanticCellSignedDirectBootstrapInterruptionResume|TestSemanticCellCLISignedBootstrapAgainstNewPostgresDatabase|TestSemanticCellProductionOperatorSignedBootstrapAgainstNewPostgresDatabase|TestWholeDatabaseBootstrap)'
       - name: Test operator empty-database bootstrap reconciliation
         run: scripts/test-live-serial.sh ./pkg/operator -run '^TestOperatorWholeDatabaseBootstrapAgainstNewPostgresDatabase$'
+      - name: Test production operator signed-artifact bootstrap
+        run: scripts/test-live-serial.sh ./internal/operatorcontroller -run '^TestArtifactApplyCreatesFreshDatabaseAgainstPostgresWithRealSignatures$'
       - name: Benchmark complete bootstrap pipeline
         if: matrix.version == 16
         run: go test ./pkg/postgres -run '^$' -bench '^BenchmarkCompleteBootstrapPipeline$' -benchtime=3x -count=1 | tee bootstrap-bench.txt

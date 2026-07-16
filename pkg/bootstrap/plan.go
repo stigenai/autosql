@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -66,12 +67,51 @@ type BootstrapPhase struct {
 // Plan is the complete, credential-free execution contract for preparing a
 // database and converging every managed resource inside it.
 type Plan struct {
-	Version    string           `json:"version"`
-	Target     DatabaseTarget   `json:"target"`
-	SchemaPlan plan.Plan        `json:"schema_plan"`
-	Steps      []BootstrapStep  `json:"steps"`
-	Phases     []BootstrapPhase `json:"phases"`
-	Digest     string           `json:"digest"`
+	Version               string           `json:"version"`
+	Target                DatabaseTarget   `json:"target"`
+	SchemaPlan            plan.Plan        `json:"schema_plan"`
+	Steps                 []BootstrapStep  `json:"steps"`
+	Phases                []BootstrapPhase `json:"phases"`
+	Digest                string           `json:"digest"`
+	runtimeAuthorizations []runtimeAuthorization
+}
+
+type runtimeAuthorization struct{ value []byte }
+
+func (runtimeAuthorization) String() string   { return "[bound]" }
+func (runtimeAuthorization) GoString() string { return "bootstrap.runtimeAuthorization{[bound]}" }
+
+// WithRuntimeAuthorization attaches an opaque, process-bound capability. The
+// bytes cannot be read back, serialized, printed through exported fields, or
+// included in plan identity. Callers may attach bytes, but only the issuing
+// driver can authenticate a capability it generated.
+func (p Plan) WithRuntimeAuthorization(capability []byte) Plan {
+	p.runtimeAuthorizations = nil
+	if len(capability) > 0 {
+		p.runtimeAuthorizations = []runtimeAuthorization{{value: append([]byte(nil), capability...)}}
+	}
+	return p
+}
+
+// AddRuntimeAuthorization adds an independently scoped capability without
+// exposing any capability already attached to the plan.
+func (p Plan) AddRuntimeAuthorization(capability []byte) Plan {
+	if len(capability) > 0 {
+		p.runtimeAuthorizations = append(p.runtimeAuthorizations, runtimeAuthorization{value: append([]byte(nil), capability...)})
+	}
+	return p
+}
+
+// RuntimeAuthorizationMatches compares a driver-generated capability without
+// exposing the bearer value.
+func (p Plan) RuntimeAuthorizationMatches(capability []byte) bool {
+	matched := 0
+	for _, current := range p.runtimeAuthorizations {
+		if len(current.value) == len(capability) {
+			matched |= subtle.ConstantTimeCompare(current.value, capability)
+		}
+	}
+	return matched == 1
 }
 
 // ComposePlan lifts an already validated schema plan into the whole-database

@@ -183,7 +183,7 @@ func TestTrustedKeyScopeStatusValidityAndClock(t *testing.T) {
 func TestBoundedCanonicalParsing(t *testing.T) {
 	a, _, _ := fixture(t)
 	b, _ := a.MarshalCanonical()
-	cases := map[string][]byte{"whitespace": append([]byte(" "), b...), "duplicate": []byte(`{"version":"a","version":"b"}`), "utf8": []byte{0xff}, "depth": []byte(strings.Repeat("[", 65) + strings.Repeat("]", 65)), "size": make([]byte, (4<<20)+1)}
+	cases := map[string][]byte{"whitespace": append([]byte(" "), b...), "duplicate": []byte(`{"version":"a","version":"b"}`), "utf8": []byte{0xff}, "depth": []byte(strings.Repeat("[", 65) + strings.Repeat("]", 65)), "size": make([]byte, maxEncodedArtifactSize+1)}
 	for name, data := range cases {
 		t.Run(name, func(t *testing.T) {
 			if _, e := Parse(data); e == nil {

@@ -3,11 +3,15 @@ package postgres
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	neturl "net/url"
 	"os"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
+	"autosql/pkg/bootstrap"
 	"autosql/pkg/plugin"
 	"autosql/pkg/schema"
 	"autosql/pkg/source"
@@ -44,6 +48,106 @@ func TestExtensionPreflightAggregatesPolicyAndAvailability(t *testing.T) {
 	want := []string{"hstore:allowlist", "hstore:package", "pgcrypto:authority", "pgcrypto:dependency", "pgcrypto:schema", "pgcrypto:version"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("diagnostics=%v want=%v", got, want)
+	}
+}
+
+func TestExtensionReadinessClassifiesEveryRequestedExtensionDeterministically(t *testing.T) {
+	makeDocument := func(name, version, namespace string) schema.Document {
+		ns := renderResource(schema.KindSchema, schema.Name{Name: namespace}, `{}`)
+		extension := renderResource(schema.KindExtension, schema.Name{Schema: namespace, Name: name, Parent: ns.ID}, fmt.Sprintf(`{"version":%q,"relocatable":true,"trusted":true,"superuser":true,"requires":[]}`, version), schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+		return schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, extension}}}
+	}
+	base := ExtensionCatalog{
+		Versions:  []ExtensionAvailability{{Name: "demo", Version: "1.0", Relocatable: true, Trusted: true, Superuser: true}},
+		Paths:     []ExtensionUpdatePath{{Name: "demo", Source: "0.9", Target: "1.0", Path: "0.9--1.0"}},
+		Privilege: ExtensionPrivilegeContext{ServerMajor: 18, CurrentUser: "owner", CurrentDatabase: "cell", DatabaseOwner: true, CanCreateDatabase: true},
+	}
+	policy := ExtensionPolicy{Allowed: map[string]bool{"demo": true}, Versions: map[string][]string{"demo": {"1.0"}}, Schemas: map[string][]string{"demo": {"app"}}}
+	tests := []struct {
+		name    string
+		doc     schema.Document
+		catalog ExtensionCatalog
+		policy  ExtensionPolicy
+		want    ExtensionReadinessStatus
+	}{
+		{"ready trusted owner", makeDocument("demo", "1.0", "app"), base, policy, ExtensionReady},
+		{"missing package", makeDocument("missing", "1.0", "app"), base, ExtensionPolicy{Allowed: map[string]bool{"missing": true}, Versions: map[string][]string{"missing": {"1.0"}}, Schemas: map[string][]string{"missing": {"app"}}}, ExtensionMissingPackage},
+		{"unavailable version", makeDocument("demo", "2.0", "app"), base, ExtensionPolicy{Allowed: map[string]bool{"demo": true}, Versions: map[string][]string{"demo": {"2.0"}}, Schemas: map[string][]string{"demo": {"app"}}}, ExtensionUnavailableVersion},
+		{"fixed schema conflict", makeDocument("demo", "1.0", "app"), ExtensionCatalog{Versions: []ExtensionAvailability{{Name: "demo", Version: "1.0", Schema: "public", Trusted: true, Superuser: true}}, Privilege: base.Privilege}, policy, ExtensionSchemaConflicted},
+		{"privilege blocked untrusted", makeDocument("demo", "1.0", "app"), ExtensionCatalog{Versions: []ExtensionAvailability{{Name: "demo", Version: "1.0", Relocatable: true, Superuser: true}}, Privilege: base.Privilege}, ExtensionPolicy{Allowed: policy.Allowed, Versions: policy.Versions, Schemas: policy.Schemas, AllowUntrusted: true}, ExtensionPrivilegeBlocked},
+		{"unauthorized allowlist", makeDocument("demo", "1.0", "app"), base, ExtensionPolicy{Allowed: map[string]bool{}, Versions: policy.Versions, Schemas: policy.Schemas}, ExtensionUnauthorized},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			first := EvaluateExtensionReadiness(test.doc, test.catalog, test.policy)
+			second := EvaluateExtensionReadiness(test.doc, test.catalog, test.policy)
+			if len(first.Extensions) != 1 || first.Extensions[0].Status != test.want || first.Extensions[0].Remediation == "" {
+				t.Fatalf("report=%+v want=%s", first, test.want)
+			}
+			firstJSON, _ := json.Marshal(first)
+			secondJSON, _ := json.Marshal(second)
+			if string(firstJSON) != string(secondJSON) || strings.Contains(string(firstJSON), "postgres://") || strings.Contains(string(firstJSON), "password") {
+				t.Fatalf("readiness is nondeterministic or leaked a secret: %s != %s", firstJSON, secondJSON)
+			}
+		})
+	}
+}
+
+func TestExtensionReadinessInstalledAndTrustedPrivilegeSemantics(t *testing.T) {
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
+	extension := renderResource(schema.KindExtension, schema.Name{Schema: "app", Name: "demo", Parent: ns.ID}, `{"version":"1.0","relocatable":true,"trusted":true,"superuser":true,"requires":[]}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	doc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, extension}}}
+	policy := ExtensionPolicy{Allowed: map[string]bool{"demo": true}, Versions: map[string][]string{"demo": {"1.0"}}, Schemas: map[string][]string{"demo": {"app"}}}
+	for major := 14; major <= 18; major++ {
+		catalog := ExtensionCatalog{Versions: []ExtensionAvailability{{Name: "demo", Version: "1.0", Relocatable: true, Trusted: true, Superuser: true}}, Privilege: ExtensionPrivilegeContext{ServerMajor: major, CurrentUser: "owner", DatabaseOwner: true, CanCreateDatabase: true}}
+		if got := EvaluateExtensionReadiness(doc, catalog, policy); !got.Ready || got.Extensions[0].SuperuserRequired {
+			t.Fatalf("PostgreSQL %d trusted extension report=%+v", major, got)
+		}
+		catalog.Installed = []ExtensionInstallation{{Name: "demo", Version: "1.0", Schema: "app", Owner: "other"}}
+		catalog.Privilege = ExtensionPrivilegeContext{ServerMajor: major, CurrentUser: "reader"}
+		if got := EvaluateExtensionReadiness(doc, catalog, policy); !got.Ready {
+			t.Fatalf("PostgreSQL %d no-op installed extension required mutation privilege: %+v", major, got)
+		}
+	}
+}
+
+func TestExtensionReadinessUsesOperationSpecificPrivileges(t *testing.T) {
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "destination"}, `{}`)
+	extension := renderResource(schema.KindExtension, schema.Name{Schema: "destination", Name: "demo", Parent: ns.ID}, `{"version":"2.0","relocatable":true,"trusted":true,"superuser":true,"requires":[]}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	doc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, extension}}}
+	policy := ExtensionPolicy{Allowed: map[string]bool{"demo": true}, Versions: map[string][]string{"demo": {"2.0"}}, Schemas: map[string][]string{"demo": {"destination"}}}
+	base := ExtensionCatalog{
+		Versions:  []ExtensionAvailability{{Name: "demo", Version: "2.0", Relocatable: true, Trusted: true, Superuser: true}},
+		Paths:     []ExtensionUpdatePath{{Name: "demo", Source: "1.0", Target: "2.0", Path: "1.0--2.0"}},
+		Schemas:   []ExtensionSchemaPrivilege{{Name: "destination", CanCreate: true}},
+		Privilege: ExtensionPrivilegeContext{ServerMajor: 18, CurrentUser: "extension_owner", CurrentDatabase: "cell"},
+	}
+
+	update := base
+	update.Installed = []ExtensionInstallation{{Name: "demo", Version: "1.0", Schema: "destination", Owner: "owner_group", OwnerUsable: true, MemberObjectsOwned: true}}
+	if got := EvaluateExtensionReadiness(doc, update, policy); !got.Ready {
+		t.Fatalf("extension owner update was incorrectly blocked by database CREATE: %+v", got)
+	}
+
+	move := base
+	move.Installed = []ExtensionInstallation{{Name: "demo", Version: "2.0", Schema: "source", Owner: "owner_group", OwnerUsable: true, MemberObjectsOwned: true}}
+	if got := EvaluateExtensionReadiness(doc, move, policy); !got.Ready {
+		t.Fatalf("owned relocation with destination CREATE was incorrectly blocked: %+v", got)
+	}
+	combined := base
+	combined.Installed = []ExtensionInstallation{{Name: "demo", Version: "1.0", Schema: "source", Owner: "owner_group", OwnerUsable: true, MemberObjectsOwned: true}}
+	if got := EvaluateExtensionReadiness(doc, combined, policy); got.Extensions[0].Status != ExtensionPrivilegeBlocked || !strings.Contains(got.Extensions[0].Reason, "update may add") {
+		t.Fatalf("trusted update plus move was not conservatively split: %+v", got)
+	}
+	move.Installed[0].MemberObjectsOwned = false
+	if got := EvaluateExtensionReadiness(doc, move, policy); got.Extensions[0].Status != ExtensionPrivilegeBlocked || !strings.Contains(got.Extensions[0].Reason, "member object") {
+		t.Fatalf("member ownership relocation report=%+v", got)
+	}
+	move.Installed[0].MemberObjectsOwned = true
+	move.Schemas = nil
+	move.Privilege.CanCreateDatabase = true
+	if got := EvaluateExtensionReadiness(doc, move, policy); got.Extensions[0].Status != ExtensionSchemaConflicted {
+		t.Fatalf("planned destination incorrectly substituted database CREATE for actual schema: %+v", got)
 	}
 }
 
@@ -96,6 +200,303 @@ func TestInspectExtensionCatalogURL(t *testing.T) {
 	if !found {
 		t.Fatal("server catalog did not expose pgcrypto")
 	}
+}
+
+func TestExtensionReadinessURLIsReadOnlyAndVersionAware(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx := context.Background()
+	config, err := pgx.ParseConfig(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	var owner string
+	var beforeExtensions, beforeSchemas int
+	if err := conn.QueryRow(ctx, `select pg_get_userbyid(datdba),(select count(*) from pg_extension),(select count(*) from pg_namespace) from pg_database where datname=current_database()`).Scan(&owner, &beforeExtensions, &beforeSchemas); err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := InspectExtensionCatalogURL(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	version := ""
+	for _, available := range catalog.Versions {
+		if available.Name == "pgcrypto" {
+			version = available.Version
+		}
+	}
+	if version == "" {
+		t.Fatal("pgcrypto control file is unavailable in matrix image")
+	}
+	target := bootstrap.DatabaseTarget{Mode: bootstrap.ExternalDatabase, Endpoint: bootstrap.ServerEndpoint{Host: config.Host, Port: uint16(config.Port), TLSMode: "disable"}, MaintenanceDatabase: config.Database, Name: config.Database, Owner: owner, ConnectionLimit: -1}.Normalize()
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "public"}, `{}`)
+	extension := renderResource(schema.KindExtension, schema.Name{Schema: "public", Name: "pgcrypto", Parent: ns.ID}, fmt.Sprintf(`{"version":%q,"relocatable":true,"trusted":true,"superuser":true,"requires":[]}`, version), schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	doc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, extension}}}
+	policy := ExtensionPolicy{Allowed: map[string]bool{"pgcrypto": true}, Versions: map[string][]string{"pgcrypto": {version}}, Schemas: map[string][]string{"pgcrypto": {"public"}}, AllowUntrusted: true}
+	report, err := PreflightExtensionReadinessURL(ctx, url, target, doc, policy)
+	if err != nil || !report.Ready || len(report.Extensions) != 1 || report.Extensions[0].Status != ExtensionReady {
+		t.Fatalf("report=%+v err=%v", report, err)
+	}
+	var afterExtensions, afterSchemas int
+	if err := conn.QueryRow(ctx, `select (select count(*) from pg_extension),(select count(*) from pg_namespace)`).Scan(&afterExtensions, &afterSchemas); err != nil {
+		t.Fatal(err)
+	}
+	if beforeExtensions != afterExtensions || beforeSchemas != afterSchemas {
+		t.Fatalf("readiness mutated catalogs: extensions %d->%d schemas %d->%d", beforeExtensions, afterExtensions, beforeSchemas, afterSchemas)
+	}
+	missing := extension
+	missing.Name.Name = "autosql_missing_control_file"
+	missing.ID = schema.StableID(missing.Kind, missing.Name)
+	missing.Spec = json.RawMessage(`{"version":"1.0","relocatable":true,"trusted":true,"superuser":true,"requires":[]}`)
+	missingDoc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, missing}}}
+	missingPolicy := ExtensionPolicy{Allowed: map[string]bool{missing.Name.Name: true}, Versions: map[string][]string{missing.Name.Name: {"1.0"}}, Schemas: map[string][]string{missing.Name.Name: {"public"}}}
+	missingReport, err := PreflightExtensionReadinessURL(ctx, url, target, missingDoc, missingPolicy)
+	if err != nil || missingReport.Extensions[0].Status != ExtensionMissingPackage || !strings.Contains(missingReport.Extensions[0].Remediation, ".control") {
+		t.Fatalf("missing report=%+v err=%v", missingReport, err)
+	}
+}
+
+func TestExtensionReadinessDetectsTrustedMemberOwnershipRelocationBlock(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx := context.Background()
+	admin, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close(ctx)
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	role, database, destination := "autosql_ext_owner_"+suffix, "autosql_ext_move_"+suffix, "locked_destination"
+	password := "autosql-extension-readiness"
+	defer func() {
+		_, _ = admin.Exec(context.Background(), `select pg_terminate_backend(pid) from pg_stat_activity where datname=$1`, database)
+		_, _ = admin.Exec(context.Background(), "drop database if exists "+pgx.Identifier{database}.Sanitize())
+		_, _ = admin.Exec(context.Background(), "drop role if exists "+pgx.Identifier{role}.Sanitize())
+	}()
+	if _, err := admin.Exec(ctx, "create role "+pgx.Identifier{role}.Sanitize()+" login password '"+password+"'"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admin.Exec(ctx, "create database "+pgx.Identifier{database}.Sanitize()+" owner "+pgx.Identifier{role}.Sanitize()); err != nil {
+		t.Fatal(err)
+	}
+	config, err := pgx.ParseConfig(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.Database, config.User, config.Password = database, role, password
+	roleURL := extensionTestRoleURL(t, url, database, role, password)
+	member, err := pgx.Connect(ctx, roleURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := member.Exec(ctx, `create extension hstore with schema public; create schema `+pgx.Identifier{destination}.Sanitize()+` authorization `+pgx.Identifier{role}.Sanitize()); err != nil {
+		member.Close(ctx)
+		t.Fatal(err)
+	}
+	catalog, err := InspectExtensionCatalogURL(ctx, roleURL)
+	if err != nil {
+		member.Close(ctx)
+		t.Fatal(err)
+	}
+	version := ""
+	for _, installed := range catalog.Installed {
+		if installed.Name == "hstore" {
+			version = installed.Version
+			if installed.MemberObjectsOwned {
+				member.Close(ctx)
+				t.Skip("server installed trusted hstore members as the invoking role; no bootstrap-owner disagreement to reproduce")
+			}
+		}
+	}
+	if version == "" {
+		member.Close(ctx)
+		t.Fatal("hstore was not installed")
+	}
+	ns := renderResource(schema.KindSchema, schema.Name{Name: destination}, `{}`)
+	extension := renderResource(schema.KindExtension, schema.Name{Schema: destination, Name: "hstore", Parent: ns.ID}, fmt.Sprintf(`{"version":%q,"relocatable":true,"trusted":true,"superuser":true,"requires":[]}`, version), schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	doc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, extension}}}
+	target := bootstrap.DatabaseTarget{Mode: bootstrap.ExternalDatabase, Endpoint: bootstrap.ServerEndpoint{Host: config.Host, Port: uint16(config.Port), TLSMode: "disable"}, MaintenanceDatabase: database, Name: database, Owner: role, ConnectionLimit: -1}.Normalize()
+	policy := ExtensionPolicy{Allowed: map[string]bool{"hstore": true}, Versions: map[string][]string{"hstore": {version}}, Schemas: map[string][]string{"hstore": {destination}}}
+	report, err := PreflightExtensionReadinessURL(ctx, roleURL, target, doc, policy)
+	if err != nil || len(report.Extensions) != 1 || report.Extensions[0].Status != ExtensionPrivilegeBlocked || !strings.Contains(report.Extensions[0].Reason, "member object") {
+		member.Close(ctx)
+		t.Fatalf("relocation report=%+v err=%v", report, err)
+	}
+	_, moveErr := member.Exec(ctx, `alter extension hstore set schema `+pgx.Identifier{destination}.Sanitize())
+	member.Close(ctx)
+	if moveErr == nil || !strings.Contains(moveErr.Error(), "must be owner") {
+		t.Fatalf("expected PostgreSQL member ownership failure, got %v", moveErr)
+	}
+}
+
+func TestExtensionReadinessAcceptsInheritedOwnerUpdateAndMovePG18(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx := context.Background()
+	admin, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close(ctx)
+	var major int
+	if err := admin.QueryRow(ctx, `select current_setting('server_version_num')::integer/10000`).Scan(&major); err != nil {
+		t.Fatal(err)
+	}
+	if major != 18 {
+		t.Skip("PG18 inherited-owner proof")
+	}
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	ownerRole, memberRole := "autosql_ext_group_"+suffix, "autosql_ext_member_"+suffix
+	database, destination, password := "autosql_ext_inherit_"+suffix, "inherited_destination", "autosql-extension-membership"
+	ownerPassword := "autosql-extension-owner"
+	defer func() {
+		_, _ = admin.Exec(context.Background(), `select pg_terminate_backend(pid) from pg_stat_activity where datname=$1`, database)
+		_, _ = admin.Exec(context.Background(), "drop database if exists "+pgx.Identifier{database}.Sanitize())
+		_, _ = admin.Exec(context.Background(), "drop role if exists "+pgx.Identifier{memberRole}.Sanitize())
+		_, _ = admin.Exec(context.Background(), "drop role if exists "+pgx.Identifier{ownerRole}.Sanitize())
+	}()
+	if _, err := admin.Exec(ctx, "create role "+pgx.Identifier{ownerRole}.Sanitize()+" login password '"+ownerPassword+"'"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admin.Exec(ctx, "create role "+pgx.Identifier{memberRole}.Sanitize()+" login password '"+password+"' in role "+pgx.Identifier{ownerRole}.Sanitize()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admin.Exec(ctx, "create database "+pgx.Identifier{database}.Sanitize()+" owner "+pgx.Identifier{ownerRole}.Sanitize()); err != nil {
+		t.Fatal(err)
+	}
+	ownerConfig, err := pgx.ParseConfig(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerConfig.Database = database
+	ownerConfig.User, ownerConfig.Password = ownerRole, ownerPassword
+	ownerTarget, err := pgx.ConnectConfig(ctx, ownerConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ownerTarget.Exec(ctx, `create extension hstore with schema public version '1.4'`); err != nil {
+		ownerTarget.Close(ctx)
+		t.Fatal(err)
+	}
+	if _, err := ownerTarget.Exec(ctx, `create schema `+pgx.Identifier{destination}.Sanitize()+" authorization "+pgx.Identifier{ownerRole}.Sanitize()); err != nil {
+		ownerTarget.Close(ctx)
+		t.Fatal(err)
+	}
+	ownerTarget.Close(ctx)
+	adminConfig, err := pgx.ParseConfig(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminConfig.Database = database
+	adminTarget, err := pgx.ConnectConfig(ctx, adminConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Trusted installation intentionally assigns member objects to the
+	// bootstrap superuser. Rebind only this extension's ownable members to the
+	// extension owner to model a reviewed ownership handoff, then prove that a
+	// member of that owner role can update and relocate it.
+	ownershipStatements := []string{
+		`update pg_extension set extowner=(select oid from pg_roles where rolname=$1) where extname='hstore'`,
+		`update pg_type set typowner=(select oid from pg_roles where rolname=$1) where oid in (select objid from pg_depend where refclassid='pg_extension'::regclass and refobjid=(select oid from pg_extension where extname='hstore') and classid='pg_type'::regclass and deptype='e')`,
+		`update pg_proc set proowner=(select oid from pg_roles where rolname=$1) where oid in (select objid from pg_depend where refclassid='pg_extension'::regclass and refobjid=(select oid from pg_extension where extname='hstore') and classid='pg_proc'::regclass and deptype='e')`,
+		`update pg_operator set oprowner=(select oid from pg_roles where rolname=$1) where oid in (select objid from pg_depend where refclassid='pg_extension'::regclass and refobjid=(select oid from pg_extension where extname='hstore') and classid='pg_operator'::regclass and deptype='e')`,
+		`update pg_opclass set opcowner=(select oid from pg_roles where rolname=$1) where oid in (select objid from pg_depend where refclassid='pg_extension'::regclass and refobjid=(select oid from pg_extension where extname='hstore') and classid='pg_opclass'::regclass and deptype='e')`,
+		`update pg_opfamily set opfowner=(select oid from pg_roles where rolname=$1) where oid in (select objid from pg_depend where refclassid='pg_extension'::regclass and refobjid=(select oid from pg_extension where extname='hstore') and classid='pg_opfamily'::regclass and deptype='e')`,
+	}
+	for _, statement := range ownershipStatements {
+		if _, err := adminTarget.Exec(ctx, statement, ownerRole); err != nil {
+			adminTarget.Close(ctx)
+			t.Fatal(err)
+		}
+	}
+	adminTarget.Close(ctx)
+	memberConfig, err := pgx.ParseConfig(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	memberConfig.Database, memberConfig.User, memberConfig.Password = database, memberRole, password
+	memberURL := extensionTestRoleURL(t, url, database, memberRole, password)
+	catalog, err := InspectExtensionCatalogURL(ctx, memberURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	installed := ExtensionInstallation{}
+	for _, item := range catalog.Installed {
+		if item.Name == "hstore" {
+			installed = item
+		}
+	}
+	if installed.Version != "1.4" || !installed.OwnerUsable || !installed.MemberObjectsOwned {
+		t.Fatalf("inherited catalog ownership=%+v all=%+v", installed, catalog.Installed)
+	}
+	target := bootstrap.DatabaseTarget{Mode: bootstrap.ExternalDatabase, Endpoint: bootstrap.ServerEndpoint{Host: memberConfig.Host, Port: uint16(memberConfig.Port), TLSMode: "disable"}, MaintenanceDatabase: database, Name: database, Owner: ownerRole, ConnectionLimit: -1}.Normalize()
+	publicNS := renderResource(schema.KindSchema, schema.Name{Name: "public"}, `{}`)
+	updateExtension := renderResource(schema.KindExtension, schema.Name{Schema: "public", Name: "hstore", Parent: publicNS.ID}, `{"version":"1.8","relocatable":true,"trusted":true,"superuser":true,"requires":[]}`, schema.Dependency{Target: publicNS.ID, Type: schema.DependencyContains})
+	updateDoc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{publicNS, updateExtension}}}
+	updatePolicy := ExtensionPolicy{Allowed: map[string]bool{"hstore": true}, Versions: map[string][]string{"hstore": {"1.8"}}, Schemas: map[string][]string{"hstore": {"public"}}}
+	report, err := PreflightExtensionReadinessURL(ctx, memberURL, target, updateDoc, updatePolicy)
+	if err != nil || !report.Ready {
+		t.Fatalf("inherited owner update readiness=%+v err=%v", report, err)
+	}
+	member, err := pgx.Connect(ctx, memberURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = member.Exec(ctx, "set role "+pgx.Identifier{ownerRole}.Sanitize()+`; alter extension hstore update to '1.8'; reset role`)
+	if err != nil {
+		member.Close(ctx)
+		t.Fatalf("PostgreSQL rejected inherited-owner update after ready preflight: %v", err)
+	}
+	adminTarget, err = pgx.ConnectConfig(ctx, adminConfig)
+	if err != nil {
+		member.Close(ctx)
+		t.Fatal(err)
+	}
+	for _, statement := range ownershipStatements {
+		if _, err := adminTarget.Exec(ctx, statement, ownerRole); err != nil {
+			adminTarget.Close(ctx)
+			member.Close(ctx)
+			t.Fatal(err)
+		}
+	}
+	adminTarget.Close(ctx)
+	destinationNS := renderResource(schema.KindSchema, schema.Name{Name: destination}, `{}`)
+	moveExtension := renderResource(schema.KindExtension, schema.Name{Schema: destination, Name: "hstore", Parent: destinationNS.ID}, `{"version":"1.8","relocatable":true,"trusted":true,"superuser":true,"requires":[]}`, schema.Dependency{Target: destinationNS.ID, Type: schema.DependencyContains})
+	moveDoc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{destinationNS, moveExtension}}}
+	movePolicy := ExtensionPolicy{Allowed: map[string]bool{"hstore": true}, Versions: map[string][]string{"hstore": {"1.8"}}, Schemas: map[string][]string{"hstore": {destination}}}
+	report, err = PreflightExtensionReadinessURL(ctx, memberURL, target, moveDoc, movePolicy)
+	if err != nil || !report.Ready {
+		member.Close(ctx)
+		t.Fatalf("inherited owner move readiness=%+v err=%v", report, err)
+	}
+	_, err = member.Exec(ctx, "set role "+pgx.Identifier{ownerRole}.Sanitize()+`; alter extension hstore set schema `+pgx.Identifier{destination}.Sanitize()+`; reset role`)
+	member.Close(ctx)
+	if err != nil {
+		t.Fatalf("PostgreSQL rejected inherited-owner move after ready preflight: %v", err)
+	}
+}
+
+func extensionTestRoleURL(t *testing.T, raw, database, user, password string) string {
+	t.Helper()
+	parsed, err := neturl.Parse(raw)
+	if err != nil || parsed.Scheme == "" {
+		t.Fatalf("test PostgreSQL URL must use URI form: %v", err)
+	}
+	parsed.User = neturl.UserPassword(user, password)
+	parsed.Path = "/" + database
+	return parsed.String()
 }
 
 func TestExtensionCreateUpdateSchemaMoveAndGuardedDrop(t *testing.T) {

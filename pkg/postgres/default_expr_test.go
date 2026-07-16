@@ -51,6 +51,11 @@ func TestClassifyDefaultExpressionTypedForms(t *testing.T) {
 				t.Fatalf("function=%+v", got.Function)
 			}
 		}},
+		{"(extract(epoch from now()) * 1000)::bigint", defaultExpressionCast, func(t *testing.T, got defaultExpression) {
+			if got.Cast == nil || got.Cast.Expression.Kind != defaultExpressionOperator || got.Cast.Expression.Operator == nil || got.Cast.Expression.Operator.Name != "*" {
+				t.Fatalf("operator cast=%+v", got.Cast)
+			}
+		}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.input, func(t *testing.T) {
@@ -85,7 +90,8 @@ func TestClassifyDefaultExpressionRejectsStatementAndUnknownShapes(t *testing.T)
 		"X'ff'",
 		"'{}'::integer[5]",
 		"'{}'::integer[][]",
-		"1 + 2",
+		"1 ^ 2",
+		"1 = 2",
 		"(SELECT 1)",
 		"CASE WHEN true THEN 1 ELSE 2 END",
 		"current_user",
@@ -130,7 +136,7 @@ func TestCoreDefaultClassifierPolicyDeniesRecognizedFutureForms(t *testing.T) {
 		{"text", "lower('VALUE')"},
 		{"integer", "nextval('app.seq'::regclass)"},
 		{"text", "app.value"},
-		{"integer", "1 + 2"},
+		{"text", "1 + 2"},
 		{"integer", "1; SELECT 2"},
 		{"timestamp", "CURRENT_TIMESTAMP(03)"},
 	} {
@@ -256,7 +262,7 @@ func TestCoreDefaultClassifierAdversarialInputsProduceNoStatements(t *testing.T)
 		"U&'secret'",
 		"B'1010'",
 		"X'ff'",
-		"1 + 2",
+		"1 ^ 2",
 		"(SELECT 1)",
 		"CASE WHEN true THEN 1 ELSE 2 END",
 		"ARRAY[1,2]",
@@ -291,7 +297,6 @@ func TestCoreDefaultClassifierRejectsNoncanonicalAndOutOfRangeValues(t *testing.
 		{"integer", "00"},
 		{"integer", "01"},
 		{"integer", "-0"},
-		{"integer", "+1"},
 		{"timestamp", "CURRENT_TIMESTAMP(7)"},
 		{"timestamp", "CURRENT_TIMESTAMP(03)"},
 		{"timestamp", "CURRENT_TIMESTAMP()"},
@@ -304,6 +309,123 @@ func TestCoreDefaultClassifierRejectsNoncanonicalAndOutOfRangeValues(t *testing.
 				t.Fatalf("out=%+v err=%v", out, err)
 			}
 		})
+	}
+}
+
+func TestBoundedOperatorDefaultsCanonicalizeAndRender(t *testing.T) {
+	tests := []struct {
+		typ, input, canonical string
+	}{
+		{"integer", "1+2*3", "(1 OPERATOR(pg_catalog.+) (2 OPERATOR(pg_catalog.*) 3))"},
+		{"integer", "(1+2)*3", "((1 OPERATOR(pg_catalog.+) 2) OPERATOR(pg_catalog.*) 3)"},
+		{"integer", "10/2%3", "((10 OPERATOR(pg_catalog./) 2) OPERATOR(pg_catalog.%) 3)"},
+		{"integer", "10-(2-1)", "(10 OPERATOR(pg_catalog.-) (2 OPERATOR(pg_catalog.-) 1))"},
+		{"integer", "-(1+2)", "(OPERATOR(pg_catalog.-) (1 OPERATOR(pg_catalog.+) 2))"},
+		{"integer", "+1", "(OPERATOR(pg_catalog.+) 1)"},
+		{"numeric", "1.5 + 2::numeric", "(1.5 OPERATOR(pg_catalog.+) 2::numeric)"},
+		{"numeric", "5.5 % 2", "(5.5 OPERATOR(pg_catalog.%) 2)"},
+		{"smallint", "32766 + 1", "(32766 OPERATOR(pg_catalog.+) 1)"},
+		{"bigint", "2147483647::bigint + 1", "(2147483647::bigint OPERATOR(pg_catalog.+) 1)"},
+		{"real", "1::real + 2::real", "(1::real OPERATOR(pg_catalog.+) 2::real)"},
+		{"bigint", "(extract(epoch from now()) * 1000)::bigint", "(extract(epoch from CURRENT_TIMESTAMP) OPERATOR(pg_catalog.*) 1000)::bigint"},
+		{"bigint", "((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint", "(extract(epoch from CURRENT_TIMESTAMP) OPERATOR(pg_catalog.*) 1000::numeric)::bigint"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			if got := postgresDefault(tc.input); got != tc.canonical {
+				t.Fatalf("postgresDefault(%q)=%q want %q", tc.input, got, tc.canonical)
+			}
+			statements, err := renderDocumentWithDefault(tc.typ, tc.canonical)
+			if err != nil || len(statements) == 0 {
+				t.Fatalf("statements=%+v err=%v", statements, err)
+			}
+			if !strings.Contains(statements[len(statements)-1], " DEFAULT "+tc.canonical) {
+				t.Fatalf("rendered statement=%q", statements[len(statements)-1])
+			}
+		})
+	}
+}
+
+func TestBoundedOperatorDefaultsFailClosed(t *testing.T) {
+	tests := []struct{ typ, value, diagnostic string }{
+		{"integer", "1 / 0", "divisor evaluates to zero"},
+		{"integer", "1 % 0.0", "divisor evaluates to zero"},
+		{"integer", "1 / (2 - 2)", "divisor evaluates to zero"},
+		{"integer", "1 % (3 * 0)", "divisor evaluates to zero"},
+		{"integer", "1 + app.secret", "not numeric"},
+		{"integer", "1 + lower('2')", "not allowlisted"},
+		{"integer", "1 + random()", "not allowlisted"},
+		{"integer", "1 + (SELECT secret FROM app.secrets)", "unsupported AST node"},
+		{"integer", "1 || 2", "operator is not allowlisted"},
+		{"integer", "1 OPERATOR(public.+) 2", "operator is not allowlisted"},
+		{"integer", "extract(day from now()) + 1", "not allowlisted"},
+		{"integer", "extract(epoch from clock_timestamp()) + 1", "not allowlisted"},
+		{"integer", "pg_catalog.extract('epoch', now()) + 1", "not allowlisted"},
+		{"numeric", "1e100 + 1", "canonical finite literal"},
+		{"text", "1 + 2", "not a numeric core type"},
+		{"integer", "1 / (1 / 2)", "divisor evaluates to zero"},
+		{"integer", "1 / (0.4::integer)", "divisor evaluates to zero"},
+		{"integer", "1 / (0.4::numeric(1,0))", "divisor evaluates to zero"},
+		{"real", "1::real / (0.00000000000000000000000000000000000000000000000001::real)", "divisor evaluates to zero"},
+		{"real", "1::real % 1::real", "modulo does not support"},
+		{"smallint", "32767 + 1", "outside PostgreSQL type bounds"},
+		{"integer", "2147483647 + 1", "outside PostgreSQL type bounds"},
+		{"bigint", "(2147483647 + 1)::bigint", "outside PostgreSQL type bounds"},
+		{"real", "1::real / ((16777216::real + 1::real) - 16777216::real)", "divisor evaluates to zero"},
+		{"integer", "(-2147483648)::integer % (-1)::integer", "minimum modulo -1"},
+		{"bigint", "(-9223372036854775808)::bigint % (-1)::bigint", "minimum modulo -1"},
+		{"integer", "(-2147483648::integer) % (-1::integer)", "outside PostgreSQL type bounds"},
+		{"bigint", "(-9223372036854775808::bigint) % (-1::bigint)", "outside PostgreSQL type bounds"},
+		{"smallint", "extract(epoch from now()) + 0", "outside PostgreSQL type bounds"},
+		{"numeric", "1 / extract(epoch from now())", "divisor range includes zero"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.value, func(t *testing.T) {
+			statements, err := renderDocumentWithDefault(tc.typ, tc.value)
+			if err == nil || len(statements) != 0 {
+				t.Fatalf("statements=%+v err=%v", statements, err)
+			}
+			if !strings.Contains(err.Error(), tc.diagnostic) {
+				t.Fatalf("diagnostic=%q want substring %q", err, tc.diagnostic)
+			}
+		})
+	}
+}
+
+func TestBoundedOperatorDefaultNormalizationIsDeterministic(t *testing.T) {
+	forms := []string{
+		"(extract(epoch from now()) * 1000)::bigint",
+		"((EXTRACT(epoch FROM transaction_timestamp()) * (1000)::bigint))::bigint",
+	}
+	want := []string{
+		"(extract(epoch from CURRENT_TIMESTAMP) OPERATOR(pg_catalog.*) 1000)::bigint",
+		"(extract(epoch from CURRENT_TIMESTAMP) OPERATOR(pg_catalog.*) 1000::bigint)::bigint",
+	}
+	for i, input := range forms {
+		first := postgresDefault(input)
+		second := postgresDefault(first)
+		if first != want[i] || second != first {
+			t.Fatalf("input=%q first=%q second=%q want=%q", input, first, second, want[i])
+		}
+	}
+	a, err := New().Normalize(context.Background(), documentWithDefault("bigint", "(extract(epoch from now())*1000)::int8"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := New().Normalize(context.Background(), documentWithDefault("bigint", "((EXTRACT(epoch FROM transaction_timestamp()) * 1000))::bigint"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	af, err := schema.SemanticFingerprint(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bf, err := schema.SemanticFingerprint(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if af != bf {
+		t.Fatalf("equivalent normalized defaults have different fingerprints: %s != %s", af, bf)
 	}
 }
 
@@ -348,11 +470,11 @@ func validDefaultExpressionShape(expr defaultExpression, depth int) bool {
 	}
 	switch expr.Kind {
 	case defaultExpressionLiteral:
-		return expr.Literal != nil && expr.Cast == nil && expr.Function == nil && expr.Reference == nil && expr.Array == nil && expr.Literal.Kind != defaultLiteralInvalid
+		return expr.Literal != nil && expr.Cast == nil && expr.Function == nil && expr.Operator == nil && expr.Reference == nil && expr.Array == nil && expr.Literal.Kind != defaultLiteralInvalid
 	case defaultExpressionCast:
-		return expr.Literal == nil && expr.Cast != nil && expr.Function == nil && expr.Reference == nil && expr.Array == nil && len(expr.Cast.Type.Name.Parts) > 0 && validDefaultExpressionShape(expr.Cast.Expression, depth+1)
+		return expr.Literal == nil && expr.Cast != nil && expr.Function == nil && expr.Operator == nil && expr.Reference == nil && expr.Array == nil && len(expr.Cast.Type.Name.Parts) > 0 && validDefaultExpressionShape(expr.Cast.Expression, depth+1)
 	case defaultExpressionFunction:
-		if expr.Literal != nil || expr.Cast != nil || expr.Function == nil || expr.Reference != nil || expr.Array != nil || len(expr.Function.Name.Parts) == 0 {
+		if expr.Literal != nil || expr.Cast != nil || expr.Function == nil || expr.Operator != nil || expr.Reference != nil || expr.Array != nil || len(expr.Function.Name.Parts) == 0 {
 			return false
 		}
 		for _, arg := range expr.Function.Arguments {
@@ -361,10 +483,18 @@ func validDefaultExpressionShape(expr defaultExpression, depth int) bool {
 			}
 		}
 		return true
+	case defaultExpressionOperator:
+		if expr.Literal != nil || expr.Cast != nil || expr.Function != nil || expr.Operator == nil || expr.Reference != nil || expr.Array != nil || !isBoundedDefaultOperator(expr.Operator.Name) {
+			return false
+		}
+		if expr.Operator.Left != nil && !validDefaultExpressionShape(*expr.Operator.Left, depth+1) {
+			return false
+		}
+		return validDefaultExpressionShape(expr.Operator.Right, depth+1)
 	case defaultExpressionReference:
-		return expr.Literal == nil && expr.Cast == nil && expr.Function == nil && expr.Reference != nil && expr.Array == nil && len(expr.Reference.Parts) > 0
+		return expr.Literal == nil && expr.Cast == nil && expr.Function == nil && expr.Operator == nil && expr.Reference != nil && expr.Array == nil && len(expr.Reference.Parts) > 0
 	case defaultExpressionArray:
-		if expr.Literal != nil || expr.Cast != nil || expr.Function != nil || expr.Reference != nil || expr.Array == nil {
+		if expr.Literal != nil || expr.Cast != nil || expr.Function != nil || expr.Operator != nil || expr.Reference != nil || expr.Array == nil {
 			return false
 		}
 		for _, element := range expr.Array {

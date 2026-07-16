@@ -90,19 +90,38 @@ func (s VerifiedArtifactApplyService) ApplyVersionedAttempt(ctx context.Context,
 	return out, nil
 }
 
-// VerifyArtifact exposes exactly the same trusted release-manifest policy used
-// by the single-artifact path, without granting a mutation capability.
-func (s VerifiedArtifactApplyService) VerifyArtifact(a artifact.Artifact) (artifact.VerifiedArtifact, error) {
+// verificationPolicy is the single policy construction path for both
+// verification-only callers and mutation. mandatoryNoEdits is supplied by
+// security boundaries (such as the Kubernetes operator), not by production
+// configuration, so a permissive configuration cannot weaken the caller.
+func (s VerifiedArtifactApplyService) verificationPolicy(a artifact.Artifact, mandatoryNoEdits bool) (artifact.VerifyPolicy, error) {
 	p := s.Policy
 	var err error
 	if s.PolicyFor != nil {
 		p, err = s.PolicyFor(a)
 		if err != nil {
-			return artifact.VerifiedArtifact{}, err
+			return artifact.VerifyPolicy{}, err
 		}
 	}
-	if s.NoEdits {
+	if s.NoEdits || mandatoryNoEdits {
 		p.NoEdits = true
+	}
+	return p, nil
+
+}
+
+// VerifyArtifact exposes the configured trusted release-manifest policy
+// without granting a mutation capability.
+func (s VerifiedArtifactApplyService) VerifyArtifact(a artifact.Artifact) (artifact.VerifiedArtifact, error) {
+	return s.VerifyArtifactForApply(a, false)
+}
+
+// VerifyArtifactForApply applies the exact verification policy used by Apply.
+// A true mandatoryNoEdits value cannot be disabled by production config.
+func (s VerifiedArtifactApplyService) VerifyArtifactForApply(a artifact.Artifact, mandatoryNoEdits bool) (artifact.VerifiedArtifact, error) {
+	p, err := s.verificationPolicy(a, mandatoryNoEdits)
+	if err != nil {
+		return artifact.VerifiedArtifact{}, err
 	}
 	return a.VerifyTrusted(p)
 }
@@ -119,17 +138,7 @@ func (s VerifiedArtifactApplyService) Apply(ctx context.Context, request ApplyRe
 	if err != nil {
 		return ApplyResult{Status: "refused"}, err
 	}
-	verifyPolicy := s.Policy
-	if s.PolicyFor != nil {
-		verifyPolicy, err = s.PolicyFor(a)
-		if err != nil {
-			return ApplyResult{Status: "refused"}, err
-		}
-	}
-	if s.NoEdits || request.NoEdits {
-		verifyPolicy.NoEdits = true
-	}
-	v, err := a.VerifyTrusted(verifyPolicy)
+	v, err := s.VerifyArtifactForApply(a, request.NoEdits)
 	if err != nil {
 		return ApplyResult{Status: "refused"}, err
 	}
