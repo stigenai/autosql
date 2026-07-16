@@ -10,6 +10,7 @@ import (
 
 	"autosql/internal/cli"
 	"autosql/pkg/artifact"
+	"autosql/pkg/bootstrap"
 	"autosql/pkg/operator"
 	"autosql/pkg/plan"
 	"autosql/pkg/postgres"
@@ -42,7 +43,7 @@ func ArtifactApply(ctx context.Context, resource operator.Resource, digest strin
 	}
 	if resource.Spec.Kind == operator.Declarative && resource.ResolvedSource != "" &&
 		(resource.Spec.Source.Inline != "" || resource.Spec.Source.SecretRef != nil || resource.Spec.Source.ConfigMapRef != nil) {
-		if err := verifyDeclarativePlan(ctx, resource.ResolvedSource, resource.ResolvedDatabaseURL, a); err != nil {
+		if err := verifyDeclarativePlan(ctx, resource.ResolvedSource, resource.ResolvedDatabaseURL, a, resource.Spec.BootstrapAuthority, resource.Spec.CreateDatabase); err != nil {
 			return operator.ApplyResult{PlanDigest: a.Plan.Digest, TargetIdentity: a.DatabaseIdentity}, err
 		}
 	}
@@ -77,7 +78,7 @@ func ArtifactApply(ctx context.Context, resource operator.Resource, digest strin
 // verifyDeclarativePlan makes source-to-plan generation explicit while still
 // keeping the signed artifact as the only mutation input. This catches drift
 // between an inline/Kubernetes-backed desired schema and the approved plan.
-func verifyDeclarativePlan(ctx context.Context, desiredSQL, databaseURL string, a artifact.Artifact) error {
+func verifyDeclarativePlan(ctx context.Context, desiredSQL, databaseURL string, a artifact.Artifact, authority *bootstrap.Contract, createDatabase bool) error {
 	desired, err := source.LoadContext(ctx, source.Input{URI: "operator:inline", Format: source.FormatSQL, Data: []byte(desiredSQL)})
 	if err != nil {
 		return errors.New("declarative source is invalid")
@@ -85,6 +86,12 @@ func verifyDeclarativePlan(ctx context.Context, desiredSQL, databaseURL string, 
 	desired, err = postgres.New().Normalize(ctx, desired)
 	if err != nil {
 		return errors.New("declarative source normalization failed")
+	}
+	if authority != nil {
+		report, preflightErr := postgres.PreflightBootstrapProvisioning(ctx, desired, nil, *authority, createDatabase)
+		if preflightErr != nil || !report.Supported {
+			return errors.New("declarative bootstrap preflight failed")
+		}
 	}
 	schemas := make([]string, 0)
 	seenSchemas := map[string]bool{}

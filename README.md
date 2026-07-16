@@ -17,6 +17,10 @@ the world changes during execution.
   dependency-ordered plans, advanced migration lint, policy checks, approvals,
   simulation, and guarded apply. Findings include evidence, confidence,
   impact, remediation, affected objects, and machine-readable properties.
+- **Complete PostgreSQL bootstrap:** managed or externally supplied databases,
+  schemas, types, tables, columns, defaults, generated columns, constraints,
+  indexes, routines, triggers, RLS, extensions, comments, roles, grants,
+  memberships, and default privileges through one resumable plan.
 - **Versioned upgrades:** signed migration artifacts, checkpoints, controlled
   down migrations, repair, and PostgreSQL expand/contract upgrades with virtual
   schemas, shadow columns, online backfills, rollback, and contract gates.
@@ -142,6 +146,7 @@ output. See [the CLI contract](docs/cli-contract.md) and
 - [Declarative HCL authoring](docs/hcl-schema.md)
 - [PostgreSQL default-expression support and safety](docs/postgresql-default-expressions.md)
 - [PostgreSQL fresh-provisioning compatibility](docs/postgresql-provisioning-compatibility.md)
+- [PostgreSQL whole-database bootstrap and recovery](docs/postgresql-database-bootstrap.md)
 - [Cloud discovery and monitoring](docs/cloud-monitoring.md)
 - [Tenant-scale fleet rollout](docs/tenant-fleet.md) · [multi-dialect contracts](docs/multi-dialect.md)
 - [CI/CD and GitOps ecosystem](docs/ci-gitops-ecosystem.md)
@@ -151,4 +156,5 @@ output. See [the CLI contract](docs/cli-contract.md) and
 - [Release binaries and container images](docs/releasing.md)
 - [Detailed PostgreSQL lifecycle example](examples/postgres-lifecycle/README.md)
 - [HCL-managed PostgreSQL example](examples/hcl-postgres/README.md)
+- [Complete HCL empty-database bootstrap runner](examples/hcl-postgres/run-complete-bootstrap.sh)
 - [Database security as code](docs/database-security.md) · [reference data](docs/reference-data.md)

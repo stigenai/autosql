@@ -43,6 +43,49 @@ jobs:
         run: scripts/test-live-serial.sh ./pkg/postgres -run '^TestStoredGeneratedColumnCreateApplyReinspect$'
       - name: Test complete PostgreSQL cell provisioning parity
         run: scripts/test-live-serial.sh ./pkg/postgres -run '^TestCompleteCellProvisioningParity$'
+      - name: Test PostgreSQL constraint and index bootstrap parity
+        run: scripts/test-live-serial.sh ./pkg/postgres -run '^TestConstraintIndexBootstrapParity$'
+      - name: Test PostgreSQL function lifecycle
+        run: scripts/test-live-serial.sh ./pkg/postgres -run '^TestFunctionReplaceRenameDropLifecycle$'
+      - name: Test PostgreSQL procedure lifecycle
+        run: scripts/test-live-serial.sh ./pkg/postgres -run '^TestProcedureBootstrapReplaceParity$'
+      - name: Test PostgreSQL trigger family lifecycle
+        run: scripts/test-live-serial.sh ./pkg/postgres -run '^TestTriggerFamilyBootstrapParity$'
+      - name: Test PostgreSQL concurrent index lifecycle
+        run: scripts/test-live-serial.sh ./pkg/postgres -run '^TestConcurrentIndexCreateRebuildDropLifecycle$'
+      - name: Test PostgreSQL count-bearing constraint/index inventory
+        run: scripts/test-live-serial.sh ./pkg/postgres -run '^TestConstraintIndexInventoryScaleParity$'
+      - name: Test PostgreSQL count-bearing routine/trigger inventory
+        run: scripts/test-live-serial.sh ./pkg/postgres -run '^TestRoutineTriggerInventoryScaleParity$'
+      - name: Test PostgreSQL RLS policy bootstrap inventory
+        run: scripts/test-live-serial.sh ./pkg/postgres -run '^TestRLSPolicyInventoryBootstrapParity$'
+      - name: Test PostgreSQL role and write-only password lifecycle
+        run: scripts/test-live-serial.sh ./pkg/postgres -run '^TestRoleLifecycleAndWriteOnlyPassword$'
+      - name: Test PostgreSQL membership lifecycle and versioned options
+        run: scripts/test-live-serial.sh ./pkg/postgres -run '^TestMembershipLifecycleVersionParity$'
+      - name: Test PostgreSQL exact grant inventory lifecycle
+        run: scripts/test-live-serial.sh ./pkg/postgres -run '^TestGrantInventoryLifecycleParity$'
+      - name: Test PostgreSQL future-object default privileges
+        run: scripts/test-live-serial.sh ./pkg/postgres -run '^TestDefaultPrivilegeFutureObjectParity$'
+      - name: Test PostgreSQL extension catalog and lifecycle parity
+        run: scripts/test-live-serial.sh ./pkg/postgres -run '^(TestInspectExtensionCatalogURL|TestExtensionCreateUpdateSchemaMoveAndGuardedDrop|TestExtensionOwnedMembersDoNotProduceDuplicateLifecycle)$'
+      - name: Test PostgreSQL composite-type model and lifecycle parity
+        run: scripts/test-live-serial.sh ./pkg/postgres -run '^(TestCompositeInspectHCLRoundTripPreservesOrderTypesAndCollation|TestCompositeCreateAttributeLifecycleRenameAndGuardedDrop)$'
+      - name: Test managed and external database-target lifecycle
+        run: scripts/test-live-serial.sh ./pkg/postgres -run '^TestManagedAndExternalDatabaseTargetLifecycle$'
+      - name: Test complete empty-database bootstrap and phase recovery
+        run: scripts/test-live-serial.sh ./pkg/postgres -run '^(TestCanonicalCompleteBootstrapInventoryManifest|TestWholeDatabaseBootstrap)'
+      - name: Test operator empty-database bootstrap reconciliation
+        run: scripts/test-live-serial.sh ./pkg/operator -run '^TestOperatorWholeDatabaseBootstrapAgainstNewPostgresDatabase$'
+      - name: Benchmark complete bootstrap pipeline
+        if: matrix.version == 16
+        run: go test ./pkg/postgres -run '^$' -bench '^BenchmarkCompleteBootstrapPipeline$' -benchtime=3x -count=1 | tee bootstrap-bench.txt
+      - name: Upload complete bootstrap benchmark
+        if: matrix.version == 16
+        uses: actions/upload-artifact@v4
+        with:
+          name: complete-bootstrap-postgres-16
+          path: bootstrap-bench.txt
       - run: go test -race -p 1 -covermode=atomic -coverprofile=zdm-coverage.out -count=1 ./pkg/zdm/... ./internal/cli
       - run: go tool cover -func=zdm-coverage.out > zdm-coverage.txt
       - run: go test -run '^$' -bench BenchmarkZDM -benchtime=1s -count=1 ./pkg/zdm/compatmatrix | tee zdm-bench.txt

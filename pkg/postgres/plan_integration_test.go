@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +15,7 @@ import (
 	"autosql/pkg/plugin"
 	"autosql/pkg/postgres"
 	"autosql/pkg/schema"
+	"autosql/pkg/secret"
 	"autosql/pkg/source"
 
 	"github.com/jackc/pgx/v5"
@@ -221,6 +224,673 @@ func TestSQLSourcePlanApplyReinspectConverges(t *testing.T) {
 	noop, err := plan.Build(ctx, postgres.New(), reinspected, sameShape, plan.Options{})
 	if err != nil || len(noop.Steps) != 0 {
 		t.Fatalf("same-shape second plan=%+v err=%v", noop, err)
+	}
+}
+
+func TestConstraintIndexBootstrapParity(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	defer conn.Exec(context.Background(), `drop schema if exists autosql_constraint_bootstrap cascade`)
+	fixture := `
+drop schema if exists autosql_constraint_bootstrap cascade;
+create schema autosql_constraint_bootstrap;
+create function autosql_constraint_bootstrap.is_positive(value numeric) returns boolean
+language sql immutable strict as $$ select value > 0 $$;
+create function autosql_constraint_bootstrap.default_label() returns text
+language sql stable as $$ select 'ready'::text $$;
+create table autosql_constraint_bootstrap.accounts (
+  tenant_id bigint not null,
+  account_id bigint not null,
+  email text not null,
+  balance numeric(12,2) not null,
+  label text not null default autosql_constraint_bootstrap.default_label(),
+  active boolean not null,
+  constraint accounts_pkey primary key (tenant_id, account_id),
+  constraint accounts_tenant_email_key unique (tenant_id, email) deferrable initially immediate,
+  constraint accounts_balance_check check (autosql_constraint_bootstrap.is_positive(balance)) not valid
+);
+comment on constraint accounts_pkey on autosql_constraint_bootstrap.accounts is 'composite identity';
+create table autosql_constraint_bootstrap.orders (
+  tenant_id bigint not null,
+  order_id bigint not null,
+  account_id bigint not null,
+  amount numeric(12,2) not null,
+  constraint orders_pkey primary key (tenant_id, order_id),
+  constraint orders_account_fkey foreign key (tenant_id, account_id)
+    references autosql_constraint_bootstrap.accounts(tenant_id, account_id)
+    on update cascade on delete restrict deferrable initially deferred
+);
+create unique index orders_positive_amount_idx on autosql_constraint_bootstrap.orders
+  using btree (tenant_id, order_id) include (account_id) with (fillfactor=80) where amount > 0;
+create index orders_amount_expr_idx on autosql_constraint_bootstrap.orders
+  using btree ((amount * 100)) where autosql_constraint_bootstrap.is_positive(amount);
+comment on index autosql_constraint_bootstrap.orders_positive_amount_idx is 'positive order lookup';
+create table autosql_constraint_bootstrap.node_a (
+  id bigint primary key,
+  b_id bigint,
+  parent_id bigint,
+  constraint node_a_parent_fkey foreign key (parent_id)
+    references autosql_constraint_bootstrap.node_a(id) not valid
+);
+create table autosql_constraint_bootstrap.node_b (
+  id bigint primary key,
+  a_id bigint
+);
+alter table autosql_constraint_bootstrap.node_a add constraint node_a_b_fkey
+  foreign key (b_id) references autosql_constraint_bootstrap.node_b(id) not valid;
+alter table autosql_constraint_bootstrap.node_b add constraint node_b_a_fkey
+  foreign key (a_id) references autosql_constraint_bootstrap.node_a(id) not valid;`
+	if _, err = conn.Exec(ctx, fixture); err != nil {
+		t.Fatal(err)
+	}
+
+	desired, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_constraint_bootstrap"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hcl, err := source.FormatHCL(desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err = source.LoadContext(ctx, source.Input{URI: "constraint-bootstrap.hcl", Format: source.FormatHCLSource, Data: hcl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err = postgres.New().Normalize(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	renderOptions := reviewedRoutineRenderOptions(desired)
+	if report, reportErr := postgres.PreflightProvisioning(ctx, desired, renderOptions); reportErr != nil || !report.Supported {
+		t.Fatalf("preflight=%+v err=%v", report, reportErr)
+	}
+
+	if _, err = conn.Exec(ctx, `drop schema autosql_constraint_bootstrap cascade`); err != nil {
+		t.Fatal(err)
+	}
+	current, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_constraint_bootstrap"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrap, err := plan.Build(ctx, postgres.New(), current, desired, plan.Options{Render: renderOptions})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, bootstrap)
+	actual, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_constraint_bootstrap"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err = postgres.New().Normalize(ctx, actual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFingerprint(t, actual, desired)
+	noop, err := plan.Build(ctx, postgres.New(), actual, desired, plan.Options{})
+	if err != nil || len(noop.Changes.Changes) != 0 || len(noop.Steps) != 0 {
+		t.Fatalf("constraint/index bootstrap did not converge: changes=%d steps=%d err=%v", len(noop.Changes.Changes), len(noop.Steps), err)
+	}
+}
+
+func TestFunctionReplaceRenameDropLifecycle(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	defer conn.Exec(context.Background(), `drop schema if exists autosql_function_lifecycle cascade`)
+	const createOne = `create or replace function autosql_function_lifecycle.bump(value integer) returns integer language sql immutable strict parallel safe as $$ select value + 1 $$`
+	const createTwo = `create or replace function autosql_function_lifecycle.bump(value integer) returns integer language sql immutable strict parallel safe as $$ select value + 2 $$`
+	if _, err = conn.Exec(ctx, `drop schema if exists autosql_function_lifecycle cascade; create schema autosql_function_lifecycle; `+createOne+`; comment on function autosql_function_lifecycle.bump(integer) is 'reviewed arithmetic';`); err != nil {
+		t.Fatal(err)
+	}
+	current, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_function_lifecycle"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = conn.Exec(ctx, createTwo); err != nil {
+		t.Fatal(err)
+	}
+	desired, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_function_lifecycle"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = conn.Exec(ctx, createOne); err != nil {
+		t.Fatal(err)
+	}
+	replace, err := plan.Build(ctx, postgres.New(), current, desired, plan.Options{Render: reviewedRoutineRenderOptions(desired)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, replace)
+	actual, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_function_lifecycle"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFingerprint(t, actual, desired)
+
+	if _, err = conn.Exec(ctx, `alter function autosql_function_lifecycle.bump(integer) rename to bump_v2`); err != nil {
+		t.Fatal(err)
+	}
+	renamed, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_function_lifecycle"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = conn.Exec(ctx, `alter function autosql_function_lifecycle.bump_v2(integer) rename to bump`); err != nil {
+		t.Fatal(err)
+	}
+	current, err = postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_function_lifecycle"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var oldID, newID string
+	for _, resource := range current.Graph.Resources {
+		if resource.Kind == schema.KindFunction {
+			oldID = resource.ID
+		}
+	}
+	for _, resource := range renamed.Graph.Resources {
+		if resource.Kind == schema.KindFunction {
+			newID = resource.ID
+		}
+	}
+	renamePlan, err := plan.Build(ctx, postgres.New(), current, renamed, plan.Options{Diff: schema.DiffOptions{RenameHints: []schema.RenameHint{{From: oldID, To: newID}}}, Render: reviewedRoutineRenderOptions(renamed)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, renamePlan)
+	actual, err = postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_function_lifecycle"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFingerprint(t, actual, renamed)
+
+	withoutFunction := renamed
+	withoutFunction.Graph.Resources = slices.DeleteFunc(append([]schema.Resource(nil), renamed.Graph.Resources...), func(resource schema.Resource) bool { return resource.Kind == schema.KindFunction })
+	withoutFunction, err = postgres.New().Normalize(ctx, withoutFunction)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dropPlan, err := plan.Build(ctx, postgres.New(), actual, withoutFunction, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, dropPlan)
+	finalState, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_function_lifecycle"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFingerprint(t, finalState, withoutFunction)
+}
+
+func TestProcedureBootstrapReplaceParity(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	defer conn.Exec(context.Background(), `drop schema if exists autosql_procedure_lifecycle cascade`)
+	const one = `create or replace procedure autosql_procedure_lifecycle.bump(IN value integer, INOUT result integer) language plpgsql as $$ begin result := value + 1; end $$`
+	const two = `create or replace procedure autosql_procedure_lifecycle.bump(IN value integer, INOUT result integer) language plpgsql as $$ begin result := value + 2; end $$`
+	if _, err = conn.Exec(ctx, `drop schema if exists autosql_procedure_lifecycle cascade; create schema autosql_procedure_lifecycle; `+one+`; comment on procedure autosql_procedure_lifecycle.bump(integer,integer) is 'reviewed procedure';`); err != nil {
+		t.Fatal(err)
+	}
+	desired, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_procedure_lifecycle"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := reviewedRoutineRenderOptions(desired)
+	if _, err = conn.Exec(ctx, `drop schema autosql_procedure_lifecycle cascade`); err != nil {
+		t.Fatal(err)
+	}
+	current, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_procedure_lifecycle"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrap, err := plan.Build(ctx, postgres.New(), current, desired, plan.Options{Render: options})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, bootstrap)
+	actual, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_procedure_lifecycle"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFingerprint(t, actual, desired)
+
+	if _, err = conn.Exec(ctx, two); err != nil {
+		t.Fatal(err)
+	}
+	replaced, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_procedure_lifecycle"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = conn.Exec(ctx, one); err != nil {
+		t.Fatal(err)
+	}
+	current, err = postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_procedure_lifecycle"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replace, err := plan.Build(ctx, postgres.New(), current, replaced, plan.Options{Render: reviewedRoutineRenderOptions(replaced)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, replace)
+	actual, err = postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_procedure_lifecycle"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFingerprint(t, actual, replaced)
+	noop, err := plan.Build(ctx, postgres.New(), actual, replaced, plan.Options{})
+	if err != nil || len(noop.Steps) != 0 {
+		t.Fatalf("procedure lifecycle did not converge: steps=%d err=%v", len(noop.Steps), err)
+	}
+}
+
+func TestTriggerFamilyBootstrapParity(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	defer conn.Exec(context.Background(), `drop schema if exists autosql_trigger_bootstrap cascade`)
+	fixture := `
+drop schema if exists autosql_trigger_bootstrap cascade;
+create schema autosql_trigger_bootstrap;
+create table autosql_trigger_bootstrap.items (
+  id bigint primary key,
+  value text,
+  updated_at timestamptz
+);
+create view autosql_trigger_bootstrap.item_view as select id, value, updated_at from autosql_trigger_bootstrap.items;
+create function autosql_trigger_bootstrap.touch_updated_at() returns trigger
+language plpgsql as $$ begin new.updated_at := current_timestamp; return new; end $$;
+create function autosql_trigger_bootstrap.audit_event() returns trigger
+language plpgsql as $$ begin return coalesce(new, old); end $$;
+create function autosql_trigger_bootstrap.route_view_insert() returns trigger
+language plpgsql as $$ begin insert into autosql_trigger_bootstrap.items(id,value) values (new.id,new.value); return new; end $$;
+create trigger items_touch before insert or update on autosql_trigger_bootstrap.items
+for each row execute function autosql_trigger_bootstrap.touch_updated_at();
+create trigger items_audit_insert after insert on autosql_trigger_bootstrap.items
+for each statement execute function autosql_trigger_bootstrap.audit_event();
+create trigger items_value_audit before update of value on autosql_trigger_bootstrap.items
+for each row when (old.value is distinct from new.value)
+execute function autosql_trigger_bootstrap.audit_event('value');
+create constraint trigger items_deferred_audit after insert on autosql_trigger_bootstrap.items
+deferrable initially deferred for each row execute function autosql_trigger_bootstrap.audit_event();
+create trigger items_transition_audit after update on autosql_trigger_bootstrap.items
+referencing old table as old_rows new table as new_rows for each statement
+execute function autosql_trigger_bootstrap.audit_event();
+create trigger item_view_insert instead of insert on autosql_trigger_bootstrap.item_view
+for each row execute function autosql_trigger_bootstrap.route_view_insert();
+alter table autosql_trigger_bootstrap.items disable trigger items_audit_insert;
+alter table autosql_trigger_bootstrap.items enable replica trigger items_value_audit;
+alter table autosql_trigger_bootstrap.items enable always trigger items_transition_audit;
+comment on trigger items_touch on autosql_trigger_bootstrap.items is 'updated_at behavior';`
+	if _, err = conn.Exec(ctx, fixture); err != nil {
+		t.Fatal(err)
+	}
+	desired, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_trigger_bootstrap"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hcl, err := source.FormatHCL(desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err = source.LoadContext(ctx, source.Input{URI: "trigger-family.hcl", Format: source.FormatHCLSource, Data: hcl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err = postgres.New().Normalize(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	triggerCount := 0
+	for _, resource := range desired.Graph.Resources {
+		if resource.Kind == schema.KindTrigger {
+			triggerCount++
+		}
+	}
+	if triggerCount != 6 {
+		t.Fatalf("trigger inventory=%d want 6", triggerCount)
+	}
+	options := reviewedRoutineRenderOptions(desired)
+	if report, reportErr := postgres.PreflightProvisioning(ctx, desired, options); reportErr != nil || !report.Supported {
+		t.Fatalf("trigger preflight=%+v err=%v", report, reportErr)
+	}
+	if _, err = conn.Exec(ctx, `drop schema autosql_trigger_bootstrap cascade`); err != nil {
+		t.Fatal(err)
+	}
+	current, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_trigger_bootstrap"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrap, err := plan.Build(ctx, postgres.New(), current, desired, plan.Options{Render: options})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, bootstrap)
+	actual, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_trigger_bootstrap"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err = postgres.New().Normalize(ctx, actual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFingerprint(t, actual, desired)
+	noop, err := plan.Build(ctx, postgres.New(), actual, desired, plan.Options{})
+	if err != nil || len(noop.Steps) != 0 {
+		t.Fatalf("trigger bootstrap did not converge: steps=%d err=%v", len(noop.Steps), err)
+	}
+}
+
+func TestConcurrentIndexCreateRebuildDropLifecycle(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	defer conn.Exec(context.Background(), `drop schema if exists autosql_concurrent_index cascade`)
+	if _, err = conn.Exec(ctx, `drop schema if exists autosql_concurrent_index cascade; create schema autosql_concurrent_index; create table autosql_concurrent_index.items(id bigint primary key, value text, payload text);`); err != nil {
+		t.Fatal(err)
+	}
+	current, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_concurrent_index"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = conn.Exec(ctx, `create index items_value_idx on autosql_concurrent_index.items using btree (value text_pattern_ops) include (payload) with (fillfactor=80) where value is not null; comment on index autosql_concurrent_index.items_value_idx is 'online index';`); err != nil {
+		t.Fatal(err)
+	}
+	desired, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_concurrent_index"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = conn.Exec(ctx, `drop index autosql_concurrent_index.items_value_idx`); err != nil {
+		t.Fatal(err)
+	}
+	options := map[string]string{"concurrent_indexes": "true"}
+	createPlan, err := plan.Build(ctx, postgres.New(), current, desired, plan.Options{Render: options})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !planContainsTransactionMode(createPlan, plan.TransactionProhibited) {
+		t.Fatal("concurrent create did not produce a non-transactional phase")
+	}
+	applyTestPlanPhased(t, ctx, conn, createPlan)
+	actual, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_concurrent_index"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFingerprint(t, actual, desired)
+
+	if _, err = conn.Exec(ctx, `drop index autosql_concurrent_index.items_value_idx; create index items_value_idx on autosql_concurrent_index.items (value desc) where value is not null; comment on index autosql_concurrent_index.items_value_idx is 'rebuilt online';`); err != nil {
+		t.Fatal(err)
+	}
+	rebuilt, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_concurrent_index"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = conn.Exec(ctx, `drop index autosql_concurrent_index.items_value_idx; create index items_value_idx on autosql_concurrent_index.items using btree (value text_pattern_ops) include (payload) with (fillfactor=80) where value is not null; comment on index autosql_concurrent_index.items_value_idx is 'online index';`); err != nil {
+		t.Fatal(err)
+	}
+	current, err = postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_concurrent_index"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebuildPlan, err := plan.Build(ctx, postgres.New(), current, rebuilt, plan.Options{Render: map[string]string{"allow_rebuild": "true", "concurrent_indexes": "true"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rebuildPlan.Phases) < 2 || !planContainsTransactionMode(rebuildPlan, plan.TransactionProhibited) {
+		t.Fatalf("online rebuild phases=%+v", rebuildPlan.Phases)
+	}
+	applyTestPlanPhased(t, ctx, conn, rebuildPlan)
+	actual, err = postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_concurrent_index"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFingerprint(t, actual, rebuilt)
+
+	withoutIndex := rebuilt
+	withoutIndex.Graph.Resources = slices.DeleteFunc(append([]schema.Resource(nil), rebuilt.Graph.Resources...), func(resource schema.Resource) bool { return resource.Kind == schema.KindIndex })
+	withoutIndex, err = postgres.New().Normalize(ctx, withoutIndex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dropPlan, err := plan.Build(ctx, postgres.New(), actual, withoutIndex, plan.Options{Render: options})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlanPhased(t, ctx, conn, dropPlan)
+	finalState, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_concurrent_index"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFingerprint(t, finalState, withoutIndex)
+}
+
+func TestConstraintIndexInventoryScaleParity(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	defer conn.Exec(context.Background(), `drop schema if exists autosql_inventory_scale cascade`)
+	var fixture strings.Builder
+	fixture.WriteString(`drop schema if exists autosql_inventory_scale cascade; create schema autosql_inventory_scale;`)
+	for index := 0; index < 69; index++ {
+		fmt.Fprintf(&fixture, `create table autosql_inventory_scale.t%02d(id bigint not null,parent_id bigint,value integer not null,unique_value bigint not null,constraint t%02d_pkey primary key(id)`, index, index)
+		if index < 27 {
+			fmt.Fprintf(&fixture, `,constraint t%02d_unique unique(unique_value)`, index)
+		}
+		if index < 45 {
+			fmt.Fprintf(&fixture, `,constraint t%02d_check check(value >= 0)`, index)
+		}
+		fixture.WriteString(`);`)
+	}
+	for index := 1; index <= 56; index++ {
+		fmt.Fprintf(&fixture, `alter table autosql_inventory_scale.t%02d add constraint t%02d_parent_fkey foreign key(parent_id) references autosql_inventory_scale.t00(id) on delete restrict;`, index, index)
+	}
+	for index := 0; index < 315; index++ {
+		fmt.Fprintf(&fixture, `create index scale_idx_%03d on autosql_inventory_scale.t%02d(value);`, index, index%69)
+	}
+	if _, err = conn.Exec(ctx, fixture.String()); err != nil {
+		t.Fatal(err)
+	}
+	desired, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_inventory_scale"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCounts := map[schema.Kind]int{schema.KindIndex: 315, schema.KindPrimaryKey: 69, schema.KindForeignKey: 56, schema.KindCheckConstraint: 45, schema.KindUniqueConstraint: 27}
+	gotCounts := map[schema.Kind]int{}
+	for _, resource := range desired.Graph.Resources {
+		gotCounts[resource.Kind]++
+	}
+	for kind, count := range wantCounts {
+		if gotCounts[kind] != count {
+			t.Fatalf("%s count=%d want=%d inventory=%v", kind, gotCounts[kind], count, gotCounts)
+		}
+	}
+	hcl, err := source.FormatHCL(desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err = source.LoadContext(ctx, source.Input{URI: "inventory-scale.hcl", Format: source.FormatHCLSource, Data: hcl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err = postgres.New().Normalize(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report, reportErr := postgres.PreflightProvisioning(ctx, desired, nil); reportErr != nil || !report.Supported {
+		t.Fatalf("scale preflight=%+v err=%v", report, reportErr)
+	}
+	if _, err = conn.Exec(ctx, `drop schema autosql_inventory_scale cascade`); err != nil {
+		t.Fatal(err)
+	}
+	current, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_inventory_scale"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrap, err := plan.Build(ctx, postgres.New(), current, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, bootstrap)
+	actual, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{"autosql_inventory_scale"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err = postgres.New().Normalize(ctx, actual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFingerprint(t, actual, desired)
+	noop, err := plan.Build(ctx, postgres.New(), actual, desired, plan.Options{})
+	if err != nil || len(noop.Steps) != 0 {
+		t.Fatalf("scale bootstrap did not converge: steps=%d err=%v", len(noop.Steps), err)
+	}
+}
+
+func TestRoutineTriggerInventoryScaleParity(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	defer conn.Exec(context.Background(), `drop schema if exists autosql_routine_scale_cell cascade; drop schema if exists autosql_routine_scale_repo cascade`)
+	var fixture strings.Builder
+	fixture.WriteString(`drop schema if exists autosql_routine_scale_cell cascade; drop schema if exists autosql_routine_scale_repo cascade; create schema autosql_routine_scale_cell; create schema autosql_routine_scale_repo;`)
+	for index := 0; index < 15; index++ {
+		fmt.Fprintf(&fixture, `create function autosql_routine_scale_cell.cell_fn_%02d(value integer) returns integer language sql immutable strict parallel safe as $$ select value + %d $$;`, index, index)
+	}
+	fixture.WriteString(`create table autosql_routine_scale_repo.events(id bigint primary key, value integer);`)
+	for index := 0; index < 6; index++ {
+		fmt.Fprintf(&fixture, `create function autosql_routine_scale_repo.trigger_fn_%02d() returns trigger language plpgsql as $$ begin return new; end $$;`, index)
+	}
+	for index := 0; index < 18; index++ {
+		fmt.Fprintf(&fixture, `create function autosql_routine_scale_repo.repo_fn_%02d(value integer) returns integer language sql stable as $$ select value + %d $$;`, index, index)
+	}
+	for index := 0; index < 8; index++ {
+		fmt.Fprintf(&fixture, `create procedure autosql_routine_scale_repo.repo_proc_%02d(IN value integer, INOUT result integer) language plpgsql as $$ begin result := value + %d; end $$;`, index, index)
+	}
+	for index := 0; index < 6; index++ {
+		fmt.Fprintf(&fixture, `create trigger repo_trigger_%02d before insert or update on autosql_routine_scale_repo.events for each row execute function autosql_routine_scale_repo.trigger_fn_%02d();`, index, index)
+	}
+	fixture.WriteString(`comment on function autosql_routine_scale_cell.cell_fn_00(integer) is 'cell routine'; comment on trigger repo_trigger_00 on autosql_routine_scale_repo.events is 'repository trigger';`)
+	if _, err = conn.Exec(ctx, fixture.String()); err != nil {
+		t.Fatal(err)
+	}
+	schemas := []string{"autosql_routine_scale_cell", "autosql_routine_scale_repo"}
+	desired, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: schemas})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cellRoutines, repositoryRoutines, triggers := 0, 0, 0
+	for _, resource := range desired.Graph.Resources {
+		if resource.Kind == schema.KindFunction || resource.Kind == schema.KindProcedure {
+			if resource.Name.Schema == schemas[0] {
+				cellRoutines++
+			} else if resource.Name.Schema == schemas[1] {
+				repositoryRoutines++
+			}
+		}
+		if resource.Kind == schema.KindTrigger {
+			triggers++
+		}
+	}
+	if cellRoutines != 15 || repositoryRoutines != 32 || triggers != 6 {
+		t.Fatalf("inventory cell=%d repo=%d triggers=%d", cellRoutines, repositoryRoutines, triggers)
+	}
+	hcl, err := source.FormatHCL(desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err = source.LoadContext(ctx, source.Input{URI: "routine-trigger-scale.hcl", Format: source.FormatHCLSource, Data: hcl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err = postgres.New().Normalize(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := reviewedRoutineRenderOptions(desired)
+	if report, reportErr := postgres.PreflightProvisioning(ctx, desired, options); reportErr != nil || !report.Supported {
+		t.Fatalf("routine scale preflight=%+v err=%v", report, reportErr)
+	}
+	if _, err = conn.Exec(ctx, `drop schema autosql_routine_scale_cell cascade; drop schema autosql_routine_scale_repo cascade`); err != nil {
+		t.Fatal(err)
+	}
+	current, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: schemas})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrap, err := plan.Build(ctx, postgres.New(), current, desired, plan.Options{Render: options})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, bootstrap)
+	actual, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: schemas})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err = postgres.New().Normalize(ctx, actual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFingerprint(t, actual, desired)
+	noop, err := plan.Build(ctx, postgres.New(), actual, desired, plan.Options{})
+	if err != nil || len(noop.Steps) != 0 {
+		t.Fatalf("routine/trigger scale did not converge: steps=%d err=%v", len(noop.Steps), err)
 	}
 }
 
@@ -547,6 +1217,40 @@ func TestStoredGeneratedColumnCreateApplyReinspect(t *testing.T) {
 	}
 }
 
+func filterRLSInventory(document schema.Document, namespace, role string) schema.Document {
+	keep := map[string]bool{}
+	for _, resource := range document.Graph.Resources {
+		securityObject := resource.Kind == schema.KindGrant || resource.Kind == schema.KindMembership || resource.Kind == schema.KindDefaultPrivilege
+		if !securityObject && (resource.Name.Schema == namespace || resource.Kind == schema.KindSchema && resource.Name.Name == namespace || resource.Kind == schema.KindRole && resource.Name.Name == role) {
+			keep[resource.ID] = true
+		}
+	}
+	filtered := document
+	filtered.Graph.Resources = nil
+	for _, resource := range document.Graph.Resources {
+		if !keep[resource.ID] {
+			continue
+		}
+		dependencies := resource.Dependencies[:0]
+		for _, dependency := range resource.Dependencies {
+			if keep[dependency.Target] && dependency.Type != schema.DependencyOwns {
+				dependencies = append(dependencies, dependency)
+			}
+		}
+		resource.Dependencies = dependencies
+		if resource.Kind != schema.KindRole {
+			var specification map[string]any
+			if json.Unmarshal(resource.Spec, &specification) == nil {
+				delete(specification, "owner")
+				resource.Spec, _ = json.Marshal(specification)
+			}
+		}
+		filtered.Graph.Resources = append(filtered.Graph.Resources, resource)
+	}
+	filtered.Normalize()
+	return filtered
+}
+
 func TestCompleteCellProvisioningParity(t *testing.T) {
 	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
 	if url == "" {
@@ -621,11 +1325,14 @@ create index jobs_status_idx on autosql_complete_cell.jobs(status);`
 	if err != nil || len(adopt.Changes.Changes) != 0 || len(adopt.Steps) != 0 {
 		t.Fatalf("adoption was not a no-op: changes=%d steps=%d err=%v", len(adopt.Changes.Changes), len(adopt.Steps), err)
 	}
-	fullReport, err := postgres.PreflightProvisioning(ctx, desired, nil)
+	reviewOptions := reviewedRoutineRenderOptions(desired)
+	fullReport, err := postgres.PreflightProvisioning(ctx, desired, reviewOptions)
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertCompleteCellExternalInventory(t, fullReport)
+	if !fullReport.Supported {
+		t.Fatalf("review-authorized complete cell still has provisioning blockers: %+v", fullReport.Diagnostics)
+	}
 
 	managed := managedCellProjection(t, desired)
 	if _, err = conn.Exec(ctx, `drop schema autosql_complete_cell cascade; `+prerequisite); err != nil {
@@ -643,7 +1350,7 @@ create index jobs_status_idx on autosql_complete_cell.jobs(status);`
 	if err != nil || !prerequisites.Satisfied || len(prerequisites.Prerequisites) != 1 {
 		t.Fatalf("generated routine prerequisites=%+v err=%v", prerequisites, err)
 	}
-	fresh, err := plan.Build(ctx, postgres.New(), current, managed, plan.Options{})
+	fresh, err := plan.Build(ctx, postgres.New(), current, managed, plan.Options{Render: reviewOptions})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -660,7 +1367,7 @@ create index jobs_status_idx on autosql_complete_cell.jobs(status);`
 		t.Fatal(err)
 	}
 	assertFingerprint(t, actual, managed)
-	noop, err := plan.Build(ctx, postgres.New(), actual, managed, plan.Options{})
+	noop, err := plan.Build(ctx, postgres.New(), actual, managed, plan.Options{Render: reviewOptions})
 	if err != nil || len(noop.Changes.Changes) != 0 || len(noop.Steps) != 0 {
 		t.Fatalf("fresh provisioning did not converge: changes=%d steps=%d err=%v", len(noop.Changes.Changes), len(noop.Steps), err)
 	}
@@ -684,7 +1391,7 @@ create index jobs_status_idx on autosql_complete_cell.jobs(status);`
 	if err != nil {
 		t.Fatal(err)
 	}
-	incremental, err := plan.Build(ctx, postgres.New(), actual, added, plan.Options{})
+	incremental, err := plan.Build(ctx, postgres.New(), actual, added, plan.Options{Render: reviewOptions})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -698,7 +1405,7 @@ create index jobs_status_idx on autosql_complete_cell.jobs(status);`
 		t.Fatal(err)
 	}
 	assertFingerprint(t, finalState, added)
-	finalNoop, err := plan.Build(ctx, postgres.New(), finalState, added, plan.Options{})
+	finalNoop, err := plan.Build(ctx, postgres.New(), finalState, added, plan.Options{Render: reviewOptions})
 	if err != nil || len(finalNoop.Changes.Changes) != 0 || len(finalNoop.Steps) != 0 {
 		t.Fatalf("incremental change did not converge: changes=%d steps=%d err=%v", len(finalNoop.Changes.Changes), len(finalNoop.Steps), err)
 	}
@@ -739,6 +1446,21 @@ func managedCellProjection(t *testing.T, input schema.Document) schema.Document 
 	return out
 }
 
+func reviewedRoutineRenderOptions(document schema.Document) map[string]string {
+	var digests []string
+	for _, resource := range document.Graph.Resources {
+		if resource.Kind != schema.KindFunction && resource.Kind != schema.KindProcedure {
+			continue
+		}
+		var values map[string]any
+		_ = json.Unmarshal(resource.Spec, &values)
+		if digest, ok := values["body_digest"].(string); ok && digest != "" {
+			digests = append(digests, digest)
+		}
+	}
+	return map[string]string{"reviewed_routine_digests": strings.Join(digests, ",")}
+}
+
 func assertCompleteCellFeatures(t *testing.T, doc schema.Document) {
 	t.Helper()
 	comments := 0
@@ -776,22 +1498,6 @@ func assertCompleteCellFeatures(t *testing.T, doc schema.Document) {
 	}
 	if comments < 7 || !identities["a"] || !identities["d"] || !found[schema.KindEnum] || !found[schema.KindDomain] || !found[schema.KindSequence] {
 		t.Fatalf("incomplete fixture: comments=%d identities=%v kinds=%v", comments, identities, found)
-	}
-}
-
-func assertCompleteCellExternalInventory(t *testing.T, report postgres.ProvisioningReport) {
-	t.Helper()
-	if report.Supported {
-		t.Fatal("full inspected cell unexpectedly reported as wholly managed")
-	}
-	kinds := map[schema.Kind]bool{}
-	external := false
-	for _, diagnostic := range report.Diagnostics {
-		kinds[diagnostic.Kind] = true
-		external = external || diagnostic.External
-	}
-	if !external || !kinds[schema.KindFunction] || !kinds[schema.KindIndex] || (!kinds[schema.KindPrimaryKey] && !kinds[schema.KindCheckConstraint]) {
-		t.Fatalf("incomplete aggregate external/read-only inventory: %+v", report.Diagnostics)
 	}
 }
 
@@ -1338,6 +2044,921 @@ func TestParentRenameRejectsRetainedOpaqueDescendants(t *testing.T) {
 	}
 }
 
+func TestRLSPolicyInventoryBootstrapParity(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	const namespace = "autosql_rls_scale"
+	const role = "autosql_rls_scale_app"
+	defer func() {
+		_, _ = conn.Exec(context.Background(), `drop schema if exists autosql_rls_scale cascade`)
+		_, _ = conn.Exec(context.Background(), `drop role if exists autosql_rls_scale_app`)
+	}()
+	if _, err = conn.Exec(ctx, `drop schema if exists autosql_rls_scale cascade; drop role if exists autosql_rls_scale_app; create role autosql_rls_scale_app; create schema autosql_rls_scale`); err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 7; index++ {
+		table := fmt.Sprintf("tenant_data_%02d", index)
+		fixture := fmt.Sprintf(`
+create table %s.%s (tenant_id uuid not null, payload text);
+alter table %s.%s enable row level security;
+alter table %s.%s force row level security;
+create policy %s_select on %s.%s as permissive for select to %s using (tenant_id::text = current_setting('app.tenant_id'));
+create policy %s_insert on %s.%s as permissive for insert to %s with check (tenant_id::text = current_setting('app.tenant_id'));
+`, namespace, table, namespace, table, namespace, table, table, namespace, table, role, table, namespace, table, role)
+		if _, err = conn.Exec(ctx, fixture); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = conn.Exec(ctx, `grant usage on schema autosql_rls_scale to autosql_rls_scale_app; grant select,insert on all tables in schema autosql_rls_scale to autosql_rls_scale_app`); err != nil {
+		t.Fatal(err)
+	}
+	const tenantA, tenantB = "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"
+	for index := 0; index < 7; index++ {
+		table := fmt.Sprintf("tenant_data_%02d", index)
+		tx, txErr := conn.Begin(ctx)
+		if txErr != nil {
+			t.Fatal(txErr)
+		}
+		if _, txErr = tx.Exec(ctx, `set local role autosql_rls_scale_app`); txErr == nil {
+			_, txErr = tx.Exec(ctx, `select set_config('app.tenant_id',$1,true)`, tenantA)
+		}
+		if txErr == nil {
+			_, txErr = tx.Exec(ctx, fmt.Sprintf(`insert into autosql_rls_scale.%s(tenant_id,payload) values($1,'owned')`, table), tenantA)
+		}
+		if txErr == nil {
+			_, txErr = tx.Exec(ctx, `select set_config('app.tenant_id',$1,true)`, tenantB)
+		}
+		var visible int
+		if txErr == nil {
+			txErr = tx.QueryRow(ctx, fmt.Sprintf(`select count(*) from autosql_rls_scale.%s`, table)).Scan(&visible)
+		}
+		if txErr != nil || visible != 0 {
+			_ = tx.Rollback(ctx)
+			t.Fatalf("tenant isolation table=%s visible=%d err=%v", table, visible, txErr)
+		}
+		if _, txErr = tx.Exec(ctx, `savepoint denied_insert`); txErr != nil {
+			_ = tx.Rollback(ctx)
+			t.Fatal(txErr)
+		}
+		if _, txErr = tx.Exec(ctx, fmt.Sprintf(`insert into autosql_rls_scale.%s(tenant_id,payload) values($1,'cross-tenant')`, table), tenantA); txErr == nil {
+			_ = tx.Rollback(ctx)
+			t.Fatalf("cross-tenant insert succeeded for %s", table)
+		}
+		if _, rollbackErr := tx.Exec(ctx, `rollback to savepoint denied_insert`); rollbackErr != nil {
+			_ = tx.Rollback(ctx)
+			t.Fatal(rollbackErr)
+		}
+		if txErr = tx.Commit(ctx); txErr != nil {
+			t.Fatal(txErr)
+		}
+	}
+
+	desired, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{namespace}, Advanced: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err = postgres.New().Normalize(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired = filterRLSInventory(desired, namespace, role)
+	policies, rlsTables := 0, 0
+	for _, resource := range desired.Graph.Resources {
+		switch resource.Kind {
+		case schema.KindPolicy:
+			policies++
+			if len(resource.Dependencies) != 3 {
+				t.Fatalf("policy %s dependencies=%+v", resource.Name.String(), resource.Dependencies)
+			}
+		case schema.KindTable:
+			var specification map[string]any
+			_ = json.Unmarshal(resource.Spec, &specification)
+			if specification["row_security"] == true && specification["force_row_security"] == true {
+				rlsTables++
+			}
+		}
+	}
+	if policies != 14 || rlsTables != 7 {
+		t.Fatalf("policies=%d rls_tables=%d", policies, rlsTables)
+	}
+	hcl, err := source.FormatHCL(desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err = source.LoadContext(ctx, source.Input{URI: "rls-scale.hcl", Format: source.FormatHCLSource, Data: hcl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err = postgres.New().Normalize(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = conn.Exec(ctx, `drop schema autosql_rls_scale cascade`); err != nil {
+		t.Fatal(err)
+	}
+	current, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{namespace}, Advanced: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err = postgres.New().Normalize(ctx, current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current = filterRLSInventory(current, namespace, role)
+	fresh, err := plan.Build(ctx, postgres.New(), current, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, fresh)
+	actual, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{namespace}, Advanced: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err = postgres.New().Normalize(ctx, actual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual = filterRLSInventory(actual, namespace, role)
+	assertFingerprint(t, actual, desired)
+	noop, err := plan.Build(ctx, postgres.New(), actual, desired, plan.Options{})
+	if err != nil || len(noop.Steps) != 0 || len(noop.Changes.Changes) != 0 {
+		t.Fatalf("RLS second plan changes=%d steps=%d err=%v", len(noop.Changes.Changes), len(noop.Steps), err)
+	}
+
+	// Exercise rename, predicate replacement, and drop against the live
+	// catalog. RLS/FORCE remain enabled throughout each transition.
+	var beforePolicy schema.Resource
+	for _, resource := range actual.Graph.Resources {
+		if resource.Kind == schema.KindPolicy && strings.HasSuffix(resource.Name.Name, "_select") {
+			beforePolicy = resource
+			break
+		}
+	}
+	renamedPolicy := beforePolicy
+	renamedPolicy.Name.Name += "_renamed"
+	renamedPolicy.ID = schema.StableID(renamedPolicy.Kind, renamedPolicy.Name)
+	renamed := replaceDocumentResource(actual, beforePolicy.ID, renamedPolicy)
+	renamePlan, err := plan.Build(ctx, postgres.New(), actual, renamed, plan.Options{Diff: schema.DiffOptions{RenameHints: []schema.RenameHint{{From: beforePolicy.ID, To: renamedPolicy.ID}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, renamePlan)
+	current = inspectFilteredRLS(t, ctx, url, namespace, role)
+	assertFingerprint(t, current, renamed)
+
+	alteredPolicy := renamedPolicy
+	var alteredSpec map[string]any
+	if err = json.Unmarshal(alteredPolicy.Spec, &alteredSpec); err != nil {
+		t.Fatal(err)
+	}
+	alteredSpec["using"] = strings.ReplaceAll(alteredSpec["using"].(string), "app.tenant_id", "app.alt_tenant")
+	alteredPolicy.Spec, _ = json.Marshal(alteredSpec)
+	altered := replaceDocumentResource(current, alteredPolicy.ID, alteredPolicy)
+	alterPlan, err := plan.Build(ctx, postgres.New(), current, altered, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, alterPlan)
+	current = inspectFilteredRLS(t, ctx, url, namespace, role)
+	assertFingerprint(t, current, altered)
+
+	dropped := current
+	dropped.Graph.Resources = nil
+	for _, resource := range current.Graph.Resources {
+		if resource.ID != alteredPolicy.ID {
+			dropped.Graph.Resources = append(dropped.Graph.Resources, resource)
+		}
+	}
+	dropPlan, err := plan.Build(ctx, postgres.New(), current, dropped, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, dropPlan)
+	current = inspectFilteredRLS(t, ctx, url, namespace, role)
+	assertFingerprint(t, current, dropped)
+}
+
+func TestRoleLifecycleAndWriteOnlyPassword(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	defer func() {
+		_, _ = conn.Exec(context.Background(), `drop schema if exists autosql_role_owned cascade`)
+		_, _ = conn.Exec(context.Background(), `drop role if exists autosql_role_app_v2; drop role if exists autosql_role_app; drop role if exists autosql_role_owner`)
+	}()
+	if _, err = conn.Exec(ctx, `drop schema if exists autosql_role_owned cascade; drop role if exists autosql_role_app_v2; drop role if exists autosql_role_app; drop role if exists autosql_role_owner`); err != nil {
+		t.Fatal(err)
+	}
+	empty := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{}}, Annotations: map[string]string{"dialect": "postgresql"}}
+	owner := integrationRole("autosql_role_owner", false, []string{"search_path=public"})
+	app := integrationRole("autosql_role_app", true, []string{"search_path=public", "statement_timeout=5s"})
+	desired := empty
+	desired.Graph.Resources = []schema.Resource{owner, app}
+	desired.Normalize()
+	fresh, err := plan.Build(ctx, postgres.New(), empty, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, fresh)
+	actual := inspectRolesNamed(t, ctx, url, "autosql_role_owner", "autosql_role_app")
+	assertFingerprint(t, actual, desired)
+
+	namespace := schema.Resource{Kind: schema.KindSchema, Name: schema.Name{Name: "autosql_role_owned"}, Dependencies: []schema.Dependency{{Target: app.ID, Type: schema.DependencyOwns}}, Spec: json.RawMessage(`{"owner":"autosql_role_app"}`)}
+	namespace.ID = schema.StableID(namespace.Kind, namespace.Name)
+	table := schema.Resource{Kind: schema.KindTable, Name: schema.Name{Schema: namespace.Name.Name, Name: "items", Parent: namespace.ID}, Dependencies: []schema.Dependency{{Target: namespace.ID, Type: schema.DependencyContains}, {Target: app.ID, Type: schema.DependencyOwns}}, Spec: json.RawMessage(`{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false,"owner":"autosql_role_app"}`)}
+	table.ID = schema.StableID(table.Kind, table.Name)
+	owned := actual
+	owned.Graph.Resources = append(append([]schema.Resource(nil), actual.Graph.Resources...), namespace, table)
+	owned.Normalize()
+	ownedPlan, err := plan.Build(ctx, postgres.New(), actual, owned, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, ownedPlan)
+	ownedActual := inspectRoleOwnership(t, ctx, url, namespace.Name.Name, "autosql_role_owner", "autosql_role_app")
+	assertFingerprint(t, ownedActual, owned)
+	transferred := ownedActual
+	transferred.Graph.Resources = append([]schema.Resource(nil), ownedActual.Graph.Resources...)
+	for index := range transferred.Graph.Resources {
+		resource := &transferred.Graph.Resources[index]
+		resource.Dependencies = append([]schema.Dependency(nil), resource.Dependencies...)
+		if resource.Kind != schema.KindSchema && resource.Kind != schema.KindTable {
+			continue
+		}
+		var specification map[string]any
+		_ = json.Unmarshal(resource.Spec, &specification)
+		specification["owner"] = owner.Name.Name
+		resource.Spec, _ = json.Marshal(specification)
+		for dependencyIndex := range resource.Dependencies {
+			if resource.Dependencies[dependencyIndex].Type == schema.DependencyOwns {
+				resource.Dependencies[dependencyIndex].Target = owner.ID
+			}
+		}
+	}
+	transferred.Normalize()
+	transferPlan, err := plan.Build(ctx, postgres.New(), ownedActual, transferred, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, transferPlan)
+	ownedActual = inspectRoleOwnership(t, ctx, url, namespace.Name.Name, "autosql_role_owner", "autosql_role_app")
+	assertFingerprint(t, ownedActual, transferred)
+	dropOwnedPlan, err := plan.Build(ctx, postgres.New(), ownedActual, actual, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, dropOwnedPlan)
+	hcl, err := source.FormatHCL(actual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip, err := source.LoadContext(ctx, source.Input{URI: "roles.hcl", Format: source.FormatHCLSource, Data: hcl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip, _ = postgres.New().Normalize(ctx, roundTrip)
+	assertFingerprint(t, roundTrip, actual)
+
+	ref, _ := secret.Parse("env://AUTOSQL_ROLE_TEST_PASSWORD")
+	resolver := secret.NewResolver()
+	resolver.Getenv = func(name string) (string, bool) { return "runtime-only-password", name == "AUTOSQL_ROLE_TEST_PASSWORD" }
+	if err = postgres.ApplyRolePasswordChange(ctx, conn, resolver, postgres.RolePasswordChange{Role: app.Name.Name, Reference: ref}); err != nil {
+		t.Fatal(err)
+	}
+	var passwordStored bool
+	if err = conn.QueryRow(ctx, `select rolpassword is not null from pg_authid where rolname=$1`, app.Name.Name).Scan(&passwordStored); err != nil || !passwordStored {
+		t.Fatalf("password write did not reach PostgreSQL: stored=%t err=%v", passwordStored, err)
+	}
+	actual = inspectRolesNamed(t, ctx, url, "autosql_role_owner", "autosql_role_app")
+	assertFingerprint(t, actual, desired) // unreadable password never creates drift
+
+	changed := actual
+	changed.Graph.Resources = append([]schema.Resource(nil), actual.Graph.Resources...)
+	for index := range changed.Graph.Resources {
+		if changed.Graph.Resources[index].Name.Name == app.Name.Name {
+			var roleSpec map[string]any
+			_ = json.Unmarshal(changed.Graph.Resources[index].Spec, &roleSpec)
+			roleSpec["connection_limit"] = float64(8)
+			roleSpec["configuration"] = []any{"search_path=public", "statement_timeout=10s"}
+			changed.Graph.Resources[index].Spec, _ = json.Marshal(roleSpec)
+		}
+	}
+	changed.Normalize()
+	alterPlan, err := plan.Build(ctx, postgres.New(), actual, changed, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, alterPlan)
+	actual = inspectRolesNamed(t, ctx, url, "autosql_role_owner", "autosql_role_app")
+	assertFingerprint(t, actual, changed)
+
+	renamed := actual
+	renamed.Graph.Resources = append([]schema.Resource(nil), actual.Graph.Resources...)
+	var oldID, newID string
+	for index := range renamed.Graph.Resources {
+		if renamed.Graph.Resources[index].Name.Name == app.Name.Name {
+			oldID = renamed.Graph.Resources[index].ID
+			renamed.Graph.Resources[index].Name.Name = "autosql_role_app_v2"
+			renamed.Graph.Resources[index].ID = schema.StableID(schema.KindRole, renamed.Graph.Resources[index].Name)
+			newID = renamed.Graph.Resources[index].ID
+		}
+	}
+	renamed.Normalize()
+	renamePlan, err := plan.Build(ctx, postgres.New(), actual, renamed, plan.Options{Diff: schema.DiffOptions{RenameHints: []schema.RenameHint{{From: oldID, To: newID}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, renamePlan)
+	actual = inspectRolesNamed(t, ctx, url, "autosql_role_owner", "autosql_role_app_v2")
+	assertFingerprint(t, actual, renamed)
+
+	retired := actual
+	retired.Graph.Resources = nil
+	for _, resource := range actual.Graph.Resources {
+		if resource.Name.Name != "autosql_role_app_v2" {
+			retired.Graph.Resources = append(retired.Graph.Resources, resource)
+		}
+	}
+	dropPlan, err := plan.Build(ctx, postgres.New(), actual, retired, plan.Options{Render: map[string]string{"allow_role_drop": "true", "reassign_owned_to.autosql_role_app_v2": "autosql_role_owner"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, dropPlan)
+	actual = inspectRolesNamed(t, ctx, url, "autosql_role_owner")
+	assertFingerprint(t, actual, retired)
+}
+
+func TestMembershipLifecycleVersionParity(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	defer func() {
+		_, _ = conn.Exec(context.Background(), `drop role if exists autosql_member_v2; drop role if exists autosql_member; drop role if exists autosql_parent`)
+	}()
+	if _, err = conn.Exec(ctx, `drop role if exists autosql_member_v2; drop role if exists autosql_member; drop role if exists autosql_parent`); err != nil {
+		t.Fatal(err)
+	}
+	var version int
+	if err = conn.QueryRow(ctx, `select current_setting('server_version_num')::integer`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	major := strconv.Itoa(version / 10000)
+	options := map[string]string{"postgres_version": major}
+	parent := integrationRole("autosql_parent", false, []string{})
+	member := integrationRole("autosql_member", false, []string{})
+	specification := map[string]any{"parent": parent.Name.Name, "member": member.Name.Name, "grantor": "postgres", "admin": false}
+	if version >= 160000 {
+		specification["inherit"], specification["set"] = false, true
+	}
+	raw, _ := json.Marshal(specification)
+	membership := schema.Resource{Kind: schema.KindMembership, Name: schema.Name{Name: "autosql_member->autosql_parent@postgres"}, Dependencies: []schema.Dependency{{Target: parent.ID, Type: schema.DependencyReferences}, {Target: member.ID, Type: schema.DependencyReferences}}, Spec: raw}
+	membership.ID = schema.StableID(membership.Kind, membership.Name)
+	empty := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{}}, Annotations: map[string]string{"dialect": "postgresql"}}
+	desired := empty
+	desired.Graph.Resources = []schema.Resource{parent, member, membership}
+	desired.Normalize()
+	fresh, err := plan.Build(ctx, postgres.New(), empty, desired, plan.Options{Render: options})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, fresh)
+	actual := inspectMembershipNamed(t, ctx, url, "autosql_parent", "autosql_member")
+	assertFingerprint(t, actual, desired)
+	hcl, err := source.FormatHCL(actual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip, err := source.LoadContext(ctx, source.Input{URI: "membership.hcl", Format: source.FormatHCLSource, Data: hcl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip, _ = postgres.New().Normalize(ctx, roundTrip)
+	assertFingerprint(t, roundTrip, actual)
+
+	changed := cloneSchemaDocument(t, actual)
+	for index := range changed.Graph.Resources {
+		if changed.Graph.Resources[index].Kind != schema.KindMembership {
+			continue
+		}
+		var values map[string]any
+		_ = json.Unmarshal(changed.Graph.Resources[index].Spec, &values)
+		values["admin"] = true
+		if version >= 160000 {
+			values["inherit"] = true
+		}
+		changed.Graph.Resources[index].Spec, _ = json.Marshal(values)
+	}
+	alterOptions := map[string]string{"postgres_version": major, "allow_membership_admin": "true"}
+	alterPlan, err := plan.Build(ctx, postgres.New(), actual, changed, plan.Options{Render: alterOptions})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, alterPlan)
+	actual = inspectMembershipNamed(t, ctx, url, "autosql_parent", "autosql_member")
+	assertFingerprint(t, actual, changed)
+
+	renamed := cloneSchemaDocument(t, actual)
+	var oldRoleID, newRoleID, oldMembershipID, newMembershipID string
+	for index := range renamed.Graph.Resources {
+		resource := &renamed.Graph.Resources[index]
+		if resource.Kind == schema.KindRole && resource.Name.Name == "autosql_member" {
+			oldRoleID = resource.ID
+			resource.Name.Name = "autosql_member_v2"
+			resource.ID = schema.StableID(resource.Kind, resource.Name)
+			newRoleID = resource.ID
+		}
+	}
+	var parentRoleID string
+	for _, resource := range renamed.Graph.Resources {
+		if resource.Kind == schema.KindRole && resource.Name.Name == "autosql_parent" {
+			parentRoleID = resource.ID
+		}
+	}
+	for index := range renamed.Graph.Resources {
+		resource := &renamed.Graph.Resources[index]
+		if resource.Kind != schema.KindMembership {
+			continue
+		}
+		oldMembershipID = resource.ID
+		resource.Name.Name = "autosql_member_v2->autosql_parent@postgres"
+		resource.ID = schema.StableID(resource.Kind, resource.Name)
+		newMembershipID = resource.ID
+		var values map[string]any
+		_ = json.Unmarshal(resource.Spec, &values)
+		values["member"] = "autosql_member_v2"
+		resource.Spec, _ = json.Marshal(values)
+		resource.Dependencies = []schema.Dependency{{Target: parentRoleID, Type: schema.DependencyReferences}, {Target: newRoleID, Type: schema.DependencyReferences}}
+	}
+	renamed.Normalize()
+	renamePlan, err := plan.Build(ctx, postgres.New(), actual, renamed, plan.Options{Render: alterOptions, Diff: schema.DiffOptions{RenameHints: []schema.RenameHint{{From: oldRoleID, To: newRoleID}, {From: oldMembershipID, To: newMembershipID}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, renamePlan)
+	actual = inspectMembershipNamed(t, ctx, url, "autosql_parent", "autosql_member_v2")
+	assertFingerprint(t, actual, renamed)
+
+	revoked := cloneSchemaDocument(t, actual)
+	revoked.Graph.Resources = revoked.Graph.Resources[:0]
+	for _, resource := range actual.Graph.Resources {
+		if resource.Kind != schema.KindMembership {
+			revoked.Graph.Resources = append(revoked.Graph.Resources, resource)
+		}
+	}
+	revoked.Normalize()
+	revokePlan, err := plan.Build(ctx, postgres.New(), actual, revoked, plan.Options{Render: alterOptions})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, revokePlan)
+	actual = inspectMembershipNamed(t, ctx, url, "autosql_parent", "autosql_member_v2")
+	assertFingerprint(t, actual, revoked)
+}
+
+func TestGrantInventoryLifecycleParity(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	defer func() {
+		_, _ = conn.Exec(context.Background(), `drop schema if exists autosql_grants cascade; drop role if exists autosql_grants_app`)
+	}()
+	if _, err = conn.Exec(ctx, `drop schema if exists autosql_grants cascade; drop role if exists autosql_grants_app`); err != nil {
+		t.Fatal(err)
+	}
+	role := integrationRole("autosql_grants_app", false, []string{})
+	ns := schema.Resource{Kind: schema.KindSchema, Name: schema.Name{Name: "autosql_grants"}, Spec: json.RawMessage(`{}`)}
+	ns.ID = schema.StableID(ns.Kind, ns.Name)
+	table := schema.Resource{Kind: schema.KindTable, Name: schema.Name{Schema: ns.Name.Name, Name: "items", Parent: ns.ID}, Dependencies: []schema.Dependency{{Target: ns.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`)}
+	table.ID = schema.StableID(table.Kind, table.Name)
+	grants := []schema.Resource{}
+	for _, fixture := range []struct {
+		target    schema.Resource
+		privilege string
+	}{{ns, "USAGE"}, {table, "SELECT"}, {table, "INSERT"}} {
+		name := role.Name.Name + ":" + strings.ToLower(fixture.privilege) + ":postgres"
+		grant := schema.Resource{Kind: schema.KindGrant, Name: schema.Name{Schema: fixture.target.Name.Schema, Name: name, Parent: fixture.target.ID}, Dependencies: []schema.Dependency{{Target: fixture.target.ID, Type: schema.DependencyReferences}, {Target: role.ID, Type: schema.DependencyReferences}}, Spec: json.RawMessage(fmt.Sprintf(`{"grantor":"postgres","grantee":%q,"privilege":%q,"grantable":false}`, role.Name.Name, fixture.privilege))}
+		grant.ID = schema.StableID(grant.Kind, grant.Name)
+		grants = append(grants, grant)
+	}
+	empty := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{}}, Annotations: map[string]string{"dialect": "postgresql"}}
+	desired := empty
+	desired.Graph.Resources = append([]schema.Resource{role, ns, table}, grants...)
+	desired.Normalize()
+	fresh, err := plan.Build(ctx, postgres.New(), empty, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, fresh)
+	actual := inspectGrantInventory(t, ctx, url, ns.Name.Name, role.Name.Name)
+	assertFingerprint(t, actual, desired)
+	hcl, err := source.FormatHCL(actual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip, err := source.LoadContext(ctx, source.Input{URI: "grants.hcl", Format: source.FormatHCLSource, Data: hcl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip, _ = postgres.New().Normalize(ctx, roundTrip)
+	assertFingerprint(t, roundTrip, actual)
+
+	grantable := cloneSchemaDocument(t, actual)
+	for index := range grantable.Graph.Resources {
+		if grantable.Graph.Resources[index].Kind == schema.KindGrant && strings.Contains(grantable.Graph.Resources[index].Name.Name, ":select:") {
+			var values map[string]any
+			_ = json.Unmarshal(grantable.Graph.Resources[index].Spec, &values)
+			values["grantable"] = true
+			grantable.Graph.Resources[index].Spec, _ = json.Marshal(values)
+		}
+	}
+	grantPlan, err := plan.Build(ctx, postgres.New(), actual, grantable, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, grantPlan)
+	actual = inspectGrantInventory(t, ctx, url, ns.Name.Name, role.Name.Name)
+	assertFingerprint(t, actual, grantable)
+	partial := cloneSchemaDocument(t, actual)
+	partial.Graph.Resources = partial.Graph.Resources[:0]
+	for _, resource := range actual.Graph.Resources {
+		if resource.Kind != schema.KindGrant || !strings.Contains(resource.Name.Name, ":insert:") {
+			partial.Graph.Resources = append(partial.Graph.Resources, resource)
+		}
+	}
+	partial.Normalize()
+	partialPlan, err := plan.Build(ctx, postgres.New(), actual, partial, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, partialPlan)
+	actual = inspectGrantInventory(t, ctx, url, ns.Name.Name, role.Name.Name)
+	assertFingerprint(t, actual, partial)
+	revoked := cloneSchemaDocument(t, actual)
+	revoked.Graph.Resources = revoked.Graph.Resources[:0]
+	for _, resource := range actual.Graph.Resources {
+		if resource.Kind != schema.KindGrant {
+			revoked.Graph.Resources = append(revoked.Graph.Resources, resource)
+		}
+	}
+	revoked.Normalize()
+	revokePlan, err := plan.Build(ctx, postgres.New(), actual, revoked, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, revokePlan)
+	actual = inspectGrantInventory(t, ctx, url, ns.Name.Name, role.Name.Name)
+	assertFingerprint(t, actual, revoked)
+}
+
+func TestDefaultPrivilegeFutureObjectParity(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	defer func() {
+		_, _ = conn.Exec(context.Background(), `drop schema if exists autosql_defaults cascade; drop role if exists autosql_defaults_app`)
+	}()
+	if _, err = conn.Exec(ctx, `drop schema if exists autosql_defaults cascade; drop role if exists autosql_defaults_app`); err != nil {
+		t.Fatal(err)
+	}
+	role := integrationRole("autosql_defaults_app", false, []string{})
+	ns := schema.Resource{Kind: schema.KindSchema, Name: schema.Name{Name: "autosql_defaults"}, Spec: json.RawMessage(`{}`)}
+	ns.ID = schema.StableID(ns.Kind, ns.Name)
+	defaultACL := schema.Resource{Kind: schema.KindDefaultPrivilege, Name: schema.Name{Name: "postgres:autosql_defaults:r:autosql_defaults_app:select"}, Dependencies: []schema.Dependency{{Target: role.ID, Type: schema.DependencyReferences}, {Target: ns.ID, Type: schema.DependencyReferences}}, Spec: json.RawMessage(`{"owner":"postgres","object_type":"r","schema":"autosql_defaults","grantee":"autosql_defaults_app","privilege":"SELECT","grantable":false}`)}
+	defaultACL.ID = schema.StableID(defaultACL.Kind, defaultACL.Name)
+	empty := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{}}, Annotations: map[string]string{"dialect": "postgresql"}}
+	desired := empty
+	desired.Graph.Resources = []schema.Resource{role, ns, defaultACL}
+	desired.Normalize()
+	fresh, err := plan.Build(ctx, postgres.New(), empty, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, fresh)
+	if _, err = conn.Exec(ctx, `create table autosql_defaults.future_one(id bigint)`); err != nil {
+		t.Fatal(err)
+	}
+	var allowed bool
+	if err = conn.QueryRow(ctx, `select has_table_privilege('autosql_defaults_app','autosql_defaults.future_one','SELECT')`).Scan(&allowed); err != nil || !allowed {
+		t.Fatalf("future table default privilege allowed=%t err=%v", allowed, err)
+	}
+	actual := inspectDefaultPrivilegeInventory(t, ctx, url, ns.Name.Name, role.Name.Name)
+	assertFingerprint(t, actual, desired)
+	hcl, err := source.FormatHCL(actual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip, err := source.LoadContext(ctx, source.Input{URI: "defaults.hcl", Format: source.FormatHCLSource, Data: hcl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip, _ = postgres.New().Normalize(ctx, roundTrip)
+	assertFingerprint(t, roundTrip, actual)
+	grantable := cloneSchemaDocument(t, actual)
+	for index := range grantable.Graph.Resources {
+		if grantable.Graph.Resources[index].Kind == schema.KindDefaultPrivilege {
+			var values map[string]any
+			_ = json.Unmarshal(grantable.Graph.Resources[index].Spec, &values)
+			values["grantable"] = true
+			grantable.Graph.Resources[index].Spec, _ = json.Marshal(values)
+		}
+	}
+	changePlan, err := plan.Build(ctx, postgres.New(), actual, grantable, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, changePlan)
+	actual = inspectDefaultPrivilegeInventory(t, ctx, url, ns.Name.Name, role.Name.Name)
+	assertFingerprint(t, actual, grantable)
+	revoked := cloneSchemaDocument(t, actual)
+	revoked.Graph.Resources = revoked.Graph.Resources[:0]
+	for _, resource := range actual.Graph.Resources {
+		if resource.Kind != schema.KindDefaultPrivilege {
+			revoked.Graph.Resources = append(revoked.Graph.Resources, resource)
+		}
+	}
+	revoked.Normalize()
+	revokePlan, err := plan.Build(ctx, postgres.New(), actual, revoked, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTestPlan(t, ctx, conn, revokePlan)
+	if _, err = conn.Exec(ctx, `create table autosql_defaults.future_two(id bigint)`); err != nil {
+		t.Fatal(err)
+	}
+	if err = conn.QueryRow(ctx, `select has_table_privilege('autosql_defaults_app','autosql_defaults.future_two','SELECT')`).Scan(&allowed); err != nil || allowed {
+		t.Fatalf("revoked future default allowed=%t err=%v", allowed, err)
+	}
+	actual = inspectDefaultPrivilegeInventory(t, ctx, url, ns.Name.Name, role.Name.Name)
+	assertFingerprint(t, actual, revoked)
+}
+
+func inspectDefaultPrivilegeInventory(t *testing.T, ctx context.Context, url, namespace, role string) schema.Document {
+	t.Helper()
+	document, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{namespace}, Advanced: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err = postgres.New().Normalize(ctx, document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keep := map[string]bool{}
+	for _, resource := range document.Graph.Resources {
+		if resource.Kind == schema.KindRole && resource.Name.Name == role || resource.Kind == schema.KindSchema && resource.Name.Name == namespace || resource.Kind == schema.KindDefaultPrivilege && stringValueTest(resource.Spec, "grantee") == role {
+			keep[resource.ID] = true
+		}
+	}
+	filtered := document
+	filtered.Graph.Resources = nil
+	for _, resource := range document.Graph.Resources {
+		if !keep[resource.ID] {
+			continue
+		}
+		dependencies := resource.Dependencies[:0]
+		for _, dependency := range resource.Dependencies {
+			if keep[dependency.Target] {
+				dependencies = append(dependencies, dependency)
+			}
+		}
+		resource.Dependencies = dependencies
+		if resource.Kind == schema.KindSchema {
+			var values map[string]any
+			_ = json.Unmarshal(resource.Spec, &values)
+			delete(values, "owner")
+			resource.Spec, _ = json.Marshal(values)
+		}
+		filtered.Graph.Resources = append(filtered.Graph.Resources, resource)
+	}
+	filtered.Normalize()
+	return filtered
+}
+
+func inspectGrantInventory(t *testing.T, ctx context.Context, url, namespace, role string) schema.Document {
+	t.Helper()
+	document, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{namespace}, Advanced: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err = postgres.New().Normalize(ctx, document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keep := map[string]bool{}
+	for _, resource := range document.Graph.Resources {
+		if resource.Kind == schema.KindRole && resource.Name.Name == role || resource.Kind == schema.KindSchema && resource.Name.Name == namespace || resource.Kind == schema.KindTable && resource.Name.Schema == namespace || resource.Kind == schema.KindGrant && stringValueTest(resource.Spec, "grantee") == role {
+			keep[resource.ID] = true
+		}
+	}
+	filtered := document
+	filtered.Graph.Resources = nil
+	for _, resource := range document.Graph.Resources {
+		if !keep[resource.ID] {
+			continue
+		}
+		dependencies := resource.Dependencies[:0]
+		for _, dependency := range resource.Dependencies {
+			if keep[dependency.Target] && dependency.Type != schema.DependencyOwns {
+				dependencies = append(dependencies, dependency)
+			}
+		}
+		resource.Dependencies = dependencies
+		if resource.Kind != schema.KindRole && resource.Kind != schema.KindGrant {
+			var values map[string]any
+			_ = json.Unmarshal(resource.Spec, &values)
+			delete(values, "owner")
+			resource.Spec, _ = json.Marshal(values)
+		}
+		filtered.Graph.Resources = append(filtered.Graph.Resources, resource)
+	}
+	filtered.Normalize()
+	return filtered
+}
+
+func stringValueTest(raw json.RawMessage, key string) string {
+	var values map[string]any
+	_ = json.Unmarshal(raw, &values)
+	value, _ := values[key].(string)
+	return value
+}
+
+func inspectMembershipNamed(t *testing.T, ctx context.Context, url string, roleNames ...string) schema.Document {
+	t.Helper()
+	document, err := postgres.InspectURL(ctx, url, postgres.Options{Advanced: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err = postgres.New().Normalize(ctx, document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wanted := map[string]bool{}
+	for _, name := range roleNames {
+		wanted[name] = true
+	}
+	roleIDs := map[string]bool{}
+	for _, resource := range document.Graph.Resources {
+		if resource.Kind == schema.KindRole && wanted[resource.Name.Name] {
+			roleIDs[resource.ID] = true
+		}
+	}
+	filtered := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{}}, Annotations: map[string]string{"dialect": "postgresql"}}
+	for _, resource := range document.Graph.Resources {
+		if resource.Kind == schema.KindRole && roleIDs[resource.ID] {
+			filtered.Graph.Resources = append(filtered.Graph.Resources, resource)
+			continue
+		}
+		if resource.Kind == schema.KindMembership {
+			all := true
+			for _, dependency := range resource.Dependencies {
+				all = all && roleIDs[dependency.Target]
+			}
+			if all {
+				filtered.Graph.Resources = append(filtered.Graph.Resources, resource)
+			}
+		}
+	}
+	filtered.Normalize()
+	return filtered
+}
+
+func integrationRole(name string, login bool, configuration []string) schema.Resource {
+	specification, _ := json.Marshal(map[string]any{"superuser": false, "inherit": true, "create_role": false, "create_database": false, "login": login, "replication": false, "bypass_rls": false, "connection_limit": -1, "configuration": configuration})
+	resource := schema.Resource{Kind: schema.KindRole, Name: schema.Name{Name: name}, Spec: specification}
+	resource.ID = schema.StableID(resource.Kind, resource.Name)
+	return resource
+}
+
+func inspectRolesNamed(t *testing.T, ctx context.Context, url string, names ...string) schema.Document {
+	t.Helper()
+	document, err := postgres.InspectURL(ctx, url, postgres.Options{Advanced: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err = postgres.New().Normalize(ctx, document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wanted := map[string]bool{}
+	for _, name := range names {
+		wanted[name] = true
+	}
+	filtered := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{}}, Annotations: map[string]string{"dialect": "postgresql"}}
+	for _, resource := range document.Graph.Resources {
+		if resource.Kind == schema.KindRole && wanted[resource.Name.Name] {
+			filtered.Graph.Resources = append(filtered.Graph.Resources, resource)
+		}
+	}
+	filtered.Normalize()
+	return filtered
+}
+
+func inspectRoleOwnership(t *testing.T, ctx context.Context, url, namespace string, roles ...string) schema.Document {
+	t.Helper()
+	document, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{namespace}, Advanced: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err = postgres.New().Normalize(ctx, document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantedRoles := map[string]bool{}
+	for _, role := range roles {
+		wantedRoles[role] = true
+	}
+	keep := map[string]bool{}
+	for _, resource := range document.Graph.Resources {
+		if resource.Kind == schema.KindRole && wantedRoles[resource.Name.Name] || resource.Kind == schema.KindSchema && resource.Name.Name == namespace || resource.Name.Schema == namespace {
+			if resource.Kind != schema.KindGrant && resource.Kind != schema.KindMembership && resource.Kind != schema.KindDefaultPrivilege {
+				keep[resource.ID] = true
+			}
+		}
+	}
+	filtered := document
+	filtered.Graph.Resources = nil
+	for _, resource := range document.Graph.Resources {
+		if !keep[resource.ID] {
+			continue
+		}
+		dependencies := resource.Dependencies[:0]
+		for _, dependency := range resource.Dependencies {
+			if keep[dependency.Target] {
+				dependencies = append(dependencies, dependency)
+			}
+		}
+		resource.Dependencies = dependencies
+		filtered.Graph.Resources = append(filtered.Graph.Resources, resource)
+	}
+	filtered.Normalize()
+	return filtered
+}
+
+func replaceDocumentResource(document schema.Document, id string, replacement schema.Resource) schema.Document {
+	out := document
+	out.Graph.Resources = append([]schema.Resource(nil), document.Graph.Resources...)
+	for index := range out.Graph.Resources {
+		if out.Graph.Resources[index].ID == id {
+			out.Graph.Resources[index] = replacement
+		}
+	}
+	out.Normalize()
+	return out
+}
+
+func inspectFilteredRLS(t *testing.T, ctx context.Context, url, namespace, role string) schema.Document {
+	t.Helper()
+	document, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{namespace}, Advanced: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err = postgres.New().Normalize(ctx, document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return filterRLSInventory(document, namespace, role)
+}
+
 func TestMaterializedViewRenameDependentGuardAndBareConvergence(t *testing.T) {
 	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
 	if url == "" {
@@ -1504,6 +3125,53 @@ func applyTestPlan(t *testing.T, ctx context.Context, conn *pgx.Conn, p plan.Pla
 	}
 	if err = tx.Commit(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func planContainsTransactionMode(p plan.Plan, mode plan.TransactionMode) bool {
+	for _, step := range p.Steps {
+		if step.Kind == plan.StepExecutable && step.Transaction == mode {
+			return true
+		}
+	}
+	return false
+}
+
+func applyTestPlanPhased(t *testing.T, ctx context.Context, conn *pgx.Conn, p plan.Plan) {
+	t.Helper()
+	steps := map[string]plan.Step{}
+	for _, step := range p.Steps {
+		steps[step.ID] = step
+	}
+	for _, phase := range p.Phases {
+		if phase.Transaction == plan.TransactionProhibited {
+			for _, id := range phase.StepIDs {
+				step := steps[id]
+				if step.Kind != plan.StepTopology {
+					if _, err := conn.Exec(ctx, step.SQL); err != nil {
+						t.Fatalf("%s: %v", step.SQL, err)
+					}
+				}
+			}
+			continue
+		}
+		tx, err := conn.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, id := range phase.StepIDs {
+			step := steps[id]
+			if step.Kind == plan.StepTopology {
+				continue
+			}
+			if _, err = tx.Exec(ctx, step.SQL); err != nil {
+				_ = tx.Rollback(ctx)
+				t.Fatalf("%s: %v", step.SQL, err)
+			}
+		}
+		if err = tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 func assertFingerprint(t *testing.T, actual, desired schema.Document) {

@@ -221,8 +221,10 @@ alter default privileges in schema autosql_inspect grant select on tables to pub
 		}
 	}
 	// The complete fixture includes comments, identity columns, types, views,
-	// policies, and read-only resources. An unchanged round-trip must still be
-	// a valid no-op even though some of those semantics cannot be mutated.
+	// policies, and complex inspected semantics. An unchanged round-trip must
+	// remain a valid no-op even when bounded fresh-provisioning grammar reports
+	// a diagnostic; every advertised PostgreSQL kind is managed, so none may be
+	// misclassified as an external prerequisite.
 	hcl, err := source.FormatHCL(first)
 	if err != nil {
 		t.Fatalf("FormatHCL inspected schema: %v", err)
@@ -243,19 +245,12 @@ alter default privileges in schema autosql_inspect grant select on tables to pub
 	if err != nil {
 		t.Fatalf("preflight complete inspected cell: %v", err)
 	}
-	wantBlockers := map[string]bool{"external_prerequisite:": false}
 	for _, diagnostic := range report.Diagnostics {
-		key := diagnostic.Class + ":" + diagnostic.Field
-		if _, ok := wantBlockers[key]; ok {
-			wantBlockers[key] = true
+		if diagnostic.External || diagnostic.Class == "external_prerequisite" {
+			t.Fatalf("managed PostgreSQL capability reported as external: %+v", diagnostic)
 		}
 		if diagnostic.Class == "unsupported_semantic" && diagnostic.Field == "generated" {
 			t.Fatalf("complete fixture retained generated blocker: %+v", diagnostic)
-		}
-	}
-	for blocker, found := range wantBlockers {
-		if !found {
-			t.Errorf("complete inspected-cell preflight missing %s: %+v", blocker, report.Diagnostics)
 		}
 	}
 	diff, err := schema.Diff(current, desired, schema.DiffOptions{})

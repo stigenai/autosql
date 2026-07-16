@@ -83,6 +83,29 @@ func TestFriendlyAdvancedHCLUsesHelpersWithoutEscapedJSONOrLiteralIDs(t *testing
 	}
 }
 
+func TestDatabaseBootstrapHCLUsesSeparateNonSecretTargetContract(t *testing.T) {
+	doc := loadHCL(t, context.Background(), "database-bootstrap.hcl")
+	var databases []schema.Resource
+	for _, resource := range doc.Graph.Resources {
+		if resource.Kind == schema.KindDatabase {
+			databases = append(databases, resource)
+		}
+	}
+	if len(databases) != 1 {
+		t.Fatalf("database resources=%d", len(databases))
+	}
+	target, err := postgres.DatabaseTargetFromResource(databases[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target.Name != "autosql_cell" || target.MaintenanceDatabase != "postgres" || target.Endpoint.Host != "postgres.internal" || target.Owner != "autosql_cell_owner" {
+		t.Fatalf("target=%+v", target)
+	}
+	if strings.Contains(string(databases[0].Spec), "password") || strings.Contains(string(databases[0].Spec), "postgres://") {
+		t.Fatal("database HCL contains a credential or resolved URL")
+	}
+}
+
 func TestDocumentedDefaultExpressionHCLBuildsFreshPlan(t *testing.T) {
 	ctx := context.Background()
 	driver := postgres.New()

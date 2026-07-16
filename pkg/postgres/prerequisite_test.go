@@ -38,12 +38,16 @@ func TestGeneratedRoutinePrerequisiteManifestAndRenderPreflight(t *testing.T) {
 	}
 
 	empty := schema.Document{Version: schema.SchemaVersion}
+	doc, err = New().Normalize(context.Background(), doc)
+	if err != nil {
+		t.Fatal(err)
+	}
 	changes, err := schema.Diff(empty, doc, schema.DiffOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Current: empty, Desired: doc})
-	if err == nil || len(out) != 0 || !strings.Contains(err.Error(), "generated-routine prerequisite") || !strings.Contains(err.Error(), "exact inspected fingerprint") {
+	if err == nil || len(out) != 0 || !strings.Contains(err.Error(), "reviewed_routine_digests") {
 		t.Fatalf("out=%+v err=%v", out, err)
 	}
 }

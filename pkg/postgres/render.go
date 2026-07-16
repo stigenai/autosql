@@ -12,6 +12,7 @@ import (
 
 	"autosql/pkg/plugin"
 	"autosql/pkg/schema"
+	pg_query "github.com/pganalyze/pg_query_go/v6"
 )
 
 func (*Driver) Render(ctx context.Context, request plugin.RenderRequest) ([]plugin.Statement, error) {
@@ -26,6 +27,9 @@ func (*Driver) Render(ctx context.Context, request plugin.RenderRequest) ([]plug
 	// read-only semantics that would be unsafe to render as an actual change.
 	if len(request.Changes.Changes) == 0 {
 		return nil, nil
+	}
+	if err := validateExtensionMemberChanges(request); err != nil {
+		return nil, fmt.Errorf("render PostgreSQL changes: %w", err)
 	}
 	if err := validateExternalGeneratedRoutineChanges(request); err != nil {
 		return nil, fmt.Errorf("render PostgreSQL changes: %w", err)
@@ -47,6 +51,11 @@ func (*Driver) Render(ctx context.Context, request plugin.RenderRequest) ([]plug
 		return nil, fmt.Errorf("render PostgreSQL changes: %w", err)
 	}
 	resources := map[string]schema.Resource{}
+	extensionTransitions := extensionTransitionIDs(request)
+	roleRenamePresent := false
+	for _, change := range request.Changes.Changes {
+		roleRenamePresent = roleRenamePresent || change.Before != nil && change.After != nil && change.After.Kind == schema.KindRole && change.Before.ID != change.After.ID
+	}
 	for _, doc := range []schema.Document{request.Current, request.Desired} {
 		for _, r := range doc.Graph.Resources {
 			resources[r.ID] = r
@@ -55,9 +64,23 @@ func (*Driver) Render(ctx context.Context, request plugin.RenderRequest) ([]plug
 	var output []plugin.Statement
 	for _, change := range request.Changes.Changes {
 		options := request.Options
+		if roleRenamePresent {
+			options = cloneOptions(options)
+			options["__membership_has_role_rename"] = "true"
+		}
 		if rebuilds[change.ID] {
 			options = cloneOptions(options)
 			options["__view_rebuild"] = "true"
+		}
+		resource := change.After
+		if resource == nil {
+			resource = change.Before
+		}
+		if resource != nil {
+			if owner := extensionOwnerID(*resource, resources); owner != "" && extensionTransitions[owner] {
+				output = append(output, plugin.Statement{ChangeID: change.ID, Transactional: true, Kind: plugin.StatementTopology})
+				continue
+			}
 		}
 		statements, err := renderChange(change, resources, options)
 		if err != nil {
@@ -68,7 +91,51 @@ func (*Driver) Render(ctx context.Context, request plugin.RenderRequest) ([]plug
 	return output, nil
 }
 
+func extensionTransitionIDs(request plugin.RenderRequest) map[string]bool {
+	out := map[string]bool{}
+	for _, change := range request.Changes.Changes {
+		if change.Before != nil && change.Before.Kind == schema.KindExtension {
+			out[change.Before.ID] = true
+		}
+		if change.After != nil && change.After.Kind == schema.KindExtension {
+			out[change.After.ID] = true
+		}
+	}
+	return out
+}
+
+func extensionOwnerID(resource schema.Resource, resources map[string]schema.Resource) string {
+	for _, dependency := range resource.Dependencies {
+		if dependency.Type == schema.DependencyOwns && resources[dependency.Target].Kind == schema.KindExtension {
+			return dependency.Target
+		}
+	}
+	return ""
+}
+
+func validateExtensionMemberChanges(request plugin.RenderRequest) error {
+	resources := resourceMapForRender(request.Current)
+	for id, resource := range resourceMapForRender(request.Desired) {
+		resources[id] = resource
+	}
+	transitions := extensionTransitionIDs(request)
+	for _, change := range request.Changes.Changes {
+		resource := change.After
+		if resource == nil {
+			resource = change.Before
+		}
+		if resource == nil || resource.Kind == schema.KindExtension {
+			continue
+		}
+		if owner := extensionOwnerID(*resource, resources); owner != "" && !transitions[owner] {
+			return unsupported(*resource, "extension-owned resource must be changed through its owning extension")
+		}
+	}
+	return nil
+}
+
 func validateExternalGeneratedRoutineChanges(request plugin.RenderRequest) error {
+	transitions := extensionTransitionIDs(request)
 	required := map[string]bool{}
 	for _, document := range []schema.Document{request.Current, request.Desired} {
 		resources := resourceMapForRender(document)
@@ -88,7 +155,7 @@ func validateExternalGeneratedRoutineChanges(request plugin.RenderRequest) error
 		if resource == nil {
 			resource = change.Before
 		}
-		if resource != nil && resource.Kind == schema.KindFunction && required[resource.ID] {
+		if resource != nil && resource.Kind == schema.KindFunction && required[resource.ID] && stringValue(spec(*resource), "extension") != "" && !transitions[extensionOwnerID(*resource, resourceMapForRender(request.Current))] && !transitions[extensionOwnerID(*resource, resourceMapForRender(request.Desired))] {
 			classification := "application-owned"
 			if stringValue(spec(*resource), "extension") != "" {
 				classification = "extension-owned"
@@ -126,15 +193,17 @@ func renderChange(change schema.Change, resources map[string]schema.Resource, op
 			return nil, err
 		}
 	}
-	parentOnlyRename := change.Operation == schema.OperationRename && change.Before != nil && change.After != nil && change.Before.Name.Name == change.After.Name.Name && change.Before.Name.Parent != change.After.Name.Parent
+	parentOnlyRename := change.Operation == schema.OperationRename && change.Before != nil && change.After != nil && change.Before.Name.Name == change.After.Name.Name && change.Before.Name.Parent != change.After.Name.Parent && r.Kind != schema.KindExtension
+	membershipRename := change.Operation == schema.OperationRename && r.Kind == schema.KindMembership
+	membershipRoleAlter := change.Operation == schema.OperationAlter && r.Kind == schema.KindMembership && options["__membership_has_role_rename"] == "true" && membershipOptionsEqual(*change.Before, *change.After)
 	projectionChild := r.Kind == schema.KindColumn && isManagedProjectionParent(r.Name.Parent, resources)
 	commentOnlyAlter := change.Operation == schema.OperationAlter && change.Before != nil && change.After != nil && !resourceSQLSemanticsChanged(*change.Before, *change.After) && change.Before.Annotations["comment"] != change.After.Annotations["comment"]
-	if !parentOnlyRename && !projectionChild && !commentOnlyAlter {
+	if !parentOnlyRename && !membershipRename && !membershipRoleAlter && !projectionChild && !commentOnlyAlter {
 		if err := plugin.RequireManagedOperation(New().Info(), r.Kind, change.Operation); err != nil {
 			return nil, err
 		}
 	}
-	if parentOnlyRename || projectionChild {
+	if parentOnlyRename || membershipRename || membershipRoleAlter || projectionChild {
 		out := []plugin.Statement{{ChangeID: change.ID, Transactional: true, Kind: plugin.StatementTopology}}
 		comments, err := renderCommentChange(change, resources)
 		if err != nil {
@@ -196,17 +265,27 @@ func renderCreate(r schema.Resource, resources map[string]schema.Resource, optio
 	parent, err := parentName(r, resources)
 	switch r.Kind {
 	case schema.KindSchema:
-		if !allowedKeys(s) {
+		if !allowedKeys(s, "owner") {
 			return nil, unsupported(r, "unknown schema semantics")
 		}
-		return []string{"CREATE SCHEMA " + quote(r.Name.Name)}, nil
+		q := "CREATE SCHEMA " + quote(r.Name.Name)
+		if owner := stringValue(s, "owner"); owner != "" {
+			q += " AUTHORIZATION " + quote(owner)
+		}
+		return []string{q}, nil
 	case schema.KindExtension:
+		if err := validateExtensionOptions(r, options); err != nil {
+			return nil, err
+		}
 		q := "CREATE EXTENSION " + quote(r.Name.Name)
 		if r.Name.Schema != "" {
 			q += " WITH SCHEMA " + quote(r.Name.Schema)
 		}
 		if v := stringValue(s, "version"); v != "" {
 			q += " VERSION " + literal(v)
+		}
+		if boolValue(s, "cascade") {
+			q += " CASCADE"
 		}
 		return []string{q}, nil
 	case schema.KindEnum:
@@ -218,7 +297,8 @@ func renderCreate(r schema.Resource, resources map[string]schema.Resource, optio
 		for i, v := range vals {
 			qs[i] = literal(v)
 		}
-		return []string{"CREATE TYPE " + name + " AS ENUM (" + strings.Join(qs, ", ") + ")"}, nil
+		out := []string{"CREATE TYPE " + name + " AS ENUM (" + strings.Join(qs, ", ") + ")"}
+		return appendOwnerCreate(out, r, "TYPE"), nil
 	case schema.KindDomain:
 		base := stringValue(s, "base_type")
 		if base == "" {
@@ -234,22 +314,21 @@ func renderCreate(r schema.Resource, resources map[string]schema.Resource, optio
 		for _, constraint := range stringSlice(s, "constraints") {
 			q += " " + constraint
 		}
-		return []string{q}, nil
+		return appendOwnerCreate([]string{q}, r, "DOMAIN"), nil
 	case schema.KindComposite:
-		attrs, _ := s["attributes"].([]any)
-		if len(attrs) == 0 {
-			return nil, unsupported(r, "composite attributes")
+		attrs, parseErr := parseCompositeAttributes(r)
+		if parseErr != nil {
+			return nil, parseErr
 		}
 		parts := []string{}
-		for _, raw := range attrs {
-			o, _ := raw.(map[string]any)
-			n, t := stringValue(o, "name"), stringValue(o, "type")
-			if n == "" || t == "" {
-				return nil, unsupported(r, "composite attribute")
+		for _, attribute := range attrs {
+			part := quote(attribute.Name) + " " + attribute.Type
+			if attribute.Collation != "" {
+				part += " COLLATE " + attribute.Collation
 			}
-			parts = append(parts, quote(n)+" "+t)
+			parts = append(parts, part)
 		}
-		return []string{"CREATE TYPE " + name + " AS (" + strings.Join(parts, ", ") + ")"}, nil
+		return appendOwnerCreate([]string{"CREATE TYPE " + name + " AS (" + strings.Join(parts, ", ") + ")"}, r, "TYPE"), nil
 	case schema.KindSequence:
 		q := "CREATE SEQUENCE " + name
 		for _, x := range []struct{ k, w string }{{"start", " START WITH "}, {"increment", " INCREMENT BY "}, {"min", " MINVALUE "}, {"max", " MAXVALUE "}, {"cache", " CACHE "}} {
@@ -260,9 +339,9 @@ func renderCreate(r schema.Resource, resources map[string]schema.Resource, optio
 		if boolValue(s, "cycle") {
 			q += " CYCLE"
 		}
-		return []string{q}, nil
+		return appendOwnerCreate([]string{q}, r, "SEQUENCE"), nil
 	case schema.KindTable:
-		if !allowedKeys(s, "partitioned", "persistence", "row_security", "force_row_security") {
+		if !allowedKeys(s, "partitioned", "persistence", "row_security", "force_row_security", "owner") {
 			return nil, unsupported(r, "unknown table semantics")
 		}
 		if e := validateTableSpec(s); e != nil {
@@ -284,7 +363,7 @@ func renderCreate(r schema.Resource, resources map[string]schema.Resource, optio
 		if boolValue(s, "force_row_security") {
 			out = append(out, "ALTER TABLE "+name+" FORCE ROW LEVEL SECURITY")
 		}
-		return out, nil
+		return appendOwnerCreate(out, r, "TABLE"), nil
 	case schema.KindColumn:
 		if err != nil {
 			return nil, err
@@ -298,18 +377,69 @@ func renderCreate(r schema.Resource, resources map[string]schema.Resource, optio
 		if err != nil {
 			return nil, err
 		}
-		d := stringValue(s, "definition")
-		if d == "" {
-			return nil, unsupported(r, "constraint definition")
+		parsed, e := parseConstraintDefinition(r, resources)
+		if e != nil {
+			return nil, e
 		}
+		if parsed.constraint.GetNullsNotDistinct() {
+			if e := requirePostgresMajor(r, options, 15, "NULLS NOT DISTINCT constraint"); e != nil {
+				return nil, e
+			}
+		}
+		d := stringValue(s, "definition")
 		return []string{"ALTER TABLE " + parent + " ADD CONSTRAINT " + quote(r.Name.Name) + " " + d}, nil
 	case schema.KindIndex:
 		if err != nil {
 			return nil, err
 		}
-		return renderCreateIndex(r, parent, options)
+		return renderCreateIndex(r, resources, options)
+	case schema.KindFunction, schema.KindProcedure:
+		if stringValue(s, "extension") != "" {
+			return nil, unsupported(r, "extension-owned routine must be provisioned by its extension")
+		}
+		parsed, e := validateRoutineSource(r, options)
+		if e != nil {
+			return nil, e
+		}
+		out := []string{parsed.SQL}
+		if owner := stringValue(s, "owner"); owner != "" {
+			signature, signatureErr := routineSignature(r)
+			if signatureErr != nil {
+				return nil, signatureErr
+			}
+			out = append(out, "ALTER "+routineKeyword(r)+" "+signature+" OWNER TO "+quote(owner))
+		}
+		return out, nil
+	case schema.KindTrigger:
+		parsed, e := parseTriggerDefinition(r, resources)
+		if e != nil {
+			return nil, e
+		}
+		out := []string{parsed.SQL}
+		if stringValue(s, "enabled") != "O" {
+			enable, enableErr := renderTriggerEnable(r, resources)
+			if enableErr != nil {
+				return nil, enableErr
+			}
+			out = append(out, enable)
+		}
+		return out, nil
+	case schema.KindPolicy:
+		parsed, e := parsePolicy(r, resources)
+		if e != nil {
+			return nil, e
+		}
+		return []string{parsed.SQL}, nil
+	case schema.KindRole:
+		return renderRoleCreate(r, options)
+	case schema.KindMembership:
+		return renderMembershipGrant(r, resources, options)
+	case schema.KindGrant:
+		return renderGrantCreate(r, resources)
+	case schema.KindDefaultPrivilege:
+		return renderDefaultPrivilegeCreate(r, resources)
 	case schema.KindView, schema.KindMaterializedView:
-		if !allowedKeys(s, "definition") {
+		if !allowedKeys(s, "definition", "owner") {
 			return nil, unsupported(r, "unknown view semantics")
 		}
 		d := stringValue(s, "definition")
@@ -326,9 +456,53 @@ func renderCreate(r schema.Resource, resources map[string]schema.Resource, optio
 		if r.Kind == schema.KindMaterializedView {
 			kind = "MATERIALIZED VIEW"
 		}
-		return []string{"CREATE " + kind + " " + name + " AS " + d}, nil
+		return appendOwnerCreate([]string{"CREATE " + kind + " " + name + " AS " + d}, r, kind), nil
 	default:
 		return nil, unsupported(r, "create")
+	}
+}
+
+func appendOwnerCreate(statements []string, resource schema.Resource, keyword string) []string {
+	if owner := stringValue(spec(resource), "owner"); owner != "" {
+		statements = append(statements, "ALTER "+keyword+" "+qualified(resource.Name)+" OWNER TO "+quote(owner))
+	}
+	return statements
+}
+
+func ownerOnlyChange(before, after map[string]any) bool {
+	b := make(map[string]any, len(before))
+	a := make(map[string]any, len(after))
+	for key, value := range before {
+		if key != "owner" {
+			b[key] = value
+		}
+	}
+	for key, value := range after {
+		if key != "owner" {
+			a[key] = value
+		}
+	}
+	return slices.Equal(canonicalMapEntries(b), canonicalMapEntries(a))
+}
+
+func ownerAlterKeyword(kind schema.Kind) string {
+	switch kind {
+	case schema.KindSchema:
+		return "SCHEMA"
+	case schema.KindEnum, schema.KindComposite:
+		return "TYPE"
+	case schema.KindDomain:
+		return "DOMAIN"
+	case schema.KindSequence:
+		return "SEQUENCE"
+	case schema.KindTable:
+		return "TABLE"
+	case schema.KindView:
+		return "VIEW"
+	case schema.KindMaterializedView:
+		return "MATERIALIZED VIEW"
+	default:
+		return ""
 	}
 }
 
@@ -339,8 +513,16 @@ func renderDrop(r schema.Resource, resources map[string]schema.Resource, options
 	case schema.KindSchema:
 		return []string{"DROP SCHEMA " + name}, nil
 	case schema.KindExtension:
+		if !enabled(options, "allow_extension_drop", false) {
+			return nil, unsupported(r, "extension drop requires allow_extension_drop=true")
+		}
 		return []string{"DROP EXTENSION " + quote(r.Name.Name)}, nil
-	case schema.KindEnum, schema.KindComposite:
+	case schema.KindComposite:
+		if !enabled(options, "allow_composite_drop", false) {
+			return nil, unsupported(r, "composite type drop requires allow_composite_drop=true")
+		}
+		return []string{"DROP TYPE " + name}, nil
+	case schema.KindEnum:
 		return []string{"DROP TYPE " + name}, nil
 	case schema.KindDomain:
 		return []string{"DROP DOMAIN " + name}, nil
@@ -364,6 +546,30 @@ func renderDrop(r schema.Resource, resources map[string]schema.Resource, options
 			q += "CONCURRENTLY "
 		}
 		return []string{q + name}, nil
+	case schema.KindFunction, schema.KindProcedure:
+		signature, e := routineSignature(r)
+		if e != nil {
+			return nil, e
+		}
+		return []string{"DROP " + routineKeyword(r) + " " + signature}, nil
+	case schema.KindTrigger:
+		if err != nil {
+			return nil, err
+		}
+		return []string{"DROP TRIGGER " + quote(r.Name.Name) + " ON " + parent}, nil
+	case schema.KindPolicy:
+		if err != nil {
+			return nil, err
+		}
+		return []string{"DROP POLICY " + quote(r.Name.Name) + " ON " + parent}, nil
+	case schema.KindRole:
+		return renderRoleDrop(r, resources, options)
+	case schema.KindMembership:
+		return renderMembershipRevoke(r, resources, options)
+	case schema.KindGrant:
+		return renderGrantDrop(r, resources)
+	case schema.KindDefaultPrivilege:
+		return renderDefaultPrivilegeDrop(r, resources)
 	case schema.KindView:
 		return []string{"DROP VIEW " + name}, nil
 	case schema.KindMaterializedView:
@@ -393,6 +599,32 @@ func renderRename(before, after schema.Resource, resources map[string]schema.Res
 		return []string{"ALTER TABLE " + parent + " RENAME CONSTRAINT " + quote(before.Name.Name) + " TO " + newName}, nil
 	case schema.KindIndex:
 		return []string{"ALTER INDEX " + old + " RENAME TO " + newName}, nil
+	case schema.KindFunction, schema.KindProcedure:
+		signature, e := routineSignature(before)
+		if e != nil {
+			return nil, e
+		}
+		identitySuffix := "(" + stringValue(spec(after), "identity_arguments") + ")"
+		newBaseName := strings.TrimSuffix(after.Name.Name, identitySuffix)
+		if newBaseName == "" || newBaseName == after.Name.Name {
+			return nil, unsupported(after, "function rename target identity is not canonical")
+		}
+		return []string{"ALTER " + routineKeyword(after) + " " + signature + " RENAME TO " + quote(newBaseName)}, nil
+	case schema.KindTrigger:
+		if err != nil {
+			return nil, err
+		}
+		return []string{"ALTER TRIGGER " + quote(before.Name.Name) + " ON " + parent + " RENAME TO " + quote(after.Name.Name)}, nil
+	case schema.KindPolicy:
+		if err != nil {
+			return nil, err
+		}
+		return []string{"ALTER POLICY " + quote(before.Name.Name) + " ON " + parent + " RENAME TO " + quote(after.Name.Name)}, nil
+	case schema.KindRole:
+		if protectedRole(before.Name.Name) || protectedRole(after.Name.Name) {
+			return nil, unsupported(after, "system/protected roles cannot be renamed")
+		}
+		return []string{"ALTER ROLE " + quote(before.Name.Name) + " RENAME TO " + quote(after.Name.Name)}, nil
 	case schema.KindSequence:
 		return []string{"ALTER SEQUENCE " + old + " RENAME TO " + newName}, nil
 	case schema.KindView:
@@ -401,6 +633,14 @@ func renderRename(before, after schema.Resource, resources map[string]schema.Res
 		return []string{"ALTER MATERIALIZED VIEW " + old + " RENAME TO " + newName}, nil
 	case schema.KindEnum, schema.KindComposite:
 		return []string{"ALTER TYPE " + old + " RENAME TO " + newName}, nil
+	case schema.KindExtension:
+		if before.Name.Name != after.Name.Name {
+			return nil, unsupported(after, "PostgreSQL extensions cannot be renamed")
+		}
+		if !boolValue(spec(before), "relocatable") {
+			return nil, unsupported(after, "extension control metadata marks it non-relocatable")
+		}
+		return []string{"ALTER EXTENSION " + quote(after.Name.Name) + " SET SCHEMA " + quote(after.Name.Schema)}, nil
 	case schema.KindDomain:
 		return []string{"ALTER DOMAIN " + old + " RENAME TO " + newName}, nil
 	default:
@@ -413,6 +653,13 @@ func renderAlter(before, after schema.Resource, resources map[string]schema.Reso
 		return nil, unsupported(after, "kind change")
 	}
 	bs, as := spec(before), spec(after)
+	if stringValue(bs, "owner") != stringValue(as, "owner") && ownerOnlyChange(bs, as) {
+		keyword := ownerAlterKeyword(after.Kind)
+		if keyword == "" || stringValue(as, "owner") == "" {
+			return nil, unsupported(after, "owner removal or ownership transfer is unsupported for this kind")
+		}
+		return []string{"ALTER " + keyword + " " + qualified(after.Name) + " OWNER TO " + quote(stringValue(as, "owner"))}, nil
+	}
 	name := qualified(after.Name)
 	parent, err := parentName(after, resources)
 	switch after.Kind {
@@ -504,10 +751,99 @@ func renderAlter(before, after schema.Resource, resources map[string]schema.Reso
 		if !enabled(options, "allow_rebuild", false) {
 			return nil, unsupported(after, "index rebuild requires allow_rebuild=true")
 		}
+		if enabled(options, "concurrent_indexes", false) {
+			return renderConcurrentIndexRebuild(before, after, resources, options)
+		}
 		drop, _ := renderDrop(before, resources, options)
 		create, e := renderCreate(after, resources, options)
 		return append(drop, create...), e
-	case schema.KindPrimaryKey, schema.KindUniqueConstraint, schema.KindCheckConstraint, schema.KindForeignKey, schema.KindMaterializedView:
+	case schema.KindPolicy:
+		// PostgreSQL cannot alter command or permissive mode. A transactional
+		// deny-first replacement keeps RLS enabled and never widens access
+		// between the two statements.
+		drop, e := renderDrop(before, resources, options)
+		if e != nil {
+			return nil, e
+		}
+		create, e := renderCreate(after, resources, options)
+		return append(drop, create...), e
+	case schema.KindRole:
+		return renderRoleAlter(before, after, options)
+	case schema.KindMembership:
+		drop, e := renderMembershipRevoke(before, resources, options)
+		if e != nil {
+			return nil, e
+		}
+		create, e := renderMembershipGrant(after, resources, options)
+		return append(drop, create...), e
+	case schema.KindGrant:
+		return renderGrantAlter(before, after, resources)
+	case schema.KindDefaultPrivilege:
+		return renderDefaultPrivilegeAlter(before, after, resources)
+	case schema.KindFunction, schema.KindProcedure:
+		if stringValue(as, "extension") != "" {
+			return nil, unsupported(after, "extension-owned routine must be maintained by its extension")
+		}
+		parsed, e := validateRoutineSource(after, options)
+		if e != nil {
+			return nil, e
+		}
+		sql := parsed.SQL
+		if !parsed.statement.GetReplace() {
+			upper := strings.ToUpper(sql)
+			createPrefix := "CREATE " + routineKeyword(after)
+			position := strings.Index(upper, createPrefix)
+			if position != 0 {
+				return nil, unsupported(after, "routine replacement source is not canonical")
+			}
+			sql = "CREATE OR REPLACE " + routineKeyword(after) + sql[len(createPrefix):]
+		}
+		out := []string{sql}
+		if beforeOwner, afterOwner := stringValue(bs, "owner"), stringValue(as, "owner"); beforeOwner != afterOwner {
+			if afterOwner == "" {
+				return nil, unsupported(after, "function owner removal")
+			}
+			signature, signatureErr := routineSignature(after)
+			if signatureErr != nil {
+				return nil, signatureErr
+			}
+			out = append(out, "ALTER "+routineKeyword(after)+" "+signature+" OWNER TO "+quote(afterOwner))
+		}
+		return out, nil
+	case schema.KindTrigger:
+		if triggerEnableOnly(bs, as) {
+			statement, e := renderTriggerEnable(after, resources)
+			if e != nil {
+				return nil, e
+			}
+			return []string{statement}, nil
+		}
+		if !enabled(options, "allow_rebuild", false) {
+			return nil, unsupported(after, "trigger definition change requires allow_rebuild=true")
+		}
+		drop, e := renderDrop(before, resources, options)
+		if e != nil {
+			return nil, e
+		}
+		create, e := renderCreate(after, resources, options)
+		return append(drop, create...), e
+	case schema.KindPrimaryKey, schema.KindUniqueConstraint, schema.KindCheckConstraint, schema.KindForeignKey:
+		if constraintValidationOnly(bs, as) {
+			if err != nil {
+				return nil, err
+			}
+			return []string{"ALTER TABLE " + parent + " VALIDATE CONSTRAINT " + quote(after.Name.Name)}, nil
+		}
+		if !enabled(options, "allow_rebuild", false) {
+			return nil, unsupported(after, "rebuild requires allow_rebuild=true")
+		}
+		drop, e := renderDrop(before, resources, options)
+		if e != nil {
+			return nil, e
+		}
+		create, e := renderCreate(after, resources, options)
+		return append(drop, create...), e
+	case schema.KindMaterializedView:
 		if !enabled(options, "allow_rebuild", false) {
 			return nil, unsupported(after, "rebuild requires allow_rebuild=true")
 		}
@@ -518,11 +854,16 @@ func renderAlter(before, after schema.Resource, resources map[string]schema.Reso
 		create, e := renderCreate(after, resources, options)
 		return append(drop, create...), e
 	case schema.KindExtension:
+		if err := validateExtensionOptions(after, options); err != nil {
+			return nil, err
+		}
 		version := stringValue(as, "version")
 		if version == "" || version == stringValue(bs, "version") {
 			return nil, unsupported(after, "extension alteration")
 		}
 		return []string{"ALTER EXTENSION " + quote(after.Name.Name) + " UPDATE TO " + literal(version)}, nil
+	case schema.KindComposite:
+		return renderCompositeAlter(before, after, options)
 	case schema.KindSequence:
 		q := "ALTER SEQUENCE " + name
 		changed := false
@@ -550,7 +891,7 @@ func renderAlter(before, after schema.Resource, resources map[string]schema.Reso
 		}
 		return []string{q}, nil
 	case schema.KindTable:
-		if !allowedKeys(bs, "partitioned", "persistence", "row_security", "force_row_security") || !allowedKeys(as, "partitioned", "persistence", "row_security", "force_row_security") {
+		if !allowedKeys(bs, "partitioned", "persistence", "row_security", "force_row_security", "owner") || !allowedKeys(as, "partitioned", "persistence", "row_security", "force_row_security", "owner") {
 			return nil, unsupported(after, "unknown table semantics")
 		}
 		if e := validateTableSpec(bs); e != nil {
@@ -586,6 +927,42 @@ func renderAlter(before, after schema.Resource, resources map[string]schema.Reso
 	}
 }
 
+func constraintValidationOnly(before, after map[string]any) bool {
+	beforeValidated, beforeOK := before["validated"].(bool)
+	afterValidated, afterOK := after["validated"].(bool)
+	if !beforeOK || !afterOK || beforeValidated || !afterValidated {
+		return false
+	}
+	for key, beforeValue := range before {
+		if key == "validated" {
+			continue
+		}
+		afterValue, ok := after[key]
+		if !ok {
+			return false
+		}
+		if key == "definition" {
+			beforeDefinition, beforeString := beforeValue.(string)
+			afterDefinition, afterString := afterValue.(string)
+			if !beforeString || !afterString || strings.TrimSuffix(beforeDefinition, " NOT VALID") != afterDefinition {
+				return false
+			}
+			continue
+		}
+		if fmt.Sprint(beforeValue) != fmt.Sprint(afterValue) {
+			return false
+		}
+	}
+	for key := range after {
+		if key != "validated" {
+			if _, ok := before[key]; !ok {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func columnOrdinalOnly(before, after schema.Resource) bool {
 	bs, as := spec(before), spec(after)
 	if numberAsInt(bs, "ordinal") == numberAsInt(as, "ordinal") {
@@ -618,29 +995,60 @@ func safeAssignmentCast(before, after string) bool {
 	}
 }
 
-func renderCreateIndex(r schema.Resource, parent string, options map[string]string) ([]string, error) {
-	s := spec(r)
-	d := stringValue(s, "definition")
-	if d == "" {
-		return nil, unsupported(r, "index definition")
+func renderCreateIndex(r schema.Resource, resources map[string]schema.Resource, options map[string]string) ([]string, error) {
+	parsed, err := parseIndexDefinition(r, resources)
+	if err != nil {
+		return nil, err
 	}
-	u := strings.ToUpper(strings.TrimSpace(d))
-	if strings.HasPrefix(u, "CREATE ") {
-		if enabled(options, "concurrent_indexes", false) && !strings.Contains(u, "CONCURRENTLY") {
-			d = strings.Replace(d, "CREATE INDEX", "CREATE INDEX CONCURRENTLY", 1)
-		}
-		return []string{d}, nil
+	if err := validateIndexAvailability(r, parsed, options); err != nil {
+		return nil, err
 	}
-	q := "CREATE "
-	if boolValue(s, "unique") {
-		q += "UNIQUE "
-	}
-	q += "INDEX "
 	if enabled(options, "concurrent_indexes", false) {
-		q += "CONCURRENTLY "
+		parsed.statement.Concurrent = true
+		sql, deparseErr := pg_query.Deparse(parsed.tree)
+		if deparseErr != nil {
+			return nil, unsupported(r, "concurrent index definition could not be canonicalized")
+		}
+		parsed.SQL = sql
 	}
-	q += qualified(r.Name) + " ON " + parent + " " + d
-	return []string{q}, nil
+	if parsed.statement.GetNullsNotDistinct() {
+		if err := requirePostgresMajor(r, options, 15, "NULLS NOT DISTINCT index"); err != nil {
+			return nil, err
+		}
+	}
+	return []string{parsed.SQL}, nil
+}
+
+func renderConcurrentIndexRebuild(before, after schema.Resource, resources map[string]schema.Resource, options map[string]string) ([]string, error) {
+	parsed, err := parseIndexDefinition(after, resources)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateIndexAvailability(after, parsed, options); err != nil {
+		return nil, err
+	}
+	shadow := "autosql_rebuild_" + strings.TrimPrefix(after.ID, string(after.Kind)+":")
+	if len(shadow) > 63 {
+		shadow = shadow[:63]
+	}
+	parsed.statement.Idxname = shadow
+	parsed.statement.Concurrent = true
+	create, err := pg_query.Deparse(parsed.tree)
+	if err != nil {
+		return nil, unsupported(after, "concurrent shadow index could not be canonicalized")
+	}
+	drop := "DROP INDEX CONCURRENTLY " + qualified(before.Name)
+	rename := "ALTER INDEX " + quote(after.Name.Schema) + "." + quote(shadow) + " RENAME TO " + quote(after.Name.Name)
+	return []string{create, drop, rename}, nil
+}
+
+func requirePostgresMajor(resource schema.Resource, options map[string]string, minimum int, feature string) error {
+	value := strings.TrimSpace(options["postgres_version"])
+	major, err := strconv.Atoi(strings.SplitN(value, ".", 2)[0])
+	if err != nil || major < minimum {
+		return unsupported(resource, fmt.Sprintf("%s requires postgres_version >= %d", feature, minimum))
+	}
+	return nil
 }
 func columnDefinition(r schema.Resource, resources map[string]schema.Resource) (string, error) {
 	s := spec(r)
@@ -809,7 +1217,11 @@ func commentTarget(resource schema.Resource, resources map[string]schema.Resourc
 	switch resource.Kind {
 	case schema.KindSchema:
 		return "SCHEMA " + quote(resource.Name.Name), nil
+	case schema.KindExtension:
+		return "EXTENSION " + quote(resource.Name.Name), nil
 	case schema.KindEnum:
+		return "TYPE " + name, nil
+	case schema.KindComposite:
 		return "TYPE " + name, nil
 	case schema.KindDomain:
 		return "DOMAIN " + name, nil
@@ -827,6 +1239,34 @@ func commentTarget(resource schema.Resource, resources map[string]schema.Resourc
 			return "", err
 		}
 		return "COLUMN " + parent + "." + quote(resource.Name.Name), nil
+	case schema.KindPrimaryKey, schema.KindUniqueConstraint, schema.KindCheckConstraint, schema.KindForeignKey:
+		parent, err := parentName(resource, resources)
+		if err != nil {
+			return "", err
+		}
+		return "CONSTRAINT " + quote(resource.Name.Name) + " ON " + parent, nil
+	case schema.KindIndex:
+		return "INDEX " + name, nil
+	case schema.KindFunction, schema.KindProcedure:
+		signature, err := routineSignature(resource)
+		if err != nil {
+			return "", err
+		}
+		return routineKeyword(resource) + " " + signature, nil
+	case schema.KindTrigger:
+		parent, err := parentName(resource, resources)
+		if err != nil {
+			return "", err
+		}
+		return "TRIGGER " + quote(resource.Name.Name) + " ON " + parent, nil
+	case schema.KindPolicy:
+		parent, err := parentName(resource, resources)
+		if err != nil {
+			return "", err
+		}
+		return "POLICY " + quote(resource.Name.Name) + " ON " + parent, nil
+	case schema.KindRole:
+		return "ROLE " + quote(resource.Name.Name), nil
 	default:
 		return "", unsupported(resource, "comments are not managed for this resource kind")
 	}
@@ -1155,33 +1595,65 @@ func validateColumnOrdinalTransitions(request plugin.RenderRequest) error {
 
 func validateManagedDocuments(request plugin.RenderRequest) error {
 	scope := defaultRenderScope(request)
+	roleRenames := map[string]string{}
+	for _, change := range request.Changes.Changes {
+		if change.Before != nil && change.After != nil && change.After.Kind == schema.KindRole && change.Before.ID != change.After.ID {
+			roleRenames[change.Before.ID] = change.After.ID
+		}
+	}
 	for docIndex, doc := range []schema.Document{request.Current, request.Desired} {
 		resources := resourceMapForRender(doc)
+		if docIndex == 1 && len(roleRenames) > 0 {
+			for id, resource := range resources {
+				if resource.Kind != schema.KindMembership {
+					continue
+				}
+				resource.Dependencies = append([]schema.Dependency(nil), resource.Dependencies...)
+				for index := range resource.Dependencies {
+					if target := roleRenames[resource.Dependencies[index].Target]; target != "" {
+						resource.Dependencies[index].Target = target
+					}
+				}
+				resources[id] = resource
+			}
+		}
 		if e := validateCoreColumnOrdinals(resources); e != nil {
 			return e
 		}
 		for _, r := range doc.Graph.Resources {
+			if rewritten, ok := resources[r.ID]; ok {
+				r = rewritten
+			}
 			mode := New().Info().Capability(r.Kind).Mode
 			if mode == plugin.Managed {
 				if scope[r.ID] {
 					if e := validateManagedMetadata(r); e != nil {
 						return e
 					}
-				}
-				if e := validateCanonicalIdentity(r, resources); e != nil {
-					return e
-				}
-				if e := validateSemanticDependencies(r, resources); e != nil {
-					return e
+					if e := validateCanonicalIdentity(r, resources); e != nil {
+						return e
+					}
+					if e := validateSemanticDependencies(r, resources); e != nil {
+						return e
+					}
+					if e := validateOwnerDependency(r, resources); e != nil {
+						return e
+					}
 				}
 				s := spec(r)
 				switch r.Kind {
 				case schema.KindSchema:
-					if !allowedKeys(s) {
+					if !allowedKeys(s, "owner") {
 						return unsupported(r, "unknown schema semantics")
 					}
+				case schema.KindExtension:
+					if docIndex == 1 && scope[r.ID] {
+						if e := validateExtensionOptions(r, request.Options); e != nil {
+							return e
+						}
+					}
 				case schema.KindTable:
-					if !allowedKeys(s, "partitioned", "persistence", "row_security", "force_row_security") {
+					if !allowedKeys(s, "partitioned", "persistence", "row_security", "force_row_security", "owner") {
 						return unsupported(r, "unknown table semantics")
 					}
 					if e := validateTableSpec(s); e != nil {
@@ -1191,12 +1663,18 @@ func validateManagedDocuments(request plugin.RenderRequest) error {
 						return unsupported(r, "table storage is outside managed matrix")
 					}
 				case schema.KindEnum:
-					if docIndex == 1 && scope[r.ID] && (!allowedKeys(s, "values") || len(stringSlice(s, "values")) == 0) {
+					if docIndex == 1 && scope[r.ID] && (!allowedKeys(s, "values", "owner") || len(stringSlice(s, "values")) == 0) {
 						return unsupported(r, "enum values must be a non-empty string list")
 					}
 				case schema.KindDomain:
 					if docIndex == 1 && scope[r.ID] {
 						if e := validateDomainSpec(r); e != nil {
+							return e
+						}
+					}
+				case schema.KindComposite:
+					if docIndex == 1 && scope[r.ID] {
+						if e := validateCompositeSpec(r, resources); e != nil {
 							return e
 						}
 					}
@@ -1207,7 +1685,7 @@ func validateManagedDocuments(request plugin.RenderRequest) error {
 						}
 					}
 				case schema.KindView, schema.KindMaterializedView:
-					if !allowedKeys(s, "definition") {
+					if !allowedKeys(s, "definition", "owner") {
 						return unsupported(r, "unknown view semantics")
 					}
 					if e := validateSQLFragment(stringValue(s, "definition")); e != nil {
@@ -1249,6 +1727,60 @@ func validateManagedDocuments(request plugin.RenderRequest) error {
 							}
 						}
 					}
+				case schema.KindPrimaryKey, schema.KindUniqueConstraint, schema.KindCheckConstraint, schema.KindForeignKey, schema.KindIndex:
+					if docIndex == 1 && scope[r.ID] {
+						if e := validateConstraintIndexSpec(r, resources); e != nil {
+							return e
+						}
+					}
+				case schema.KindFunction, schema.KindProcedure:
+					if !allowedKeys(s, "name", "identity_arguments", "arguments", "result", "returns_set", "language", "volatility", "strict", "security_definer", "leakproof", "parallel", "cost", "rows", "configuration", "owner", "definition", "body_digest", "extension") {
+						return unsupported(r, "unknown routine semantics")
+					}
+				case schema.KindTrigger:
+					if docIndex == 1 && scope[r.ID] {
+						if e := validateTriggerSpec(r, resources); e != nil {
+							return e
+						}
+					}
+				case schema.KindPolicy:
+					if docIndex == 1 && scope[r.ID] {
+						if _, e := parsePolicy(r, resources); e != nil {
+							return e
+						}
+					}
+				case schema.KindRole:
+					if docIndex == 1 && scope[r.ID] {
+						if e := validateRoleSpec(r, request.Options); e != nil {
+							return e
+						}
+					}
+				case schema.KindMembership:
+					if docIndex == 1 && scope[r.ID] {
+						membershipOptions := request.Options
+						if len(roleRenames) > 0 {
+							membershipOptions = cloneOptions(request.Options)
+							membershipOptions["__membership_role_rename"] = "true"
+							for before, after := range roleRenames {
+								membershipOptions["__role_rename."+before] = after
+							}
+						}
+						if e := validateMembershipSpec(r, resources, membershipOptions); e != nil {
+							return e
+						}
+					}
+				case schema.KindGrant:
+					if docIndex == 1 && scope[r.ID] {
+						if _, e := parseGrant(r, resources); e != nil {
+							return e
+						}
+					}
+				case schema.KindDefaultPrivilege:
+					if docIndex == 1 && scope[r.ID] {
+						if _, e := parseDefaultPrivilege(r, resources); e != nil {
+							return e
+						}
+					}
 				}
 			} else if r.Kind == schema.KindColumn && isManagedProjectionParent(r.Name.Parent, resources) {
 				if scope[r.ID] {
@@ -1259,6 +1791,11 @@ func validateManagedDocuments(request plugin.RenderRequest) error {
 				if e := validateProjectionResource(r, r.Name.Parent); e != nil {
 					return e
 				}
+			}
+		}
+		if docIndex == 1 {
+			if e := validateMembershipCycles(resources); e != nil {
+				return e
 			}
 		}
 	}
@@ -1284,7 +1821,7 @@ var canonicalDomainCheck = regexp.MustCompile(`^CHECK \(\(*VALUE (?:=|<>|!=|<|<=
 
 func validateDomainSpec(resource schema.Resource) error {
 	s := spec(resource)
-	if !allowedKeys(s, "base_type", "default", "not_null", "constraints") {
+	if !allowedKeys(s, "base_type", "default", "not_null", "constraints", "owner") {
 		return unsupported(resource, "unknown domain semantics")
 	}
 	baseName := postgresTypeAlias(stringValue(s, "base_type"))
@@ -1322,7 +1859,7 @@ func validateDomainSpec(resource schema.Resource) error {
 
 func validateSequenceSpec(resource schema.Resource) error {
 	s := spec(resource)
-	if !allowedKeys(s, "start", "increment", "min", "max", "cache", "cycle") {
+	if !allowedKeys(s, "start", "increment", "min", "max", "cache", "cycle", "owner") {
 		return unsupported(resource, "unknown sequence semantics")
 	}
 	for _, key := range []string{"start", "increment", "min", "max", "cache"} {
@@ -1629,6 +2166,8 @@ func validateSemanticDependencies(r schema.Resource, resources map[string]schema
 			if err := validateGeneratedDependencies(r, resources); err != nil {
 				return err
 			}
+		} else if err := validateDefaultRoutineDependencies(r, resources); err != nil {
+			return err
 		}
 		typ := stringValue(spec(r), "type")
 		for id, candidate := range resources {
@@ -1639,12 +2178,56 @@ func validateSemanticDependencies(r schema.Resource, resources map[string]schema
 				}
 			}
 		}
+	case schema.KindComposite:
+		expectedType = schema.DependencyUses
+		attributes, err := parseCompositeAttributes(r)
+		if err != nil {
+			return err
+		}
+		for _, attribute := range attributes {
+			for id, candidate := range resources {
+				if candidate.ID == r.ID {
+					continue
+				}
+				switch candidate.Kind {
+				case schema.KindEnum, schema.KindDomain, schema.KindComposite:
+					if typeReferenceMatches(attribute.Type, r.Name.Schema, candidate.Name) {
+						expected = append(expected, id)
+					}
+				}
+			}
+		}
+	case schema.KindPrimaryKey, schema.KindUniqueConstraint, schema.KindCheckConstraint, schema.KindForeignKey, schema.KindIndex:
+		expectedType = schema.DependencyContains
+		var err error
+		expected, err = constraintIndexExpectedDependencies(r, resources)
+		if err != nil {
+			return err
+		}
+	case schema.KindTrigger:
+		expectedType = schema.DependencyContains
+		var err error
+		expected, err = triggerExpectedDependencies(r, resources)
+		if err != nil {
+			return err
+		}
+	case schema.KindPolicy:
+		expectedType = schema.DependencyContains
+		var err error
+		expected, err = policyExpectedDependencies(r, resources)
+		if err != nil {
+			return err
+		}
 	default:
 		return nil
 	}
 	var actual []string
 	for _, dep := range r.Dependencies {
-		if dep.Type == expectedType {
+		if extensionDependency(dep, resources) {
+			continue
+		}
+		dependentObject := r.Kind == schema.KindPrimaryKey || r.Kind == schema.KindUniqueConstraint || r.Kind == schema.KindCheckConstraint || r.Kind == schema.KindForeignKey || r.Kind == schema.KindIndex || r.Kind == schema.KindTrigger || r.Kind == schema.KindPolicy
+		if dep.Type == expectedType || dependentObject && dep.Type == schema.DependencyReferences {
 			actual = append(actual, dep.Target)
 		}
 	}
@@ -1684,16 +2267,36 @@ func validateCanonicalIdentity(r schema.Resource, resources map[string]schema.Re
 	}
 	switch r.Kind {
 	case schema.KindSchema:
-		if r.Name.Schema != "" || r.Name.Parent != "" || len(r.Dependencies) != 0 {
+		if r.Name.Schema != "" || r.Name.Parent != "" {
 			return unsupported(r, "schema name/parent/dependencies are noncanonical")
 		}
-	case schema.KindTable, schema.KindView, schema.KindMaterializedView, schema.KindEnum, schema.KindDomain, schema.KindComposite, schema.KindSequence:
+		for _, dependency := range r.Dependencies {
+			if dependency.Type != schema.DependencyOwns {
+				return unsupported(r, "schema dependencies are noncanonical")
+			}
+		}
+	case schema.KindRole:
+		if r.Name.Schema != "" || r.Name.Parent != "" || len(r.Dependencies) != 0 {
+			return unsupported(r, "role identity/dependencies are noncanonical")
+		}
+	case schema.KindMembership:
+		if r.Name.Schema != "" || r.Name.Parent != "" {
+			return unsupported(r, "membership identity is noncanonical")
+		}
+	case schema.KindGrant:
+		if r.Name.Parent == "" {
+			return unsupported(r, "grant target parent is required")
+		}
+	case schema.KindExtension, schema.KindTable, schema.KindView, schema.KindMaterializedView, schema.KindEnum, schema.KindDomain, schema.KindComposite, schema.KindSequence:
 		parent, ok := resources[r.Name.Parent]
 		if !ok || parent.Kind != schema.KindSchema || parent.Name.Name != r.Name.Schema || r.Name.Schema == "" {
 			return unsupported(r, "schema parent is noncanonical")
 		}
 		contains := 0
 		for _, dep := range r.Dependencies {
+			if extensionDependency(dep, resources) {
+				continue
+			}
 			if dep.Target == parent.ID && dep.Type == schema.DependencyContains {
 				contains++
 				continue
@@ -1702,6 +2305,9 @@ func validateCanonicalIdentity(r schema.Resource, resources map[string]schema.Re
 				if _, ok := resources[dep.Target]; ok {
 					continue
 				}
+			}
+			if dep.Type == schema.DependencyOwns {
+				continue
 			}
 			return unsupported(r, "dependencies are noncanonical")
 		}
@@ -1715,6 +2321,9 @@ func validateCanonicalIdentity(r schema.Resource, resources map[string]schema.Re
 		}
 		contains := 0
 		for _, dep := range r.Dependencies {
+			if extensionDependency(dep, resources) {
+				continue
+			}
 			if dep.Target == parent.ID && dep.Type == schema.DependencyContains {
 				contains++
 				continue
@@ -1729,6 +2338,9 @@ func validateCanonicalIdentity(r schema.Resource, resources map[string]schema.Re
 					if target.Kind == schema.KindSequence {
 						continue
 					}
+					if stringValue(spec(r), "generated") == "" && stringValue(spec(r), "default") != "" && target.Kind == schema.KindFunction {
+						continue
+					}
 					if stringValue(spec(r), "generated") == "s" && (target.Kind == schema.KindFunction || target.Kind == schema.KindColumn && target.Name.Parent == r.Name.Parent) {
 						continue
 					}
@@ -1739,9 +2351,48 @@ func validateCanonicalIdentity(r schema.Resource, resources map[string]schema.Re
 		if contains != 1 {
 			return unsupported(r, "column requires exactly one parent containment dependency")
 		}
+	case schema.KindPolicy:
+		parent, ok := resources[r.Name.Parent]
+		if !ok || parent.Kind != schema.KindTable || r.Name.Schema != parent.Name.Schema {
+			return unsupported(r, "policy table parent is noncanonical")
+		}
 	}
 	return nil
 }
+func validateOwnerDependency(resource schema.Resource, resources map[string]schema.Resource) error {
+	if resource.Kind == schema.KindDefaultPrivilege {
+		return nil
+	}
+	owner := stringValue(spec(resource), "owner")
+	var actual []string
+	for _, dependency := range resource.Dependencies {
+		if dependency.Type == schema.DependencyOwns && resources[dependency.Target].Kind == schema.KindRole {
+			actual = append(actual, dependency.Target)
+		}
+	}
+	if owner == "" {
+		if len(actual) != 0 {
+			return unsupported(resource, "owner dependency exists without owner")
+		}
+		return nil
+	}
+	// Routine ownership predates managed cluster-role inspection. Preserve
+	// stable adoption when roles were intentionally not selected; advanced
+	// inventories carry the exact OWNS edge and are checked below.
+	if (resource.Kind == schema.KindFunction || resource.Kind == schema.KindProcedure) && len(actual) == 0 {
+		return nil
+	}
+	expected, err := roleOwnerDependency(owner, resources)
+	if err != nil || len(actual) != 1 || actual[0] != expected {
+		return unsupported(resource, "owner dependency does not exactly match declared owner")
+	}
+	return nil
+}
+
+func extensionDependency(dependency schema.Dependency, resources map[string]schema.Resource) bool {
+	return resources[dependency.Target].Kind == schema.KindExtension && (dependency.Type == schema.DependencyOwns || dependency.Type == schema.DependencyUses || dependency.Type == schema.DependencyReferences)
+}
+
 func validateNativeAtom(value string) error {
 	if strings.TrimSpace(value) == "" {
 		return fmt.Errorf("empty")

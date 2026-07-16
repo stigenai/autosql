@@ -66,6 +66,83 @@ spec:
                   properties:
                     name: {type: string, minLength: 1, pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'}
                     key: {type: string, minLength: 1, pattern: '^[A-Za-z0-9._-]+$'}
+                maintenanceDatabaseURL:
+                  type: object
+                  required: [name, key]
+                  properties:
+                    name: {type: string, minLength: 1, pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'}
+                    key: {type: string, minLength: 1, pattern: '^[A-Za-z0-9._-]+$'}
+                databaseTarget:
+                  type: object
+                  required: [mode, endpoint, maintenanceDatabase, name, owner, connectionLimit, allowConnections]
+                  properties:
+                    mode: {type: string, enum: [managed, external]}
+                    endpoint:
+                      type: object
+                      required: [host]
+                      properties:
+                        host: {type: string, minLength: 1}
+                        port: {type: integer, minimum: 1, maximum: 65535, default: 5432}
+                        tlsMode: {type: string, enum: [disable, require, verify-ca, verify-full], default: require}
+                    maintenanceDatabase: {type: string, minLength: 1, default: postgres}
+                    name: {type: string, minLength: 1}
+                    owner: {type: string, minLength: 1}
+                    encoding: {type: string, minLength: 1, default: UTF8}
+                    localeProvider: {type: string, enum: [libc, icu, builtin]}
+                    collation: {type: string}
+                    characterType: {type: string}
+                    icuLocale: {type: string}
+                    template: {type: string, minLength: 1, default: template0}
+                    tablespace: {type: string, minLength: 1, default: pg_default}
+                    connectionLimit: {type: integer, minimum: -1}
+                    allowConnections: {type: boolean}
+                createDatabase: {type: boolean, default: false}
+                bootstrapAuthority:
+                  type: object
+                  required: [identities, assignments]
+                  properties:
+                    identities:
+                      type: array
+                      minItems: 1
+                      x-kubernetes-list-type: map
+                      x-kubernetes-list-map-keys: [name]
+                      items:
+                        type: object
+                        required: [name, subject, authentication, capabilities]
+                        properties:
+                          name: {type: string, minLength: 1}
+                          subject: {type: string, minLength: 1}
+                          authentication: {type: string, enum: [current_session, secret_reference, aws_irsa, oidc]}
+                          credential:
+                            type: object
+                            required: [provider, name]
+                            properties:
+                              provider: {type: string, minLength: 1}
+                              name: {type: string, minLength: 1}
+                              key: {type: string, minLength: 1}
+                          capabilities:
+                            type: array
+                            minItems: 1
+                            x-kubernetes-list-type: set
+                            items:
+                              type: string
+                              enum: [create_database, manage_roles, manage_extensions, manage_schema_objects, manage_grants, transfer_ownership]
+                        x-kubernetes-validations:
+                          - rule: "self.authentication == 'secret_reference' ? has(self.credential) : !has(self.credential)"
+                            message: only secret_reference authentication requires a credential reference
+                    assignments:
+                      type: array
+                      minItems: 1
+                      x-kubernetes-list-type: map
+                      x-kubernetes-list-map-keys: [responsibility]
+                      items:
+                        type: object
+                        required: [responsibility, identity]
+                        properties:
+                          responsibility:
+                            type: string
+                            enum: [database_creation, role_creation, extension_setup, schema_objects, grant_setup, ownership_handoff]
+                          identity: {type: string, minLength: 1}
                 requireApproval: {type: boolean}
               x-kubernetes-validations:
                 - rule: "self.generation >= 1"
@@ -74,6 +151,12 @@ spec:
                   message: operator migrations require artifactDigest
                 - rule: "!has(self.source.registryDigest) || self.source.registryDigest == self.artifactDigest"
                   message: registryDigest must equal artifactDigest
+                - rule: "!self.createDatabase || has(self.bootstrapAuthority)"
+                  message: createDatabase requires bootstrapAuthority
+                - rule: "!has(self.databaseTarget) || self.databaseTarget.mode != 'managed' || (has(self.bootstrapAuthority) && has(self.maintenanceDatabaseURL))"
+                  message: managed databaseTarget requires bootstrapAuthority and maintenanceDatabaseURL
+                - rule: "!self.createDatabase || !has(self.databaseTarget) || self.databaseTarget.mode == 'managed'"
+                  message: createDatabase conflicts with external databaseTarget mode
             status:
               type: object
               properties:

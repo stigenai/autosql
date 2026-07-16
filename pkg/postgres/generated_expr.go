@@ -95,6 +95,47 @@ func validateGeneratedDependencies(resource schema.Resource, resources map[strin
 	return nil
 }
 
+func validateDefaultRoutineDependencies(resource schema.Resource, resources map[string]schema.Resource) error {
+	values := spec(resource)
+	if stringValue(values, "generated") != "" || stringValue(values, "default") == "" {
+		return nil
+	}
+	analysis, err := analyzeGeneratedExpression(stringValue(values, "default"))
+	if err != nil {
+		// The default grammar performs its own bounded validation. Only enforce
+		// application routine edges when the expression analyzer supports it.
+		return nil
+	}
+	var expected []string
+	for _, call := range analysis.Functions {
+		var matches []string
+		for id, candidate := range resources {
+			if candidate.Kind == schema.KindFunction && generatedFunctionReferenceMatches(call, resource.Name.Schema, candidate) {
+				matches = append(matches, id)
+			}
+		}
+		if len(matches) == 0 {
+			continue
+		}
+		if len(matches) != 1 {
+			return unsupported(resource, "default routine reference is ambiguous")
+		}
+		expected = append(expected, matches[0])
+	}
+	var actual []string
+	for _, dependency := range resource.Dependencies {
+		if candidate, ok := resources[dependency.Target]; ok && dependency.Type == schema.DependencyReferences && candidate.Kind == schema.KindFunction {
+			actual = append(actual, dependency.Target)
+		}
+	}
+	sort.Strings(expected)
+	sort.Strings(actual)
+	if !slices.Equal(expected, actual) {
+		return unsupported(resource, "default routine dependencies are not exact")
+	}
+	return nil
+}
+
 func validateGeneratedColumnCreate(resource schema.Resource, resources map[string]schema.Resource) error {
 	values := spec(resource)
 	if stringValue(values, "generated") != "s" || stringValue(values, "default") == "" {

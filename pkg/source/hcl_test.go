@@ -189,3 +189,37 @@ resource "primary_key" "users_pkey" {
 		t.Fatalf("missing helper dependencies: %+v", want)
 	}
 }
+
+func TestHCLCompositeHelpersProduceOrderedAttributesAndTypedIDs(t *testing.T) {
+	doc, err := ParseHCL("composite-helpers.hcl", []byte(`schema "app" {}
+composite_type "profile" {
+  schema = "app"
+  dependencies = [uses(extension_id("app", "hstore"))]
+  attributes = [
+    composite_attribute("name", "text", 1),
+    collated_composite_attribute("label", "text", 2, "pg_catalog.\"C\""),
+  ]
+}
+extension "hstore" {
+  schema = "app"
+  version = "1.8"
+}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, resource := range doc.Graph.Resources {
+		switch resource.Kind {
+		case schema.KindComposite:
+			if resource.ID != schema.StableID(schema.KindComposite, resource.Name) || !strings.Contains(string(resource.Spec), `"ordinal":2`) || !strings.Contains(string(resource.Spec), `"collation"`) {
+				t.Fatalf("composite helper result=%s id=%s", resource.Spec, resource.ID)
+			}
+			if len(resource.Dependencies) != 2 {
+				t.Fatalf("composite helper dependencies=%+v", resource.Dependencies)
+			}
+		case schema.KindExtension:
+			if resource.ID != schema.StableID(schema.KindExtension, resource.Name) {
+				t.Fatalf("extension helper id=%s", resource.ID)
+			}
+		}
+	}
+}

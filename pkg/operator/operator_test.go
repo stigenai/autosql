@@ -5,6 +5,8 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+
+	"autosql/pkg/bootstrap"
 )
 
 func TestFileStorePersistsRecords(t *testing.T) {
@@ -161,5 +163,47 @@ func TestRegistryDigestMustMatchArtifactDigest(t *testing.T) {
 	}}
 	if _, err := r.Reconcile(context.Background(), obj, true); err == nil {
 		t.Fatal("mismatched registry and artifact digests accepted")
+	}
+}
+
+func TestFreshDatabaseRequiresValidSharedBootstrapAuthority(t *testing.T) {
+	obj := resource()
+	obj.Spec.RequireApproval = false
+	obj.Spec.CreateDatabase = true
+	r := Reconciler{Store: NewMemoryStore(), Apply: func(context.Context, Resource, string) (ApplyResult, error) {
+		t.Fatal("invalid bootstrap authority reached apply")
+		return ApplyResult{}, nil
+	}}
+	if _, err := r.Reconcile(context.Background(), obj, true); err == nil {
+		t.Fatal("createDatabase without authority accepted")
+	}
+	obj.Spec.BootstrapAuthority = &bootstrap.Contract{
+		Identities:  []bootstrap.Identity{{Name: "operator", Subject: "system:serviceaccount:autosql:operator", Authentication: bootstrap.AWSIRSA, Capabilities: []bootstrap.Capability{bootstrap.CreateDatabase}}},
+		Assignments: []bootstrap.Assignment{{Responsibility: bootstrap.DatabaseCreation, Identity: "operator"}},
+	}
+	calls := 0
+	r = Reconciler{Store: NewMemoryStore(), Apply: func(context.Context, Resource, string) (ApplyResult, error) { calls++; return ApplyResult{}, nil }}
+	if _, err := r.Reconcile(context.Background(), obj, true); err != nil || calls != 1 {
+		t.Fatalf("shared authority rejected: calls=%d err=%v", calls, err)
+	}
+}
+
+func TestManagedDatabaseTargetRequiresMaintenanceReferenceAndAuthority(t *testing.T) {
+	obj := resource()
+	obj.Spec.RequireApproval = false
+	obj.Spec.DatabaseTarget = &bootstrap.DatabaseTarget{Mode: bootstrap.ManagedDatabase, Endpoint: bootstrap.ServerEndpoint{Host: "postgres.internal", Port: 5432, TLSMode: "require"}, MaintenanceDatabase: "postgres", Name: "cell", Owner: "cell_owner", Encoding: "UTF8", Template: "template0", Tablespace: "pg_default", ConnectionLimit: 20, AllowConnections: true}
+	reconciler := Reconciler{Store: NewMemoryStore(), Apply: func(context.Context, Resource, string) (ApplyResult, error) {
+		t.Fatal("invalid target applied")
+		return ApplyResult{}, nil
+	}}
+	if _, err := reconciler.Reconcile(context.Background(), obj, true); err == nil {
+		t.Fatal("managed target without authority/reference passed")
+	}
+	obj.Spec.MaintenanceDatabaseURL = &SecretKeyRef{Name: "maintenance-db", Key: "url"}
+	obj.Spec.BootstrapAuthority = &bootstrap.Contract{Identities: []bootstrap.Identity{{Name: "cluster", Subject: "db-admin", Authentication: bootstrap.OIDC, Capabilities: []bootstrap.Capability{bootstrap.CreateDatabase}}}, Assignments: []bootstrap.Assignment{{Responsibility: bootstrap.DatabaseCreation, Identity: "cluster"}}}
+	calls := 0
+	reconciler = Reconciler{Store: NewMemoryStore(), Apply: func(context.Context, Resource, string) (ApplyResult, error) { calls++; return ApplyResult{}, nil }}
+	if _, err := reconciler.Reconcile(context.Background(), obj, true); err != nil || calls != 1 {
+		t.Fatalf("managed target rejected calls=%d err=%v", calls, err)
 	}
 }

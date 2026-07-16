@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"autosql/pkg/bootstrap"
 	"autosql/pkg/schema"
 )
 
@@ -54,14 +55,13 @@ func TestPreflightProvisioningAggregatesCompleteCellBlockers(t *testing.T) {
 	if string(a) != string(b) {
 		t.Fatalf("preflight is unstable:\n%s\n%s", a, b)
 	}
-	if first.Supported || len(first.Diagnostics) < 4 {
+	if first.Supported || len(first.Diagnostics) < 3 {
 		t.Fatalf("report=%s", a)
 	}
 	want := map[string]bool{
 		"unsupported_spec_key:future_semantic":     false,
 		"unsupported_annotation:future_annotation": false,
-		"external_prerequisite:":                   false,
-		"unsupported_operation:create":             false,
+		"renderability:":                           false,
 	}
 	for _, diagnostic := range first.Diagnostics {
 		key := diagnostic.Class + ":" + diagnostic.Field
@@ -86,5 +86,45 @@ func TestPreflightProvisioningAggregatesCompleteCellBlockers(t *testing.T) {
 	var decoded ProvisioningReport
 	if err := json.Unmarshal(a, &decoded); err != nil || len(decoded.Diagnostics) != len(first.Diagnostics) {
 		t.Fatalf("canonical report did not round-trip: %v", err)
+	}
+}
+
+func TestPreflightBootstrapProvisioningBindsEveryAuthorityBeforeSQL(t *testing.T) {
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "cell"}, `{}`)
+	role := renderResource(schema.KindRole, schema.Name{Name: "cell_app"}, `{"login":true}`)
+	grant := renderResource(schema.KindGrant, schema.Name{Name: "cell_app.table.cell.jobs.SELECT"}, `{"grantee":"cell_app","object_type":"table","object_identity":"cell.jobs","privilege":"SELECT","grantable":false}`)
+	extension := renderResource(schema.KindExtension, schema.Name{Name: "pgcrypto"}, `{"version":"1.3","schema":"public"}`)
+	doc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, role, grant, extension}}, Annotations: map[string]string{"dialect": "postgresql"}}
+	contract := bootstrap.Contract{
+		Identities: []bootstrap.Identity{
+			{Name: "cluster", Subject: "bootstrap_admin", Authentication: bootstrap.CurrentSession, Capabilities: []bootstrap.Capability{bootstrap.CreateDatabase, bootstrap.ManageRoles, bootstrap.ManageExtensions, bootstrap.ManageGrants}},
+			{Name: "owner", Subject: "cell_owner", Authentication: bootstrap.OIDC, Capabilities: []bootstrap.Capability{bootstrap.ManageSchema, bootstrap.TransferOwnership}},
+		},
+		Assignments: []bootstrap.Assignment{
+			{Responsibility: bootstrap.DatabaseCreation, Identity: "cluster"},
+			{Responsibility: bootstrap.RoleCreation, Identity: "cluster"},
+			{Responsibility: bootstrap.ExtensionSetup, Identity: "cluster"},
+			{Responsibility: bootstrap.SchemaObjects, Identity: "owner"},
+			{Responsibility: bootstrap.GrantSetup, Identity: "cluster"},
+			{Responsibility: bootstrap.OwnershipHandoff, Identity: "owner"},
+		},
+	}
+	report, err := PreflightBootstrapProvisioning(context.Background(), doc, nil, contract, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Authority) != 6 || len(report.AuthorityDiagnostics) != 0 {
+		t.Fatalf("authority=%+v diagnostics=%v", report.Authority, report.AuthorityDiagnostics)
+	}
+	// These kinds remain read-only until their lifecycle stories land, so the
+	// complete report is not yet supported even though authority is complete.
+	if report.Supported {
+		t.Fatal("read-only security resources unexpectedly passed renderability")
+	}
+
+	contract.Assignments = contract.Assignments[:4]
+	report, err = PreflightBootstrapProvisioning(context.Background(), doc, nil, contract, true)
+	if err != nil || report.Supported || len(report.AuthorityDiagnostics) != 2 {
+		t.Fatalf("report=%+v err=%v", report, err)
 	}
 }

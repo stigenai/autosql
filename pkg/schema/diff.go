@@ -254,7 +254,8 @@ func Diff(current, desired Document, options DiffOptions) (ChangeSet, error) {
 		}
 		parentMapped := from.Name.Parent != "" && hintedParents[from.Name.Parent] == to.Name.Parent
 		sameContainer := from.Name.Parent == to.Name.Parent && from.Name.Catalog == to.Name.Catalog && from.Name.Schema == to.Name.Schema
-		if !sameContainer && !parentMapped {
+		extensionSchemaMove := from.Kind == KindExtension && from.Name.Name == to.Name.Name && from.Name.Catalog == to.Name.Catalog
+		if !sameContainer && !parentMapped && !extensionSchemaMove {
 			return ChangeSet{}, fmt.Errorf("%w: cross-parent rename %s -> %s", ErrAmbiguousRename, hint.From, hint.To)
 		}
 		pairs[from.ID] = to.ID
@@ -305,6 +306,12 @@ func Diff(current, desired Document, options DiffOptions) (ChangeSet, error) {
 			intermediate := remapResourceReferences(before, pairs)
 			intermediate.ID = after.ID
 			intermediate.Name = after.Name
+			// An extension SET SCHEMA changes its containment edge without
+			// renaming either schema. Treat that edge as part of the explicit
+			// cross-container rename so it does not produce a spurious alter.
+			if before.Kind == KindExtension && before.Name.Parent != after.Name.Parent {
+				intermediate.Dependencies = append([]Dependency(nil), after.Dependencies...)
+			}
 			rename, e := newChange(OperationRename, &before, &intermediate)
 			if e != nil {
 				return ChangeSet{}, e
@@ -355,7 +362,10 @@ func Diff(current, desired Document, options DiffOptions) (ChangeSet, error) {
 			changes = append(changes, change)
 		}
 	}
-	changes = orderChanges(changes, current, desired)
+	changes, err = orderChanges(changes, current, desired)
+	if err != nil {
+		return ChangeSet{}, err
+	}
 	result := ChangeSet{Version: ChangeVersion, Changes: changes}
 	if err := result.Validate(); err != nil {
 		return ChangeSet{}, err
@@ -435,7 +445,7 @@ func resourcesEqual(a, b Resource) (bool, error) {
 	return af == bf, e
 }
 
-func orderChanges(changes []Change, current, desired Document) []Change {
+func orderChanges(changes []Change, current, desired Document) ([]Change, error) {
 	byResource := map[string]string{}
 	for _, c := range changes {
 		byResource[c.ResourceID] = c.ID
@@ -492,6 +502,27 @@ func orderChanges(changes []Change, current, desired Document) []Change {
 			}
 		}
 	}
+	// Grants, memberships, and default privileges are the explicit access
+	// handoff boundary. On convergence they run only after every other object
+	// has reached its desired owner/security state; on teardown their edges are
+	// reversed so access is revoked before protected objects disappear.
+	for _, access := range changes {
+		if !isAccessHandoffChange(access) {
+			continue
+		}
+		for _, object := range changes {
+			if object.ID == access.ID || isAccessHandoffChange(object) {
+				continue
+			}
+			if access.Operation == OperationDrop {
+				if object.Operation == OperationDrop {
+					add(object.ID, access.ID)
+				}
+			} else if object.Operation != OperationDrop {
+				add(access.ID, object.ID)
+			}
+		}
+	}
 	ready := []string{}
 	for id, n := range indegree {
 		if n == 0 {
@@ -528,7 +559,26 @@ func orderChanges(changes []Change, current, desired Document) []Change {
 		ready = append(ready, next...)
 		sort.Slice(ready, func(i, j int) bool { return less(ready[i], ready[j]) })
 	}
-	return out
+	if len(out) != len(changes) {
+		return nil, fmt.Errorf("%w: change dependency graph contains a cycle", ErrInvalidDocument)
+	}
+	return out, nil
+}
+
+func isAccessHandoffChange(change Change) bool {
+	resource := change.After
+	if resource == nil {
+		resource = change.Before
+	}
+	if resource == nil {
+		return false
+	}
+	switch resource.Kind {
+	case KindGrant, KindMembership, KindDefaultPrivilege:
+		return true
+	default:
+		return false
+	}
 }
 func changeSortKey(c Change) string {
 	rank := map[Operation]string{OperationDrop: "3", OperationRename: "1", OperationAlter: "1", OperationCreate: "2"}[c.Operation]

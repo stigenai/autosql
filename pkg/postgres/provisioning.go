@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"autosql/pkg/bootstrap"
 	"autosql/pkg/plugin"
 	"autosql/pkg/schema"
 )
@@ -26,8 +27,67 @@ type ProvisioningDiagnostic struct {
 
 // ProvisioningReport is a deterministic, aggregate fresh-provisioning check.
 type ProvisioningReport struct {
-	Supported   bool                     `json:"supported"`
-	Diagnostics []ProvisioningDiagnostic `json:"diagnostics"`
+	Supported            bool                     `json:"supported"`
+	Diagnostics          []ProvisioningDiagnostic `json:"diagnostics"`
+	Authority            []bootstrap.Binding      `json:"authority,omitempty"`
+	AuthorityDiagnostics []string                 `json:"authority_diagnostics,omitempty"`
+}
+
+// PreflightBootstrapProvisioning performs the complete renderability and
+// non-secret authority check for a fresh database. createDatabase controls
+// whether cluster-level database creation is part of this run. The returned
+// assignments state exactly which principal performs each required phase.
+func PreflightBootstrapProvisioning(ctx context.Context, doc schema.Document, options map[string]string, contract bootstrap.Contract, createDatabase bool) (ProvisioningReport, error) {
+	report, err := PreflightProvisioning(ctx, doc, options)
+	if err != nil {
+		return report, err
+	}
+	bindings, authorityErr := contract.Validate(bootstrapRequirements(doc, createDatabase))
+	report.Authority = bindings
+	if authorityErr != nil {
+		for _, problem := range strings.Split(authorityErr.Error(), "\n") {
+			problem = strings.TrimPrefix(problem, "- ")
+			if problem != "" {
+				report.AuthorityDiagnostics = append(report.AuthorityDiagnostics, problem)
+			}
+		}
+		sort.Strings(report.AuthorityDiagnostics)
+		report.Supported = false
+	}
+	return report, nil
+}
+
+func bootstrapRequirements(doc schema.Document, createDatabase bool) []bootstrap.Requirement {
+	required := map[bootstrap.Responsibility]bootstrap.Requirement{}
+	add := func(responsibility bootstrap.Responsibility, capability bootstrap.Capability, reason string) {
+		required[responsibility] = bootstrap.Requirement{Responsibility: responsibility, Capability: capability, Reason: reason}
+	}
+	if createDatabase {
+		add(bootstrap.DatabaseCreation, bootstrap.CreateDatabase, "create the target database")
+	}
+	for _, resource := range doc.Graph.Resources {
+		switch resource.Kind {
+		case schema.KindDatabase:
+			add(bootstrap.DatabaseCreation, bootstrap.CreateDatabase, "create the target database")
+		case schema.KindRole, schema.KindMembership:
+			add(bootstrap.RoleCreation, bootstrap.ManageRoles, "create roles and establish memberships")
+		case schema.KindExtension:
+			add(bootstrap.ExtensionSetup, bootstrap.ManageExtensions, "install required database extensions")
+		case schema.KindGrant, schema.KindDefaultPrivilege:
+			add(bootstrap.GrantSetup, bootstrap.ManageGrants, "apply grants and default privileges")
+		default:
+			add(bootstrap.SchemaObjects, bootstrap.ManageSchema, "create schemas and database objects")
+		}
+	}
+	if len(doc.Graph.Resources) > 0 {
+		add(bootstrap.OwnershipHandoff, bootstrap.TransferOwnership, "transfer final ownership to declared owners")
+	}
+	out := make([]bootstrap.Requirement, 0, len(required))
+	for _, requirement := range required {
+		out = append(out, requirement)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Responsibility < out[j].Responsibility })
+	return out
 }
 
 // PreflightProvisioning inventories every known managed blocker and external
@@ -68,6 +128,17 @@ func PreflightProvisioning(ctx context.Context, doc schema.Document, options map
 		}
 		if capability.Mode != plugin.Managed {
 			add(resource, "external_prerequisite", "", "resource is inspectable but must be provisioned outside AutoSQL", true)
+			if resource.Kind == schema.KindFunction || resource.Kind == schema.KindProcedure {
+				allowed := provisioningSpecKeys(resource.Kind)
+				for key := range spec(resource) {
+					if !allowed[key] {
+						add(resource, "unsupported_spec_key", key, "routine field is outside the canonical inspected model", true)
+					}
+				}
+				if _, sourceErr := validateRoutineSource(resource, options); sourceErr != nil {
+					add(resource, "routine_source_trust", "definition", "routine source is not parser-proven and bound to explicit review authority", true)
+				}
+			}
 			continue
 		}
 		for key := range resource.Annotations {
@@ -134,14 +205,29 @@ func hasResourceDiagnostic(diagnostics []ProvisioningDiagnostic, resourceID stri
 
 func provisioningSpecKeys(kind schema.Kind) map[string]bool {
 	keys := map[schema.Kind][]string{
-		schema.KindSchema:           {},
-		schema.KindEnum:             {"values"},
-		schema.KindDomain:           {"base_type", "default", "not_null", "constraints"},
-		schema.KindSequence:         {"start", "increment", "min", "max", "cache", "cycle"},
-		schema.KindTable:            {"partitioned", "persistence", "row_security", "force_row_security"},
+		schema.KindSchema:           {"owner"},
+		schema.KindExtension:        {"version", "relocatable", "trusted", "superuser", "requires", "owner", "cascade"},
+		schema.KindEnum:             {"values", "owner"},
+		schema.KindDomain:           {"base_type", "default", "not_null", "constraints", "owner"},
+		schema.KindComposite:        {"attributes", "owner"},
+		schema.KindSequence:         {"start", "increment", "min", "max", "cache", "cycle", "owner"},
+		schema.KindTable:            {"partitioned", "persistence", "row_security", "force_row_security", "owner"},
 		schema.KindColumn:           {"type", "default", "not_null", "ordinal", "identity", "generated"},
-		schema.KindView:             {"definition"},
-		schema.KindMaterializedView: {"definition"},
+		schema.KindPrimaryKey:       {"definition", "deferrable", "initially_deferred", "validated", "columns"},
+		schema.KindUniqueConstraint: {"definition", "deferrable", "initially_deferred", "validated", "columns"},
+		schema.KindCheckConstraint:  {"definition", "deferrable", "initially_deferred", "validated", "columns"},
+		schema.KindForeignKey:       {"definition", "deferrable", "initially_deferred", "validated", "columns", "referenced_columns"},
+		schema.KindIndex:            {"definition", "method", "unique", "valid", "ready", "columns"},
+		schema.KindView:             {"definition", "owner"},
+		schema.KindMaterializedView: {"definition", "owner"},
+		schema.KindFunction:         {"name", "identity_arguments", "arguments", "result", "returns_set", "language", "volatility", "strict", "security_definer", "leakproof", "parallel", "cost", "rows", "configuration", "owner", "definition", "body_digest", "extension"},
+		schema.KindProcedure:        {"name", "identity_arguments", "arguments", "result", "returns_set", "language", "volatility", "strict", "security_definer", "leakproof", "parallel", "cost", "rows", "configuration", "owner", "definition", "body_digest", "extension"},
+		schema.KindTrigger:          {"definition", "enabled", "columns"},
+		schema.KindPolicy:           {"command", "permissive", "roles", "using", "check"},
+		schema.KindRole:             {"superuser", "inherit", "create_role", "create_database", "login", "replication", "bypass_rls", "connection_limit", "valid_until", "configuration"},
+		schema.KindMembership:       {"parent", "member", "grantor", "admin", "inherit", "set"},
+		schema.KindGrant:            {"grantor", "grantee", "privilege", "grantable"},
+		schema.KindDefaultPrivilege: {"owner", "object_type", "schema", "grantee", "privilege", "grantable"},
 	}
 	out := map[string]bool{}
 	for _, key := range keys[kind] {

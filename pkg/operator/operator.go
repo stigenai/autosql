@@ -13,6 +13,8 @@ import (
 	"regexp"
 	"sync"
 	"time"
+
+	"autosql/pkg/bootstrap"
 )
 
 var digestRE = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
@@ -40,12 +42,16 @@ type ConfigMapKeyRef struct {
 	Key  string `json:"key" yaml:"key"`
 }
 type Spec struct {
-	Kind            ResourceKind  `json:"kind" yaml:"kind"`
-	Generation      int64         `json:"generation" yaml:"generation"`
-	Source          Source        `json:"source" yaml:"source"`
-	ArtifactDigest  string        `json:"artifactDigest,omitempty" yaml:"artifactDigest,omitempty"`
-	DatabaseURL     *SecretKeyRef `json:"databaseURL,omitempty" yaml:"databaseURL,omitempty"`
-	RequireApproval bool          `json:"requireApproval,omitempty" yaml:"requireApproval,omitempty"`
+	Kind                   ResourceKind              `json:"kind" yaml:"kind"`
+	Generation             int64                     `json:"generation" yaml:"generation"`
+	Source                 Source                    `json:"source" yaml:"source"`
+	ArtifactDigest         string                    `json:"artifactDigest,omitempty" yaml:"artifactDigest,omitempty"`
+	DatabaseURL            *SecretKeyRef             `json:"databaseURL,omitempty" yaml:"databaseURL,omitempty"`
+	MaintenanceDatabaseURL *SecretKeyRef             `json:"maintenanceDatabaseURL,omitempty" yaml:"maintenanceDatabaseURL,omitempty"`
+	DatabaseTarget         *bootstrap.DatabaseTarget `json:"databaseTarget,omitempty" yaml:"databaseTarget,omitempty"`
+	BootstrapAuthority     *bootstrap.Contract       `json:"bootstrapAuthority,omitempty" yaml:"bootstrapAuthority,omitempty"`
+	CreateDatabase         bool                      `json:"createDatabase,omitempty" yaml:"createDatabase,omitempty"`
+	RequireApproval        bool                      `json:"requireApproval,omitempty" yaml:"requireApproval,omitempty"`
 }
 type ConditionType string
 
@@ -85,8 +91,9 @@ type Resource struct {
 	Status Status
 	// ResolvedDatabaseURL is transient controller input. It is never written
 	// to a record or Kubernetes status.
-	ResolvedDatabaseURL string `json:"-"`
-	ResolvedSource      string `json:"-"`
+	ResolvedDatabaseURL            string `json:"-"`
+	ResolvedMaintenanceDatabaseURL string `json:"-"`
+	ResolvedSource                 string `json:"-"`
 }
 type Record struct {
 	Status                  Status
@@ -247,6 +254,31 @@ func validate(s Spec) error {
 	if s.DatabaseURL == nil || s.DatabaseURL.Name == "" || s.DatabaseURL.Key == "" {
 		return errors.New("databaseURL secret reference is required")
 	}
+	if s.CreateDatabase && s.BootstrapAuthority == nil {
+		return errors.New("createDatabase requires bootstrapAuthority")
+	}
+	if s.DatabaseTarget != nil {
+		target := s.DatabaseTarget.Normalize()
+		if err := target.Validate(); err != nil {
+			return fmt.Errorf("invalid databaseTarget: %w", err)
+		}
+		if target.Mode == bootstrap.ManagedDatabase {
+			if s.BootstrapAuthority == nil {
+				return errors.New("managed databaseTarget requires bootstrapAuthority")
+			}
+			if s.MaintenanceDatabaseURL == nil || s.MaintenanceDatabaseURL.Name == "" || s.MaintenanceDatabaseURL.Key == "" {
+				return errors.New("managed databaseTarget requires maintenanceDatabaseURL")
+			}
+		}
+		if s.CreateDatabase && target.Mode != bootstrap.ManagedDatabase {
+			return errors.New("createDatabase conflicts with external databaseTarget mode")
+		}
+	}
+	if s.BootstrapAuthority != nil {
+		if _, err := s.BootstrapAuthority.Validate(nil); err != nil {
+			return fmt.Errorf("invalid bootstrapAuthority: %w", err)
+		}
+	}
 	if s.Generation < 1 {
 		return errors.New("generation must be at least 1")
 	}
@@ -261,12 +293,16 @@ func validate(s Spec) error {
 
 func applyKey(obj Resource) string {
 	raw, _ := json.Marshal(struct {
-		Kind           ResourceKind  `json:"kind"`
-		Generation     int64         `json:"generation"`
-		Source         Source        `json:"source"`
-		ArtifactDigest string        `json:"artifact_digest"`
-		DatabaseURL    *SecretKeyRef `json:"database_url"`
-	}{obj.Spec.Kind, obj.Spec.Generation, obj.Spec.Source, obj.Spec.ArtifactDigest, obj.Spec.DatabaseURL})
+		Kind                   ResourceKind              `json:"kind"`
+		Generation             int64                     `json:"generation"`
+		Source                 Source                    `json:"source"`
+		ArtifactDigest         string                    `json:"artifact_digest"`
+		DatabaseURL            *SecretKeyRef             `json:"database_url"`
+		MaintenanceDatabaseURL *SecretKeyRef             `json:"maintenance_database_url,omitempty"`
+		DatabaseTarget         *bootstrap.DatabaseTarget `json:"database_target,omitempty"`
+		BootstrapAuthority     *bootstrap.Contract       `json:"bootstrap_authority,omitempty"`
+		CreateDatabase         bool                      `json:"create_database,omitempty"`
+	}{obj.Spec.Kind, obj.Spec.Generation, obj.Spec.Source, obj.Spec.ArtifactDigest, obj.Spec.DatabaseURL, obj.Spec.MaintenanceDatabaseURL, obj.Spec.DatabaseTarget, obj.Spec.BootstrapAuthority, obj.Spec.CreateDatabase})
 	digest := sha256.Sum256(raw)
 	return fmt.Sprintf("%s/%d/%s/%s", obj.Spec.Kind, obj.Spec.Generation, obj.Spec.ArtifactDigest, hex.EncodeToString(digest[:]))
 }

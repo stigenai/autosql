@@ -13,6 +13,24 @@ status: conditions, generation, retry count, artifact/plan digests, target
 identity, operation and execution IDs, pending recovery step, and recovery
 guidance. It never copies secret values.
 
+Fresh database provisioning uses the same `bootstrapAuthority` contract as
+the PostgreSQL library preflight. Each of database creation, role creation,
+extension setup, schema-object creation, grant setup, and final ownership
+handoff is assigned to one named identity with the exact required capability.
+Authentication may use the current session, an external Secret reference, AWS
+IRSA, or OIDC. IRSA and OIDC carry no credential reference; short-lived values
+are resolved only by the runtime provider. The contract, plan, status, logs,
+and fingerprints therefore contain identity subjects and reference metadata,
+never passwords, tokens, or resolved connection URLs. `createDatabase: true`
+is rejected at admission and by the reconciliation core without this contract.
+
+The live PostgreSQL 14–18 gate drives a `DeclarativeSchema` reconciliation
+through `databaseTarget`, `maintenanceDatabaseURL`, and `bootstrapAuthority`
+into the same whole-database planner/executor used by the CLI. The operator
+persists only plan/execution IDs, applied-step counts, pending step IDs, and
+recovery guidance in status; resolved maintenance credentials and routine SQL
+remain transient.
+
 The reconciliation core in `pkg/operator` persists an idempotency key and
 requires a leader lease before applying. Conditions move through Planning,
 ApprovalRequired (when configured), Applying, Ready, or Failed. Persisting the
@@ -30,6 +48,8 @@ invalid objects before they reach the controller:
 - registry sources must name the same digest as `artifactDigest`;
 - generations must be positive;
 - Secret/ConfigMap names and keys must be valid Kubernetes references;
+- fresh database creation must declare a bootstrap authority contract, whose
+  credential reference is present only for `secret_reference` authentication;
 - status conditions have typed condition names, statuses, timestamps, and
   deduplicating list semantics; and
 - plan, target, operation, and recovery fields have explicit status types.

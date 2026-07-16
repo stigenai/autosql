@@ -1,7 +1,7 @@
 schema "generated_demo" {}
 
-# Read-only external prerequisite. Verify its exact fingerprint on the target
-# before planning; AutoSQL never renders this inspected routine body.
+# Managed only when the normalized body digest is independently supplied in
+# reviewed_routine_digests. Without that authority this definition is inert.
 resource "function" "lifecycle_state_to_v2(value text)" {
   schema = "generated_demo"
   parent = schema_id("generated_demo")
