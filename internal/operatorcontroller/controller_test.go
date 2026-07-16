@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"autosql/pkg/bootstrap"
 	"autosql/pkg/operator"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -85,4 +86,46 @@ func TestReconcileUpdatesStatusAndHonorsApproval(t *testing.T) {
 
 func requestFor(obj *unstructured.Unstructured) reconcile.Request {
 	return reconcile.Request{NamespacedName: types.NamespacedName{Namespace: obj.GetNamespace(), Name: obj.GetName()}}
+}
+
+func TestResourceFromObjectParsesOIDCBootstrapAuthority(t *testing.T) {
+	obj := testObject()
+	spec := obj.Object["spec"].(map[string]any)
+	spec["createDatabase"] = true
+	spec["bootstrapAuthority"] = map[string]any{
+		"identities": []any{map[string]any{
+			"name": "operator", "subject": "system:serviceaccount:autosql:operator", "authentication": "oidc",
+			"capabilities": []any{"create_database", "manage_schema_objects", "transfer_ownership"},
+		}},
+		"assignments": []any{
+			map[string]any{"responsibility": "database_creation", "identity": "operator"},
+			map[string]any{"responsibility": "schema_objects", "identity": "operator"},
+			map[string]any{"responsibility": "ownership_handoff", "identity": "operator"},
+		},
+	}
+	resource, _, err := resourceFromObject(obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resource.Spec.CreateDatabase || resource.Spec.BootstrapAuthority == nil || resource.Spec.BootstrapAuthority.Identities[0].Authentication != bootstrap.OIDC {
+		t.Fatalf("resource=%+v", resource.Spec)
+	}
+}
+
+func TestResourceFromObjectParsesDatabaseTargetContract(t *testing.T) {
+	obj := testObject()
+	spec := obj.Object["spec"].(map[string]any)
+	spec["maintenanceDatabaseURL"] = map[string]any{"name": "maintenance-db", "key": "url"}
+	spec["databaseTarget"] = map[string]any{
+		"mode": "managed", "name": "cell", "owner": "cell_owner", "maintenanceDatabase": "postgres",
+		"endpoint":        map[string]any{"host": "postgres.internal", "port": int64(5432), "tlsMode": "require"},
+		"connectionLimit": int64(20), "allowConnections": true,
+	}
+	resource, _, err := resourceFromObject(obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resource.Spec.DatabaseTarget == nil || resource.Spec.DatabaseTarget.Name != "cell" || resource.Spec.MaintenanceDatabaseURL == nil || resource.Spec.MaintenanceDatabaseURL.Name != "maintenance-db" {
+		t.Fatalf("resource=%+v", resource.Spec)
+	}
 }

@@ -14,6 +14,13 @@ SQL/change bindings for the existing safety, policy, approval, precheck, and
 guardrail path. Transaction-prohibited phases must be handled explicitly by a
 guarded executor; they are never silently moved into a transaction.
 
+Fresh PostgreSQL targets add a signed orchestration layer described in
+[PostgreSQL database target bootstrap](postgresql-database-bootstrap.md). It
+places managed creation or external verification in a server-scoped prohibited
+phase, then binds the complete schema plan into scope- and resource-aware
+phases with stable checkpoints. Access grants are an explicit final handoff,
+and dependency edges reverse for teardown.
+
 ## PostgreSQL rendering
 
 The PostgreSQL driver advertises managed lifecycle support for schemas, tables,

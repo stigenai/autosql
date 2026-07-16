@@ -95,6 +95,10 @@ func RunWithServices(ctx context.Context, args []string, streams Streams, servic
 		err = runSchemaInspect(ctx, args[2:], o, redactor)
 	case len(args) >= 2 && args[0] == "schema" && args[1] == "diff":
 		err = runSchemaDiff(ctx, args[2:], o, services.ReadPlan)
+	case len(args) >= 2 && args[0] == "database" && args[1] == "prepare":
+		err = runDatabasePrepare(ctx, args[2:], o, redactor)
+	case len(args) >= 2 && args[0] == "database" && args[1] == "bootstrap":
+		err = runDatabaseBootstrap(ctx, args[2:], o, redactor)
 	case len(args) >= 2 && args[0] == "migrate" && args[1] == "status":
 		err = runMigrateStatus(ctx, args[2:], o, redactor)
 	case len(args) >= 2 && args[0] == "migrate" && args[1] == "apply":
@@ -343,10 +347,11 @@ func usageError(err error) *Error {
 	return &Error{Kind: "usage", Message: err.Error(), Code: ExitUsage, Cause: err}
 }
 func usageBase() string {
-	return "usage: autosql <command>\n\ncommands:\n  version [--json]\n  config validate [--config path] [--env name] [--preflight] [--json]\n  migrate generate --dir path --from source --to source --version semver --label name [--rename-hints value] [--json]\n  migrate checkpoint create|verify --dir path [--json]\n  migrate validate-online --file path --format json|yaml [--json]\n  migrate expand-plan --file path --url env://NAME --public-key env://NAME --plan-signing-key env://NAME --plan-key-id id --target id --env name --expected-fingerprint digest --schema name [--json]\n  migrate virtual-schema-apply|virtual-schema-status --file path --url env://NAME --target id --env name [--json]\n  migrate shadow-sync apply|status|remove --file path --url env://NAME --target id --env name [--allow-lossy] [--allow-non-reversible] [--json]\n  migrate backfill run|status|pause|resume|cancel --file path --url env://NAME --target id --env name [--batch-size n] [--json]\n  migrate metadata-init|metadata-status --url env://NAME [--metadata-schema name] [--json]\n  migrate metadata-baseline --url env://NAME --id id --target id --env name --operator id --schema name [--json]\n  migrate status [--config path --env name | --url env://NAME --migration-dir path] [--revision-schema name] [--json]\n  migrate apply|baseline [--config path | --url env://NAME --migration-dir path] [--from version] [--to version] [--count n] [--dry-run] [--json]\n  migrate down --to version [--dry-run] [--json]\n  migrate diagnose --url env://NAME --migration-dir path [--json]\n  migrate repair mark|remove|reconcile --url env://NAME --proposal file --operator-public-key env://NAME --audit path [--json]\n  schema load --source sql:path|json:path|hcl:path [--source ...] [--json]\n  schema inspect --url env://NAME|file://path [--format native|sql|json|hcl]\n  schema diff --from source --to source [--max-changes n] [--json]\n  plan --from source --to source [--max-changes n] [--json]\n  plan edit --artifact file --sql file --editor id --reason text --output file\n  plan review --artifact file [--json]\n  plan revalidate --draft file --output file [--json]\n  plan publish --attested file --output file [--json]\n  apply --from source --to source [--dry-run|--approve-digest digest|--artifact path] [--no-edits] [--json]"
+	return "usage: autosql <command>\n\ncommands:\n  version [--json]\n  config validate [--config path] [--env name] [--preflight] [--json]\n  database prepare --target-hcl path --maintenance-url env://NAME|file://path [--json]\n  migrate generate --dir path --from source --to source --version semver --label name [--rename-hints value] [--json]\n  migrate checkpoint create|verify --dir path [--json]\n  migrate validate-online --file path --format json|yaml [--json]\n  migrate expand-plan --file path --url env://NAME --public-key env://NAME --plan-signing-key env://NAME --plan-key-id id --target id --env name --expected-fingerprint digest --schema name [--json]\n  migrate virtual-schema-apply|virtual-schema-status --file path --url env://NAME --target id --env name [--json]\n  migrate shadow-sync apply|status|remove --file path --url env://NAME --target id --env name [--allow-lossy] [--allow-non-reversible] [--json]\n  migrate backfill run|status|pause|resume|cancel --file path --url env://NAME --target id --env name [--batch-size n] [--json]\n  migrate metadata-init|metadata-status --url env://NAME [--metadata-schema name] [--json]\n  migrate metadata-baseline --url env://NAME --id id --target id --env name --operator id --schema name [--json]\n  migrate status [--config path --env name | --url env://NAME --migration-dir path] [--revision-schema name] [--json]\n  migrate apply|baseline [--config path | --url env://NAME --migration-dir path] [--from version] [--to version] [--count n] [--dry-run] [--json]\n  migrate down --to version [--dry-run] [--json]\n  migrate diagnose --url env://NAME --migration-dir path [--json]\n  migrate repair mark|remove|reconcile --url env://NAME --proposal file --operator-public-key env://NAME --audit path [--json]\n  schema load --source sql:path|json:path|hcl:path [--source ...] [--json]\n  schema inspect --url env://NAME|file://path [--format native|sql|json|hcl]\n  schema diff --from source --to source [--max-changes n] [--json]\n  plan --from source --to source [--max-changes n] [--json]\n  plan edit --artifact file --sql file --editor id --reason text --output file\n  plan review --artifact file [--json]\n  plan revalidate --draft file --output file [--json]\n  plan publish --attested file --output file [--json]\n  apply --from source --to source [--dry-run|--approve-digest digest|--artifact path] [--no-edits] [--json]"
 }
 func usage() string {
-	return usageBase() + "\n  migrate start-status --file path --url env://NAME --target id --env name [--json]"
+	base := strings.Replace(usageBase(), "\n  migrate generate", "\n  database bootstrap --file path --maintenance-url env://NAME|file://path [--json]\n  migrate generate", 1)
+	return base + "\n  migrate start-status --file path --url env://NAME --target id --env name [--json]"
 }
 func contains(args []string, want string) bool {
 	for _, a := range args {
@@ -375,6 +380,12 @@ func commandName(args []string) string {
 	}
 	if len(args) >= 2 && args[0] == "schema" && args[1] == "diff" {
 		return "schema diff"
+	}
+	if len(args) >= 2 && args[0] == "database" && args[1] == "prepare" {
+		return "database prepare"
+	}
+	if len(args) >= 2 && args[0] == "database" && args[1] == "bootstrap" {
+		return "database bootstrap"
 	}
 	if len(args) >= 2 && args[0] == "plan" && (args[1] == "edit" || args[1] == "review") {
 		return "plan " + args[1]

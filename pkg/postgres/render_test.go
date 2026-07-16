@@ -170,14 +170,21 @@ func TestRenderDocumentGolden(t *testing.T) {
 	}
 }
 
-func TestConcurrentRenderingRejectedWithoutGuardedPhaseExecutor(t *testing.T) {
-	table := renderResource(schema.KindTable, schema.Name{Schema: "public", Name: "users"}, `{}`)
+func TestConcurrentRenderingUsesNonTransactionalPhase(t *testing.T) {
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "public"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "public", Name: "users", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
 	idx := renderResource(schema.KindIndex, schema.Name{Schema: "public", Name: "users_email_idx", Parent: table.ID}, `{"definition":"(email)"}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains})
 	empty := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{}}}
-	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{table, idx}}}
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, idx}}}
 	changes, _ := schema.Diff(empty, desired, schema.DiffOptions{})
 	out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Current: empty, Desired: desired, Options: map[string]string{"concurrent_indexes": "true"}})
-	if err == nil || len(out) != 0 {
+	concurrent := 0
+	for _, statement := range out {
+		if strings.Contains(statement.SQL, "CONCURRENTLY") && !statement.Transactional {
+			concurrent++
+		}
+	}
+	if err != nil || concurrent != 1 {
 		t.Fatalf("out=%+v err=%v", out, err)
 	}
 }
@@ -230,7 +237,8 @@ func TestCreateHelpersRemainDeterministicForInspectedKinds(t *testing.T) {
 		}
 	}
 	for _, r := range cases {
-		if _, err := renderCreate(r, resources, nil); err != nil {
+		options := map[string]string{"extension_allowlist": "hstore"}
+		if _, err := renderCreate(r, resources, options); err != nil {
 			t.Errorf("create %s: %v", r.Kind, err)
 		}
 	}

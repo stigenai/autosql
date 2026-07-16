@@ -8,7 +8,7 @@ import (
 )
 
 func validateColumnDefault(column schema.Resource, value string, resources map[string]schema.Resource) error {
-	var types, sequences []schema.Resource
+	var types, sequences, functions []schema.Resource
 	for _, dependency := range column.Dependencies {
 		target, ok := resources[dependency.Target]
 		if !ok {
@@ -20,6 +20,15 @@ func validateColumnDefault(column schema.Resource, value string, resources map[s
 		if dependency.Type == schema.DependencyReferences && target.Kind == schema.KindSequence {
 			sequences = append(sequences, target)
 		}
+		if dependency.Type == schema.DependencyReferences && target.Kind == schema.KindFunction {
+			functions = append(functions, target)
+		}
+	}
+	if len(functions) != 0 {
+		if len(types) != 0 || len(sequences) != 0 || len(functions) != 1 {
+			return unsupported(column, "default rejected: managed routine dependency is ambiguous or combined with incompatible dependencies")
+		}
+		return validateManagedRoutineDefault(column, value, functions[0])
 	}
 	if len(types) > 1 {
 		return unsupported(column, "default rejected: user-defined column type has ambiguous uses dependencies")
@@ -34,6 +43,28 @@ func validateColumnDefault(column schema.Resource, value string, resources map[s
 		return validateSequenceDefault(column, value, sequences)
 	}
 	return validateCoreDefault(column, value)
+}
+
+func validateManagedRoutineDefault(column schema.Resource, value string, routine schema.Resource) error {
+	expression, err := classifyDefaultExpression(value)
+	if err != nil {
+		return unsupported(column, "default rejected: managed routine expression is outside the bounded grammar")
+	}
+	for expression.Kind == defaultExpressionCast && expression.Cast != nil {
+		expression = expression.Cast.Expression
+	}
+	if expression.Kind != defaultExpressionFunction || expression.Function == nil || !generatedFunctionReferenceMatches(expression.Function.Name, column.Name.Schema, routine) {
+		return unsupported(column, "default rejected: expression does not call the exact managed routine dependency")
+	}
+	if volatility := stringValue(spec(routine), "volatility"); volatility != "i" && volatility != "s" {
+		return unsupported(column, "default rejected: managed routine must be immutable or stable")
+	}
+	columnType, columnOK := parseCoreColumnType(stringValue(spec(column), "type"))
+	resultType, resultOK := parseCoreColumnType(postgresTypeAlias(stringValue(spec(routine), "result")))
+	if !columnOK || !resultOK || !coreTypesCompatible(columnType, resultType) {
+		return unsupported(column, "default rejected: managed routine result is incompatible with the column type")
+	}
+	return nil
 }
 
 func validateUserDefinedDefault(column schema.Resource, value string, target schema.Resource) error {

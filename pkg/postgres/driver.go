@@ -3,6 +3,7 @@ package postgres
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"autosql/pkg/plugin"
 	"autosql/pkg/schema"
 	"github.com/jackc/pgx/v5"
+	pg_query "github.com/pganalyze/pg_query_go/v6"
 )
 
 const version = "0.1.0"
@@ -90,12 +92,27 @@ func (*Driver) Info() plugin.Info {
 	caps := make([]plugin.Capability, 0, len(kinds))
 	all := []schema.Operation{schema.OperationCreate, schema.OperationAlter, schema.OperationDrop, schema.OperationRename}
 	profiles := map[schema.Kind]plugin.Capability{
-		schema.KindSchema:           {Kind: schema.KindSchema, Mode: plugin.Managed, Operations: []schema.Operation{schema.OperationCreate, schema.OperationDrop, schema.OperationRename}, Features: []string{"namespace.lifecycle"}},
+		schema.KindSchema:           {Kind: schema.KindSchema, Mode: plugin.Managed, Operations: all, Features: []string{"namespace.lifecycle", "owner.lifecycle"}},
+		schema.KindExtension:        {Kind: schema.KindExtension, Mode: plugin.Managed, Operations: []schema.Operation{schema.OperationCreate, schema.OperationAlter, schema.OperationDrop, schema.OperationRename}, Features: []string{"extension.lifecycle", "extension.allowlist", "extension.exact_version", "extension.schema_policy", "extension.trust_policy"}},
+		schema.KindComposite:        {Kind: schema.KindComposite, Mode: plugin.Managed, Operations: all, Features: []string{"composite.lifecycle", "composite.ordered_attributes", "composite.attribute_add_drop", "composite.attribute_rename", "composite.attribute_type_change", "composite.exact_type_dependencies"}},
 		schema.KindEnum:             {Kind: schema.KindEnum, Mode: plugin.Managed, Operations: all, Features: []string{"enum.lifecycle", "enum.append_values"}},
-		schema.KindDomain:           {Kind: schema.KindDomain, Mode: plugin.Managed, Operations: []schema.Operation{schema.OperationCreate, schema.OperationDrop, schema.OperationRename}, Features: []string{"domain.lifecycle", "domain.core_base_type", "domain.literal_check"}},
+		schema.KindDomain:           {Kind: schema.KindDomain, Mode: plugin.Managed, Operations: all, Features: []string{"domain.lifecycle", "domain.core_base_type", "domain.literal_check", "owner.lifecycle"}},
 		schema.KindSequence:         {Kind: schema.KindSequence, Mode: plugin.Managed, Operations: all, Features: []string{"sequence.lifecycle", "sequence.options"}},
 		schema.KindTable:            {Kind: schema.KindTable, Mode: plugin.Managed, Operations: all, Features: []string{"table.permanent_nonpartitioned", "table.rls", "table.child_columns"}},
 		schema.KindColumn:           {Kind: schema.KindColumn, Mode: plugin.Managed, Operations: all, Features: []string{"column.type_safe_casts", "column.default", "column.not_null", "column.ordinal_metadata", "column.identity_create", "column.generated_external_routines", "column.generated_stored_create"}},
+		schema.KindPrimaryKey:       {Kind: schema.KindPrimaryKey, Mode: plugin.Managed, Operations: all, Features: []string{"constraint.primary_key", "constraint.lifecycle", "alter.explicit_rebuild"}},
+		schema.KindUniqueConstraint: {Kind: schema.KindUniqueConstraint, Mode: plugin.Managed, Operations: all, Features: []string{"constraint.unique", "constraint.lifecycle", "alter.explicit_rebuild"}},
+		schema.KindCheckConstraint:  {Kind: schema.KindCheckConstraint, Mode: plugin.Managed, Operations: all, Features: []string{"constraint.check", "constraint.lifecycle", "alter.explicit_rebuild"}},
+		schema.KindForeignKey:       {Kind: schema.KindForeignKey, Mode: plugin.Managed, Operations: all, Features: []string{"constraint.foreign_key", "constraint.lifecycle", "alter.explicit_rebuild"}},
+		schema.KindIndex:            {Kind: schema.KindIndex, Mode: plugin.Managed, Operations: all, Features: []string{"index.lifecycle", "index.expression", "index.partial", "index.include", "index.operator_class", "index.storage_parameters", "index.tablespace", "alter.explicit_rebuild"}},
+		schema.KindFunction:         {Kind: schema.KindFunction, Mode: plugin.Managed, Operations: all, Features: []string{"function.lifecycle", "routine.reviewed_source", "routine.overloads", "routine.sql", "routine.plpgsql"}},
+		schema.KindProcedure:        {Kind: schema.KindProcedure, Mode: plugin.Managed, Operations: all, Features: []string{"procedure.lifecycle", "procedure.transaction_control_guard", "routine.reviewed_source", "routine.overloads", "routine.sql", "routine.plpgsql"}},
+		schema.KindTrigger:          {Kind: schema.KindTrigger, Mode: plugin.Managed, Operations: all, Features: []string{"trigger.lifecycle", "trigger.enablement", "trigger.constraint", "trigger.transition_tables", "trigger.when"}},
+		schema.KindPolicy:           {Kind: schema.KindPolicy, Mode: plugin.Managed, Operations: all, Features: []string{"policy.lifecycle", "policy.permissive_restrictive", "policy.exact_dependencies", "policy.deny_first_rls"}},
+		schema.KindRole:             {Kind: schema.KindRole, Mode: plugin.Managed, Operations: all, Features: []string{"role.lifecycle", "role.external_password", "role.protected", "role.reassign_owned"}},
+		schema.KindMembership:       {Kind: schema.KindMembership, Mode: plugin.Managed, Operations: all, Features: []string{"membership.lifecycle", "membership.admin_guard", "membership.pg16_options", "membership.cycle_guard"}},
+		schema.KindGrant:            {Kind: schema.KindGrant, Mode: plugin.Managed, Operations: []schema.Operation{schema.OperationCreate, schema.OperationAlter, schema.OperationDrop}, Features: []string{"grant.lifecycle", "grant.option", "grant.partial_revoke", "grant.exact_dependencies"}},
+		schema.KindDefaultPrivilege: {Kind: schema.KindDefaultPrivilege, Mode: plugin.Managed, Operations: []schema.Operation{schema.OperationCreate, schema.OperationAlter, schema.OperationDrop}, Features: []string{"default_privilege.lifecycle", "default_privilege.future_objects", "default_privilege.exact_dependencies"}},
 		schema.KindView:             {Kind: schema.KindView, Mode: plugin.Managed, Operations: all, Features: []string{"view.provable_projection"}},
 		schema.KindMaterializedView: {Kind: schema.KindMaterializedView, Mode: plugin.Managed, Operations: all, Features: []string{"materialized_view.provable_projection", "alter.explicit_rebuild"}},
 	}
@@ -485,6 +502,26 @@ func normalizePostgresSpecForKind(kind schema.Kind, spec map[string]any) {
 			spec["force_row_security"] = false
 		}
 	}
+	if kind == schema.KindComposite {
+		if attributes, ok := spec["attributes"].([]any); ok {
+			for index, raw := range attributes {
+				attribute, ok := raw.(map[string]any)
+				if !ok {
+					continue
+				}
+				if nullable, ok := attribute["not_null"].(bool); ok && !nullable {
+					delete(attribute, "not_null")
+				}
+				attribute["ordinal"] = index + 1
+				if typ, ok := attribute["type"].(string); ok {
+					attribute["type"] = postgresTypeAlias(typ)
+				}
+				if collation, ok := attribute["collation"].(string); ok && strings.TrimSpace(collation) == "" {
+					delete(attribute, "collation")
+				}
+			}
+		}
+	}
 	if kind == schema.KindView || kind == schema.KindMaterializedView {
 		if definition, ok := spec["definition"].(string); ok {
 			definition = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(definition), ";"))
@@ -501,6 +538,22 @@ func normalizePostgresSpecForKind(kind schema.Kind, spec map[string]any) {
 			}
 		}
 	}
+	if kind == schema.KindFunction || kind == schema.KindProcedure {
+		if definition, ok := spec["definition"].(string); ok {
+			if parsed, err := pg_query.Parse(definition); err == nil && len(parsed.Stmts) == 1 && parsed.Stmts[0].Stmt.GetCreateFunctionStmt() != nil {
+				if canonical, err := pg_query.Deparse(parsed); err == nil && strings.TrimSpace(canonical) != "" {
+					definition = strings.TrimSpace(canonical)
+					spec["definition"] = definition
+				}
+			}
+			spec["body_digest"] = routineDefinitionDigest(definition)
+		}
+	}
+}
+
+func routineDefinitionDigest(definition string) string {
+	digest := sha256.Sum256([]byte(definition))
+	return fmt.Sprintf("sha256:%x", digest[:])
 }
 
 func normalizePostgresSpec(spec map[string]any) {

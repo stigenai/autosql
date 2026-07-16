@@ -56,10 +56,10 @@ func TestDeclarativePlanVerificationAgainstPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	resource := operatorResourceForPlanTest(desiredSQL, url)
-	if err := verifyDeclarativePlan(ctx, resource.ResolvedSource, resource.ResolvedDatabaseURL, artifact.Artifact{Plan: p}); err != nil {
+	if err := verifyDeclarativePlan(ctx, resource.ResolvedSource, resource.ResolvedDatabaseURL, artifact.Artifact{Plan: p}, nil, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := verifyDeclarativePlan(ctx, "create schema "+schemaName+";", url, artifact.Artifact{Plan: p}); err == nil {
+	if err := verifyDeclarativePlan(ctx, "create schema "+schemaName+";", url, artifact.Artifact{Plan: p}, nil, false); err == nil {
 		t.Fatal("mismatched declarative source was accepted")
 	}
 }

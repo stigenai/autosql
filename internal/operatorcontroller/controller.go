@@ -5,6 +5,7 @@ package operatorcontroller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"autosql/pkg/bootstrap"
 	"autosql/pkg/operator"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -134,6 +136,17 @@ func (c *Controller) resolveReferences(ctx context.Context, namespace string, re
 		}
 		resource.ResolvedDatabaseURL = string(value)
 	}
+	if resource.Spec.MaintenanceDatabaseURL != nil {
+		secret := &corev1.Secret{}
+		if err := c.read(ctx, types.NamespacedName{Namespace: namespace, Name: resource.Spec.MaintenanceDatabaseURL.Name}, secret); err != nil {
+			return fmt.Errorf("maintenance database Secret reference unavailable")
+		}
+		value := secret.Data[resource.Spec.MaintenanceDatabaseURL.Key]
+		if len(value) == 0 {
+			return fmt.Errorf("maintenance database Secret key unavailable")
+		}
+		resource.ResolvedMaintenanceDatabaseURL = string(value)
+	}
 	if ref := resource.Spec.Source.SecretRef; ref != nil {
 		secret := &corev1.Secret{}
 		if err := c.read(ctx, types.NamespacedName{Namespace: namespace, Name: ref.Name}, secret); err != nil {
@@ -185,6 +198,7 @@ func resourceFromObject(obj *unstructured.Unstructured) (operator.Resource, bool
 	generation, _, _ := unstructured.NestedInt64(spec, "generation")
 	artifactDigest, _, _ := unstructured.NestedString(spec, "artifactDigest")
 	requireApproval, _, _ := unstructured.NestedBool(spec, "requireApproval")
+	createDatabase, _, _ := unstructured.NestedBool(spec, "createDatabase")
 	sourceMap, _, _ := unstructured.NestedMap(spec, "source")
 	source, err := sourceFromMap(sourceMap)
 	if err != nil {
@@ -194,10 +208,43 @@ func resourceFromObject(obj *unstructured.Unstructured) (operator.Resource, bool
 	databaseURL := &operator.SecretKeyRef{}
 	databaseURL.Name, _, _ = unstructured.NestedString(database, "name")
 	databaseURL.Key, _, _ = unstructured.NestedString(database, "key")
+	maintenanceDatabase, _, _ := unstructured.NestedMap(spec, "maintenanceDatabaseURL")
+	maintenanceDatabaseURL := &operator.SecretKeyRef{}
+	maintenanceDatabaseURL.Name, _, _ = unstructured.NestedString(maintenanceDatabase, "name")
+	maintenanceDatabaseURL.Key, _, _ = unstructured.NestedString(maintenanceDatabase, "key")
+	if maintenanceDatabaseURL.Name == "" && maintenanceDatabaseURL.Key == "" {
+		maintenanceDatabaseURL = nil
+	}
+	var databaseTarget *bootstrap.DatabaseTarget
+	if value, found, nestedErr := unstructured.NestedMap(spec, "databaseTarget"); nestedErr != nil {
+		return operator.Resource{}, false, fmt.Errorf("databaseTarget is invalid")
+	} else if found {
+		raw, marshalErr := json.Marshal(value)
+		if marshalErr != nil {
+			return operator.Resource{}, false, fmt.Errorf("databaseTarget is invalid")
+		}
+		databaseTarget = &bootstrap.DatabaseTarget{}
+		if unmarshalErr := json.Unmarshal(raw, databaseTarget); unmarshalErr != nil {
+			return operator.Resource{}, false, fmt.Errorf("databaseTarget is invalid")
+		}
+	}
+	var authority *bootstrap.Contract
+	if value, found, nestedErr := unstructured.NestedMap(spec, "bootstrapAuthority"); nestedErr != nil {
+		return operator.Resource{}, false, fmt.Errorf("bootstrapAuthority is invalid")
+	} else if found {
+		raw, marshalErr := json.Marshal(value)
+		if marshalErr != nil {
+			return operator.Resource{}, false, fmt.Errorf("bootstrapAuthority is invalid")
+		}
+		authority = &bootstrap.Contract{}
+		if unmarshalErr := json.Unmarshal(raw, authority); unmarshalErr != nil {
+			return operator.Resource{}, false, fmt.Errorf("bootstrapAuthority is invalid")
+		}
+	}
 	approved := strings.EqualFold(obj.GetAnnotations()["autosql.io/approved"], "true")
 	return operator.Resource{Name: obj.GetNamespace() + "/" + obj.GetName(), Spec: operator.Spec{
 		Kind: operator.ResourceKind(kind), Generation: generation, Source: source,
-		ArtifactDigest: artifactDigest, DatabaseURL: databaseURL, RequireApproval: requireApproval,
+		ArtifactDigest: artifactDigest, DatabaseURL: databaseURL, MaintenanceDatabaseURL: maintenanceDatabaseURL, DatabaseTarget: databaseTarget, BootstrapAuthority: authority, CreateDatabase: createDatabase, RequireApproval: requireApproval,
 	}, Status: statusFromObject(obj)}, approved, nil
 }
 

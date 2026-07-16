@@ -1,5 +1,20 @@
 schema "friendly" {}
 
+extension "hstore" {
+  schema  = "friendly"
+  version = "1.8"
+}
+
+composite_type "contact_profile" {
+  schema = "friendly"
+  dependencies = [uses(extension_id("friendly", "hstore"))]
+  attributes = [
+    composite_attribute("email", "text", 1),
+    collated_composite_attribute("display_name", "text", 2, "pg_catalog.\"C\""),
+    composite_attribute("metadata", "friendly.hstore", 3),
+  ]
+}
+
 resource "enum" "account_status" {
   schema    = "friendly"
   parent    = schema_id("friendly")
@@ -117,7 +132,7 @@ role "friendly_reader" {
   login       = false
   superuser   = false
   create_role = false
-  create_db   = false
+  create_database = false
   inherit     = true
 }
 
@@ -125,7 +140,7 @@ role "friendly_app" {
   login       = false
   superuser   = false
   create_role = false
-  create_db   = false
+  create_database = false
   inherit     = true
 }
 
@@ -133,13 +148,14 @@ resource "policy" "accounts_reader_policy" {
   schema    = "friendly"
   parent    = table_id("friendly", "accounts")
   spec_json = jsonencode({
-    command    = "SELECT"
+    command    = "r"
     roles      = ["friendly_reader"]
     permissive = true
     using      = "status = 'active'"
   })
   deps_json = jsonencode([
     contains(table_id("friendly", "accounts")),
+    references(column_id("friendly", "accounts", "status")),
     references(resource_id("role", "", "", "friendly_reader")),
   ])
 }
@@ -184,5 +200,6 @@ resource "default_privilege" "friendly_future_tables" {
   deps_json = jsonencode([
     references(resource_id("role", "", "", "friendly_app")),
     references(resource_id("role", "", "", "friendly_reader")),
+    references(schema_id("friendly")),
   ])
 }

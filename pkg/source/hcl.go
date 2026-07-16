@@ -232,6 +232,13 @@ func hclDocument(ctx context.Context, uri string, body *hclsyntax.Body, data []b
 					}
 				}
 			} else {
+				if authored, ok := spec["dependencies"]; ok {
+					encoded, marshalErr := json.Marshal(authored)
+					if marshalErr != nil || json.Unmarshal(encoded, &deps) != nil {
+						return fmt.Errorf("%w: dependencies must be a list produced by contains/references/uses/owns", ErrHCL)
+					}
+					delete(spec, "dependencies")
+				}
 				if raw, ok := spec["schema"]; ok {
 					if v, ok := raw.(string); ok {
 						nameObj.Schema = strings.TrimPrefix(v, "schema.")
@@ -241,7 +248,9 @@ func hclDocument(ctx context.Context, uri string, body *hclsyntax.Body, data []b
 				if sk == schema.KindSchema {
 					nameObj = schema.Name{Name: name}
 				}
-				deps = []schema.Dependency{}
+				if deps == nil {
+					deps = []schema.Dependency{}
+				}
 				if parent != "" {
 					deps = append(deps, schema.Dependency{Target: parent, Type: schema.DependencyContains})
 				} else if nameObj.Schema != "" {
@@ -289,15 +298,19 @@ func blockIdentity(b *hclsyntax.Block) (string, string, error) {
 }
 func knownHCLKind(k string) bool {
 	switch k {
-	case "resource", "schema", "table", "column", "index", "view", "materialized_view", "sequence", "domain", "enum", "function", "procedure", "trigger", "policy", "role", "user", "permission", "grant", "membership", "default_privilege", "reference_data", "data":
+	case "resource", "database", "schema", "extension", "table", "column", "index", "view", "materialized_view", "sequence", "domain", "enum", "composite_type", "function", "procedure", "trigger", "policy", "role", "user", "permission", "grant", "membership", "default_privilege", "reference_data", "data":
 		return true
 	}
 	return false
 }
 func kindToSchema(k string) schema.Kind {
 	switch k {
+	case "database":
+		return schema.KindDatabase
 	case "schema":
 		return schema.KindSchema
+	case "extension":
+		return schema.KindExtension
 	case "table":
 		return schema.KindTable
 	case "column":
@@ -314,6 +327,8 @@ func kindToSchema(k string) schema.Kind {
 		return schema.KindDomain
 	case "enum":
 		return schema.KindEnum
+	case "composite_type":
+		return schema.KindComposite
 	case "function":
 		return schema.KindFunction
 	case "procedure":
@@ -391,16 +406,40 @@ func expressionValue(expr hcl.Expression, data []byte, variables HCLVariables) (
 
 func hclFunctions() map[string]function.Function {
 	return map[string]function.Function{
-		"jsonencode":  stdlib.JSONEncodeFunc,
-		"schema_id":   stableIDFunction(schema.KindSchema, false),
-		"table_id":    stableIDFunction(schema.KindTable, true),
-		"column_id":   columnIDFunction(),
-		"resource_id": resourceIDFunction(),
-		"contains":    dependencyFunction(schema.DependencyContains),
-		"references":  dependencyFunction(schema.DependencyReferences),
-		"uses":        dependencyFunction(schema.DependencyUses),
-		"owns":        dependencyFunction(schema.DependencyOwns),
+		"jsonencode":                   stdlib.JSONEncodeFunc,
+		"schema_id":                    stableIDFunction(schema.KindSchema, false),
+		"table_id":                     stableIDFunction(schema.KindTable, true),
+		"extension_id":                 stableIDFunction(schema.KindExtension, true),
+		"composite_id":                 stableIDFunction(schema.KindComposite, true),
+		"column_id":                    columnIDFunction(),
+		"resource_id":                  resourceIDFunction(),
+		"contains":                     dependencyFunction(schema.DependencyContains),
+		"references":                   dependencyFunction(schema.DependencyReferences),
+		"uses":                         dependencyFunction(schema.DependencyUses),
+		"owns":                         dependencyFunction(schema.DependencyOwns),
+		"composite_attribute":          compositeAttributeFunction(false),
+		"collated_composite_attribute": compositeAttributeFunction(true),
 	}
+}
+
+func compositeAttributeFunction(collated bool) function.Function {
+	params := []function.Parameter{{Name: "name", Type: cty.String}, {Name: "type", Type: cty.String}, {Name: "ordinal", Type: cty.Number}}
+	attributeType := map[string]cty.Type{"name": cty.String, "type": cty.String, "ordinal": cty.Number}
+	if collated {
+		params = append(params, function.Parameter{Name: "collation", Type: cty.String})
+		attributeType["collation"] = cty.String
+	}
+	return function.New(&function.Spec{
+		Params: params,
+		Type:   function.StaticReturnType(cty.Object(attributeType)),
+		Impl: func(args []cty.Value, _ cty.Type) (cty.Value, error) {
+			value := map[string]cty.Value{"name": args[0], "type": args[1], "ordinal": args[2]}
+			if collated {
+				value["collation"] = args[3]
+			}
+			return cty.ObjectVal(value), nil
+		},
+	})
 }
 
 func stableIDFunction(kind schema.Kind, schemaScoped bool) function.Function {
@@ -512,6 +551,15 @@ func ctyToAny(v cty.Value) any {
 	if v.Type() == cty.Number {
 		f, _ := v.AsBigFloat().Float64()
 		return f
+	}
+	if v.Type().IsObjectType() || v.Type().IsMapType() {
+		out := map[string]any{}
+		iterator := v.ElementIterator()
+		for iterator.Next() {
+			key, value := iterator.Element()
+			out[key.AsString()] = ctyToAny(value)
+		}
+		return out
 	}
 	if v.CanIterateElements() {
 		it := v.ElementIterator()

@@ -46,6 +46,29 @@ verified: hcl_load=true changes=2 plan_steps=2 postgres_round_trip=true converge
 Example completed successfully.
 ```
 
+## Complete empty-database bootstrap
+
+The count-bearing bootstrap demo generates one monolithic
+`complete-bootstrap.hcl` containing a non-secret managed-database target and
+more than 1,004 canonical resources. It includes 315 indexes, 197 constraints, 47
+routines, six triggers, 14 policies on seven RLS tables, two extensions, a
+composite type, roles,
+memberships, grants, default privileges, and comments. The runner loads the HCL
+back, plans it twice byte-identically, creates a new database, interrupts once
+before every phase, resumes, reinspects exact catalog parity, and proves a
+second ordinary schema plan is a no-op.
+
+```sh
+export AUTOSQL_TEST_POSTGRES_URL='postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable'
+AUTOSQL_KEEP_WORKDIR=1 ./examples/hcl-postgres/run-complete-bootstrap.sh
+```
+
+The maintenance identity and database are external prerequisites. The runner
+creates and removes a uniquely named target and its disposable roles. With
+`AUTOSQL_KEEP_WORKDIR=1`, it retains the exact generated HCL for inspection;
+otherwise the artifact is removed after successful verification. CI runs this
+same proof on PostgreSQL 14–18.
+
 ## HCL model
 
 The checked-in files use ergonomic nested blocks:
@@ -103,6 +126,17 @@ Available pure helpers are `jsonencode(value)`, `schema_id(name)`,
 filesystem, network, environment, or secret access, keeping HCL evaluation
 deterministic and safe for CI.
 
+Extensions and composite types have direct authoring blocks plus
+`extension_id`, `composite_id`, `composite_attribute`, and
+`collated_composite_attribute` helpers. Extension execution still requires the
+separate render policy (`extension_allowlist`, exact `extension_version.<name>`,
+and optional `extension_schemas.<name>`), so an HCL declaration cannot approve
+its own privileged supply-chain input.
+
+[`database-bootstrap.hcl`](database-bootstrap.hcl) declares the separate
+server/maintenance-database/target-database contract used by
+`autosql database prepare`. It contains no connection URL or credential.
+
 [`defaults.hcl`](defaults.hcl) is the executable default-expression reference.
 It provisions scalar and cast literals, JSONB, UUIDs, the generated-function
 allowlist, enum and domain defaults, one-dimensional arrays, temporal and
@@ -112,11 +146,12 @@ creation precedes the dependent column. The complete grammar and its explicit
 rejection boundaries are documented in
 [PostgreSQL default expressions](../../docs/postgresql-default-expressions.md).
 
-Stored generated columns may reference an inspected application- or
-extension-owned routine through exact `references(...)` dependencies. Those
-routines remain external prerequisites: produce their fingerprinted manifest
-with `postgres.GeneratedRoutinePrerequisites`, verify the target with
-`postgres.VerifyGeneratedRoutinePrerequisites`, and only then plan the column.
+Stored generated columns may reference an application routine through exact
+`references(...)` dependencies. Application functions are managed when their
+normalized digest is explicitly supplied through `reviewed_routine_digests`;
+the catalog definition remains inert without that independent review authority.
+Extension-owned routines remain extension prerequisites and can still be
+verified with `postgres.VerifyGeneratedRoutinePrerequisites`.
 Verification distinguishes exact matches, missing routines, and definition or
 extension-version mismatches without rendering arbitrary routine bodies.
 [`generated.hcl`](generated.hcl) is the executable lifecycle-style example: it
@@ -135,13 +170,14 @@ creation-only `generated = "s"` expression.
 | Row security | `policy` | Forced RLS with a role-scoped `SELECT` policy |
 | Identities and access | `role`, `grant`, `membership`, `default_privilege` | NOLOGIN roles, inheritance, object grants, future-table grants |
 
-The capability mode matters. AutoSQL manages schema, enum, domain, sequence,
-table, column, view, and materialized-view transitions within their advertised
-operation matrices. Other PostgreSQL kinds are losslessly inspected and
-represented as read-only catalog resources, allowing drift detection, policy
-review, and signed evidence without pretending AutoSQL can safely synthesize
-every mutation. The example uses explicit SQL for those read-only advanced
-objects, then proves their HCL representation round-trips.
+The capability mode matters. AutoSQL now manages relational constraints,
+standalone indexes, review-authorized functions/procedures, and triggers in
+addition to schema, type, sequence, table, column, view, and materialized-view
+transitions. Extension and database-security objects are fully planned and
+maintained, but remain explicit authority boundaries: extension packages must
+already exist, routine bodies need reviewed digests, and server/database/
+security credentials are supplied only at runtime. The advanced catalog
+continues to round-trip every advertised kind without field loss.
 
 ## Useful commands
 

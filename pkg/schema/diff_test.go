@@ -95,6 +95,44 @@ func TestCreateAndReverseDropDependencyOrder(t *testing.T) {
 		}
 	}
 }
+
+func TestAccessHandoffIsLastAndRevokedFirst(t *testing.T) {
+	role := res(schema.KindRole, "app_reader", "", `{}`)
+	namespace := res(schema.KindSchema, "app", "", `{}`)
+	table := res(schema.KindTable, "items", namespace.ID, `{}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
+	policy := res(schema.KindPolicy, "tenant_read", table.ID, `{}`,
+		schema.Dependency{Target: table.ID, Type: schema.DependencyContains},
+		schema.Dependency{Target: role.ID, Type: schema.DependencyReferences})
+	grant := res(schema.KindGrant, "table:app.items:app_reader", "", `{}`,
+		schema.Dependency{Target: table.ID, Type: schema.DependencyReferences},
+		schema.Dependency{Target: role.ID, Type: schema.DependencyReferences})
+	full := doc(grant, policy, table, namespace, role)
+	created, err := schema.Diff(doc(), full, schema.DiffOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNames(t, created, "app_reader", "app", "items", "tenant_read", "table:app.items:app_reader")
+	if dependencies := created.Changes[len(created.Changes)-1].DependsOn; len(dependencies) != len(created.Changes)-1 {
+		t.Fatalf("access handoff dependencies=%v want every prior change", dependencies)
+	}
+	dropped, err := schema.Diff(full, doc(), schema.DiffOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNames(t, dropped, "table:app.items:app_reader", "tenant_read", "app_reader", "items", "app")
+}
+
+func TestAccessHandoffCycleFailsClosed(t *testing.T) {
+	namespace := res(schema.KindSchema, "app", "", `{}`)
+	table := res(schema.KindTable, "items", namespace.ID, `{}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
+	grant := res(schema.KindGrant, "table:app.items:reader", "", `{}`, schema.Dependency{Target: table.ID, Type: schema.DependencyReferences})
+	policy := res(schema.KindPolicy, "invalid_policy", table.ID, `{}`,
+		schema.Dependency{Target: table.ID, Type: schema.DependencyContains},
+		schema.Dependency{Target: grant.ID, Type: schema.DependencyReferences})
+	if _, err := schema.Diff(doc(), doc(namespace, table, grant, policy), schema.DiffOptions{}); err == nil {
+		t.Fatal("access handoff cycle produced a partial plan")
+	}
+}
 func assertNames(t *testing.T, cs schema.ChangeSet, want ...string) {
 	t.Helper()
 	got := []string{}

@@ -16,16 +16,16 @@ func TestDriverMetadata(t *testing.T) {
 	if err := plugin.ValidateDriver(d); err != nil {
 		t.Fatalf("ValidateDriver: %v", err)
 	}
-	for kind, want := range map[schema.Kind]plugin.Mode{schema.KindSchema: plugin.Managed, schema.KindView: plugin.Managed, schema.KindMaterializedView: plugin.Managed, schema.KindTable: plugin.Managed, schema.KindColumn: plugin.Managed, schema.KindEnum: plugin.Managed, schema.KindDomain: plugin.Managed, schema.KindSequence: plugin.Managed, schema.KindIndex: plugin.ReadOnly, schema.KindPolicy: plugin.ReadOnly, schema.KindRole: plugin.ReadOnly, schema.KindGrant: plugin.ReadOnly} {
+	for kind, want := range map[schema.Kind]plugin.Mode{schema.KindSchema: plugin.Managed, schema.KindView: plugin.Managed, schema.KindMaterializedView: plugin.Managed, schema.KindTable: plugin.Managed, schema.KindColumn: plugin.Managed, schema.KindEnum: plugin.Managed, schema.KindDomain: plugin.Managed, schema.KindSequence: plugin.Managed, schema.KindIndex: plugin.Managed, schema.KindPrimaryKey: plugin.Managed, schema.KindUniqueConstraint: plugin.Managed, schema.KindCheckConstraint: plugin.Managed, schema.KindForeignKey: plugin.Managed, schema.KindPolicy: plugin.Managed, schema.KindRole: plugin.Managed, schema.KindGrant: plugin.Managed} {
 		if got := d.Info().Capability(kind).Mode; got != want {
 			t.Errorf("capability %s = %s, want %s", kind, got, want)
 		}
 	}
 	all := []schema.Operation{schema.OperationCreate, schema.OperationAlter, schema.OperationDrop, schema.OperationRename}
 	for kind, want := range map[schema.Kind][]schema.Operation{
-		schema.KindSchema:           {schema.OperationCreate, schema.OperationDrop, schema.OperationRename},
+		schema.KindSchema:           all,
 		schema.KindEnum:             all,
-		schema.KindDomain:           {schema.OperationCreate, schema.OperationDrop, schema.OperationRename},
+		schema.KindDomain:           all,
 		schema.KindSequence:         all,
 		schema.KindTable:            all,
 		schema.KindColumn:           all,
@@ -36,8 +36,8 @@ func TestDriverMetadata(t *testing.T) {
 			t.Errorf("operations %s = %v, want %v", kind, got, want)
 		}
 	}
-	if got := d.Info().Capability(schema.KindIndex).Operations; len(got) != 0 {
-		t.Fatalf("read-only index advertises operations: %v", got)
+	if got := d.Info().Capability(schema.KindIndex).Operations; len(got) != 4 {
+		t.Fatalf("managed index operations: %v", got)
 	}
 }
 

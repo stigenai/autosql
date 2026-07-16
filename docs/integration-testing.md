@@ -41,6 +41,23 @@ reinspects it, proves a second-plan no-op, and applies an unrelated incremental
 change. See [PostgreSQL fresh-provisioning compatibility](postgresql-provisioning-compatibility.md)
 for the exact managed and external/read-only boundary.
 
+`TestCanonicalCompleteBootstrapInventoryManifest` adds the empty-database
+control-plane proof. It creates roles, extensions, 47 routines, 69 tables,
+197 constraints, 315 concurrent indexes, triggers, RLS policies, and access
+grants in a brand-new database. Every execution phase is interrupted once and
+resumed from its digest-bound checkpoint before final catalog parity is
+verified. Separate cases cover transaction rollback, untracked collision
+refusal, ambiguous online-step diagnosis and confirmation, no-op reruns,
+explicit abort authorization, and exclusion of the reserved execution ledger
+from the managed graph.
+
+The same proof enforces documented resource, HCL, SQL, plan-byte, step, phase,
+and dependency-fanout budgets and logs aggregate lock/transaction/scan
+exposure. PostgreSQL 16 also runs `BenchmarkCompleteBootstrapPipeline` with
+allocation reporting for inspect, normalize, HCL round-trip, preflight and
+planning, and plan serialization. Wall-clock results are retained as CI
+artifacts for trend review; pass/fail uses deterministic structural limits.
+
 ## Current audit baseline
 
 The repository contains live tests for PostgreSQL inspection/planning,
