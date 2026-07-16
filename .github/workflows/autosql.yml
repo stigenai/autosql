@@ -15,7 +15,7 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Install envtest asset manager
-        run: go install sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.24.0
+        run: go install sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.0.0-20251218032627-56d9e70af999
       - name: Test operator against Kubernetes 1.35
         run: |
           KUBEBUILDER_ASSETS="$(setup-envtest use -p path 1.35.x)"
