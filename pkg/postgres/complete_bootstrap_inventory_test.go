@@ -36,7 +36,11 @@ func TestCanonicalCompleteBootstrapInventoryManifest(t *testing.T) {
 	if url == "" {
 		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	// This is intentionally a single end-to-end budget: the proof builds the
+	// 1,007-resource fixture, plans it twice, exercises interruption recovery
+	// before every phase, and inspects the result. Hosted matrix runners are
+	// substantially slower than local development machines.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 	conn, err := pgx.Connect(ctx, url)
 	if err != nil {
