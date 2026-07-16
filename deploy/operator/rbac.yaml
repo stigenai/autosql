@@ -11,7 +11,7 @@ rules:
     verbs: [get, list, watch, patch, update]
   - apiGroups: [""]
     resources: [secrets, configmaps]
-    verbs: [get]
+    verbs: [get, list, watch]
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
     verbs: [get, create, update, patch]

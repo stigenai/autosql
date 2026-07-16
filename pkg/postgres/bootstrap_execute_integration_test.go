@@ -2,6 +2,8 @@ package postgres
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"autosql/pkg/artifact"
 	"autosql/pkg/bootstrap"
 	"autosql/pkg/plan"
 	"autosql/pkg/schema"
@@ -214,6 +217,151 @@ func TestWholeDatabaseBootstrapRejectsUntrackedManagedCollision(t *testing.T) {
 	result, err := ExecuteDatabaseBootstrapURL(ctx, maintenanceURL, whole, BootstrapExecutionHooks{})
 	if !errors.Is(err, ErrBootstrapCollision) || result.RecoveryGuidance == "" {
 		t.Fatalf("collision result=%+v err=%v", result, err)
+	}
+}
+
+func TestWholeDatabaseBootstrapExtensionReadinessFailsBeforeTargetMutation(t *testing.T) {
+	maintenanceURL := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if maintenanceURL == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx := context.Background()
+	target := bootstrapExecutionTarget(t, ctx, maintenanceURL, "autosql_extension_preflight")
+	defer DropDatabaseURL(context.Background(), maintenanceURL, target.Name, true)
+	_ = DropDatabaseURL(ctx, maintenanceURL, target.Name, true)
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "extension_preflight_app"}, `{}`)
+	extension := renderResource(schema.KindExtension, schema.Name{Schema: ns.Name.Name, Name: "autosql_missing_control_file", Parent: ns.ID}, `{"version":"1.0","relocatable":true,"trusted":true,"superuser":true,"requires":[]}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, extension}}}
+	whole, err := PlanDatabaseBootstrap(ctx, target, desired, plan.Options{Render: map[string]string{
+		"extension_allowlist":                      extension.Name.Name,
+		"extension_version." + extension.Name.Name: "1.0",
+		"extension_schemas." + extension.Name.Name: ns.Name.Name,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := ExecuteDatabaseBootstrapURL(ctx, maintenanceURL, whole, BootstrapExecutionHooks{})
+	if err == nil || result.CreatedDatabase || !strings.Contains(err.Error(), "missing_package_control_file") || !strings.Contains(err.Error(), ".control") {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	conn, connectErr := pgx.Connect(ctx, maintenanceURL)
+	if connectErr != nil {
+		t.Fatal(connectErr)
+	}
+	defer conn.Close(ctx)
+	var exists bool
+	if err := conn.QueryRow(ctx, `select exists(select 1 from pg_database where datname=$1)`, target.Name).Scan(&exists); err != nil || exists {
+		t.Fatalf("target exists=%v err=%v; readiness ran after mutation", exists, err)
+	}
+}
+
+func TestBootstrapExtensionReadinessUsesServerTrustAndExplicitAuthority(t *testing.T) {
+	maintenanceURL := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if maintenanceURL == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx := context.Background()
+	config, err := pgx.ParseConfig(maintenanceURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := InspectExtensionCatalogURL(ctx, maintenanceURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, secondVersion := "", ""
+	for _, available := range catalog.Versions {
+		if available.Name == "dblink" && !available.Trusted {
+			version = available.Version
+		}
+		if available.Name == "amcheck" && !available.Trusted {
+			secondVersion = available.Version
+		}
+	}
+	if version == "" || secondVersion == "" {
+		t.Skip("server does not expose both untrusted dblink and amcheck control files")
+	}
+	var owner string
+	conn, err := pgx.Connect(ctx, maintenanceURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.QueryRow(ctx, `select pg_get_userbyid(datdba) from pg_database where datname=current_database()`).Scan(&owner); err != nil {
+		conn.Close(ctx)
+		t.Fatal(err)
+	}
+	conn.Close(ctx)
+	target := bootstrap.DatabaseTarget{Mode: bootstrap.ExternalDatabase, Endpoint: bootstrap.ServerEndpoint{Host: config.Host, Port: uint16(config.Port), TLSMode: "disable"}, MaintenanceDatabase: config.Database, Name: config.Database, Owner: owner, ConnectionLimit: -1}.Normalize()
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "public"}, `{}`)
+	extension := renderResource(schema.KindExtension, schema.Name{Schema: "public", Name: "dblink", Parent: ns.ID}, fmt.Sprintf(`{"version":%q,"relocatable":true,"trusted":true,"superuser":true,"requires":[]}`, version), schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, extension}}}
+	render := map[string]string{"extension_allowlist": "dblink", "extension_version.dblink": version, "extension_schemas.dblink": "public"}
+
+	withoutAuthority, err := PlanDatabaseBootstrap(ctx, target, desired, plan.Options{Render: render})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := PreflightBootstrapExtensionsURL(ctx, maintenanceURL, withoutAuthority)
+	if err != nil || report.Extensions[0].Status != ExtensionUnauthorized {
+		t.Fatalf("HCL trusted metadata bypassed server trust: report=%+v err=%v", report, err)
+	}
+
+	legacyRender := cloneRenderOptions(render)
+	legacyRender["allow_untrusted_extensions"] = "true"
+	legacy, err := PlanDatabaseBootstrap(ctx, target, desired, plan.Options{Render: legacyRender})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report, err = PreflightBootstrapExtensionsURL(ctx, maintenanceURL, legacy); err != nil || !report.Ready {
+		t.Fatalf("explicit legacy authority was not preserved: report=%+v err=%v", report, err)
+	}
+
+	var untrustedSpec map[string]any
+	if err := json.Unmarshal(extension.Spec, &untrustedSpec); err != nil {
+		t.Fatal(err)
+	}
+	untrustedSpec["trusted"] = false
+	extension.Spec, _ = json.Marshal(untrustedSpec)
+	desired.Graph.Resources[1] = extension
+	// The signed inventory intentionally trusts amcheck while authorizing
+	// dblink as untrusted. Live server metadata says both are untrusted, so the
+	// exact dblink capability must not spill over to amcheck.
+	second := renderResource(schema.KindExtension, schema.Name{Schema: "public", Name: "amcheck", Parent: ns.ID}, fmt.Sprintf(`{"version":%q,"relocatable":true,"trusted":true,"superuser":true,"requires":[]}`, secondVersion), schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	desired.Graph.Resources = append(desired.Graph.Resources, second)
+	inventory, err := PrepareBootstrapAuthorizationInventory(ctx, target, desired, BootstrapAuthorizationInventoryOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	manifest, err := NewBootstrapAuthorizationManifest(inventory, now.Add(-time.Minute), now.Add(-time.Minute), now.Add(time.Hour), "security", "dba", "bootstrap-authorization")
+	if err != nil {
+		t.Fatal(err)
+	}
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manifest.Sign("test-key", private); err != nil {
+		t.Fatal(err)
+	}
+	verified, err := VerifyBootstrapAuthorizationManifest(manifest, inventory, BootstrapAuthorizationVerifyPolicy{Now: func() time.Time { return now }, Keys: map[string]artifact.KeyRecord{"test-key": {PublicKey: public, Issuer: "security", Identity: "dba", Purpose: "bootstrap-authorization", Status: "active", NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour)}}, Issuer: "security", Signer: "dba", Purpose: "bootstrap-authorization"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestPlan, err := PlanDatabaseBootstrapAuthorized(ctx, target, desired, plan.Options{}, verified)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err = PreflightBootstrapExtensionsURL(ctx, maintenanceURL, manifestPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statuses := map[string]ExtensionReadinessStatus{}
+	for _, item := range report.Extensions {
+		statuses[item.Name] = item.Status
+	}
+	if report.Ready || statuses["dblink"] != ExtensionReady || statuses["amcheck"] != ExtensionUnauthorized {
+		t.Fatalf("manifest extension authority was not exact: report=%+v", report)
 	}
 }
 

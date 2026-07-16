@@ -82,6 +82,15 @@ func ExecuteDatabaseBootstrapURL(ctx context.Context, maintenanceURL string, who
 	if hooks.Now == nil {
 		hooks.Now = time.Now
 	}
+	// Extension readiness is a read-only gate and must run before target
+	// creation, bootstrap history initialization, or any schema mutation.
+	extensionReport, err := PreflightBootstrapExtensionsURL(ctx, maintenanceURL, whole)
+	if err != nil {
+		return result, safeError("preflight bootstrap extensions", maintenanceURL, err)
+	}
+	if !extensionReport.Ready {
+		return result, extensionReadinessError(extensionReport)
+	}
 	emit := func(typ string, phase bootstrap.BootstrapPhase, step string) {
 		result.Events = append(result.Events, BootstrapExecutionEvent{Type: typ, PlanDigest: whole.Digest, PhaseID: phase.ID, Checkpoint: phase.Checkpoint, StepID: step, At: hooks.Now().UTC()})
 	}
@@ -476,6 +485,10 @@ func verifyBootstrapState(ctx context.Context, conn *pgx.Conn, whole bootstrap.P
 	if err != nil {
 		return errors.New("inspect bootstrap precondition")
 	}
+	inspected, err = New().Normalize(ctx, inspected)
+	if err != nil {
+		return errors.New("normalize bootstrap precondition")
+	}
 	actualByID := map[string]schema.Resource{}
 	for _, resource := range inspected.Graph.Resources {
 		actualByID[resource.ID] = resource
@@ -588,8 +601,12 @@ func projectInspectedBootstrapResource(actual, desired schema.Resource, desiredI
 	// projects the same snapshot both resource-by-resource and as a complete
 	// document; an in-place filter would corrupt the latter projection's input.
 	dependencies := make([]schema.Dependency, 0, len(actual.Dependencies))
+	desiredDependencies := map[string]bool{}
+	for _, dependency := range desired.Dependencies {
+		desiredDependencies[dependency.Target+"\x00"+string(dependency.Type)] = true
+	}
 	for _, dependency := range actual.Dependencies {
-		if desiredIDs[dependency.Target] {
+		if desiredIDs[dependency.Target] && desiredDependencies[dependency.Target+"\x00"+string(dependency.Type)] {
 			dependencies = append(dependencies, dependency)
 		}
 	}

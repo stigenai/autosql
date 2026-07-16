@@ -3,6 +3,7 @@ package postgres
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 )
@@ -16,6 +17,7 @@ type defaultExpression struct {
 	Literal   *defaultLiteral
 	Cast      *defaultCast
 	Function  *defaultFunction
+	Operator  *defaultOperator
 	Reference *defaultReference
 	Array     []defaultExpression
 }
@@ -27,6 +29,7 @@ const (
 	defaultExpressionLiteral
 	defaultExpressionCast
 	defaultExpressionFunction
+	defaultExpressionOperator
 	defaultExpressionReference
 	defaultExpressionArray
 )
@@ -57,6 +60,13 @@ type defaultFunction struct {
 	Name      defaultReference
 	Arguments []defaultExpression
 	Precision *int
+	SQLSyntax bool
+}
+
+type defaultOperator struct {
+	Name  string
+	Left  *defaultExpression
+	Right defaultExpression
 }
 
 type defaultReference struct {
@@ -215,12 +225,14 @@ func classifyDefaultNode(node *pg_query.Node, depth int, nodes *int) (defaultExp
 		return defaultExpression{Kind: defaultExpressionCast, Cast: &defaultCast{Expression: arg, Type: typ}}, nil
 	}
 	if call := node.GetFuncCall(); call != nil {
-		if call.GetAggFilter() != nil || len(call.GetAggOrder()) != 0 || call.GetOver() != nil || call.GetAggWithinGroup() || call.GetAggStar() || call.GetAggDistinct() || call.GetFuncVariadic() || call.GetFuncformat() != pg_query.CoercionForm_COERCE_EXPLICIT_CALL {
-			return defaultExpression{}, errors.New("default function uses unsupported call features")
-		}
 		name, err := classifyDefaultName(call.GetFuncname())
 		if err != nil {
 			return defaultExpression{}, fmt.Errorf("default function name: %w", err)
+		}
+		explicitCall := call.GetFuncformat() == pg_query.CoercionForm_COERCE_EXPLICIT_CALL
+		extractSyntax := call.GetFuncformat() == pg_query.CoercionForm_COERCE_SQL_SYNTAX && strings.Join(name.Parts, ".") == "pg_catalog.extract"
+		if call.GetAggFilter() != nil || len(call.GetAggOrder()) != 0 || call.GetOver() != nil || call.GetAggWithinGroup() || call.GetAggStar() || call.GetAggDistinct() || call.GetFuncVariadic() || !explicitCall && !extractSyntax {
+			return defaultExpression{}, errors.New("default function uses unsupported call features")
 		}
 		if len(call.GetArgs()) > maxDefaultFunctionArgs {
 			return defaultExpression{}, errors.New("default function exceeds argument limit")
@@ -233,7 +245,7 @@ func classifyDefaultNode(node *pg_query.Node, depth int, nodes *int) (defaultExp
 			}
 			args = append(args, arg)
 		}
-		return defaultExpression{Kind: defaultExpressionFunction, Function: &defaultFunction{Name: name, Arguments: args}}, nil
+		return defaultExpression{Kind: defaultExpressionFunction, Function: &defaultFunction{Name: name, Arguments: args, SQLSyntax: extractSyntax}}, nil
 	}
 	if ref := node.GetColumnRef(); ref != nil {
 		name, err := classifyDefaultName(ref.GetFields())
@@ -294,20 +306,51 @@ func classifyDefaultNode(node *pg_query.Node, depth int, nodes *int) (defaultExp
 		}
 		return defaultExpression{Kind: defaultExpressionFunction, Function: &defaultFunction{Name: defaultReference{Parts: []string{name}}, Precision: precision}}, nil
 	}
-	if unary := node.GetAExpr(); unary != nil {
-		// PostgreSQL represents a negative numeric constant as a unary A_Expr.
-		// Preserve that one legacy form without admitting general operators.
-		if unary.GetKind() != pg_query.A_Expr_Kind_AEXPR_OP || unary.GetLexpr() != nil || !defaultNameEquals(unary.GetName(), "-") {
-			return defaultExpression{}, errors.New("default operators are not supported")
+	if operator := node.GetAExpr(); operator != nil {
+		if operator.GetKind() != pg_query.A_Expr_Kind_AEXPR_OP {
+			return defaultExpression{}, errors.New("default operator expression kind is not supported")
 		}
-		expr, err := classifyDefaultNode(unary.GetRexpr(), depth+1, nodes)
-		if err != nil || expr.Kind != defaultExpressionLiteral || expr.Literal == nil || (expr.Literal.Kind != defaultLiteralInteger && expr.Literal.Kind != defaultLiteralFloat) {
-			return defaultExpression{}, errors.New("only unary-negative numeric literals are supported")
+		name, err := classifyDefaultName(operator.GetName())
+		operatorName := ""
+		if err == nil && len(name.Parts) == 1 {
+			operatorName = name.Parts[0]
+		} else if err == nil && len(name.Parts) == 2 && name.Parts[0] == "pg_catalog" {
+			operatorName = name.Parts[1]
 		}
-		expr.Literal.Text = "-" + expr.Literal.Text
-		return expr, nil
+		if !isBoundedDefaultOperator(operatorName) {
+			return defaultExpression{}, errors.New("default operator is not allowlisted; supported operators are +, -, *, /, and %")
+		}
+		if operator.GetRexpr() == nil {
+			return defaultExpression{}, errors.New("default operator is missing its right operand")
+		}
+		right, err := classifyDefaultNode(operator.GetRexpr(), depth+1, nodes)
+		if err != nil {
+			return defaultExpression{}, fmt.Errorf("default operator right operand: %w", err)
+		}
+		var left *defaultExpression
+		if operator.GetLexpr() == nil {
+			if operatorName != "+" && operatorName != "-" {
+				return defaultExpression{}, errors.New("only + and - are supported as unary default operators")
+			}
+		} else {
+			classified, err := classifyDefaultNode(operator.GetLexpr(), depth+1, nodes)
+			if err != nil {
+				return defaultExpression{}, fmt.Errorf("default operator left operand: %w", err)
+			}
+			left = &classified
+		}
+		return defaultExpression{Kind: defaultExpressionOperator, Operator: &defaultOperator{Name: operatorName, Left: left, Right: right}}, nil
 	}
 	return defaultExpression{}, errors.New("default expression contains an unsupported AST node")
+}
+
+func isBoundedDefaultOperator(value string) bool {
+	switch value {
+	case "+", "-", "*", "/", "%":
+		return true
+	default:
+		return false
+	}
 }
 
 func classifyDefaultConstant(value *pg_query.A_Const) (defaultExpression, error) {

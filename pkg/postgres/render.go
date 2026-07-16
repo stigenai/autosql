@@ -2021,6 +2021,12 @@ func validateCoreDefault(r schema.Resource, value string) error {
 	if err != nil {
 		return unsupported(r, fmt.Sprintf("default rejected for normalized type %q: %s", stringValue(spec(r), "type"), err.Error()))
 	}
+	if containsDefaultOperator(expr) {
+		if err := validateCoreOperatorDefault(typ, expr, value); err != nil {
+			return unsupported(r, fmt.Sprintf("default rejected for normalized type %q: %s", stringValue(spec(r), "type"), err.Error()))
+		}
+		return nil
+	}
 	if !coreDefaultAllowed(typ, expr, value) {
 		return unsupported(r, fmt.Sprintf("default rejected for normalized type %q: %s is not allowlisted", stringValue(spec(r), "type"), defaultExpressionClass(expr)))
 	}
@@ -2041,6 +2047,14 @@ func defaultExpressionClass(expr defaultExpression) string {
 			return "function " + strings.Join(expr.Function.Name.Parts, ".")
 		}
 		return "function"
+	case defaultExpressionOperator:
+		if expr.Operator != nil {
+			if expr.Operator.Left == nil {
+				return "unary operator " + expr.Operator.Name
+			}
+			return "binary operator " + expr.Operator.Name
+		}
+		return "operator"
 	case defaultExpressionReference:
 		return "reference"
 	case defaultExpressionArray:

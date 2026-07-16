@@ -57,6 +57,15 @@ func PreflightBootstrapProvisioning(ctx context.Context, doc schema.Document, op
 	return report, nil
 }
 
+// ValidateBootstrapAuthority validates only the non-secret phase-to-identity
+// contract. Callers using a signed bootstrap authorization manifest validate
+// routine and extension renderability when they materialize the exact
+// manifest-bound plan, rather than weakening those gates with synthetic
+// legacy render options during the earlier authority check.
+func ValidateBootstrapAuthority(doc schema.Document, contract bootstrap.Contract, createDatabase bool) ([]bootstrap.Binding, error) {
+	return contract.Validate(bootstrapRequirements(doc, createDatabase))
+}
+
 func bootstrapRequirements(doc schema.Document, createDatabase bool) []bootstrap.Requirement {
 	required := map[bootstrap.Responsibility]bootstrap.Requirement{}
 	add := func(responsibility bootstrap.Responsibility, capability bootstrap.Capability, reason string) {

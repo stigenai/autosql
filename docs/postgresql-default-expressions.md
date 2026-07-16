@@ -29,6 +29,45 @@ Literal casts may use a compatible narrower core type, such as an integer cast
 for a bigint column or a shorter character cast for a wider character column.
 AutoSQL checks both the cast type and the destination type before rendering.
 
+## Bounded arithmetic defaults
+
+Numeric columns support unary `+` and `-` and the binary operators `+`, `-`,
+`*`, `/`, and `%`. Parentheses, numeric core-type casts, and PostgreSQL's
+standard precedence and left associativity are preserved by a typed expression
+tree and rendered to one canonical spelling. For example, the DBOS millisecond
+timestamp default is supported directly:
+
+```sql
+(extract(epoch from CURRENT_TIMESTAMP) OPERATOR(pg_catalog.*) 1000)::bigint
+```
+
+Every arithmetic operator is canonically rendered as
+`OPERATOR(pg_catalog.<symbol>)`. This binds execution to PostgreSQL's built-in
+operator even if an untrusted schema earlier in `search_path` defines the same
+symbol. Explicit operators from any other schema are rejected. `extract` is
+accepted only in PostgreSQL's `extract(epoch from ...)` syntax,
+and its source is limited to stable transaction-time builtins such as `now()`
+and `CURRENT_TIMESTAMP`. Inspection normalizes those aliases and PostgreSQL's
+implicit numeric cast, so apply/reinspect converges to a no-op on PostgreSQL
+14–18. Literal zero divisors, other operators, explicit `OPERATOR(...)`
+selection, column references, subqueries, and non-allowlisted functions fail
+closed. Validation follows PostgreSQL numeric promotion, integer division,
+numeric-to-integer cast rounding, modulo operand support, and intermediate plus
+destination bounds. Consequently nested typed zero divisors such as
+`1 / (1 / 2)` and `1 / (0.4::integer)`, `real % real`, and an overflowing
+`smallint` default such as `32767 + 1` are rejected before any DDL is emitted.
+`real` and `double precision` results are rounded after every operation before
+they are reused, matching PostgreSQL's typed evaluation. Integer MIN `% -1` is
+also rejected as a deliberately fail-closed overflow edge.
+
+Dynamic arithmetic carries conservative numeric ranges through every operator.
+The allowlisted transaction-time `extract(epoch ...)` source is bounded wider
+than PostgreSQL's complete timestamp range; casts and fixed-width destinations
+must prove that both range endpoints fit. This admits the DBOS milliseconds
+expression in `bigint`, while rejecting an unsafe `smallint` expression such as
+`extract(epoch from now()) + 0`. Dynamic divisors whose range includes zero are
+rejected.
+
 ## Supported generated and temporal defaults
 
 The generated-function allowlist is intentionally small:
@@ -111,7 +150,7 @@ sequence references are rejected.
 ## Safety and diagnostics
 
 AutoSQL does not provide an arbitrary-expression escape hatch for defaults.
-It rejects unknown functions, operators, column references, subqueries,
+It rejects unknown functions, unmodeled operators, column references, subqueries,
 multiple statements, comments, dollar quoting, escape-prefixed strings,
 variadic calls, malformed casts, incompatible types, and expressions outside
 the bounded AST grammar. An unchanged legacy default does not block an

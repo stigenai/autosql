@@ -503,8 +503,15 @@ func (a Artifact) validateStored() error {
 	}
 	return nil
 }
+
+// maxEncodedArtifactSize bounds parser allocation while leaving room for
+// complete database bootstrap plans. Those plans intentionally carry the SQL,
+// checks, resource specifications, comments, and dependency metadata needed to
+// verify the exact generated artifact before mutation.
+const maxEncodedArtifactSize = 8 << 20
+
 func Parse(data []byte) (Artifact, error) {
-	if len(data) > 4<<20 || !utf8.Valid(data) || jsonDepthAndDuplicates(data) != nil {
+	if len(data) > maxEncodedArtifactSize || !utf8.Valid(data) || jsonDepthAndDuplicates(data) != nil {
 		return Artifact{}, fail("encoding", ErrInvalid)
 	}
 	var a Artifact

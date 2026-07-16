@@ -37,8 +37,9 @@ spec:
                 source:
                   type: object
                   minProperties: 1
-                  maxProperties: 1
+                  maxProperties: 2
                   properties:
+                    format: {type: string, enum: [sql, hcl]}
                     inline:
                       type: string
                       minLength: 1
@@ -59,6 +60,8 @@ spec:
                   x-kubernetes-validations:
                     - rule: "(has(self.inline) ? 1 : 0) + (has(self.secretRef) ? 1 : 0) + (has(self.configMapRef) ? 1 : 0) + (has(self.url) ? 1 : 0) + (has(self.registryDigest) ? 1 : 0) == 1"
                       message: exactly one source variant must be set
+                    - rule: "!has(self.format) || has(self.inline) || has(self.secretRef) || has(self.configMapRef)"
+                      message: source format applies only to inline, Secret, or ConfigMap declarative content
                 artifactDigest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
                 databaseURL:
                   type: object
@@ -97,6 +100,8 @@ spec:
                     connectionLimit: {type: integer, minimum: -1}
                     allowConnections: {type: boolean}
                 createDatabase: {type: boolean, default: false}
+                postgresVersion: {type: integer, minimum: 14, maximum: 18}
+                concurrentIndexes: {type: boolean, default: true}
                 bootstrapAuthority:
                   type: object
                   required: [identities, assignments]
@@ -143,6 +148,31 @@ spec:
                             type: string
                             enum: [database_creation, role_creation, extension_setup, schema_objects, grant_setup, ownership_handoff]
                           identity: {type: string, minLength: 1}
+                bootstrapAuthorization:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                  required: [manifestSecretRef, publicKeySecretRef, issuer, signer, purpose]
+                  properties:
+                    manifestSecretRef:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                      required: [name, key]
+                      properties:
+                        name: {type: string, minLength: 1, pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'}
+                        key: {type: string, minLength: 1, pattern: '^[A-Za-z0-9._-]+$'}
+                    publicKeySecretRef:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                      required: [name, key]
+                      properties:
+                        name: {type: string, minLength: 1, pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'}
+                        key: {type: string, minLength: 1, pattern: '^[A-Za-z0-9._-]+$'}
+                    issuer: {type: string, minLength: 1, maxLength: 253}
+                    signer: {type: string, minLength: 1, maxLength: 253}
+                    purpose: {type: string, minLength: 1, maxLength: 253}
+                  x-kubernetes-validations:
+                    - rule: "self.manifestSecretRef.name != '' && self.manifestSecretRef.key != '' && self.publicKeySecretRef.name != '' && self.publicKeySecretRef.key != ''"
+                      message: authorization manifest and public key runtime references must be complete
                 requireApproval: {type: boolean}
               x-kubernetes-validations:
                 - rule: "self.generation >= 1"
@@ -157,6 +187,8 @@ spec:
                   message: managed databaseTarget requires bootstrapAuthority and maintenanceDatabaseURL
                 - rule: "!self.createDatabase || !has(self.databaseTarget) || self.databaseTarget.mode == 'managed'"
                   message: createDatabase conflicts with external databaseTarget mode
+                - rule: "!has(self.bootstrapAuthorization) || (self.kind == 'DeclarativeSchema' && has(self.databaseTarget) && (has(self.source.inline) || has(self.source.secretRef) || has(self.source.configMapRef)))"
+                  message: bootstrapAuthorization requires databaseTarget and a controller-resolvable DeclarativeSchema source
             status:
               type: object
               properties:
@@ -171,6 +203,8 @@ spec:
                 recoveryGuidance: {type: string, minLength: 1}
                 appliedSteps: {type: integer, minimum: 0}
                 retryCount: {type: integer, minimum: 0}
+                appliedFingerprint: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+                authorizationExpiresAt: {type: string, format: date-time}
                 conditions:
                   type: array
                   x-kubernetes-list-type: map
@@ -179,7 +213,7 @@ spec:
                     type: object
                     required: [type, status, observedGeneration, lastTransitionTime]
                     properties:
-                      type: {type: string, enum: [Planning, ApprovalRequired, Applying, Ready, Failed]}
+                      type: {type: string, enum: [Planning, ApprovalRequired, Applying, Ready, Failed, BootstrapAuthorization]}
                       status: {type: string, enum: ["True", "False", Unknown]}
                       reason: {type: string}
                       message: {type: string}

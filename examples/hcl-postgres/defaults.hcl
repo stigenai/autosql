@@ -194,3 +194,15 @@ resource "column" "flags" {
   spec_json = jsonencode({ type = "bit(4)", default = "'1010'::bit(4)", not_null = true, ordinal = 19 })
   deps_json = jsonencode([contains(table_id("defaults_demo", "widgets"))])
 }
+
+resource "column" "dbos_updated_at" {
+  schema = "defaults_demo"
+  parent = table_id("defaults_demo", "widgets")
+  spec_json = jsonencode({
+    type     = "bigint"
+    default  = "(extract(epoch from CURRENT_TIMESTAMP) OPERATOR(pg_catalog.*) 1000)::bigint"
+    not_null = true
+    ordinal  = 20
+  })
+  deps_json = jsonencode([contains(table_id("defaults_demo", "widgets"))])
+}

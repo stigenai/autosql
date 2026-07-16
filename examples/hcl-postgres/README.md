@@ -69,6 +69,20 @@ creates and removes a uniquely named target and its disposable roles. With
 otherwise the artifact is removed after successful verification. CI runs this
 same proof on PostgreSQL 14–18.
 
+Before running a retained `complete-bootstrap.hcl` outside the disposable demo,
+use `autosql database bootstrap prepare --json` to review its complete
+authorization inventory, then `autosql database bootstrap authorize` to create
+one signed, expiring manifest. Execution accepts that manifest with an
+independently supplied Ed25519 public key; the artifact binds the exact source
+and plan while containing no SQL, routine source, executable steps, or
+credentials. See [PostgreSQL database bootstrap](../../docs/postgresql-database-bootstrap.md)
+for the full commands and key policy.
+
+`database-bootstrap.hcl` also demonstrates the execution-side
+`bootstrap_authorization` block. It contains only `env://`/`file://` runtime
+references plus issuer, signer, and purpose; it cannot carry a private key or
+resolved credential. Remove or replace the example paths before execution.
+
 ## HCL model
 
 The checked-in files use ergonomic nested blocks:
@@ -133,14 +147,23 @@ separate render policy (`extension_allowlist`, exact `extension_version.<name>`,
 and optional `extension_schemas.<name>`), so an HCL declaration cannot approve
 its own privileged supply-chain input.
 
+[`extension-readiness.hcl`](extension-readiness.hcl) is a non-secret, complete
+preflight example. Run `autosql database bootstrap preflight` with an extension
+allowlist plus repeatable `--extension-version` and `--extension-schema` flags
+to get deterministic text or JSON readiness for each requested package. The
+report separates authorization failures from missing server control files,
+unavailable versions, fixed-schema conflicts, and insufficient database or
+schema privilege; the command performs no bootstrap mutation.
+
 [`database-bootstrap.hcl`](database-bootstrap.hcl) declares the separate
 server/maintenance-database/target-database contract used by
 `autosql database prepare`. It contains no connection URL or credential.
 
 [`defaults.hcl`](defaults.hcl) is the executable default-expression reference.
-It provisions scalar and cast literals, JSONB, UUIDs, the generated-function
-allowlist, enum and domain defaults, one-dimensional arrays, temporal and
-interval forms, and an exactly qualified sequence-backed `nextval`. The
+It provisions scalar and cast literals, JSONB, UUIDs, bounded arithmetic
+(including the DBOS `extract(epoch from ...) * 1000` default), the
+generated-function allowlist, enum and domain defaults, one-dimensional arrays,
+temporal and interval forms, and an exactly qualified sequence-backed `nextval`. The
 automated example test builds a clean-database plan and checks that sequence
 creation precedes the dependent column. The complete grammar and its explicit
 rejection boundaries are documented in

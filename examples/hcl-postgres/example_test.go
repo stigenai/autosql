@@ -2,6 +2,7 @@ package hclpostgres_test
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
@@ -106,6 +107,30 @@ func TestDatabaseBootstrapHCLUsesSeparateNonSecretTargetContract(t *testing.T) {
 	}
 }
 
+func TestExtensionReadinessHCLHasOneTargetAndExactExtensionRequests(t *testing.T) {
+	doc := loadHCL(t, context.Background(), "extension-readiness.hcl")
+	var databases int
+	versions := map[string]string{}
+	for _, resource := range doc.Graph.Resources {
+		switch resource.Kind {
+		case schema.KindDatabase:
+			databases++
+		case schema.KindExtension:
+			var spec struct {
+				Version string `json:"version"`
+			}
+			err := json.Unmarshal(resource.Spec, &spec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			versions[resource.Name.Name] = spec.Version
+		}
+	}
+	if databases != 1 || versions["hstore"] != "1.8" || versions["pgcrypto"] != "1.3" {
+		t.Fatalf("databases=%d extensions=%v", databases, versions)
+	}
+}
+
 func TestDocumentedDefaultExpressionHCLBuildsFreshPlan(t *testing.T) {
 	ctx := context.Background()
 	driver := postgres.New()
@@ -151,6 +176,7 @@ func TestDocumentedDefaultExpressionHCLBuildsFreshPlan(t *testing.T) {
 		`DEFAULT CURRENT_DATE`,
 		`DEFAULT CURRENT_TIMESTAMP`,
 		`DEFAULT pg_catalog.timezone('utc'::text, CURRENT_TIMESTAMP)`,
+		`DEFAULT (extract(epoch from CURRENT_TIMESTAMP) OPERATOR(pg_catalog.*) 1000)::bigint`,
 	} {
 		if !strings.Contains(sql.String(), want) {
 			t.Errorf("documented plan is missing %q", want)

@@ -2,6 +2,8 @@ package postgres
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"math"
 	"regexp"
 	"strconv"
@@ -22,6 +24,9 @@ func coreDefaultAllowed(typ coreColumnType, expr defaultExpression, source strin
 	if typ.array {
 		return coreArrayDefaultAllowed(typ, expr)
 	}
+	if expr.Kind == defaultExpressionOperator {
+		return coreOperatorDefaultAllowed(typ, expr, source)
+	}
 	if expr.Kind == defaultExpressionFunction {
 		return coreFunctionDefaultAllowed(typ, expr.Function, source)
 	}
@@ -30,10 +35,52 @@ func coreDefaultAllowed(typ coreColumnType, expr defaultExpression, source strin
 		if !ok || castType.array || !coreTypesCompatible(typ, castType) {
 			return false
 		}
+		if containsDefaultOperator(expr.Cast.Expression) {
+			return coreOperatorDefaultAllowed(typ, expr, source)
+		}
 		literal, ok := coreCastLiteralExpression(castType, expr.Cast.Expression)
 		return ok && coreScalarLiteralAllowed(castType, literal) && coreScalarLiteralAllowed(typ, literal)
 	}
 	return coreScalarLiteralAllowed(typ, expr) && coreLiteralSourceCanonical(typ, expr, source)
+}
+
+func coreOperatorDefaultAllowed(typ coreColumnType, expr defaultExpression, source string) bool {
+	return validateCoreOperatorDefault(typ, expr, source) == nil
+}
+
+func validateCoreOperatorDefault(typ coreColumnType, expr defaultExpression, source string) error {
+	if !isNumericCoreType(typ) {
+		return errors.New("operator destination is not a numeric core type")
+	}
+	analysis, err := analyzeNumericDefaultExpression(expr)
+	if err != nil {
+		return err
+	}
+	destination := numericTypeFromCore(typ)
+	if _, err := convertDefaultNumericConstantToCore(analysis.Constant, typ); err != nil {
+		return fmt.Errorf("operator destination conversion: %w", err)
+	}
+	if analysis.Minimum == nil || analysis.Maximum == nil {
+		return errors.New("operator destination range is not proven safe")
+	}
+	if _, err := convertDefaultNumericConstantToCore(analysis.Minimum, typ); err != nil {
+		return fmt.Errorf("operator destination minimum: %w", err)
+	}
+	if _, err := convertDefaultNumericConstantToCore(analysis.Maximum, typ); err != nil {
+		return fmt.Errorf("operator destination maximum: %w", err)
+	}
+	if destination == defaultNumericInvalid {
+		return errors.New("operator destination numeric type is invalid")
+	}
+	if !canonicalDefaultSource(expr, source) {
+		return errors.New("operator expression is not in canonical pg_catalog-bound form")
+	}
+	return nil
+}
+
+func canonicalDefaultSource(expr defaultExpression, source string) bool {
+	canonical, err := canonicalOperatorDefault(expr)
+	return err == nil && source == canonical
 }
 
 func coreDefaultCastType(ref defaultTypeReference) (coreColumnType, bool) {

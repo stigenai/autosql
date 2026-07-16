@@ -17,4 +17,14 @@ database "autosql_cell" {
   tablespace            = "pg_default"
   connection_limit      = 50
   allow_connections     = true
+
+  # Execution resolves these at runtime. The HCL graph contains neither the
+  # signed manifest bytes nor public/private key material.
+  bootstrap_authorization = {
+    manifest   = "file:///run/autosql/bootstrap-authorization.json"
+    public_key = "env://AUTOSQL_BOOTSTRAP_AUTH_PUBLIC_KEY"
+    issuer     = "security"
+    signer     = "dba-reviewers"
+    purpose    = "bootstrap-authorization"
+  }
 }
