@@ -784,7 +784,14 @@ func TestMaterializedViewIndexesAdoptProvisionAndConverge(t *testing.T) {
 	}
 	defer conn.Close(context.Background())
 	const namespace = "autosql_matview_indexes"
-	if _, err = conn.Exec(ctx, `drop schema if exists autosql_matview_indexes cascade; create schema autosql_matview_indexes; create materialized view autosql_matview_indexes.block_health_summary as select 1 as block_number`); err != nil {
+	if _, err = conn.Exec(ctx, `drop schema if exists autosql_matview_indexes cascade;
+create schema autosql_matview_indexes;
+create table autosql_matview_indexes.block_health(block_number bigint);
+insert into autosql_matview_indexes.block_health values (1), (1), (2);
+create materialized view autosql_matview_indexes.block_health_summary as
+select block_number, count(*)::bigint as sample_count
+from autosql_matview_indexes.block_health
+group by block_number`); err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Exec(context.Background(), `drop schema if exists autosql_matview_indexes cascade`)
@@ -807,7 +814,13 @@ func TestMaterializedViewIndexesAdoptProvisionAndConverge(t *testing.T) {
 		resourcesByID[resource.ID] = resource
 	}
 	indexCount := 0
+	complexDependencyProven := false
 	for _, resource := range desired.Graph.Resources {
+		if resource.Kind == schema.KindMaterializedView && resource.Name.Name == "block_health_summary" {
+			for _, dependency := range resource.Dependencies {
+				complexDependencyProven = complexDependencyProven || resourcesByID[dependency.Target].Kind == schema.KindTable
+			}
+		}
 		if resource.Kind == schema.KindIndex {
 			indexCount++
 			parent, ok := resourcesByID[resource.Name.Parent]
@@ -816,8 +829,8 @@ func TestMaterializedViewIndexesAdoptProvisionAndConverge(t *testing.T) {
 			}
 		}
 	}
-	if indexCount != 8 {
-		t.Fatalf("inspected materialized-view indexes=%d want 8", indexCount)
+	if indexCount != 8 || !complexDependencyProven {
+		t.Fatalf("inspected materialized-view indexes=%d dependency_proven=%t", indexCount, complexDependencyProven)
 	}
 	if _, err = conn.Exec(ctx, `drop schema autosql_matview_indexes cascade`); err != nil {
 		t.Fatal(err)
@@ -847,6 +860,85 @@ func TestMaterializedViewIndexesAdoptProvisionAndConverge(t *testing.T) {
 	noop, err := plan.Build(ctx, New(), actual, desired, plan.Options{})
 	if err != nil || len(noop.Steps) != 0 {
 		t.Fatalf("materialized-view index no-op plan=%+v err=%v", noop, err)
+	}
+}
+
+func TestUnqualifiedTriggerTargetProvisionAndConverge(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	const namespace = "autosql_unqualified_trigger"
+	if _, err = conn.Exec(ctx, `drop schema if exists autosql_unqualified_trigger cascade;
+create schema autosql_unqualified_trigger;
+create table autosql_unqualified_trigger.tenant_assignments(id bigint);
+create function autosql_unqualified_trigger.capacity_check() returns trigger language plpgsql as $$ begin return new; end $$;
+set search_path to autosql_unqualified_trigger, public;
+create trigger tenant_assignments_capacity_trigger before insert on tenant_assignments for each row execute function autosql_unqualified_trigger.capacity_check()`); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Exec(context.Background(), `drop schema if exists autosql_unqualified_trigger cascade`)
+	desired, err := InspectURL(ctx, url, Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for index := range desired.Graph.Resources {
+		resource := &desired.Graph.Resources[index]
+		if resource.Kind != schema.KindTrigger || resource.Name.Name != "tenant_assignments_capacity_trigger" {
+			continue
+		}
+		values := specMap(resource.Spec)
+		definition := stringValue(values, "definition")
+		values["definition"] = strings.Replace(definition, namespace+".tenant_assignments", "tenant_assignments", 1)
+		resource.Spec, err = json.Marshal(values)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found = true
+	}
+	if !found {
+		t.Fatal("inspected trigger is missing")
+	}
+	desired, err = New().Normalize(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = conn.Exec(ctx, `drop trigger tenant_assignments_capacity_trigger on autosql_unqualified_trigger.tenant_assignments`); err != nil {
+		t.Fatal(err)
+	}
+	current, err := InspectURL(ctx, url, Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err = New().Normalize(ctx, current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	migration, err := plan.Build(ctx, New(), current, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyDefaultMatrixPlan(t, ctx, conn, migration)
+	actual, err := InspectURL(ctx, url, Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err = New().Normalize(ctx, actual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertDocumentsEqual(t, actual, desired)
+	noop, err := plan.Build(ctx, New(), actual, desired, plan.Options{})
+	if err != nil || len(noop.Steps) != 0 {
+		t.Fatalf("unqualified trigger no-op plan=%+v err=%v", noop, err)
 	}
 }
 

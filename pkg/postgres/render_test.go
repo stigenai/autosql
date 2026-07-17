@@ -520,23 +520,37 @@ func TestColumnOrdinalTransitionsRequirePhysicalProof(t *testing.T) {
 	}
 }
 
-func TestNestedViewDependenciesFailClosed(t *testing.T) {
+func TestNestedViewDependenciesRequireExactCapturedGraph(t *testing.T) {
 	ns := renderResource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
 	a := renderResource(schema.KindTable, schema.Name{Schema: "app", Name: "a", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
 	b := renderResource(schema.KindTable, schema.Name{Schema: "app", Name: "b", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
-	for name, deps := range map[string][]schema.Dependency{
-		"missing nested relation":  {{Target: ns.ID, Type: schema.DependencyContains}, {Target: a.ID, Type: schema.DependencyReferences}},
-		"declared nested relation": {{Target: ns.ID, Type: schema.DependencyContains}, {Target: a.ID, Type: schema.DependencyReferences}, {Target: b.ID, Type: schema.DependencyReferences}},
+	for name, test := range map[string]struct {
+		deps    []schema.Dependency
+		allowed bool
+	}{
+		"missing nested relation":  {deps: []schema.Dependency{{Target: ns.ID, Type: schema.DependencyContains}, {Target: a.ID, Type: schema.DependencyReferences}}},
+		"declared nested relation": {deps: []schema.Dependency{{Target: ns.ID, Type: schema.DependencyContains}, {Target: a.ID, Type: schema.DependencyReferences}, {Target: b.ID, Type: schema.DependencyReferences}}, allowed: true},
 	} {
 		t.Run(name, func(t *testing.T) {
-			view := renderResource(schema.KindView, schema.Name{Schema: "app", Name: "v", Parent: ns.ID}, `{"definition":"SELECT id FROM app.a WHERE EXISTS (SELECT 1 FROM app.b)"}`, deps...)
+			view := renderResource(schema.KindView, schema.Name{Schema: "app", Name: "v", Parent: ns.ID}, `{"definition":"SELECT id FROM app.a WHERE EXISTS (SELECT 1 FROM app.b)"}`, test.deps...)
 			projection := projection(view, "id", "integer")
 			desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, a, b, view, projection}}}
 			changes := schema.ChangeSet{Version: schema.ChangeVersion, Changes: []schema.Change{{ID: "c", Operation: schema.OperationCreate, ResourceID: view.ID, After: &view}}}
-			if out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Desired: desired}); err == nil || len(out) != 0 {
+			out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Desired: desired})
+			if test.allowed && (err != nil || len(out) != 1) {
+				t.Fatalf("out=%+v err=%v", out, err)
+			}
+			if !test.allowed && (err == nil || len(out) != 0) {
 				t.Fatalf("out=%+v err=%v", out, err)
 			}
 		})
+	}
+	cte := renderResource(schema.KindMaterializedView, schema.Name{Schema: "app", Name: "cte_v", Parent: ns.ID}, `{"definition":"WITH source AS (SELECT id FROM app.a) SELECT id FROM source"}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains}, schema.Dependency{Target: a.ID, Type: schema.DependencyReferences})
+	cteProjection := projection(cte, "id", "integer")
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, a, cte, cteProjection}}}
+	changes := schema.ChangeSet{Version: schema.ChangeVersion, Changes: []schema.Change{{ID: "cte", Operation: schema.OperationCreate, ResourceID: cte.ID, After: &cte}}}
+	if out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Desired: desired}); err != nil || len(out) != 1 {
+		t.Fatalf("CTE out=%+v err=%v", out, err)
 	}
 }
 

@@ -21,8 +21,27 @@ func triggerFixture() (schema.Resource, schema.Resource, schema.Resource, schema
 func TestTriggerDefinitionAndDependencyValidationFailClosed(t *testing.T) {
 	ns, table, function, trigger := triggerFixture()
 	resources := map[string]schema.Resource{ns.ID: ns, table.ID: table, function.ID: function, trigger.ID: trigger}
-	if err := validateTriggerSpec(trigger, resources); err != nil {
+	parsed, err := parseTriggerDefinition(trigger, resources)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !strings.Contains(parsed.SQL, " ON app.items ") {
+		t.Fatalf("qualified trigger SQL=%q", parsed.SQL)
+	}
+	unqualified := trigger
+	unqualified.Spec = json.RawMessage(`{"definition":"CREATE TRIGGER items_audit BEFORE UPDATE ON items FOR EACH ROW EXECUTE FUNCTION app.audit_event()","enabled":"O","columns":[]}`)
+	parsed, err = parseTriggerDefinition(unqualified, resources)
+	if err != nil || !strings.Contains(parsed.SQL, " ON app.items ") {
+		t.Fatalf("unqualified trigger SQL=%q err=%v", parsed.SQL, err)
+	}
+	normalized, err := New().Normalize(context.Background(), schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, function, unqualified}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, resource := range normalized.Graph.Resources {
+		if resource.Kind == schema.KindTrigger && !strings.Contains(stringValue(spec(resource), "definition"), " ON app.items ") {
+			t.Fatalf("normalized trigger definition=%q", stringValue(spec(resource), "definition"))
+		}
 	}
 	for name, mutate := range map[string]func(*schema.Resource){
 		"statement smuggling": func(resource *schema.Resource) {
@@ -30,6 +49,9 @@ func TestTriggerDefinitionAndDependencyValidationFailClosed(t *testing.T) {
 		},
 		"wrong table": func(resource *schema.Resource) {
 			resource.Spec = json.RawMessage(`{"definition":"CREATE TRIGGER items_audit BEFORE UPDATE ON app.other FOR EACH ROW EXECUTE FUNCTION app.audit_event()","enabled":"O","columns":[]}`)
+		},
+		"wrong schema": func(resource *schema.Resource) {
+			resource.Spec = json.RawMessage(`{"definition":"CREATE TRIGGER items_audit BEFORE UPDATE ON other.items FOR EACH ROW EXECUTE FUNCTION app.audit_event()","enabled":"O","columns":[]}`)
 		},
 		"unknown mode": func(resource *schema.Resource) {
 			resource.Spec = json.RawMessage(`{"definition":"CREATE TRIGGER items_audit BEFORE UPDATE ON app.items FOR EACH ROW EXECUTE FUNCTION app.audit_event()","enabled":"X","columns":[]}`)

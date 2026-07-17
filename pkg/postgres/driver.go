@@ -107,14 +107,14 @@ func (*Driver) Info() plugin.Info {
 		schema.KindIndex:            {Kind: schema.KindIndex, Mode: plugin.Managed, Operations: all, Features: []string{"index.lifecycle", "index.expression", "index.partial", "index.include", "index.operator_class", "index.storage_parameters", "index.tablespace", "alter.explicit_rebuild"}},
 		schema.KindFunction:         {Kind: schema.KindFunction, Mode: plugin.Managed, Operations: all, Features: []string{"function.lifecycle", "routine.reviewed_source", "routine.overloads", "routine.sql", "routine.plpgsql"}},
 		schema.KindProcedure:        {Kind: schema.KindProcedure, Mode: plugin.Managed, Operations: all, Features: []string{"procedure.lifecycle", "procedure.transaction_control_guard", "routine.reviewed_source", "routine.overloads", "routine.sql", "routine.plpgsql"}},
-		schema.KindTrigger:          {Kind: schema.KindTrigger, Mode: plugin.Managed, Operations: all, Features: []string{"trigger.lifecycle", "trigger.enablement", "trigger.constraint", "trigger.transition_tables", "trigger.when"}},
+		schema.KindTrigger:          {Kind: schema.KindTrigger, Mode: plugin.Managed, Operations: all, Features: []string{"trigger.lifecycle", "trigger.enablement", "trigger.constraint", "trigger.transition_tables", "trigger.when", "trigger.schema_bound_target"}},
 		schema.KindPolicy:           {Kind: schema.KindPolicy, Mode: plugin.Managed, Operations: all, Features: []string{"policy.lifecycle", "policy.permissive_restrictive", "policy.exact_dependencies", "policy.deny_first_rls"}},
 		schema.KindRole:             {Kind: schema.KindRole, Mode: plugin.Managed, Operations: all, Features: []string{"role.lifecycle", "role.external_password", "role.protected", "role.reassign_owned"}},
 		schema.KindMembership:       {Kind: schema.KindMembership, Mode: plugin.Managed, Operations: all, Features: []string{"membership.lifecycle", "membership.admin_guard", "membership.pg16_options", "membership.cycle_guard"}},
 		schema.KindGrant:            {Kind: schema.KindGrant, Mode: plugin.Managed, Operations: []schema.Operation{schema.OperationCreate, schema.OperationAlter, schema.OperationDrop}, Features: []string{"grant.lifecycle", "grant.option", "grant.partial_revoke", "grant.exact_dependencies"}},
 		schema.KindDefaultPrivilege: {Kind: schema.KindDefaultPrivilege, Mode: plugin.Managed, Operations: []schema.Operation{schema.OperationCreate, schema.OperationAlter, schema.OperationDrop}, Features: []string{"default_privilege.lifecycle", "default_privilege.future_objects", "default_privilege.exact_dependencies"}},
-		schema.KindView:             {Kind: schema.KindView, Mode: plugin.Managed, Operations: all, Features: []string{"view.provable_projection"}},
-		schema.KindMaterializedView: {Kind: schema.KindMaterializedView, Mode: plugin.Managed, Operations: all, Features: []string{"materialized_view.provable_projection", "alter.explicit_rebuild"}},
+		schema.KindView:             {Kind: schema.KindView, Mode: plugin.Managed, Operations: all, Features: []string{"view.provable_projection", "view.ast_dependency_graph", "view.captured_projection"}},
+		schema.KindMaterializedView: {Kind: schema.KindMaterializedView, Mode: plugin.Managed, Operations: all, Features: []string{"materialized_view.provable_projection", "materialized_view.ast_dependency_graph", "materialized_view.captured_projection", "alter.explicit_rebuild"}},
 	}
 	for _, kind := range kinds {
 		if capability, ok := profiles[kind]; ok {
@@ -168,11 +168,37 @@ func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Documen
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
 	augmentProjectionColumns(&doc)
+	canonicalizeTriggerDefinitions(&doc)
 	doc.Normalize()
 	if err := doc.Validate(); err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
 	return doc, nil
+}
+
+func canonicalizeTriggerDefinitions(doc *schema.Document) {
+	resources := make(map[string]schema.Resource, len(doc.Graph.Resources))
+	for _, resource := range doc.Graph.Resources {
+		resources[resource.ID] = resource
+	}
+	for index := range doc.Graph.Resources {
+		resource := &doc.Graph.Resources[index]
+		if resource.Kind != schema.KindTrigger {
+			continue
+		}
+		parsed, err := parseTriggerDefinition(*resource, resources)
+		if err != nil {
+			continue
+		}
+		values := specMap(resource.Spec)
+		values["definition"] = parsed.SQL
+		normalized, err := json.Marshal(values)
+		if err != nil {
+			continue
+		}
+		resource.Spec = normalized
+		resources[resource.ID] = *resource
+	}
 }
 
 func canonicalizeUsedTypes(doc *schema.Document) error {

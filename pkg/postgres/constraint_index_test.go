@@ -84,12 +84,21 @@ func TestConstraintAndIndexDefinitionsAreParserBounded(t *testing.T) {
 
 func TestMaterializedViewIndexesResolveParentAndOrderAfterView(t *testing.T) {
 	ns := renderResource(schema.KindSchema, schema.Name{Name: "cell"}, `{}`)
-	view := renderResource(schema.KindMaterializedView, schema.Name{Schema: "cell", Name: "block_health_summary", Parent: ns.ID}, `{"definition":"SELECT 1 AS block_number"}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	source := renderResource(schema.KindTable, schema.Name{Schema: "cell", Name: "block_health", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	sourceColumn := renderResource(schema.KindColumn, schema.Name{Schema: "cell", Name: "block_number", Parent: source.ID}, `{"type":"bigint","not_null":false,"ordinal":1}`, schema.Dependency{Target: source.ID, Type: schema.DependencyContains})
+	view := renderResource(schema.KindMaterializedView, schema.Name{Schema: "cell", Name: "block_health_summary", Parent: ns.ID}, `{"definition":"SELECT block_number, count(*)::bigint AS sample_count FROM cell.block_health GROUP BY block_number"}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains}, schema.Dependency{Target: source.ID, Type: schema.DependencyReferences})
 	column := projection(view, "block_number", "integer")
-	resources := []schema.Resource{ns, view, column}
+	column.Spec = json.RawMessage(`{"type":"bigint","not_null":false,"ordinal":1}`)
+	countColumn := projection(view, "sample_count", "bigint")
+	countColumn.Spec = json.RawMessage(`{"type":"bigint","not_null":false,"ordinal":2}`)
+	resources := []schema.Resource{ns, source, sourceColumn, view, column, countColumn}
+	var firstIndex schema.Resource
 	for number := 1; number <= 8; number++ {
 		name := fmt.Sprintf("block_health_summary_idx_%d", number)
 		index := renderResource(schema.KindIndex, schema.Name{Schema: "cell", Name: name, Parent: view.ID}, fmt.Sprintf(`{"definition":"CREATE INDEX %s ON cell.block_health_summary (block_number)","method":"btree","unique":false,"valid":true,"ready":true,"columns":["block_number"]}`, name), schema.Dependency{Target: view.ID, Type: schema.DependencyContains}, schema.Dependency{Target: column.ID, Type: schema.DependencyReferences})
+		if firstIndex.ID == "" {
+			firstIndex = index
+		}
 		resources = append(resources, index)
 	}
 	desired, err := New().Normalize(context.Background(), schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: resources}})
@@ -121,7 +130,7 @@ func TestMaterializedViewIndexesResolveParentAndOrderAfterView(t *testing.T) {
 	}
 
 	regularView := renderResource(schema.KindView, schema.Name{Schema: "cell", Name: "ordinary_view", Parent: ns.ID}, `{"definition":"SELECT 1 AS block_number"}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
-	badIndex := resources[3]
+	badIndex := firstIndex
 	badIndex.Name.Parent = regularView.ID
 	if _, err := parseIndexDefinition(badIndex, map[string]schema.Resource{regularView.ID: regularView}); err == nil {
 		t.Fatal("ordinary view was accepted as an index parent")
@@ -129,6 +138,17 @@ func TestMaterializedViewIndexesResolveParentAndOrderAfterView(t *testing.T) {
 	badConstraint := renderResource(schema.KindCheckConstraint, schema.Name{Schema: "cell", Name: "mv_check", Parent: view.ID}, `{"definition":"CHECK (block_number > 0)","deferrable":false,"initially_deferred":false,"validated":true}`, schema.Dependency{Target: view.ID, Type: schema.DependencyContains})
 	if _, err := parseConstraintDefinition(badConstraint, map[string]schema.Resource{view.ID: view}); err == nil {
 		t.Fatal("materialized view was accepted as a table-constraint parent")
+	}
+
+	missingDependency := view
+	missingDependency.Dependencies = missingDependency.Dependencies[:1]
+	if err := validateSemanticDependencies(missingDependency, map[string]schema.Resource{ns.ID: ns, source.ID: source, view.ID: missingDependency}); err == nil {
+		t.Fatal("complex materialized view with FROM but no captured relation dependency was accepted")
+	}
+	duplicateDependency := view
+	duplicateDependency.Dependencies = append(duplicateDependency.Dependencies, schema.Dependency{Target: source.ID, Type: schema.DependencyReferences})
+	if err := validateSemanticDependencies(duplicateDependency, map[string]schema.Resource{ns.ID: ns, source.ID: source, view.ID: duplicateDependency}); err == nil {
+		t.Fatal("complex materialized view with duplicate captured dependencies was accepted")
 	}
 }
 

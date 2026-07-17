@@ -25,14 +25,14 @@ in [PostgreSQL database target bootstrap](postgresql-database-bootstrap.md).
 | Primary, unique, check, and foreign-key constraints | Yes | Yes | Rename, online validation, explicit rebuild, and drop |
 | Standalone table and materialized-view indexes, including expressions, predicates, `INCLUDE`, opclasses, storage parameters, and tablespaces | Yes | Yes | Rename, drop, explicit rebuild, and concurrent online phases |
 | Reviewed SQL and PL/pgSQL functions and procedures | Yes | Yes with an exact reviewed digest | Compatible replace, owner/comment, rename, and drop |
-| Table and view triggers, including constraint triggers and transition tables | Yes | Yes when their routine is reviewed | Rebuild, rename, enable-mode changes, and drop |
+| Table and view triggers, including constraint triggers and transition tables | Yes | Yes when their routine is reviewed; unqualified inspected targets are bound to the exact containing schema | Rebuild, rename, enable-mode changes, and drop |
 | Row-level security policies and table ENABLE/FORCE state | Yes | Yes | Deny-first create, transactional replace, rename, and drop |
 | Roles and schema-object ownership | Yes without password hashes | Yes | Guarded alter/rename, ownership transfer, and reassign-before-drop |
 | Role memberships | Yes | Yes | ADMIN guard, cycle rejection, revoke, rename topology, and PG16+ INHERIT/SET options |
 | Object and column grants | Yes | Yes | Exact privilege edges, grant-option changes, partial/full revoke |
 | Default privileges for future objects | Yes | Yes | Exact owner/schema/class edges, grant-option changes, revoke |
 | Comments on all managed resources above | Yes | Yes | Add, replace, and remove |
-| Provable views and materialized views | Yes | Yes | Within the bounded projection grammar |
+| Provable views and materialized views | Yes | Yes, including complex queries whose parsed relation set exactly matches the captured graph | Within the parser-bounded query and canonical projection graph |
 
 The stored-generated expression grammar is structural and fail-closed. It
 accepts literals, column references, bounded casts and arrays, and exact
@@ -53,6 +53,13 @@ calls require one exact dependency and immutable volatility. Undeclared or
 ambiguous overloads, subqueries, version-unsafe JSON nodes, unavailable access
 methods/operator classes, and invalid concurrent-index remnants are reported
 before a plan is published.
+
+Complex view and materialized-view queries are parsed as exactly one PostgreSQL
+query statement. AutoSQL walks the full query AST, including nested subqueries,
+and requires its resolved table/view/materialized-view set to equal the captured
+`references` graph. Missing, extra, ambiguous, duplicate, self, and
+catalog-qualified relation edges fail before SQL is emitted. Captured projection
+columns must remain contiguous, uniquely named, typed, and canonical.
 
 ## Privileged and external boundary
 
