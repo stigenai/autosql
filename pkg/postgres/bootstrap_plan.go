@@ -24,12 +24,37 @@ func PlanDatabaseBootstrap(ctx context.Context, target bootstrap.DatabaseTarget,
 		return bootstrap.Plan{}, err
 	}
 	current := schema.Document{
-		Version:     desired.Version,
-		Graph:       schema.Graph{Extra: desired.Graph.Extra},
+		Version: desired.Version,
+		Graph: schema.Graph{
+			Resources: managedBootstrapIntrinsicResources(target, desired),
+			Extra:     desired.Graph.Extra,
+		},
 		Annotations: desired.Annotations,
 		Extra:       desired.Extra,
 	}
 	return PlanDatabaseTransition(ctx, target, current, desired, options)
+}
+
+// managedBootstrapIntrinsicResources models objects PostgreSQL creates as part
+// of CREATE DATABASE. The public schema is always present in a fresh managed
+// target, so planning it from an entirely empty graph would emit a conflicting
+// CREATE SCHEMA. Only the empty namespace is adopted here; comments, ownership,
+// and every child resource remain explicit desired-state transitions.
+func managedBootstrapIntrinsicResources(target bootstrap.DatabaseTarget, desired schema.Document) []schema.Resource {
+	if target.Mode != bootstrap.ManagedDatabase {
+		return nil
+	}
+	for _, resource := range desired.Graph.Resources {
+		if resource.Kind == schema.KindSchema && resource.Name.Name == "public" && resource.Name.Schema == "" {
+			return []schema.Resource{{
+				ID:   schema.StableID(schema.KindSchema, resource.Name),
+				Kind: schema.KindSchema,
+				Name: resource.Name,
+				Spec: []byte(`{}`),
+			}}
+		}
+	}
+	return nil
 }
 
 // PlanDatabaseTransition lifts any in-database convergence or teardown into
