@@ -227,3 +227,10 @@ resource "column" "client_mac" {
   spec_json = jsonencode({ type = "macaddr", default = "'08:00:2b:01:02:03'::macaddr", not_null = true, ordinal = 23 })
   deps_json = jsonencode([contains(table_id("defaults_demo", "widgets"))])
 }
+
+resource "column" "generated_text_id" {
+  schema = "defaults_demo"
+  parent = table_id("defaults_demo", "widgets")
+  spec_json = jsonencode({ type = "text", default = "pg_catalog.gen_random_uuid()::text", not_null = true, ordinal = 24 })
+  deps_json = jsonencode([contains(table_id("defaults_demo", "widgets"))])
+}

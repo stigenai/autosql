@@ -403,6 +403,7 @@ create table autosql_default_matrix.widgets (
   client_address inet default '192.0.2.1/24'::inet,
   client_mac macaddr default '08:00:2b:01:02:03'::macaddr,
   generated_id uuid default gen_random_uuid(),
+  generated_text_id text default (gen_random_uuid())::text,
   state autosql_default_matrix.job_status default 'pending'::autosql_default_matrix.job_status,
   positive autosql_default_matrix.positive_int default 5,
   text_state text default 'pending'::text,
@@ -440,32 +441,33 @@ create table autosql_default_matrix.widgets (
 		t.Fatal(err)
 	}
 	expectedDefaults := map[string]string{
-		"seq_id":         "nextval('autosql_default_matrix.widget_id_seq'::regclass)",
-		"serial_id":      "nextval('autosql_default_matrix.widgets_serial_id_seq'::regclass)",
-		"price":          "0.00",
-		"metadata":       "'{}'::jsonb",
-		"items":          "'[]'::jsonb",
-		"external_id":    "'550e8400-e29b-41d4-a716-446655440000'::uuid",
-		"client_network": "'10.0.0.0/8'::cidr",
-		"client_address": "'192.0.2.1/24'::inet",
-		"client_mac":     "'08:00:2b:01:02:03'::macaddr",
-		"generated_id":   "gen_random_uuid()",
-		"state":          "'pending'::autosql_default_matrix.job_status",
-		"positive":       "5",
-		"text_state":     "'pending'::text",
-		"empty_tags":     "'{}'::text[]",
-		"tags":           "ARRAY['a'::text, 'b'::text]",
-		"numbers":        "ARRAY[1, 2]",
-		"switches":       "ARRAY[true, false]",
-		"business_date":  "CURRENT_DATE",
-		"local_clock":    "LOCALTIME(3)",
-		"zoned_clock":    "CURRENT_TIME(2)",
-		"created_at":     "now()",
-		"local_stamp":    "LOCALTIMESTAMP(2)",
-		"utc_stamp":      "timezone('utc'::text, now())",
-		"delay":          "'00:05:00'::interval",
-		"code":           "'x'::bpchar",
-		"flags":          "'1010'::\"bit\"",
+		"seq_id":            "nextval('autosql_default_matrix.widget_id_seq'::regclass)",
+		"serial_id":         "nextval('autosql_default_matrix.widgets_serial_id_seq'::regclass)",
+		"price":             "0.00",
+		"metadata":          "'{}'::jsonb",
+		"items":             "'[]'::jsonb",
+		"external_id":       "'550e8400-e29b-41d4-a716-446655440000'::uuid",
+		"client_network":    "'10.0.0.0/8'::cidr",
+		"client_address":    "'192.0.2.1/24'::inet",
+		"client_mac":        "'08:00:2b:01:02:03'::macaddr",
+		"generated_id":      "gen_random_uuid()",
+		"generated_text_id": "(gen_random_uuid())::text",
+		"state":             "'pending'::autosql_default_matrix.job_status",
+		"positive":          "5",
+		"text_state":        "'pending'::text",
+		"empty_tags":        "'{}'::text[]",
+		"tags":              "ARRAY['a'::text, 'b'::text]",
+		"numbers":           "ARRAY[1, 2]",
+		"switches":          "ARRAY[true, false]",
+		"business_date":     "CURRENT_DATE",
+		"local_clock":       "LOCALTIME(3)",
+		"zoned_clock":       "CURRENT_TIME(2)",
+		"created_at":        "now()",
+		"local_stamp":       "LOCALTIMESTAMP(2)",
+		"utc_stamp":         "timezone('utc'::text, now())",
+		"delay":             "'00:05:00'::interval",
+		"code":              "'x'::bpchar",
+		"flags":             "'1010'::\"bit\"",
 	}
 	sequenceIDs := map[string]string{}
 	var enumID, domainID string
@@ -766,6 +768,85 @@ func applyDefaultMatrixPlan(t *testing.T, ctx context.Context, conn *pgx.Conn, m
 	}
 	if err = transaction.Commit(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestMaterializedViewIndexesAdoptProvisionAndConverge(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	const namespace = "autosql_matview_indexes"
+	if _, err = conn.Exec(ctx, `drop schema if exists autosql_matview_indexes cascade; create schema autosql_matview_indexes; create materialized view autosql_matview_indexes.block_health_summary as select 1 as block_number`); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Exec(context.Background(), `drop schema if exists autosql_matview_indexes cascade`)
+	for number := 1; number <= 8; number++ {
+		name := fmt.Sprintf("block_health_summary_idx_%d", number)
+		if _, err = conn.Exec(ctx, "create index "+pgx.Identifier{name}.Sanitize()+" on autosql_matview_indexes.block_health_summary (block_number)"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	desired, err := InspectURL(ctx, url, Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err = New().Normalize(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resourcesByID := map[string]schema.Resource{}
+	for _, resource := range desired.Graph.Resources {
+		resourcesByID[resource.ID] = resource
+	}
+	indexCount := 0
+	for _, resource := range desired.Graph.Resources {
+		if resource.Kind == schema.KindIndex {
+			indexCount++
+			parent, ok := resourcesByID[resource.Name.Parent]
+			if !ok || parent.Kind != schema.KindMaterializedView {
+				t.Fatalf("index parent=%+v exists=%t", parent, ok)
+			}
+		}
+	}
+	if indexCount != 8 {
+		t.Fatalf("inspected materialized-view indexes=%d want 8", indexCount)
+	}
+	if _, err = conn.Exec(ctx, `drop schema autosql_matview_indexes cascade`); err != nil {
+		t.Fatal(err)
+	}
+	empty, err := InspectURL(ctx, url, Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty, err = New().Normalize(ctx, empty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	migration, err := plan.Build(ctx, New(), empty, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyDefaultMatrixPlan(t, ctx, conn, migration)
+	actual, err := InspectURL(ctx, url, Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err = New().Normalize(ctx, actual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertDocumentsEqual(t, actual, desired)
+	noop, err := plan.Build(ctx, New(), actual, desired, plan.Options{})
+	if err != nil || len(noop.Steps) != 0 {
+		t.Fatalf("materialized-view index no-op plan=%+v err=%v", noop, err)
 	}
 }
 

@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -78,6 +79,56 @@ func TestConstraintAndIndexDefinitionsAreParserBounded(t *testing.T) {
 	badConstraint.Spec = json.RawMessage(`{"definition":"CHECK (age >= 0); DROP TABLE app.users"}`)
 	if _, err := parseConstraintDefinition(badConstraint, resources); err == nil {
 		t.Fatal("unsafe constraint definition accepted")
+	}
+}
+
+func TestMaterializedViewIndexesResolveParentAndOrderAfterView(t *testing.T) {
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "cell"}, `{}`)
+	view := renderResource(schema.KindMaterializedView, schema.Name{Schema: "cell", Name: "block_health_summary", Parent: ns.ID}, `{"definition":"SELECT 1 AS block_number"}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	column := projection(view, "block_number", "integer")
+	resources := []schema.Resource{ns, view, column}
+	for number := 1; number <= 8; number++ {
+		name := fmt.Sprintf("block_health_summary_idx_%d", number)
+		index := renderResource(schema.KindIndex, schema.Name{Schema: "cell", Name: name, Parent: view.ID}, fmt.Sprintf(`{"definition":"CREATE INDEX %s ON cell.block_health_summary (block_number)","method":"btree","unique":false,"valid":true,"ready":true,"columns":["block_number"]}`, name), schema.Dependency{Target: view.ID, Type: schema.DependencyContains}, schema.Dependency{Target: column.ID, Type: schema.DependencyReferences})
+		resources = append(resources, index)
+	}
+	desired, err := New().Normalize(context.Background(), schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: resources}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty, err := New().Normalize(context.Background(), schema.Document{Version: schema.SchemaVersion})
+	if err != nil {
+		t.Fatal(err)
+	}
+	migration, err := plan.Build(context.Background(), New(), empty, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	viewPosition, indexCount := -1, 0
+	for position, step := range migration.Steps {
+		if strings.Contains(step.SQL, `CREATE MATERIALIZED VIEW "cell"."block_health_summary"`) {
+			viewPosition = position
+		}
+		if strings.Contains(step.SQL, "CREATE INDEX block_health_summary_idx_") {
+			indexCount++
+			if viewPosition < 0 || position <= viewPosition {
+				t.Fatalf("materialized-view index was not ordered after its parent: view=%d index=%d", viewPosition, position)
+			}
+		}
+	}
+	if viewPosition < 0 || indexCount != 8 {
+		t.Fatalf("materialized-view plan view=%d indexes=%d steps=%+v", viewPosition, indexCount, migration.Steps)
+	}
+
+	regularView := renderResource(schema.KindView, schema.Name{Schema: "cell", Name: "ordinary_view", Parent: ns.ID}, `{"definition":"SELECT 1 AS block_number"}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	badIndex := resources[3]
+	badIndex.Name.Parent = regularView.ID
+	if _, err := parseIndexDefinition(badIndex, map[string]schema.Resource{regularView.ID: regularView}); err == nil {
+		t.Fatal("ordinary view was accepted as an index parent")
+	}
+	badConstraint := renderResource(schema.KindCheckConstraint, schema.Name{Schema: "cell", Name: "mv_check", Parent: view.ID}, `{"definition":"CHECK (block_number > 0)","deferrable":false,"initially_deferred":false,"validated":true}`, schema.Dependency{Target: view.ID, Type: schema.DependencyContains})
+	if _, err := parseConstraintDefinition(badConstraint, map[string]schema.Resource{view.ID: view}); err == nil {
+		t.Fatal("materialized view was accepted as a table-constraint parent")
 	}
 }
 

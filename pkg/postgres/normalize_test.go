@@ -311,6 +311,8 @@ func TestNormalizeTypesConservatively(t *testing.T) {
 		"gen_random_uuid()":                       "pg_catalog.gen_random_uuid()",
 		"timezone('utc'::text, now())":            "pg_catalog.timezone('utc'::text, CURRENT_TIMESTAMP)",
 		"pg_catalog.timezone('utc'::text, now())": "pg_catalog.timezone('utc'::text, CURRENT_TIMESTAMP)",
+		"(gen_random_uuid())::text":               "pg_catalog.gen_random_uuid()::text",
+		"pg_catalog.gen_random_uuid()::text":      "pg_catalog.gen_random_uuid()::text",
 	}
 	for input, want := range defaults {
 		if got := postgresDefault(input); got != want {

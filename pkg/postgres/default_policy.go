@@ -37,6 +37,9 @@ func coreDefaultAllowed(typ coreColumnType, expr defaultExpression, source strin
 		if !ok || castType.array || !coreTypesCompatible(typ, castType) {
 			return false
 		}
+		if expr.Cast.Expression.Kind == defaultExpressionFunction {
+			return genRandomUUIDTextCastAllowed(typ, castType, expr.Cast.Expression.Function, source)
+		}
 		if containsDefaultOperator(expr.Cast.Expression) {
 			return coreOperatorDefaultAllowed(typ, expr, source)
 		}
@@ -44,6 +47,19 @@ func coreDefaultAllowed(typ coreColumnType, expr defaultExpression, source strin
 		return ok && coreScalarLiteralAllowed(castType, literal) && coreScalarLiteralAllowed(typ, literal)
 	}
 	return coreScalarLiteralAllowed(typ, expr) && coreLiteralSourceCanonical(typ, expr, source)
+}
+
+func genRandomUUIDTextCastAllowed(column, cast coreColumnType, function *defaultFunction, source string) bool {
+	return column.base == "text" && !column.array && cast.base == "text" && !cast.array &&
+		isGenRandomUUIDFunction(function, true) && source == "pg_catalog.gen_random_uuid()::text"
+}
+
+func isGenRandomUUIDFunction(function *defaultFunction, requireCatalog bool) bool {
+	if function == nil || len(function.Arguments) != 0 || function.Precision != nil || function.SQLSyntax {
+		return false
+	}
+	name := strings.Join(function.Name.Parts, ".")
+	return name == "pg_catalog.gen_random_uuid" || !requireCatalog && name == "gen_random_uuid"
 }
 
 func coreOperatorDefaultAllowed(typ coreColumnType, expr defaultExpression, source string) bool {
@@ -466,7 +482,7 @@ func coreFunctionDefaultAllowed(typ coreColumnType, function *defaultFunction, s
 	case "localtimestamp", "localtimestamp_n":
 		return precisionOK && len(function.Arguments) == 0 && typ.base == "timestamp" && (source == "LOCALTIMESTAMP" || canonicalTemporalPrecision(source, "LOCALTIMESTAMP"))
 	case "pg_catalog.gen_random_uuid":
-		return len(function.Arguments) == 0 && typ.base == "uuid" && source == "pg_catalog.gen_random_uuid()"
+		return isGenRandomUUIDFunction(function, true) && typ.base == "uuid" && source == "pg_catalog.gen_random_uuid()"
 	case "pg_catalog.timezone":
 		return typ.base == "timestamp" && source == "pg_catalog.timezone('utc'::text, CURRENT_TIMESTAMP)" && utcTimezoneArguments(function.Arguments)
 	default:
