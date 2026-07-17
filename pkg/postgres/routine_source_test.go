@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"autosql/pkg/schema"
+	"autosql/pkg/source"
 )
 
 func reviewedRoutine(t *testing.T, definition, language string, security bool, configuration []string) schema.Resource {
@@ -44,11 +45,43 @@ func TestRoutineSourceRequiresExactReviewDigest(t *testing.T) {
 	}
 }
 
-func TestRoutineDefinitionNormalizationIsCatalogWhitespaceStable(t *testing.T) {
+func TestRoutineDefinitionNormalizationPreservesReviewedSource(t *testing.T) {
 	oneLine := reviewedRoutine(t, `CREATE FUNCTION app.run(value integer) RETURNS integer LANGUAGE sql AS $$ SELECT value + 1 $$`, "sql", false, nil)
-	multiLine := reviewedRoutine(t, "CREATE FUNCTION app.run(value integer)\nRETURNS integer\nLANGUAGE sql\nAS $$ SELECT value + 1 $$", "sql", false, nil)
-	if stringValue(spec(oneLine), "definition") != stringValue(spec(multiLine), "definition") || stringValue(spec(oneLine), "body_digest") != stringValue(spec(multiLine), "body_digest") {
-		t.Fatalf("routine catalog whitespace was not canonicalized")
+	multiLineSource := "CREATE FUNCTION app.run(value integer)\r\nRETURNS integer\r\nLANGUAGE sql\r\nAS $function$\r\n  -- preserve this semantic line boundary\r\n  SELECT value + 1;\r\n$function$"
+	multiLine := reviewedRoutine(t, multiLineSource, "sql", false, nil)
+	definition := stringValue(spec(multiLine), "definition")
+	if definition != strings.ReplaceAll(multiLineSource, "\r\n", "\n") {
+		t.Fatalf("routine source layout changed:\n%s", definition)
+	}
+	if strings.Contains(definition, "BEGIN --") || !strings.Contains(definition, "$function$\n  -- preserve this semantic line boundary\n") {
+		t.Fatalf("routine line comment boundary or dollar quote was not preserved:\n%s", definition)
+	}
+	if stringValue(spec(oneLine), "body_digest") == stringValue(spec(multiLine), "body_digest") {
+		t.Fatal("distinct reviewed routine sources shared a digest")
+	}
+	digest := stringValue(spec(multiLine), "body_digest")
+	parsed, err := validateRoutineSource(multiLine, map[string]string{"reviewed_routine_digests": digest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.SQL != definition {
+		t.Fatalf("validated routine source changed before execution:\n%s", parsed.SQL)
+	}
+	document := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{multiLine}}}
+	hcl, err := source.FormatHCL(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := source.LoadContext(context.Background(), source.Input{URI: "routine-lines.hcl", Format: source.FormatHCLSource, Data: hcl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err = New().Normalize(context.Background(), reloaded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stringValue(spec(reloaded.Graph.Resources[0]), "definition"); got != definition {
+		t.Fatalf("routine source layout changed across HCL round trip:\n%s", got)
 	}
 }
 
