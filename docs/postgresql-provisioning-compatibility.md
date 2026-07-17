@@ -41,10 +41,13 @@ arbitrary PostgreSQL expressions through to execution. Calls with same-name
 overloads currently fail closed because AutoSQL does not guess PostgreSQL's
 argument-type resolution from a declared edge.
 
-Routine bodies are executable only when their normalized `sha256:` digest is
+Routine bodies are executable only when their exact-source `sha256:` digest is
 present in the `reviewed_routine_digests` render option. Catalog text and
-authored HCL are inert without that separate authority. SQL and PL/pgSQL are
-the default language allowlist; unsafe languages, privileged bodies,
+authored HCL are inert without that separate authority. AutoSQL preserves the
+reviewed source's line structure and dollar-quote tag through rendering, so
+line comments in SQL and PL/pgSQL retain their PostgreSQL semantics. Line
+endings are normalized to LF before hashing. SQL and PL/pgSQL are the default
+language allowlist; unsafe languages, privileged bodies,
 transaction-controlling procedures, and `SECURITY DEFINER` routines have
 additional fail-closed policy gates.
 

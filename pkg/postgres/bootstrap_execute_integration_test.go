@@ -171,6 +171,107 @@ func TestManagedBootstrapExecutesIntoIntrinsicPublicSchema(t *testing.T) {
 	}
 }
 
+func TestManagedBootstrapPreservesRoutineLineComments(t *testing.T) {
+	maintenanceURL := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if maintenanceURL == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	target := bootstrapExecutionTarget(t, ctx, maintenanceURL, "autosql_bootstrap_routine_lines")
+	defer DropDatabaseURL(context.Background(), maintenanceURL, target.Name, true)
+	_ = DropDatabaseURL(ctx, maintenanceURL, target.Name, true)
+
+	namespace := renderResource(schema.KindSchema, schema.Name{Name: "global"}, `{}`)
+	definition := "CREATE OR REPLACE FUNCTION global.record_assignment_history(value integer)\n" +
+		" RETURNS integer\n" +
+		" LANGUAGE plpgsql\n" +
+		"AS $function$\n" +
+		"BEGIN\n" +
+		"  -- On UPDATE, preserve the previous assignment.\n" +
+		"  RETURN value + 1;\n" +
+		"END;\n" +
+		"$function$"
+	routineSpec, err := json.Marshal(map[string]any{
+		"name": "record_assignment_history", "identity_arguments": "value integer", "arguments": "value integer",
+		"result": "integer", "returns_set": false, "language": "plpgsql", "volatility": "v", "strict": false,
+		"security_definer": false, "leakproof": false, "parallel": "u", "cost": 100.0, "rows": 0.0,
+		"configuration": []string{}, "owner": target.Owner, "definition": definition,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	routine := renderResource(schema.KindFunction, schema.Name{Schema: "global", Name: "record_assignment_history(value integer)", Parent: namespace.ID}, string(routineSpec), schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
+	desired, err := New().Normalize(ctx, schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{namespace, routine}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, resource := range desired.Graph.Resources {
+		if resource.Kind == schema.KindFunction {
+			routine = resource
+		}
+	}
+	digest := stringValue(spec(routine), "body_digest")
+	whole, err := PlanDatabaseBootstrap(ctx, target, desired, plan.Options{Render: map[string]string{"reviewed_routine_digests": digest}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundRoutine := false
+	for _, step := range whole.SchemaPlan.Steps {
+		if !strings.Contains(step.SQL, "CREATE OR REPLACE FUNCTION") || !strings.Contains(step.SQL, "record_assignment_history") {
+			continue
+		}
+		foundRoutine = true
+		if !strings.Contains(step.SQL, "$function$\nBEGIN\n  -- On UPDATE") || strings.Contains(step.SQL, "BEGIN -- On UPDATE") {
+			t.Fatalf("bootstrap plan changed routine line semantics:\n%s", step.SQL)
+		}
+	}
+	if !foundRoutine {
+		t.Fatal("bootstrap plan omitted reviewed routine")
+	}
+	result, err := ExecuteDatabaseBootstrapURL(ctx, maintenanceURL, whole, BootstrapExecutionHooks{})
+	if err != nil || !result.Completed {
+		t.Fatalf("routine bootstrap result=%+v err=%v", result, err)
+	}
+
+	config, err := pgx.ParseConfig(maintenanceURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.Database = target.Name
+	conn, err := pgx.ConnectConfig(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	var got int
+	if err := conn.QueryRow(ctx, `select global.record_assignment_history(41)`).Scan(&got); err != nil || got != 42 {
+		t.Fatalf("executed commented routine result=%d err=%v", got, err)
+	}
+	var installedSource string
+	if err := conn.QueryRow(ctx, `select pg_get_functiondef('global.record_assignment_history(integer)'::regprocedure)`).Scan(&installedSource); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(installedSource, "$function$\nBEGIN\n  -- On UPDATE") {
+		t.Fatalf("installed routine lost source lines:\n%s", installedSource)
+	}
+	inspected, err := InspectConn(ctx, conn, Options{Schemas: []string{"global"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := New().Normalize(ctx, inspected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noOp, err := plan.Build(ctx, New(), current, desired, plan.Options{Render: map[string]string{"reviewed_routine_digests": digest}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(noOp.Changes.Changes) != 0 || len(noOp.Steps) != 0 {
+		t.Fatalf("reinspected routine did not converge: changes=%+v steps=%+v", noOp.Changes.Changes, noOp.Steps)
+	}
+}
+
 func TestWholeDatabaseBootstrapTransactionalFailureRollsBackAndIdentityIsBound(t *testing.T) {
 	maintenanceURL := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
 	if maintenanceURL == "" {

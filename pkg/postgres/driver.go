@@ -15,7 +15,6 @@ import (
 	"autosql/pkg/plugin"
 	"autosql/pkg/schema"
 	"github.com/jackc/pgx/v5"
-	pg_query "github.com/pganalyze/pg_query_go/v6"
 )
 
 const version = "0.1.0"
@@ -489,6 +488,14 @@ func numberAsInt(values map[string]any, key string) int {
 }
 
 func normalizePostgresSpecForKind(kind schema.Kind, spec map[string]any) {
+	// Routine definitions are reviewed and authorized as exact source. Preserve
+	// their line structure before the generic definition normalizer collapses
+	// SQL whitespace: a PL/pgSQL -- comment is semantic through end-of-line.
+	var routineDefinition string
+	var hasRoutineDefinition bool
+	if kind == schema.KindFunction || kind == schema.KindProcedure {
+		routineDefinition, hasRoutineDefinition = spec["definition"].(string)
+	}
 	normalizePostgresSpec(spec)
 	if kind == schema.KindColumn {
 		if nullable, ok := spec["nullable"].(bool); ok {
@@ -565,16 +572,18 @@ func normalizePostgresSpecForKind(kind schema.Kind, spec map[string]any) {
 		}
 	}
 	if kind == schema.KindFunction || kind == schema.KindProcedure {
-		if definition, ok := spec["definition"].(string); ok {
-			if parsed, err := pg_query.Parse(definition); err == nil && len(parsed.Stmts) == 1 && parsed.Stmts[0].Stmt.GetCreateFunctionStmt() != nil {
-				if canonical, err := pg_query.Deparse(parsed); err == nil && strings.TrimSpace(canonical) != "" {
-					definition = strings.TrimSpace(canonical)
-					spec["definition"] = definition
-				}
-			}
+		if hasRoutineDefinition {
+			definition := normalizeRoutineSource(routineDefinition)
+			spec["definition"] = definition
 			spec["body_digest"] = routineDefinitionDigest(definition)
 		}
 	}
+}
+
+func normalizeRoutineSource(definition string) string {
+	definition = strings.ReplaceAll(definition, "\r\n", "\n")
+	definition = strings.ReplaceAll(definition, "\r", "\n")
+	return strings.TrimSpace(definition)
 }
 
 func routineDefinitionDigest(definition string) string {
