@@ -183,6 +183,7 @@ func TestCoreDefaultClassifierSupportsInspectedScalarArrayAndBuiltinForms(t *tes
 		{"text[]", "ARRAY['a'::text, 'b'::text]"},
 		{"integer[]", "ARRAY[1, 2]"},
 		{"uuid", "pg_catalog.gen_random_uuid()"},
+		{"text", "pg_catalog.gen_random_uuid()::text"},
 		{"timestamp", "pg_catalog.timezone('utc'::text, CURRENT_TIMESTAMP)"},
 	}
 	for _, tc := range tests {
@@ -247,6 +248,12 @@ func TestCoreDefaultClassifierRejectsUnsafeExtendedForms(t *testing.T) {
 		{"timestamp", "pg_catalog.timezone('utc'::text, app.clock())"},
 		{"timestamp", "pg_catalog.timezone('utc'::text, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"},
 		{"uuid", "pg_catalog.gen_random_uuid(1)"},
+		{"text", "gen_random_uuid()::text"},
+		{"text", "app.gen_random_uuid()::text"},
+		{"text", "pg_catalog.gen_random_uuid(1)::text"},
+		{"text", "pg_catalog.random()::text"},
+		{"text", "lower('value')::text"},
+		{"uuid", "pg_catalog.gen_random_uuid()::text"},
 		{"integer", "random()"},
 		{"text", "concat(VARIADIC ARRAY['x'])"},
 		{"date", "LOCALTIME"},

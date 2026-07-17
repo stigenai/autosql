@@ -663,6 +663,12 @@ func postgresDefault(value string) string {
 	if lower == "gen_random_uuid()" || lower == "pg_catalog.gen_random_uuid()" {
 		return "pg_catalog.gen_random_uuid()"
 	}
+	if expression, err := classifyDefaultExpression(s); err == nil && expression.Kind == defaultExpressionCast && expression.Cast != nil {
+		castType, castOK := coreDefaultCastType(expression.Cast.Type)
+		if castOK && castType.base == "text" && !castType.array && expression.Cast.Expression.Kind == defaultExpressionFunction && isGenRandomUUIDFunction(expression.Cast.Expression.Function, false) {
+			return "pg_catalog.gen_random_uuid()::text"
+		}
+	}
 	for _, clock := range []string{"now()", "transaction_timestamp()", "current_timestamp", "current_timestamp()"} {
 		if lower == "timezone('utc'::text, "+clock+")" || lower == "pg_catalog.timezone('utc'::text, "+clock+")" {
 			return "pg_catalog.timezone('utc'::text, CURRENT_TIMESTAMP)"

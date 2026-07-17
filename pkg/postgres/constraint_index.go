@@ -24,7 +24,7 @@ func parseConstraintDefinition(resource schema.Resource, resources map[string]sc
 	if definition == "" {
 		return parsedConstraint{}, unsupported(resource, "constraint definition is required")
 	}
-	parent, err := parentResource(resource, resources)
+	parent, err := constraintParentResource(resource, resources)
 	if err != nil {
 		return parsedConstraint{}, err
 	}
@@ -92,7 +92,7 @@ func parseIndexDefinition(resource schema.Resource, resources map[string]schema.
 	if definition == "" {
 		return parsedIndex{}, unsupported(resource, "index definition is required")
 	}
-	parent, err := parentResource(resource, resources)
+	parent, err := indexParentResource(resource, resources)
 	if err != nil {
 		return parsedIndex{}, err
 	}
@@ -147,10 +147,18 @@ func parseIndexDefinition(resource schema.Resource, resources map[string]schema.
 	return parsedIndex{statement: statement, tree: parsed, SQL: sql}, nil
 }
 
-func parentResource(resource schema.Resource, resources map[string]schema.Resource) (schema.Resource, error) {
+func constraintParentResource(resource schema.Resource, resources map[string]schema.Resource) (schema.Resource, error) {
 	parent, ok := resources[resource.Name.Parent]
 	if !ok || parent.Kind != schema.KindTable {
 		return schema.Resource{}, unsupported(resource, "containing table is missing")
+	}
+	return parent, nil
+}
+
+func indexParentResource(resource schema.Resource, resources map[string]schema.Resource) (schema.Resource, error) {
+	parent, ok := resources[resource.Name.Parent]
+	if !ok || parent.Kind != schema.KindTable && parent.Kind != schema.KindMaterializedView {
+		return schema.Resource{}, unsupported(resource, "containing table or materialized view is missing")
 	}
 	return parent, nil
 }
@@ -223,7 +231,13 @@ func commaOptionContains(options map[string]string, key, wanted string) bool {
 
 func constraintIndexExpectedDependencies(resource schema.Resource, resources map[string]schema.Resource) ([]string, error) {
 	expected := []string{resource.Name.Parent}
-	parent, err := parentResource(resource, resources)
+	var parent schema.Resource
+	var err error
+	if resource.Kind == schema.KindIndex {
+		parent, err = indexParentResource(resource, resources)
+	} else {
+		parent, err = constraintParentResource(resource, resources)
+	}
 	if err != nil {
 		return nil, err
 	}

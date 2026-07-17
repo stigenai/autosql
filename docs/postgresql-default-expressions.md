@@ -78,7 +78,7 @@ The generated-function allowlist is intentionally small:
 - `CURRENT_TIME(0..6)` for time-with-time-zone columns;
 - `LOCALTIME(0..6)` for time-without-time-zone columns;
 - `LOCALTIMESTAMP(0..6)` for timestamp-without-time-zone columns;
-- `gen_random_uuid()` for UUID columns; and
+- `gen_random_uuid()` for UUID columns and its exact `::text` result cast for text identifiers; and
 - `timezone('utc'::text, now())` for a UTC timestamp without time zone.
 
 Inspection aliases are normalized before comparison and rendering. In

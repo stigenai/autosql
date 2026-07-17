@@ -174,6 +174,7 @@ func TestDocumentedDefaultExpressionHCLBuildsFreshPlan(t *testing.T) {
 		`DEFAULT '192.0.2.1/24'::inet`,
 		`DEFAULT '08:00:2b:01:02:03'::macaddr`,
 		`DEFAULT pg_catalog.gen_random_uuid()`,
+		`DEFAULT pg_catalog.gen_random_uuid()::text`,
 		`DEFAULT 'pending'::defaults_demo.job_status`,
 		`DEFAULT '{}'::text[]`,
 		`DEFAULT CURRENT_DATE`,
