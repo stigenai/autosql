@@ -1001,7 +1001,7 @@ func renderCreateIndex(r schema.Resource, resources map[string]schema.Resource, 
 	if err != nil {
 		return nil, err
 	}
-	if err := validateIndexAvailability(r, parsed, options); err != nil {
+	if err := validateIndexAvailability(r, parsed, resources, options); err != nil {
 		return nil, err
 	}
 	if enabled(options, "concurrent_indexes", false) {
@@ -1025,7 +1025,7 @@ func renderConcurrentIndexRebuild(before, after schema.Resource, resources map[s
 	if err != nil {
 		return nil, err
 	}
-	if err := validateIndexAvailability(after, parsed, options); err != nil {
+	if err := validateIndexAvailability(after, parsed, resources, options); err != nil {
 		return nil, err
 	}
 	shadow := "autosql_rebuild_" + strings.TrimPrefix(after.ID, string(after.Kind)+":")
@@ -1464,12 +1464,12 @@ func validateProjectionTopology(request plugin.RenderRequest) (map[string]bool, 
 			continue
 		}
 		if change.Before != nil && change.Operation != schema.OperationRename {
-			if e := validateProjectionResource(*change.Before, beforeParent); e != nil {
+			if e := validateProjectionResource(*change.Before, beforeParent, current); e != nil {
 				return nil, e
 			}
 		}
 		if change.After != nil && change.Operation != schema.OperationRename {
-			if e := validateProjectionResource(*change.After, afterParent); e != nil {
+			if e := validateProjectionResource(*change.After, afterParent, desired); e != nil {
 				return nil, e
 			}
 		}
@@ -1814,7 +1814,7 @@ func validateManagedDocuments(request plugin.RenderRequest) error {
 						return e
 					}
 				}
-				if e := validateProjectionResource(r, r.Name.Parent); e != nil {
+				if e := validateProjectionResource(r, r.Name.Parent, resources); e != nil {
 					return e
 				}
 			}
@@ -2564,7 +2564,7 @@ func isProjectionID(id string, resources map[string]schema.Resource) bool {
 	r, ok := resources[id]
 	return ok && (r.Kind == schema.KindView || r.Kind == schema.KindMaterializedView)
 }
-func validateProjectionResource(r schema.Resource, parent string) error {
+func validateProjectionResource(r schema.Resource, parent string, resources map[string]schema.Resource) error {
 	s := spec(r)
 	if !allowedKeys(s, "type", "not_null", "ordinal") {
 		return unsupported(r, "unknown projection spec")
@@ -2578,8 +2578,35 @@ func validateProjectionResource(r schema.Resource, parent string) error {
 	if !validPositiveOrdinal(s, "ordinal") {
 		return unsupported(r, "projection ordinal must be a positive integer")
 	}
-	if len(r.Dependencies) != 1 || r.Dependencies[0].Target != parent || r.Dependencies[0].Type != schema.DependencyContains || len(r.Dependencies[0].Extra) > 0 {
-		return unsupported(r, "projection dependency must be exactly its parent")
+	contains := 0
+	var actualUses []string
+	for _, dependency := range r.Dependencies {
+		if len(dependency.Extra) != 0 {
+			return unsupported(r, "projection dependencies contain unknown metadata")
+		}
+		if dependency.Type == schema.DependencyContains && dependency.Target == parent {
+			contains++
+			continue
+		}
+		if dependency.Type == schema.DependencyUses {
+			actualUses = append(actualUses, dependency.Target)
+			continue
+		}
+		return unsupported(r, "projection dependency is not canonical containment or type use")
+	}
+	if contains != 1 {
+		return unsupported(r, "projection requires exactly one parent containment dependency")
+	}
+	var expectedUses []string
+	for id, candidate := range resources {
+		if (candidate.Kind == schema.KindEnum || candidate.Kind == schema.KindDomain || candidate.Kind == schema.KindComposite) && typeReferenceMatches(stringValue(s, "type"), r.Name.Schema, candidate.Name) {
+			expectedUses = append(expectedUses, id)
+		}
+	}
+	sort.Strings(expectedUses)
+	sort.Strings(actualUses)
+	if !slices.Equal(expectedUses, actualUses) {
+		return unsupported(r, "projection type dependencies do not exactly match its type")
 	}
 	return nil
 }
@@ -2591,7 +2618,7 @@ func projectionSignature(resources map[string]schema.Resource, parent string) (s
 	var children []schema.Resource
 	for _, r := range resources {
 		if r.Kind == schema.KindColumn && r.Name.Parent == parent {
-			if e := validateProjectionResource(r, parent); e != nil {
+			if e := validateProjectionResource(r, parent, resources); e != nil {
 				return "", e
 			}
 			children = append(children, r)

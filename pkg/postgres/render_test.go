@@ -554,6 +554,43 @@ func TestNestedViewDependenciesRequireExactCapturedGraph(t *testing.T) {
 	}
 }
 
+func TestMaterializedViewProjectionTypeDependenciesAreExact(t *testing.T) {
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "public"}, `{}`)
+	provider := renderResource(schema.KindEnum, schema.Name{Schema: "public", Name: "provider", Parent: ns.ID}, `{"values":["aws","gcp"]}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	source := renderResource(schema.KindTable, schema.Name{Schema: "public", Name: "blocks", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	sourceProvider := renderResource(schema.KindColumn, schema.Name{Schema: "public", Name: "provider", Parent: source.ID}, `{"type":"provider","not_null":false,"ordinal":1}`, schema.Dependency{Target: source.ID, Type: schema.DependencyContains}, schema.Dependency{Target: provider.ID, Type: schema.DependencyUses})
+	view := renderResource(schema.KindMaterializedView, schema.Name{Schema: "public", Name: "block_health_summary", Parent: ns.ID}, `{"definition":"SELECT provider, count(*)::bigint AS total FROM public.blocks GROUP BY provider"}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains}, schema.Dependency{Target: source.ID, Type: schema.DependencyReferences})
+	projectionProvider := projection(view, "provider", "provider")
+	projectionProvider.Dependencies = append(projectionProvider.Dependencies, schema.Dependency{Target: provider.ID, Type: schema.DependencyUses})
+	total := projection(view, "total", "bigint")
+	total.Spec = json.RawMessage(`{"type":"bigint","not_null":false,"ordinal":2}`)
+	resources := []schema.Resource{ns, provider, source, sourceProvider, view, projectionProvider, total}
+	doc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: resources}}
+	if statements, err := RenderDocument(context.Background(), doc, nil); err != nil || len(statements) == 0 {
+		t.Fatalf("projection type-use statements=%+v err=%v", statements, err)
+	}
+	for name, mutate := range map[string]func(*schema.Resource){
+		"missing type use": func(column *schema.Resource) { column.Dependencies = column.Dependencies[:1] },
+		"duplicate type use": func(column *schema.Resource) {
+			column.Dependencies = append(column.Dependencies, schema.Dependency{Target: provider.ID, Type: schema.DependencyUses})
+		},
+		"reference instead of use": func(column *schema.Resource) {
+			column.Dependencies[1].Type = schema.DependencyReferences
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			bad := projectionProvider
+			bad.Dependencies = append([]schema.Dependency(nil), projectionProvider.Dependencies...)
+			mutate(&bad)
+			badResources := append([]schema.Resource(nil), resources...)
+			badResources[5] = bad
+			if statements, err := RenderDocument(context.Background(), schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: badResources}}, nil); err == nil || len(statements) != 0 {
+				t.Fatalf("statements=%+v err=%v", statements, err)
+			}
+		})
+	}
+}
+
 func TestTableQueryExpressionFailsClosed(t *testing.T) {
 	ns := renderResource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
 	table := renderResource(schema.KindTable, schema.Name{Schema: "app", Name: "b", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})

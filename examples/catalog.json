@@ -135,6 +135,7 @@
         "index.partial",
         "index.include",
         "index.operator_class",
+        "index.network_inet_ops",
         "index.storage_parameters",
         "index.tablespace",
         "function.lifecycle",
@@ -174,9 +175,11 @@
         "view.provable_projection",
         "view.ast_dependency_graph",
         "view.captured_projection",
+        "view.projection_type_dependencies",
         "materialized_view.provable_projection",
         "materialized_view.ast_dependency_graph",
         "materialized_view.captured_projection",
+        "materialized_view.projection_type_dependencies",
         "alter.explicit_rebuild"
       ]
     },

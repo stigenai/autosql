@@ -182,7 +182,7 @@ func validateConstraintIndexSpec(resource schema.Resource, resources map[string]
 	}
 }
 
-func validateIndexAvailability(resource schema.Resource, parsed parsedIndex, options map[string]string) error {
+func validateIndexAvailability(resource schema.Resource, parsed parsedIndex, resources map[string]schema.Resource, options map[string]string) error {
 	method := parsed.statement.GetAccessMethod()
 	if method == "" {
 		method = "btree"
@@ -213,9 +213,45 @@ func validateIndexAvailability(resource schema.Resource, parsed parsedIndex, opt
 		if len(parts) > 0 {
 			base = parts[len(parts)-1]
 		}
+		if base == "inet_ops" {
+			if err := validateBuiltinInetOpclass(resource, element, method, parts, resources); err != nil {
+				return err
+			}
+			continue
+		}
 		if !knownOpclasses[base] && !commaOptionContains(options, "available_index_opclasses", name) {
 			return unsupported(resource, fmt.Sprintf("index operator class %q is not declared available", name))
 		}
+	}
+	return nil
+}
+
+func validateBuiltinInetOpclass(resource schema.Resource, element *pg_query.IndexElem, method string, parts []string, resources map[string]schema.Resource) error {
+	if len(parts) != 1 && (len(parts) != 2 || parts[0] != "pg_catalog") {
+		return unsupported(resource, "inet_ops must be unqualified or explicitly pg_catalog-qualified")
+	}
+	if method != "btree" && method != "hash" && method != "gist" && method != "spgist" {
+		return unsupported(resource, fmt.Sprintf("inet_ops is unavailable for index access method %q", method))
+	}
+	if element.GetName() == "" || element.GetExpr() != nil {
+		return unsupported(resource, "inet_ops requires one direct inet or cidr column")
+	}
+	parent, err := indexParentResource(resource, resources)
+	if err != nil {
+		return err
+	}
+	var matches []schema.Resource
+	for _, candidate := range resources {
+		if candidate.Kind == schema.KindColumn && candidate.Name.Parent == parent.ID && candidate.Name.Name == element.GetName() {
+			matches = append(matches, candidate)
+		}
+	}
+	if len(matches) != 1 {
+		return unsupported(resource, "inet_ops index column is missing or ambiguous")
+	}
+	typ := postgresTypeAlias(stringValue(spec(matches[0]), "type"))
+	if typ != "inet" && typ != "cidr" {
+		return unsupported(resource, fmt.Sprintf("inet_ops requires inet or cidr, got %q", typ))
 	}
 	return nil
 }
