@@ -145,6 +145,7 @@
         "trigger.constraint",
         "trigger.transition_tables",
         "trigger.when",
+        "trigger.schema_bound_target",
         "policy.lifecycle",
         "policy.permissive_restrictive",
         "policy.exact_dependencies",
@@ -171,7 +172,11 @@
         "routine.plpgsql",
         "metadata.comment",
         "view.provable_projection",
+        "view.ast_dependency_graph",
+        "view.captured_projection",
         "materialized_view.provable_projection",
+        "materialized_view.ast_dependency_graph",
+        "materialized_view.captured_projection",
         "alter.explicit_rebuild"
       ]
     },

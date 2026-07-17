@@ -3,6 +3,7 @@ package postgres
 import (
 	"fmt"
 	"slices"
+	"strings"
 
 	"autosql/pkg/schema"
 	pg_query "github.com/pganalyze/pg_query_go/v6"
@@ -31,13 +32,21 @@ func parseTriggerDefinition(resource schema.Resource, resources map[string]schem
 		return parsedTrigger{}, unsupported(resource, "trigger containing table or view is missing")
 	}
 	relation := statement.GetRelation()
-	if relation == nil || relation.GetCatalogname() != "" || relation.GetSchemaname() != parent.Name.Schema || relation.GetRelname() != parent.Name.Name {
+	if relation == nil || relation.GetCatalogname() != "" || relation.GetRelname() != parent.Name.Name || relation.GetSchemaname() != "" && relation.GetSchemaname() != parent.Name.Schema {
 		return parsedTrigger{}, unsupported(resource, "trigger target does not match its containing table")
 	}
+	// pg_get_triggerdef may omit the target schema even though inspection has
+	// already bound the trigger to an exact containing relation. Canonicalize
+	// that spelling in the parsed tree so execution never depends on search_path.
+	relation.Schemaname = parent.Name.Schema
 	if len(statement.GetFuncname()) < 1 || len(statement.GetFuncname()) > 2 {
 		return parsedTrigger{}, unsupported(resource, "trigger function identity is not canonical")
 	}
-	return parsedTrigger{statement: statement, SQL: definition}, nil
+	canonical, err := pg_query.Deparse(parsed)
+	if err != nil {
+		return parsedTrigger{}, unsupported(resource, "trigger definition cannot be rendered canonically")
+	}
+	return parsedTrigger{statement: statement, SQL: strings.TrimSuffix(strings.TrimSpace(canonical), ";")}, nil
 }
 
 func validateTriggerSpec(resource schema.Resource, resources map[string]schema.Resource) error {

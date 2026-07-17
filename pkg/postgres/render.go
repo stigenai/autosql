@@ -13,6 +13,7 @@ import (
 	"autosql/pkg/plugin"
 	"autosql/pkg/schema"
 	pg_query "github.com/pganalyze/pg_query_go/v6"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 func (*Driver) Render(ctx context.Context, request plugin.RenderRequest) ([]plugin.Statement, error) {
@@ -1323,6 +1324,12 @@ func validateProjectionShape(view schema.Resource, resources map[string]schema.R
 			expectedOrdinal[name] = 1
 		}
 	}
+	if len(expected) == 0 {
+		if simpleViewMatch(definition) != nil || simpleLiteralMatch(definition) != nil {
+			return fmt.Errorf("projection count mismatch")
+		}
+		return validateCapturedProjectionShape(view, children)
+	}
 	if len(expected) != len(children) {
 		return fmt.Errorf("projection count mismatch")
 	}
@@ -1333,6 +1340,25 @@ func validateProjectionShape(view schema.Resource, resources map[string]schema.R
 	}
 	return nil
 }
+
+func validateCapturedProjectionShape(view schema.Resource, children []schema.Resource) error {
+	if err := validateViewQuery(stringValue(spec(view), "definition")); err != nil {
+		return err
+	}
+	sort.Slice(children, func(i, j int) bool {
+		return numberAsInt(spec(children[i]), "ordinal") < numberAsInt(spec(children[j]), "ordinal")
+	})
+	seen := map[string]bool{}
+	for index, child := range children {
+		values := spec(child)
+		if child.Name.Name == "" || seen[child.Name.Name] || numberAsInt(values, "ordinal") != index+1 || stringValue(values, "type") == "" || boolValue(values, "not_null") {
+			return fmt.Errorf("captured projection %s is noncanonical", child.Name.Name)
+		}
+		seen[child.Name.Name] = true
+	}
+	return nil
+}
+
 func validateManagedMetadata(r schema.Resource) error {
 	if r.Name.Catalog != "" {
 		return unsupported(r, "PostgreSQL catalog qualification is not renderable")
@@ -2171,7 +2197,11 @@ func validateSemanticDependencies(r schema.Resource, resources map[string]schema
 				return unsupported(r, "view source dependency is not provable")
 			}
 		} else if simpleLiteralMatch(definition) == nil {
-			return unsupported(r, "view dependencies are not provable from definition")
+			var err error
+			expected, err = capturedViewDependencies(r, resources)
+			if err != nil {
+				return err
+			}
 		}
 	case schema.KindColumn:
 		if parent := resources[r.Name.Parent]; parent.Kind != schema.KindTable {
@@ -2253,6 +2283,91 @@ func validateSemanticDependencies(r schema.Resource, resources map[string]schema
 	}
 	return nil
 }
+
+func capturedViewDependencies(view schema.Resource, resources map[string]schema.Resource) ([]string, error) {
+	query, err := parseViewQuery(stringValue(spec(view), "definition"))
+	if err != nil {
+		return nil, unsupported(view, "view definition is not one parser-proven query")
+	}
+	cteNames := map[string]bool{}
+	var relations []*pg_query.RangeVar
+	walkPostgresMessages(query.ProtoReflect(), func(message protoreflect.Message) {
+		switch value := message.Interface().(type) {
+		case *pg_query.CommonTableExpr:
+			cteNames[value.GetCtename()] = true
+		case *pg_query.RangeVar:
+			relations = append(relations, value)
+		}
+	})
+	seen := map[string]bool{}
+	var expected []string
+	for _, relation := range relations {
+		if relation.GetCatalogname() != "" {
+			return nil, unsupported(view, "view relation uses unsupported catalog qualification")
+		}
+		if relation.GetSchemaname() == "" && cteNames[relation.GetRelname()] {
+			continue
+		}
+		namespace := relation.GetSchemaname()
+		if namespace == "" {
+			namespace = view.Name.Schema
+		}
+		matches := []string{}
+		for id, candidate := range resources {
+			if id != view.ID && (candidate.Kind == schema.KindTable || candidate.Kind == schema.KindView || candidate.Kind == schema.KindMaterializedView) && candidate.Name.Schema == namespace && candidate.Name.Name == relation.GetRelname() {
+				matches = append(matches, id)
+			}
+		}
+		if len(matches) != 1 {
+			return nil, unsupported(view, "view relation dependency is missing or ambiguous")
+		}
+		if !seen[matches[0]] {
+			expected = append(expected, matches[0])
+			seen[matches[0]] = true
+		}
+	}
+	return expected, nil
+}
+
+func walkPostgresMessages(message protoreflect.Message, visit func(protoreflect.Message)) {
+	if !message.IsValid() {
+		return
+	}
+	visit(message)
+	message.Range(func(field protoreflect.FieldDescriptor, value protoreflect.Value) bool {
+		if field.IsMap() && field.MapValue().Kind() == protoreflect.MessageKind {
+			value.Map().Range(func(_ protoreflect.MapKey, item protoreflect.Value) bool {
+				walkPostgresMessages(item.Message(), visit)
+				return true
+			})
+		} else if field.IsList() && field.Kind() == protoreflect.MessageKind {
+			list := value.List()
+			for index := 0; index < list.Len(); index++ {
+				walkPostgresMessages(list.Get(index).Message(), visit)
+			}
+		} else if field.Kind() == protoreflect.MessageKind {
+			walkPostgresMessages(value.Message(), visit)
+		}
+		return true
+	})
+}
+
+func validateViewQuery(definition string) error {
+	_, err := parseViewQuery(definition)
+	return err
+}
+
+func parseViewQuery(definition string) (*pg_query.SelectStmt, error) {
+	if err := validateSQLFragment(definition); err != nil {
+		return nil, err
+	}
+	parsed, err := pg_query.Parse(definition)
+	if err != nil || parsed == nil || len(parsed.Stmts) != 1 || parsed.Stmts[0].GetStmt().GetSelectStmt() == nil {
+		return nil, fmt.Errorf("definition must parse as exactly one query statement")
+	}
+	return parsed.Stmts[0].GetStmt().GetSelectStmt(), nil
+}
+
 func typeReferenceMatches(typ, columnSchema string, name schema.Name) bool {
 	base := strings.TrimSpace(typ)
 	for strings.HasSuffix(base, "[]") {
