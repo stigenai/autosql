@@ -21,6 +21,7 @@ checks the emitted defaults and dependency order.
 | Text | `'pending'`, `'pending'::text` | `character(n)` and `character varying(n)` values must fit their declared length. |
 | Bit string | `'1010'::bit(4)` | Values contain only `0` and `1` and must fit the declared fixed or varying length. |
 | UUID | `'550e8400-e29b-41d4-a716-446655440000'::uuid` | Must be a complete UUID literal. |
+| Network address | `'10.0.0.0/8'::cidr`, `'192.0.2.1/24'::inet`, `'08:00:2b:01:02:03'::macaddr` | CIDR host bits must be clear, INET accepts bounded IPv4/IPv6 address or prefix forms without zones, and MACADDR must contain exactly six bytes. |
 | JSON/JSONB | `'{}'::jsonb`, `'[]'::jsonb` | The string must contain valid JSON and the cast must match the column family. |
 | Date/time | `'2026-07-15'::date`, `'12:30:00'::time`, timestamp literals | The value must parse exactly as its target temporal type. |
 | Interval | `'1 day 00:05:00'::interval` | Supports a signed day/time form with valid minute and second fields and up to six fractional digits. |

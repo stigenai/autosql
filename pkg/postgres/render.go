@@ -1957,6 +1957,7 @@ func parseCoreColumnType(value string) (coreColumnType, bool) {
 		"interval day to minute": true, "interval day to second": true, "interval hour to minute": true,
 		"interval hour to second": true, "interval minute to second": true,
 		"uuid": true, "json": true, "jsonb": true, "bytea": true,
+		"cidr": true, "inet": true, "macaddr": true,
 	}
 	if !allowed[typ.base] {
 		return coreColumnType{}, false

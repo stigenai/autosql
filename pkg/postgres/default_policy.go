@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
+	"net/netip"
 	"regexp"
 	"strconv"
 	"strings"
@@ -175,6 +177,8 @@ func coreScalarLiteralAllowed(typ coreColumnType, expr defaultExpression) bool {
 		return literal.Kind == defaultLiteralString && uuidDefault.MatchString(literal.Text)
 	case "json", "jsonb":
 		return literal.Kind == defaultLiteralString && json.Valid([]byte(literal.Text))
+	case "cidr", "inet", "macaddr":
+		return literal.Kind == defaultLiteralString && networkLiteralAllowed(typ.base, literal.Text)
 	case "date":
 		return literal.Kind == defaultLiteralString && parsesTime("2006-01-02", literal.Text)
 	case "time":
@@ -187,6 +191,25 @@ func coreScalarLiteralAllowed(typ coreColumnType, expr defaultExpression) bool {
 		return literal.Kind == defaultLiteralString && parsesAnyTime(literal.Text, "2006-01-02 15:04:05Z07:00", "2006-01-02 15:04:05.999999Z07:00")
 	default:
 		return strings.HasPrefix(typ.base, "interval") && literal.Kind == defaultLiteralString && validIntervalDefault(literal.Text)
+	}
+}
+
+func networkLiteralAllowed(typ, value string) bool {
+	switch typ {
+	case "cidr":
+		prefix, err := netip.ParsePrefix(value)
+		return err == nil && prefix.Addr().Zone() == "" && prefix == prefix.Masked()
+	case "inet":
+		if address, err := netip.ParseAddr(value); err == nil {
+			return address.Zone() == ""
+		}
+		prefix, err := netip.ParsePrefix(value)
+		return err == nil && prefix.Addr().Zone() == ""
+	case "macaddr":
+		address, err := net.ParseMAC(value)
+		return err == nil && len(address) == 6
+	default:
+		return false
 	}
 }
 

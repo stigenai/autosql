@@ -206,3 +206,24 @@ resource "column" "dbos_updated_at" {
   })
   deps_json = jsonencode([contains(table_id("defaults_demo", "widgets"))])
 }
+
+resource "column" "client_network" {
+  schema = "defaults_demo"
+  parent = table_id("defaults_demo", "widgets")
+  spec_json = jsonencode({ type = "cidr", default = "'10.0.0.0/8'::cidr", not_null = true, ordinal = 21 })
+  deps_json = jsonencode([contains(table_id("defaults_demo", "widgets"))])
+}
+
+resource "column" "client_address" {
+  schema = "defaults_demo"
+  parent = table_id("defaults_demo", "widgets")
+  spec_json = jsonencode({ type = "inet", default = "'192.0.2.1/24'::inet", not_null = true, ordinal = 22 })
+  deps_json = jsonencode([contains(table_id("defaults_demo", "widgets"))])
+}
+
+resource "column" "client_mac" {
+  schema = "defaults_demo"
+  parent = table_id("defaults_demo", "widgets")
+  spec_json = jsonencode({ type = "macaddr", default = "'08:00:2b:01:02:03'::macaddr", not_null = true, ordinal = 23 })
+  deps_json = jsonencode([contains(table_id("defaults_demo", "widgets"))])
+}

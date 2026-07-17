@@ -292,6 +292,9 @@ func TestNormalizeTypesConservatively(t *testing.T) {
 		"bpchar(4)":                      "character(4)",
 		"varbit(8)":                      "bit varying(8)",
 		"pg_catalog.int4[][]":            "integer[]",
+		"pg_catalog.cidr":                "cidr",
+		"PG_CATALOG.INET[]":              "inet[]",
+		"MACADDR":                        "macaddr",
 		`"CaseSensitiveType"`:            `"CaseSensitiveType"`,
 		"App.CustomType":                 "App.CustomType",
 	}

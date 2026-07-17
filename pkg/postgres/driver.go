@@ -631,6 +631,7 @@ func postgresTypeAlias(value string) string {
 		"time without time zone": "time", "time": "time", "time with time zone": "timetz", "timetz": "timetz",
 		"numeric": "numeric", "decimal": "numeric", "date": "date", "interval": "interval", "text": "text",
 		"uuid": "uuid", "json": "json", "jsonb": "jsonb", "bytea": "bytea",
+		"cidr": "cidr", "inet": "inet", "macaddr": "macaddr",
 	}
 	if normalized, ok := aliases[s]; ok {
 		return normalized + suffix + array
