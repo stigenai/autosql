@@ -31,6 +31,45 @@ func TestProjectInspectedBootstrapResourceDoesNotMutateSnapshot(t *testing.T) {
 	}
 }
 
+func TestManagedBootstrapAdoptsIntrinsicPublicSchema(t *testing.T) {
+	public := renderResource(schema.KindSchema, schema.Name{Name: "public"}, `{}`)
+	app := renderResource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "public", Name: "widgets", Parent: public.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: public.ID, Type: schema.DependencyContains})
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{public, app, table}}}
+	target := bootstrap.DatabaseTarget{Mode: bootstrap.ManagedDatabase, Endpoint: bootstrap.ServerEndpoint{Host: "db.internal", TLSMode: "verify-full"}, MaintenanceDatabase: "postgres", Name: "app", Owner: "postgres", ConnectionLimit: -1, AllowConnections: true}
+
+	whole, err := PlanDatabaseBootstrap(context.Background(), target, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var publicCreate, appCreate, tableCreate bool
+	for _, step := range whole.SchemaPlan.Steps {
+		publicCreate = publicCreate || strings.Contains(step.SQL, `CREATE SCHEMA "public"`)
+		appCreate = appCreate || strings.Contains(step.SQL, `CREATE SCHEMA "app"`)
+		tableCreate = tableCreate || strings.Contains(step.SQL, `CREATE TABLE "public"."widgets"`)
+	}
+	if publicCreate {
+		t.Fatal("managed bootstrap attempted to recreate PostgreSQL's intrinsic public schema")
+	}
+	if !appCreate || !tableCreate {
+		t.Fatalf("ordinary managed resources were not preserved: app_schema=%t public_table=%t", appCreate, tableCreate)
+	}
+
+	external := target
+	external.Mode = bootstrap.ExternalDatabase
+	externalPlan, err := PlanDatabaseBootstrap(context.Background(), external, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicCreate = false
+	for _, step := range externalPlan.SchemaPlan.Steps {
+		publicCreate = publicCreate || strings.Contains(step.SQL, `CREATE SCHEMA "public"`)
+	}
+	if !publicCreate {
+		t.Fatal("external database planning unexpectedly adopted the public schema")
+	}
+}
+
 func TestWholeDatabasePlanStagesCyclicForeignKeysAndOnlineIndexes(t *testing.T) {
 	namespace := renderResource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
 	a := renderResource(schema.KindTable, schema.Name{Schema: "app", Name: "a", Parent: namespace.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})

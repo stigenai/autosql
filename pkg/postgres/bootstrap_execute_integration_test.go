@@ -129,6 +129,48 @@ func TestWholeDatabaseBootstrapExecutionResumeAndReconcile(t *testing.T) {
 	}
 }
 
+func TestManagedBootstrapExecutesIntoIntrinsicPublicSchema(t *testing.T) {
+	maintenanceURL := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if maintenanceURL == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	target := bootstrapExecutionTarget(t, ctx, maintenanceURL, "autosql_bootstrap_public")
+	defer DropDatabaseURL(context.Background(), maintenanceURL, target.Name, true)
+	_ = DropDatabaseURL(ctx, maintenanceURL, target.Name, true)
+
+	desired := bootstrapExecutionDocument(t, "public")
+	whole, err := PlanDatabaseBootstrap(ctx, target, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range whole.SchemaPlan.Steps {
+		if strings.Contains(step.SQL, `CREATE SCHEMA "public"`) {
+			t.Fatal("plan attempts to recreate PostgreSQL's intrinsic public schema")
+		}
+	}
+	result, err := ExecuteDatabaseBootstrapURL(ctx, maintenanceURL, whole, BootstrapExecutionHooks{})
+	if err != nil || !result.Completed {
+		t.Fatalf("public-schema bootstrap result=%+v err=%v", result, err)
+	}
+
+	config, err := pgx.ParseConfig(maintenanceURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.Database = target.Name
+	conn, err := pgx.ConnectConfig(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	var exists bool
+	if err := conn.QueryRow(ctx, `select to_regclass('public.items') is not null`).Scan(&exists); err != nil || !exists {
+		t.Fatalf("public.items exists=%t err=%v", exists, err)
+	}
+}
+
 func TestWholeDatabaseBootstrapTransactionalFailureRollsBackAndIdentityIsBound(t *testing.T) {
 	maintenanceURL := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
 	if maintenanceURL == "" {
