@@ -272,6 +272,81 @@ func TestManagedBootstrapPreservesRoutineLineComments(t *testing.T) {
 	}
 }
 
+func TestManagedBootstrapExecutesEnumDefaultOutsideSearchPath(t *testing.T) {
+	maintenanceURL := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if maintenanceURL == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	target := bootstrapExecutionTarget(t, ctx, maintenanceURL, "autosql_bootstrap_enum_default")
+	defer DropDatabaseURL(context.Background(), maintenanceURL, target.Name, true)
+	_ = DropDatabaseURL(ctx, maintenanceURL, target.Name, true)
+
+	namespace := renderResource(schema.KindSchema, schema.Name{Name: "global"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "global", Name: "cells", Parent: namespace.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
+	statusType := renderResource(schema.KindEnum, schema.Name{Schema: "global", Name: "cell_status", Parent: namespace.ID}, `{"values":["provisioning","active","draining","offline"]}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
+	id := renderResource(schema.KindColumn, schema.Name{Schema: "global", Name: "id", Parent: table.ID}, `{"type":"bigint","not_null":true,"ordinal":1}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains})
+	status := renderResource(schema.KindColumn, schema.Name{Schema: "global", Name: "status", Parent: table.ID}, `{"type":"global.cell_status","default":"'provisioning'::cell_status","not_null":true,"ordinal":2}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: statusType.ID, Type: schema.DependencyUses})
+	desired, err := New().Normalize(ctx, schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{status, id, table, statusType, namespace}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	whole, err := PlanDatabaseBootstrap(ctx, target, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	typePosition, columnPosition := -1, -1
+	for position, step := range whole.SchemaPlan.Steps {
+		if strings.Contains(step.SQL, `CREATE TYPE "global"."cell_status"`) {
+			typePosition = position
+		}
+		if strings.Contains(step.SQL, `ADD COLUMN "status"`) {
+			columnPosition = position
+			if !strings.Contains(step.SQL, `'provisioning'::global.cell_status`) && !strings.Contains(step.SQL, `'provisioning'::"global"."cell_status"`) {
+				t.Fatalf("enum default is not schema-bound: %s", step.SQL)
+			}
+		}
+	}
+	if typePosition < 0 || columnPosition < 0 || typePosition >= columnPosition {
+		t.Fatalf("enum type position=%d column position=%d", typePosition, columnPosition)
+	}
+	result, err := ExecuteDatabaseBootstrapURL(ctx, maintenanceURL, whole, BootstrapExecutionHooks{})
+	if err != nil || !result.Completed {
+		t.Fatalf("enum bootstrap result=%+v err=%v", result, err)
+	}
+
+	config, err := pgx.ParseConfig(maintenanceURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.Database = target.Name
+	conn, err := pgx.ConnectConfig(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	var got string
+	if err := conn.QueryRow(ctx, `insert into global.cells(id) values (1) returning status::text`).Scan(&got); err != nil || got != "provisioning" {
+		t.Fatalf("schema-bound enum default=%q err=%v", got, err)
+	}
+	inspected, err := InspectConn(ctx, conn, Options{Schemas: []string{"global"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := New().Normalize(ctx, inspected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noOp, err := plan.Build(ctx, New(), current, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(noOp.Changes.Changes) != 0 || len(noOp.Steps) != 0 {
+		t.Fatalf("reinspected enum bootstrap did not converge: changes=%+v steps=%+v", noOp.Changes.Changes, noOp.Steps)
+	}
+}
+
 func TestWholeDatabaseBootstrapTransactionalFailureRollsBackAndIdentityIsBound(t *testing.T) {
 	maintenanceURL := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
 	if maintenanceURL == "" {

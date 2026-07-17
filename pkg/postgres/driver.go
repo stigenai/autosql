@@ -241,6 +241,16 @@ func canonicalizeUsedTypes(doc *schema.Document) error {
 				name = identifier(target.Name.Schema) + "." + name
 			}
 			s["type"] = name + array
+			if value, ok := s["default"].(string); ok && stringValue(s, "generated") == "" && (target.Kind == schema.KindEnum || target.Kind == schema.KindDomain || target.Kind == schema.KindComposite) {
+				expression, expressionErr := classifyDefaultExpression(value)
+				if expressionErr == nil && userDefinedCastMatches(expression, target, r.Name.Schema, array != "") {
+					canonical, canonicalErr := qualifyUserDefinedDefaultCast(value, target)
+					if canonicalErr != nil {
+						return fmt.Errorf("column %s default cast: %w", r.Name.String(), canonicalErr)
+					}
+					s["default"] = canonical
+				}
+			}
 			r.Spec, _ = json.Marshal(s)
 		}
 		if uses > 1 {
