@@ -160,7 +160,8 @@ server/maintenance-database/target-database contract used by
 `autosql database prepare`. It contains no connection URL or credential.
 
 [`defaults.hcl`](defaults.hcl) is the executable default-expression reference.
-It provisions scalar and cast literals, JSONB, UUIDs, bounded arithmetic
+It provisions scalar and cast literals, JSONB, UUIDs, CIDR/INET/MACADDR network
+values, bounded arithmetic
 (including the DBOS `extract(epoch from ...) * 1000` default), the
 generated-function allowlist, enum and domain defaults, one-dimensional arrays,
 temporal and interval forms, and an exactly qualified sequence-backed `nextval`. The
