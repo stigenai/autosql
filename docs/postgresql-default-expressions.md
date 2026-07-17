@@ -132,6 +132,12 @@ declared domain. Validation uses the modeled `base_type`; PostgreSQL still
 enforces the actual domain constraints when the statement runs. Missing,
 mismatched, or ambiguous type dependencies fail closed.
 
+Normalization binds an accepted enum or domain cast to the exact `uses`
+dependency with a schema-qualified type name. This applies even when inspected
+catalog text used an unqualified cast such as `'pending'::job_status`, so fresh
+bootstrap does not depend on the target database's `search_path`. The type
+dependency also orders `CREATE TYPE` before the dependent `ADD COLUMN`.
+
 ## Sequence-backed defaults
 
 `nextval` is supported only for integer-family columns and only in this exact

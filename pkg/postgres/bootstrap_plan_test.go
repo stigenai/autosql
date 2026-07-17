@@ -70,6 +70,53 @@ func TestManagedBootstrapAdoptsIntrinsicPublicSchema(t *testing.T) {
 	}
 }
 
+func TestManagedBootstrapOrdersEnumBeforeDependentAddedColumn(t *testing.T) {
+	namespace := renderResource(schema.KindSchema, schema.Name{Name: "global"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "global", Name: "cells", Parent: namespace.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
+	statusType := renderResource(schema.KindEnum, schema.Name{Schema: "global", Name: "cell_status", Parent: namespace.ID}, `{"values":["provisioning","active","draining","offline"]}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
+	status := renderResource(schema.KindColumn, schema.Name{Schema: "global", Name: "status", Parent: table.ID}, `{"type":"\"global\".\"cell_status\"","default":"'provisioning'::cell_status","not_null":true,"ordinal":1}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: statusType.ID, Type: schema.DependencyUses})
+	// Keep the desired graph deliberately out of dependency order. Planning must
+	// derive execution topology from edges rather than input serialization.
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{status, table, statusType, namespace}}}
+	target := bootstrap.DatabaseTarget{Mode: bootstrap.ManagedDatabase, Endpoint: bootstrap.ServerEndpoint{Host: "db.internal", TLSMode: "verify-full"}, MaintenanceDatabase: "postgres", Name: "app", Owner: "postgres", ConnectionLimit: -1, AllowConnections: true}
+
+	whole, err := PlanDatabaseBootstrap(context.Background(), target, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	typePosition, columnPosition := -1, -1
+	var typeStepID, columnStepID string
+	for position, step := range whole.SchemaPlan.Steps {
+		switch {
+		case strings.Contains(step.SQL, `CREATE TYPE "global"."cell_status"`):
+			typePosition, typeStepID = position, step.ID
+		case strings.Contains(step.SQL, `ADD COLUMN "status"`):
+			columnPosition, columnStepID = position, step.ID
+			if !strings.Contains(step.SQL, `'provisioning'::global.cell_status`) && !strings.Contains(step.SQL, `'provisioning'::"global"."cell_status"`) {
+				t.Fatalf("column default cast is not bound to the declared enum dependency: %s", step.SQL)
+			}
+		}
+	}
+	if typePosition < 0 || columnPosition < 0 || typePosition >= columnPosition {
+		t.Fatalf("enum type position=%d column position=%d steps=%+v", typePosition, columnPosition, whole.SchemaPlan.Steps)
+	}
+	columnStep := schemaStepByID(whole.SchemaPlan, columnStepID)
+	if !containsBootstrapID(columnStep.DependsOn, typeStepID) {
+		t.Fatalf("column step dependencies=%v missing enum step %s", columnStep.DependsOn, typeStepID)
+	}
+	var typeBootstrapID string
+	for _, step := range whole.Steps {
+		if step.SchemaStepID == typeStepID {
+			typeBootstrapID = step.ID
+		}
+	}
+	for _, step := range whole.Steps {
+		if step.SchemaStepID == columnStepID && (!containsBootstrapID(step.DependsOn, typeBootstrapID) || step.Stage != bootstrap.StageStorage) {
+			t.Fatalf("column bootstrap step=%+v missing type bootstrap dependency=%s", step, typeBootstrapID)
+		}
+	}
+}
+
 func TestWholeDatabasePlanStagesCyclicForeignKeysAndOnlineIndexes(t *testing.T) {
 	namespace := renderResource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
 	a := renderResource(schema.KindTable, schema.Name{Schema: "app", Name: "a", Parent: namespace.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})

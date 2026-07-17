@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"autosql/pkg/schema"
+	pg_query "github.com/pganalyze/pg_query_go/v6"
 )
 
 func validateColumnDefault(column schema.Resource, value string, resources map[string]schema.Resource) error {
@@ -126,6 +127,35 @@ func userDefinedCastMatches(expr defaultExpression, target schema.Resource, colu
 		return parts[0] == target.Name.Schema && parts[1] == target.Name.Name
 	}
 	return len(parts) == 1 && parts[0] == target.Name.Name && (target.Name.Schema == columnSchema || target.Name.Schema == "public")
+}
+
+func qualifyUserDefinedDefaultCast(value string, target schema.Resource) (string, error) {
+	parsed, err := pg_query.Parse("SELECT " + value)
+	if err != nil || parsed == nil || len(parsed.Stmts) != 1 {
+		return "", fmt.Errorf("expression could not be reparsed")
+	}
+	statement := parsed.Stmts[0].Stmt.GetSelectStmt()
+	if statement == nil || len(statement.TargetList) != 1 {
+		return "", fmt.Errorf("expression wrapper changed shape")
+	}
+	targetValue := statement.TargetList[0].GetResTarget()
+	if targetValue == nil || targetValue.Val == nil || targetValue.Val.GetTypeCast() == nil || targetValue.Val.GetTypeCast().TypeName == nil {
+		return "", fmt.Errorf("expression is not a root cast")
+	}
+	castType := targetValue.Val.GetTypeCast().TypeName
+	castType.Names = []*pg_query.Node{
+		{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: target.Name.Schema}}},
+		{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: target.Name.Name}}},
+	}
+	rendered, err := pg_query.Deparse(parsed)
+	if err != nil {
+		return "", fmt.Errorf("qualified cast could not be rendered")
+	}
+	rendered = strings.TrimSpace(rendered)
+	if !strings.HasPrefix(rendered, "SELECT ") {
+		return "", fmt.Errorf("qualified cast rendered an unexpected statement")
+	}
+	return strings.TrimSpace(strings.TrimPrefix(rendered, "SELECT ")), nil
 }
 
 func validateSequenceDefault(column schema.Resource, value string, sequences []schema.Resource) error {
