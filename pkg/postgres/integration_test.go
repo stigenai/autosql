@@ -786,12 +786,13 @@ func TestMaterializedViewIndexesAdoptProvisionAndConverge(t *testing.T) {
 	const namespace = "autosql_matview_indexes"
 	if _, err = conn.Exec(ctx, `drop schema if exists autosql_matview_indexes cascade;
 create schema autosql_matview_indexes;
-create table autosql_matview_indexes.block_health(block_number bigint);
-insert into autosql_matview_indexes.block_health values (1), (1), (2);
+create type autosql_matview_indexes.provider as enum ('aws', 'gcp');
+create table autosql_matview_indexes.block_health(block_number bigint, provider autosql_matview_indexes.provider);
+insert into autosql_matview_indexes.block_health values (1, 'aws'), (1, 'gcp'), (2, 'aws');
 create materialized view autosql_matview_indexes.block_health_summary as
-select block_number, count(*)::bigint as sample_count
+select block_number, provider, count(*)::bigint as sample_count
 from autosql_matview_indexes.block_health
-group by block_number`); err != nil {
+group by block_number, provider`); err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Exec(context.Background(), `drop schema if exists autosql_matview_indexes cascade`)
@@ -860,6 +861,68 @@ group by block_number`); err != nil {
 	noop, err := plan.Build(ctx, New(), actual, desired, plan.Options{})
 	if err != nil || len(noop.Steps) != 0 {
 		t.Fatalf("materialized-view index no-op plan=%+v err=%v", noop, err)
+	}
+}
+
+func TestNetworkInetOperatorClassProvisionAndConverge(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	const namespace = "autosql_network_opclass"
+	if _, err = conn.Exec(ctx, `drop schema if exists autosql_network_opclass cascade;
+create schema autosql_network_opclass;
+create table autosql_network_opclass.ipam_allocations(id bigint, allocation cidr);
+create index idx_ipam_allocations_cidr_btree on autosql_network_opclass.ipam_allocations using btree (allocation inet_ops);
+create index idx_ipam_allocations_cidr_hash on autosql_network_opclass.ipam_allocations using hash (allocation inet_ops);
+create index idx_ipam_allocations_cidr_gist on autosql_network_opclass.ipam_allocations using gist (allocation inet_ops);
+create index idx_ipam_allocations_cidr_spgist on autosql_network_opclass.ipam_allocations using spgist (allocation inet_ops)`); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Exec(context.Background(), `drop schema if exists autosql_network_opclass cascade`)
+	desired, err := InspectURL(ctx, url, Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err = New().Normalize(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = conn.Exec(ctx, `drop schema autosql_network_opclass cascade`); err != nil {
+		t.Fatal(err)
+	}
+	empty, err := InspectURL(ctx, url, Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty, err = New().Normalize(ctx, empty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	migration, err := plan.Build(ctx, New(), empty, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyDefaultMatrixPlan(t, ctx, conn, migration)
+	actual, err := InspectURL(ctx, url, Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err = New().Normalize(ctx, actual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertDocumentsEqual(t, actual, desired)
+	noop, err := plan.Build(ctx, New(), actual, desired, plan.Options{})
+	if err != nil || len(noop.Steps) != 0 {
+		t.Fatalf("inet_ops no-op plan=%+v err=%v", noop, err)
 	}
 }
 

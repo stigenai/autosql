@@ -298,6 +298,47 @@ func TestIndexPreflightDetectsInvalidRemnantsAndUnavailableAccessMethods(t *test
 	}
 }
 
+func TestBuiltinInetOperatorClassIsMethodAndTypeBound(t *testing.T) {
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "global"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "global", Name: "ipam_allocations", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	column := renderResource(schema.KindColumn, schema.Name{Schema: "global", Name: "cidr", Parent: table.ID}, `{"type":"cidr","not_null":false,"ordinal":1}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains})
+	index := renderResource(schema.KindIndex, schema.Name{Schema: "global", Name: "idx_ipam_allocations_cidr", Parent: table.ID}, `{"definition":"CREATE INDEX idx_ipam_allocations_cidr ON global.ipam_allocations USING gist (cidr inet_ops)","method":"gist","unique":false,"valid":true,"ready":true,"columns":["cidr"]}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: column.ID, Type: schema.DependencyReferences})
+	for _, method := range []string{"btree", "hash", "gist", "spgist"} {
+		candidate := index
+		candidate.Name.Name = "idx_ipam_allocations_cidr_" + method
+		candidate.ID = schema.StableID(candidate.Kind, candidate.Name)
+		candidate.Spec = json.RawMessage(fmt.Sprintf(`{"definition":"CREATE INDEX %s ON global.ipam_allocations USING %s (cidr inet_ops)","method":"%s","unique":false,"valid":true,"ready":true,"columns":["cidr"]}`, candidate.Name.Name, method, method))
+		resources := []schema.Resource{ns, table, column, candidate}
+		if statements, err := RenderDocument(context.Background(), schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: resources}}, nil); err != nil || len(statements) == 0 {
+			t.Fatalf("%s inet_ops statements=%+v err=%v", method, statements, err)
+		}
+	}
+	qualified := index
+	qualified.Spec = json.RawMessage(strings.Replace(string(index.Spec), "cidr inet_ops", "cidr pg_catalog.inet_ops", 1))
+	if statements, err := RenderDocument(context.Background(), schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, column, qualified}}}, nil); err != nil || len(statements) == 0 {
+		t.Fatalf("pg_catalog.inet_ops statements=%+v err=%v", statements, err)
+	}
+	for name, mutate := range map[string]func(*schema.Resource, *schema.Resource){
+		"GIN method": func(candidate, _ *schema.Resource) {
+			candidate.Spec = json.RawMessage(strings.Replace(strings.Replace(string(candidate.Spec), "USING gist", "USING gin", 1), `"method":"gist"`, `"method":"gin"`, 1))
+		},
+		"text column": func(_ *schema.Resource, candidateColumn *schema.Resource) {
+			candidateColumn.Spec = json.RawMessage(`{"type":"text","not_null":false,"ordinal":1}`)
+		},
+		"custom qualification": func(candidate, _ *schema.Resource) {
+			candidate.Spec = json.RawMessage(strings.Replace(string(candidate.Spec), "cidr inet_ops", "cidr public.inet_ops", 1))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate, candidateColumn := index, column
+			mutate(&candidate, &candidateColumn)
+			if statements, err := RenderDocument(context.Background(), schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, candidateColumn, candidate}}}, nil); err == nil || len(statements) != 0 {
+				t.Fatalf("statements=%+v err=%v", statements, err)
+			}
+		})
+	}
+}
+
 func TestConstraintIndexPlanOrderingAndPhaseIdentityAreStable(t *testing.T) {
 	ns := renderResource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
 	accounts := renderResource(schema.KindTable, schema.Name{Schema: "app", Name: "accounts", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})

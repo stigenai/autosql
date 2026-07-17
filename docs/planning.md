@@ -73,7 +73,9 @@ validated. Inspected complex queries may instead use their captured projection
 graph when the definition parses as exactly one query and every projection is
 contiguous, uniquely named, typed, and canonical. Shape-changing view alters
 require an explicit proven rebuild; independent projection-child changes fail
-closed.
+closed. Projection columns whose output type is a managed enum, domain, or
+composite must carry exactly the matching type-use dependency; builtin outputs
+must not carry one.
 
 Reference and type-use dependencies are part of rendered semantics, not advisory
 metadata. For managed views, the renderer walks PostgreSQL's parsed query tree,
