@@ -67,13 +67,14 @@ index or privileged server operation as transactional. Runtime URLs and
 credentials are not accepted by the planner and cannot enter the artifact.
 
 The dependency graph, rather than resource array order, controls execution.
-Extension and type dependencies precede signatures and columns; generated
-expression routines precede their consumers; referenced primary/unique keys
-precede foreign keys; mutual foreign keys are added only after both tables
-exist; and grants, memberships, and default privileges form the final access
-handoff. Teardown reverses these edges, revoking access and removing dependent
-objects first. `PlanDatabaseTransition` exposes the same contract for upgrades
-and reviewed teardown plans.
+Extension and type dependencies precede signatures, columns, CHECK
+constraints, and partial-index predicates; generated expression routines
+precede their consumers; referenced primary/unique keys precede foreign keys;
+mutual foreign keys are added only after both tables exist; and grants,
+memberships, and default privileges form the final access handoff. Teardown
+reverses these edges, revoking access and removing dependent objects first.
+`PlanDatabaseTransition` exposes the same contract for upgrades and reviewed
+teardown plans.
 
 ## Resumable execution and repair
 
@@ -87,12 +88,15 @@ secret values.
 Transactional phases commit their DDL and confirmed step records together. An
 injected error rolls both back, and the next invocation resumes at that phase.
 For transaction-prohibited work such as `CREATE INDEX CONCURRENTLY`, the
-executor durably records intent first. An interrupted or ambiguous step stops
-with `ErrBootstrapReconcile`; `DiagnoseDatabaseBootstrapURL` returns the bound
-step ID and repair guidance without SQL. After an operator verifies the live
-postcondition, `ConfirmBootstrapStepURL` records that exact digest-bound step
-and the same plan resumes. A different plan, schema digest, target settings, or
-untracked managed-name collision fails before schema SQL.
+executor durably records intent first. On resume, an absent concurrent index is
+safe to retry, while an exact valid and ready catalog match is safe to confirm;
+the executor performs those two bounded reconciliations automatically. An
+invalid, different, or otherwise ambiguous remnant stops with
+`ErrBootstrapReconcile`; `DiagnoseDatabaseBootstrapURL` returns the bound step
+ID and repair guidance without SQL. After an operator verifies an ambiguous
+live postcondition, `ConfirmBootstrapStepURL` records that exact digest-bound
+step and the same plan resumes. A different plan, schema digest, target
+settings, or untracked managed-name collision fails before schema SQL.
 
 `AbortDatabaseBootstrapURL` is explicit cleanup. A managed target requires the
 caller to authorize database deletion; AutoSQL drops the database and then

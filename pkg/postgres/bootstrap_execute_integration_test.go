@@ -56,9 +56,6 @@ func TestWholeDatabaseBootstrapExecutionResumeAndReconcile(t *testing.T) {
 	if err != nil || diagnosis.PendingStep != first.PendingStep || diagnosis.RecoveryGuidance == "" {
 		t.Fatalf("diagnosis=%+v err=%v", diagnosis, err)
 	}
-	if err := ConfirmBootstrapStepURL(ctx, maintenanceURL, whole, first.PendingStep); err != nil {
-		t.Fatal(err)
-	}
 	resumed, err := ExecuteDatabaseBootstrapURL(ctx, maintenanceURL, whole, BootstrapExecutionHooks{})
 	if err != nil || !resumed.Resumed || !resumed.Completed {
 		t.Fatalf("resume=%+v err=%v", resumed, err)
@@ -121,7 +118,16 @@ func TestWholeDatabaseBootstrapExecutionResumeAndReconcile(t *testing.T) {
 	if !errors.Is(err, ErrBootstrapReconcile) || maintenanceResult.PendingStep == "" {
 		t.Fatalf("maintenance interruption result=%+v err=%v", maintenanceResult, err)
 	}
-	if err := ConfirmBootstrapStepURL(ctx, maintenanceURL, maintenancePlan, maintenanceResult.PendingStep); err != nil {
+	if _, err := conn.Exec(ctx, `drop index bootstrap_app.items_id_maintenance_idx`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, `create index items_id_maintenance_idx on bootstrap_app.items(value)`); err != nil {
+		t.Fatal(err)
+	}
+	if mismatched, mismatchErr := ExecuteDatabaseBootstrapURL(ctx, maintenanceURL, maintenancePlan, BootstrapExecutionHooks{}); !errors.Is(mismatchErr, ErrBootstrapReconcile) || mismatched.PendingStep != maintenanceResult.PendingStep {
+		t.Fatalf("mismatched concurrent remnant result=%+v err=%v", mismatched, mismatchErr)
+	}
+	if _, err := conn.Exec(ctx, `drop index bootstrap_app.items_id_maintenance_idx`); err != nil {
 		t.Fatal(err)
 	}
 	maintenanceResult, err = ExecuteDatabaseBootstrapURL(ctx, maintenanceURL, maintenancePlan, BootstrapExecutionHooks{})

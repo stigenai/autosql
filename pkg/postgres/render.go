@@ -2275,7 +2275,7 @@ func validateSemanticDependencies(r schema.Resource, resources map[string]schema
 			continue
 		}
 		dependentObject := r.Kind == schema.KindPrimaryKey || r.Kind == schema.KindUniqueConstraint || r.Kind == schema.KindCheckConstraint || r.Kind == schema.KindForeignKey || r.Kind == schema.KindIndex || r.Kind == schema.KindTrigger || r.Kind == schema.KindPolicy
-		if dep.Type == expectedType || dependentObject && dep.Type == schema.DependencyReferences || r.Kind == schema.KindCheckConstraint && dep.Type == schema.DependencyUses {
+		if dep.Type == expectedType || dependentObject && dep.Type == schema.DependencyReferences || (r.Kind == schema.KindCheckConstraint || r.Kind == schema.KindIndex) && dep.Type == schema.DependencyUses {
 			actual = append(actual, dep.Target)
 		}
 	}

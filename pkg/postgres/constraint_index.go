@@ -389,7 +389,7 @@ func constraintIndexExpectedDependencies(resource schema.Resource, resources map
 			return nil, unsupported(resource, "check and index expression routines must be immutable")
 		}
 	}
-	if resource.Kind == schema.KindCheckConstraint {
+	if resource.Kind == schema.KindCheckConstraint || resource.Kind == schema.KindIndex {
 		types, typeErr := expressionTypeDependencies(expressionRoot, resource.Name.Schema, resource, resources)
 		if typeErr != nil {
 			return nil, typeErr

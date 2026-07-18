@@ -132,6 +132,18 @@ func ExecuteDatabaseBootstrapURL(ctx context.Context, maintenanceURL string, who
 		return result, err
 	}
 	if intended != "" {
+		reconciled, reconcileErr := reconcileConcurrentIndexIntent(ctx, conn, whole, intended)
+		if reconcileErr != nil {
+			return result, reconcileErr
+		}
+		if reconciled {
+			confirmed, intended, err = readBootstrapSteps(ctx, conn, whole)
+			if err != nil {
+				return result, err
+			}
+		}
+	}
+	if intended != "" {
 		result.PendingStep = intended
 		result.RecoveryGuidance = "inspect the non-transactional object, then explicitly confirm or remove the remnant before retry"
 		return result, ErrBootstrapReconcile
@@ -186,6 +198,85 @@ func ExecuteDatabaseBootstrapURL(ctx context.Context, maintenanceURL string, who
 	result.Completed = true
 	emit("completed", bootstrap.BootstrapPhase{}, result.LastConfirmed)
 	return result, nil
+}
+
+// reconcileConcurrentIndexIntent handles the two catalog states that can be
+// proven safe after an interrupted CREATE INDEX CONCURRENTLY. An absent index
+// proves the statement did not take effect and its intent may be retried. An
+// exact, valid, ready index proves the statement completed and may be
+// confirmed. Invalid or different remnants remain operator-reconciled.
+func reconcileConcurrentIndexIntent(ctx context.Context, conn *pgx.Conn, whole bootstrap.Plan, stepID string) (bool, error) {
+	var bound bootstrap.BootstrapStep
+	for _, candidate := range whole.Steps {
+		if candidate.ID == stepID {
+			bound = candidate
+			break
+		}
+	}
+	if bound.ID == "" || bound.Transaction != plan.TransactionProhibited {
+		return false, nil
+	}
+	var schemaStep plan.Step
+	for _, candidate := range whole.SchemaPlan.Steps {
+		if candidate.ID == bound.SchemaStepID {
+			schemaStep = candidate
+			break
+		}
+	}
+	if schemaStep.ID == "" || schemaStep.Kind != plan.StepExecutable {
+		return false, nil
+	}
+	var desired schema.Resource
+	for _, change := range whole.SchemaPlan.Changes.Changes {
+		if change.ID == schemaStep.ChangeID && change.Operation == schema.OperationCreate && change.After != nil && change.After.Kind == schema.KindIndex {
+			desired = *change.After
+			break
+		}
+	}
+	if desired.ID == "" {
+		return false, nil
+	}
+	expectedSQL, concurrent, err := canonicalConcurrentIndexSQL(schemaStep.SQL)
+	if err != nil || !concurrent {
+		return false, nil
+	}
+	var valid, ready bool
+	var actualDefinition string
+	err = conn.QueryRow(ctx, `select x.indisvalid,x.indisready,pg_get_indexdef(c.oid) from pg_class c join pg_namespace n on n.oid=c.relnamespace join pg_index x on x.indexrelid=c.oid where n.nspname=$1 and c.relname=$2`, desired.Name.Schema, desired.Name.Name).Scan(&valid, &ready, &actualDefinition)
+	if errors.Is(err, pgx.ErrNoRows) {
+		tag, deleteErr := conn.Exec(ctx, `delete from autosql_internal.bootstrap_steps where plan_digest=$1 and step_id=$2 and state='intended' and step_hash=$3`, whole.Digest, stepID, bootstrapStepHash(bound, whole.SchemaPlan))
+		if deleteErr != nil || tag.RowsAffected() != 1 {
+			return false, ErrBootstrapIdentity
+		}
+		return true, nil
+	}
+	if err != nil {
+		return false, errors.New("inspect concurrent index intent")
+	}
+	actualSQL, _, err := canonicalConcurrentIndexSQL(actualDefinition)
+	if err != nil || !valid || !ready || actualSQL != expectedSQL {
+		return false, nil
+	}
+	tag, err := conn.Exec(ctx, `update autosql_internal.bootstrap_steps set state='confirmed',confirmed_at=clock_timestamp() where plan_digest=$1 and step_id=$2 and state='intended' and step_hash=$3`, whole.Digest, stepID, bootstrapStepHash(bound, whole.SchemaPlan))
+	if err != nil || tag.RowsAffected() != 1 {
+		return false, ErrBootstrapIdentity
+	}
+	return true, nil
+}
+
+func canonicalConcurrentIndexSQL(sql string) (string, bool, error) {
+	parsed, err := pg_query.Parse(sql)
+	if err != nil || len(parsed.GetStmts()) != 1 {
+		return "", false, err
+	}
+	statement := parsed.GetStmts()[0].GetStmt().GetIndexStmt()
+	if statement == nil {
+		return "", false, nil
+	}
+	concurrent := statement.GetConcurrent()
+	statement.Concurrent = false
+	canonical, err := pg_query.Deparse(parsed)
+	return canonical, concurrent, err
 }
 
 func openBootstrapTarget(ctx context.Context, maintenanceURL string, whole bootstrap.Plan) (*pgx.Conn, bool, bool, func(context.Context), error) {
