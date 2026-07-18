@@ -167,7 +167,7 @@ func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Documen
 	if err := canonicalizeConstraintIndexTypeDependencies(&doc); err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
-	if err := canonicalizeConstraintTypeCasts(&doc); err != nil {
+	if err := canonicalizeConstraintIndexTypeCasts(&doc); err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
 	if err := canonicalizeColumnOrdinals(&doc); err != nil {
@@ -316,14 +316,14 @@ func canonicalizeConstraintIndexTypeDependencies(doc *schema.Document) error {
 	return nil
 }
 
-func canonicalizeConstraintTypeCasts(doc *schema.Document) error {
+func canonicalizeConstraintIndexTypeCasts(doc *schema.Document) error {
 	resources := make(map[string]schema.Resource, len(doc.Graph.Resources))
 	for _, resource := range doc.Graph.Resources {
 		resources[resource.ID] = resource
 	}
 	for index := range doc.Graph.Resources {
 		resource := &doc.Graph.Resources[index]
-		if resource.Kind != schema.KindCheckConstraint {
+		if resource.Kind != schema.KindCheckConstraint && resource.Kind != schema.KindIndex {
 			continue
 		}
 		hasManagedType := false
@@ -334,16 +334,30 @@ func canonicalizeConstraintTypeCasts(doc *schema.Document) error {
 		if !hasManagedType {
 			continue
 		}
-		_, definition, err := renderConstraintCreate(*resource, resources)
-		if err != nil {
-			return err
+		definition := ""
+		if resource.Kind == schema.KindIndex {
+			parsed, err := parseIndexDefinition(*resource, resources)
+			if err != nil {
+				return err
+			}
+			if err := schemaBindIndexTypeCasts(&parsed, *resource, resources); err != nil {
+				return err
+			}
+			definition = parsed.SQL
+		} else {
+			_, renderedDefinition, err := renderConstraintCreate(*resource, resources)
+			if err != nil {
+				return err
+			}
+			definition = renderedDefinition
 		}
 		values := specMap(resource.Spec)
 		values["definition"] = definition
-		resource.Spec, err = json.Marshal(values)
+		normalized, err := json.Marshal(values)
 		if err != nil {
 			return err
 		}
+		resource.Spec = normalized
 		resources[resource.ID] = *resource
 	}
 	return nil

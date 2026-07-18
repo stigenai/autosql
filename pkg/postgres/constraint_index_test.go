@@ -472,10 +472,12 @@ func TestConstraintIndexPlanOrderingAndPhaseIdentityAreStable(t *testing.T) {
 func TestIndexPredicateTypeDependencyIsDerivedAndOrdered(t *testing.T) {
 	ns := renderResource(schema.KindSchema, schema.Name{Name: "global"}, `{}`)
 	cellType := renderResource(schema.KindEnum, schema.Name{Schema: "global", Name: "cell_type", Parent: ns.ID}, `{"values":["shared","dedicated"]}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	cellStatus := renderResource(schema.KindEnum, schema.Name{Schema: "global", Name: "cell_status", Parent: ns.ID}, `{"values":["active","inactive"]}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
 	table := renderResource(schema.KindTable, schema.Name{Schema: "global", Name: "cells", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
 	column := renderResource(schema.KindColumn, schema.Name{Schema: "global", Name: "type", Parent: table.ID}, `{"type":"global.cell_type","not_null":true,"ordinal":1}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: cellType.ID, Type: schema.DependencyUses})
-	index := renderResource(schema.KindIndex, schema.Name{Schema: "global", Name: "idx_cells_available_shared", Parent: table.ID}, `{"definition":"CREATE INDEX idx_cells_available_shared ON global.cells (type) WHERE (type = 'shared'::cell_type)","method":"btree","unique":false,"valid":true,"ready":true,"columns":["type"]}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: column.ID, Type: schema.DependencyReferences})
-	desired, err := New().Normalize(context.Background(), schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, cellType, table, column, index}}})
+	status := renderResource(schema.KindColumn, schema.Name{Schema: "global", Name: "status", Parent: table.ID}, `{"type":"global.cell_status","not_null":true,"ordinal":2}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: cellStatus.ID, Type: schema.DependencyUses})
+	index := renderResource(schema.KindIndex, schema.Name{Schema: "global", Name: "idx_cells_available_shared", Parent: table.ID}, `{"definition":"CREATE INDEX idx_cells_available_shared ON global.cells USING btree (type) WHERE ((type = 'shared'::cell_type) AND (status = 'active'::cell_status))","method":"btree","unique":false,"valid":true,"ready":true,"columns":["type"]}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: column.ID, Type: schema.DependencyReferences})
+	desired, err := New().Normalize(context.Background(), schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, cellType, cellStatus, table, column, status, index}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -491,6 +493,10 @@ func TestIndexPredicateTypeDependencyIsDerivedAndOrdered(t *testing.T) {
 	}
 	if !foundTypeDependency {
 		t.Fatalf("index predicate dependencies=%+v", normalizedIndex.Dependencies)
+	}
+	definition := stringValue(spec(normalizedIndex), "definition")
+	if !strings.Contains(definition, "global.cell_type") || !strings.Contains(definition, "global.cell_status") {
+		t.Fatalf("index predicate casts are not schema-qualified: %s", definition)
 	}
 	hcl, err := source.FormatHCL(desired)
 	if err != nil {
@@ -518,7 +524,7 @@ func TestIndexPredicateTypeDependencyIsDerivedAndOrdered(t *testing.T) {
 	otherType := renderResource(schema.KindEnum, schema.Name{Schema: "global", Name: "other_type", Parent: ns.ID}, `{"values":["shared"]}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
 	badIndex := index
 	badIndex.Dependencies = append(badIndex.Dependencies, schema.Dependency{Target: otherType.ID, Type: schema.DependencyUses})
-	bad, err := New().Normalize(context.Background(), schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, cellType, otherType, table, column, badIndex}}})
+	bad, err := New().Normalize(context.Background(), schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, cellType, cellStatus, otherType, table, column, status, badIndex}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -545,6 +551,9 @@ func TestIndexPredicateTypeDependencyIsDerivedAndOrdered(t *testing.T) {
 			}
 			if strings.Contains(step.SQL, "idx_cells_available_shared") && strings.Contains(step.SQL, "CREATE INDEX") {
 				indexPosition = position
+				if !strings.Contains(step.SQL, "global.cell_type") || !strings.Contains(step.SQL, "global.cell_status") {
+					t.Fatalf("concurrent=%v unqualified index SQL: %s", concurrent, step.SQL)
+				}
 			}
 		}
 		if typePosition < 0 || indexPosition < 0 || typePosition >= indexPosition {

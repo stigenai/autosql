@@ -1007,6 +1007,9 @@ func renderCreateIndex(r schema.Resource, resources map[string]schema.Resource, 
 	if err := validateIndexAvailability(r, parsed, resources, options); err != nil {
 		return nil, err
 	}
+	if err := schemaBindIndexTypeCasts(&parsed, r, resources); err != nil {
+		return nil, err
+	}
 	if enabled(options, "concurrent_indexes", false) {
 		parsed.statement.Concurrent = true
 		sql, deparseErr := pg_query.Deparse(parsed.tree)
@@ -1029,6 +1032,9 @@ func renderConcurrentIndexRebuild(before, after schema.Resource, resources map[s
 		return nil, err
 	}
 	if err := validateIndexAvailability(after, parsed, resources, options); err != nil {
+		return nil, err
+	}
+	if err := schemaBindIndexTypeCasts(&parsed, after, resources); err != nil {
 		return nil, err
 	}
 	shadow := "autosql_rebuild_" + strings.TrimPrefix(after.ID, string(after.Kind)+":")

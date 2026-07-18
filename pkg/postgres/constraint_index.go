@@ -213,6 +213,26 @@ func parseIndexDefinition(resource schema.Resource, resources map[string]schema.
 	return parsedIndex{statement: statement, tree: parsed, SQL: sql}, nil
 }
 
+func schemaBindIndexTypeCasts(parsed *parsedIndex, resource schema.Resource, resources map[string]schema.Resource) error {
+	managedType := false
+	for _, dependency := range resource.Dependencies {
+		target := resources[dependency.Target]
+		managedType = managedType || dependency.Type == schema.DependencyUses && (target.Kind == schema.KindEnum || target.Kind == schema.KindDomain || target.Kind == schema.KindComposite)
+	}
+	if !managedType {
+		return nil
+	}
+	if err := qualifyExpressionTypeCasts(parsed.statement.ProtoReflect(), resource.Name.Schema, resource, resources); err != nil {
+		return err
+	}
+	sql, err := pg_query.Deparse(parsed.tree)
+	if err != nil {
+		return unsupported(resource, "index definition could not be schema-bound")
+	}
+	parsed.SQL = sql
+	return nil
+}
+
 func constraintParentResource(resource schema.Resource, resources map[string]schema.Resource) (schema.Resource, error) {
 	parent, ok := resources[resource.Name.Parent]
 	if !ok || parent.Kind != schema.KindTable {
