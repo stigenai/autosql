@@ -167,7 +167,7 @@ func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Documen
 	if err := canonicalizeConstraintIndexTypeDependencies(&doc); err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
-	if err := canonicalizeConstraintIndexTypeCasts(&doc); err != nil {
+	if err := canonicalizeConstraintIndexBindings(&doc); err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
 	if err := canonicalizeColumnOrdinals(&doc); err != nil {
@@ -316,14 +316,17 @@ func canonicalizeConstraintIndexTypeDependencies(doc *schema.Document) error {
 	return nil
 }
 
-func canonicalizeConstraintIndexTypeCasts(doc *schema.Document) error {
+func canonicalizeConstraintIndexBindings(doc *schema.Document) error {
 	resources := make(map[string]schema.Resource, len(doc.Graph.Resources))
 	for _, resource := range doc.Graph.Resources {
 		resources[resource.ID] = resource
 	}
 	for index := range doc.Graph.Resources {
 		resource := &doc.Graph.Resources[index]
-		if resource.Kind != schema.KindCheckConstraint && resource.Kind != schema.KindIndex {
+		if resource.Kind != schema.KindCheckConstraint && resource.Kind != schema.KindForeignKey && resource.Kind != schema.KindIndex {
+			continue
+		}
+		if resource.Kind == schema.KindForeignKey && stringValue(spec(*resource), "definition") == "" {
 			continue
 		}
 		hasManagedType := false
@@ -331,7 +334,7 @@ func canonicalizeConstraintIndexTypeCasts(doc *schema.Document) error {
 			target := resources[dependency.Target]
 			hasManagedType = hasManagedType || dependency.Type == schema.DependencyUses && (target.Kind == schema.KindEnum || target.Kind == schema.KindDomain || target.Kind == schema.KindComposite)
 		}
-		if !hasManagedType {
+		if !hasManagedType && resource.Kind != schema.KindForeignKey {
 			continue
 		}
 		definition := ""
