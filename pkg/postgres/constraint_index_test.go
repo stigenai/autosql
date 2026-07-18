@@ -10,6 +10,7 @@ import (
 	"autosql/pkg/plan"
 	"autosql/pkg/plugin"
 	"autosql/pkg/schema"
+	"autosql/pkg/source"
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 )
 
@@ -465,6 +466,90 @@ func TestConstraintIndexPlanOrderingAndPhaseIdentityAreStable(t *testing.T) {
 	}
 	if !hasProhibited {
 		t.Fatalf("concurrent phase missing: %+v", first.Phases)
+	}
+}
+
+func TestIndexPredicateTypeDependencyIsDerivedAndOrdered(t *testing.T) {
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "global"}, `{}`)
+	cellType := renderResource(schema.KindEnum, schema.Name{Schema: "global", Name: "cell_type", Parent: ns.ID}, `{"values":["shared","dedicated"]}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	table := renderResource(schema.KindTable, schema.Name{Schema: "global", Name: "cells", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	column := renderResource(schema.KindColumn, schema.Name{Schema: "global", Name: "type", Parent: table.ID}, `{"type":"global.cell_type","not_null":true,"ordinal":1}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: cellType.ID, Type: schema.DependencyUses})
+	index := renderResource(schema.KindIndex, schema.Name{Schema: "global", Name: "idx_cells_available_shared", Parent: table.ID}, `{"definition":"CREATE INDEX idx_cells_available_shared ON global.cells (type) WHERE (type = 'shared'::cell_type)","method":"btree","unique":false,"valid":true,"ready":true,"columns":["type"]}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: column.ID, Type: schema.DependencyReferences})
+	desired, err := New().Normalize(context.Background(), schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, cellType, table, column, index}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var normalizedIndex schema.Resource
+	for _, resource := range desired.Graph.Resources {
+		if resource.ID == index.ID {
+			normalizedIndex = resource
+		}
+	}
+	foundTypeDependency := false
+	for _, dependency := range normalizedIndex.Dependencies {
+		foundTypeDependency = foundTypeDependency || dependency.Target == cellType.ID && dependency.Type == schema.DependencyUses
+	}
+	if !foundTypeDependency {
+		t.Fatalf("index predicate dependencies=%+v", normalizedIndex.Dependencies)
+	}
+	hcl, err := source.FormatHCL(desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip, err := source.LoadContext(context.Background(), source.Input{URI: "index-predicate.hcl", Format: source.FormatHCLSource, Data: hcl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip, err = New().Normalize(context.Background(), roundTrip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundTypeDependency = false
+	for _, resource := range roundTrip.Graph.Resources {
+		if resource.ID == index.ID {
+			for _, dependency := range resource.Dependencies {
+				foundTypeDependency = foundTypeDependency || dependency.Target == cellType.ID && dependency.Type == schema.DependencyUses
+			}
+		}
+	}
+	if !foundTypeDependency {
+		t.Fatal("index predicate type dependency was lost through HCL")
+	}
+	otherType := renderResource(schema.KindEnum, schema.Name{Schema: "global", Name: "other_type", Parent: ns.ID}, `{"values":["shared"]}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	badIndex := index
+	badIndex.Dependencies = append(badIndex.Dependencies, schema.Dependency{Target: otherType.ID, Type: schema.DependencyUses})
+	bad, err := New().Normalize(context.Background(), schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, cellType, otherType, table, column, badIndex}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if statements, renderErr := RenderDocument(context.Background(), bad, nil); renderErr == nil || len(statements) != 0 {
+		t.Fatalf("mismatched index type dependency statements=%+v err=%v", statements, renderErr)
+	}
+	empty, err := New().Normalize(context.Background(), schema.Document{Version: schema.SchemaVersion})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, concurrent := range []bool{false, true} {
+		options := map[string]string{}
+		if concurrent {
+			options["concurrent_indexes"] = "true"
+		}
+		built, buildErr := plan.Build(context.Background(), New(), empty, desired, plan.Options{Render: options})
+		if buildErr != nil {
+			t.Fatalf("concurrent=%v: %v", concurrent, buildErr)
+		}
+		typePosition, indexPosition := -1, -1
+		for position, step := range built.Steps {
+			if strings.Contains(step.SQL, `CREATE TYPE "global"."cell_type"`) {
+				typePosition = position
+			}
+			if strings.Contains(step.SQL, "idx_cells_available_shared") && strings.Contains(step.SQL, "CREATE INDEX") {
+				indexPosition = position
+			}
+		}
+		if typePosition < 0 || indexPosition < 0 || typePosition >= indexPosition {
+			t.Fatalf("concurrent=%v type=%d index=%d steps=%+v", concurrent, typePosition, indexPosition, built.Steps)
+		}
 	}
 }
 

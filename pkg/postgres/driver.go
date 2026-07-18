@@ -15,6 +15,7 @@ import (
 	"autosql/pkg/plugin"
 	"autosql/pkg/schema"
 	"github.com/jackc/pgx/v5"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 const version = "0.1.0"
@@ -163,7 +164,7 @@ func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Documen
 	if err := canonicalizeUsedTypes(&doc); err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
-	if err := canonicalizeConstraintTypeDependencies(&doc); err != nil {
+	if err := canonicalizeConstraintIndexTypeDependencies(&doc); err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
 	if err := canonicalizeConstraintTypeCasts(&doc); err != nil {
@@ -266,24 +267,38 @@ func canonicalizeUsedTypes(doc *schema.Document) error {
 	return nil
 }
 
-func canonicalizeConstraintTypeDependencies(doc *schema.Document) error {
+func canonicalizeConstraintIndexTypeDependencies(doc *schema.Document) error {
 	resources := make(map[string]schema.Resource, len(doc.Graph.Resources))
 	for _, resource := range doc.Graph.Resources {
 		resources[resource.ID] = resource
 	}
 	for index := range doc.Graph.Resources {
 		resource := &doc.Graph.Resources[index]
-		if resource.Kind != schema.KindCheckConstraint {
+		if resource.Kind != schema.KindCheckConstraint && resource.Kind != schema.KindIndex {
 			continue
 		}
-		parsed, err := parseConstraintDefinition(*resource, resources)
+		var expressionRoot protoreflect.Message
+		var err error
+		if resource.Kind == schema.KindIndex {
+			var parsed parsedIndex
+			parsed, err = parseIndexDefinition(*resource, resources)
+			if err == nil {
+				expressionRoot = parsed.statement.ProtoReflect()
+			}
+		} else {
+			var parsed parsedConstraint
+			parsed, err = parseConstraintDefinition(*resource, resources)
+			if err == nil {
+				expressionRoot = parsed.statement.ProtoReflect()
+			}
+		}
 		if err != nil {
-			// Normalization historically leaves unsupported constraint grammar to
+			// Normalization historically leaves unsupported constraint/index grammar to
 			// the scoped renderer. Preserve that contract when no dependency can
 			// be proven from a parser-bound expression.
 			continue
 		}
-		targets, err := expressionTypeDependencies(parsed.statement.ProtoReflect(), resource.Name.Schema, *resource, resources)
+		targets, err := expressionTypeDependencies(expressionRoot, resource.Name.Schema, *resource, resources)
 		if err != nil {
 			return err
 		}
