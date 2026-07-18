@@ -17,6 +17,7 @@ import (
 type parsedConstraint struct {
 	statement  *pg_query.AlterTableStmt
 	constraint *pg_query.Constraint
+	tree       *pg_query.ParseResult
 }
 
 func parseConstraintDefinition(resource schema.Resource, resources map[string]schema.Resource) (parsedConstraint, error) {
@@ -77,7 +78,72 @@ func parseConstraintDefinition(resource schema.Resource, resources map[string]sc
 			return parsedConstraint{}, unsupported(resource, "constraint validated metadata does not match its definition")
 		}
 	}
-	return parsedConstraint{statement: statement, constraint: constraint}, nil
+	return parsedConstraint{statement: statement, constraint: constraint, tree: parsed}, nil
+}
+
+func renderConstraintCreateSQL(resource schema.Resource, resources map[string]schema.Resource) (string, error) {
+	sql, _, err := renderConstraintCreate(resource, resources)
+	return sql, err
+}
+
+func renderConstraintCreate(resource schema.Resource, resources map[string]schema.Resource) (string, string, error) {
+	parsed, err := parseConstraintDefinition(resource, resources)
+	if err != nil {
+		return "", "", err
+	}
+	managedType := false
+	for _, dependency := range resource.Dependencies {
+		target := resources[dependency.Target]
+		managedType = managedType || dependency.Type == schema.DependencyUses && (target.Kind == schema.KindEnum || target.Kind == schema.KindDomain || target.Kind == schema.KindComposite)
+	}
+	if !managedType {
+		parent, parentErr := constraintParentResource(resource, resources)
+		if parentErr != nil {
+			return "", "", parentErr
+		}
+		definition := stringValue(spec(resource), "definition")
+		return "ALTER TABLE " + qualified(parent.Name) + " ADD CONSTRAINT " + quote(resource.Name.Name) + " " + definition, definition, nil
+	}
+	if err := qualifyExpressionTypeCasts(parsed.statement.ProtoReflect(), resource.Name.Schema, resource, resources); err != nil {
+		return "", "", err
+	}
+	sql, err := pg_query.Deparse(parsed.tree)
+	if err != nil {
+		return "", "", unsupported(resource, "constraint definition could not be schema-bound")
+	}
+	marker := " ADD CONSTRAINT "
+	position := strings.Index(sql, marker)
+	if position < 0 {
+		return "", "", unsupported(resource, "schema-bound constraint changed statement shape")
+	}
+	remainder := strings.TrimSpace(sql[position+len(marker):])
+	if remainder == "" {
+		return "", "", unsupported(resource, "schema-bound constraint lost its identity")
+	}
+	if remainder[0] == '"' {
+		index := 1
+		for index < len(remainder) {
+			if remainder[index] != '"' {
+				index++
+				continue
+			}
+			if index+1 < len(remainder) && remainder[index+1] == '"' {
+				index += 2
+				continue
+			}
+			index++
+			remainder = strings.TrimSpace(remainder[index:])
+			break
+		}
+	} else if index := strings.IndexByte(remainder, ' '); index >= 0 {
+		remainder = strings.TrimSpace(remainder[index+1:])
+	} else {
+		remainder = ""
+	}
+	if remainder == "" {
+		return "", "", unsupported(resource, "schema-bound constraint lost its definition")
+	}
+	return sql, remainder, nil
 }
 
 type parsedIndex struct {
@@ -322,6 +388,13 @@ func constraintIndexExpectedDependencies(resource schema.Resource, resources map
 		if stringValue(spec(resources[routine]), "volatility") != "i" {
 			return nil, unsupported(resource, "check and index expression routines must be immutable")
 		}
+	}
+	if resource.Kind == schema.KindCheckConstraint {
+		types, typeErr := expressionTypeDependencies(expressionRoot, resource.Name.Schema, resource, resources)
+		if typeErr != nil {
+			return nil, typeErr
+		}
+		expected = append(expected, types...)
 	}
 	if resource.Kind != schema.KindForeignKey {
 		return expected, nil

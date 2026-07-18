@@ -195,7 +195,7 @@ func inspectSnapshot(ctx context.Context, conn catalogQueryer, req plugin.Inspec
 		{"routines", "USAGE on schemas and routines", i.inspectRoutines},
 		{"routine dependencies", "USAGE on schemas, routines, types, and relations", i.inspectRoutineDependencies},
 		{"column routine dependencies", "USAGE on column defaults and routines", i.inspectColumnRoutineDependencies},
-		{"expression routine dependencies", "USAGE on constraints, indexes, and routines", i.inspectExpressionRoutineDependencies},
+		{"expression dependencies", "USAGE on constraints, indexes, routines, and types", i.inspectExpressionDependencies},
 		{"generated column dependencies", "USAGE on schemas, columns, and routines", i.inspectGeneratedColumnDependencies},
 		{"triggers", "USAGE on schemas and tables", i.inspectTriggers},
 	}
@@ -1121,19 +1121,20 @@ func (i *inspector) inspectRoutineDependencies(ctx context.Context) error {
 	return rows.Err()
 }
 
-func (i *inspector) inspectExpressionRoutineDependencies(ctx context.Context) error {
-	rows, err := i.conn.Query(ctx, `select distinct d.classid::regclass::text,d.objid::oid,d.refobjid::oid from pg_depend d join pg_proc p on p.oid=d.refobjid join pg_namespace n on n.oid=p.pronamespace where d.classid in ('pg_constraint'::regclass,'pg_class'::regclass) and d.refclassid='pg_proc'::regclass and d.deptype in ('n','a') and n.nspname <> 'information_schema' and n.nspname !~ '^pg_' order by 1,2,3`)
+func (i *inspector) inspectExpressionDependencies(ctx context.Context) error {
+	rows, err := i.conn.Query(ctx, `select distinct d.classid::regclass::text,d.objid::oid,d.refclassid::regclass::text,d.refobjid::oid from pg_depend d where d.classid in ('pg_constraint'::regclass,'pg_class'::regclass) and (d.refclassid='pg_proc'::regclass or d.classid='pg_constraint'::regclass and d.refclassid='pg_type'::regclass) and d.deptype in ('n','a') order by 1,2,3,4`)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var catalog string
+		var catalog, targetCatalog string
 		var fromOID, toOID uint32
-		if err := rows.Scan(&catalog, &fromOID, &toOID); err != nil {
+		if err := rows.Scan(&catalog, &fromOID, &targetCatalog, &toOID); err != nil {
 			return err
 		}
-		from, to := i.byOID[fromOID], i.byOID[toOID]
+		from := i.byCatalog[catalogOID{catalog: catalog, oid: fromOID}]
+		to := i.byCatalog[catalogOID{catalog: targetCatalog, oid: toOID}]
 		if from == "" || to == "" {
 			continue
 		}
@@ -1142,12 +1143,16 @@ func (i *inspector) inspectExpressionRoutineDependencies(ctx context.Context) er
 			if resource.ID != from || catalog == "pg_class" && resource.Kind != schema.KindIndex {
 				continue
 			}
+			dependencyType := schema.DependencyReferences
+			if targetCatalog == "pg_type" {
+				dependencyType = schema.DependencyUses
+			}
 			exists := false
 			for _, dependency := range resource.Dependencies {
-				exists = exists || dependency.Target == to && dependency.Type == schema.DependencyReferences
+				exists = exists || dependency.Target == to && dependency.Type == dependencyType
 			}
 			if !exists {
-				resource.Dependencies = append(resource.Dependencies, schema.Dependency{Target: to, Type: schema.DependencyReferences})
+				resource.Dependencies = append(resource.Dependencies, schema.Dependency{Target: to, Type: dependencyType})
 			}
 		}
 	}

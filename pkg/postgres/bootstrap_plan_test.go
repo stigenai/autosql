@@ -226,6 +226,40 @@ func schemaStepByID(schemaPlan plan.Plan, id string) plan.Step {
 	return plan.Step{}
 }
 
+func TestManagedBootstrapOrdersEnumBeforeDependentCheckConstraint(t *testing.T) {
+	namespace := renderResource(schema.KindSchema, schema.Name{Name: "global"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "global", Name: "cells", Parent: namespace.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
+	cellType := renderResource(schema.KindEnum, schema.Name{Schema: "global", Name: "cell_type", Parent: namespace.ID}, `{"values":["dedicated","isolated","shared"]}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
+	typeColumn := renderResource(schema.KindColumn, schema.Name{Schema: "global", Name: "type", Parent: table.ID}, `{"type":"global.cell_type","not_null":true,"ordinal":1}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: cellType.ID, Type: schema.DependencyUses})
+	check := renderResource(schema.KindCheckConstraint, schema.Name{Schema: "global", Name: "cells_dedicated_capacity_check", Parent: table.ID}, `{"definition":"CHECK (type = ANY (ARRAY['dedicated'::cell_type, 'isolated'::cell_type, 'shared'::cell_type]))","columns":["type"],"deferrable":false,"initially_deferred":false,"validated":true}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: typeColumn.ID, Type: schema.DependencyReferences}, schema.Dependency{Target: cellType.ID, Type: schema.DependencyUses})
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{check, typeColumn, table, cellType, namespace}}}
+	target := bootstrap.DatabaseTarget{Mode: bootstrap.ManagedDatabase, Endpoint: bootstrap.ServerEndpoint{Host: "db.internal", TLSMode: "verify-full"}, MaintenanceDatabase: "postgres", Name: "app", Owner: "postgres", ConnectionLimit: -1, AllowConnections: true}
+
+	whole, err := PlanDatabaseBootstrap(context.Background(), target, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	typePosition, checkPosition := -1, -1
+	var typeStepID, checkStepID string
+	for position, step := range whole.SchemaPlan.Steps {
+		switch {
+		case strings.Contains(step.SQL, `CREATE TYPE "global"."cell_type"`):
+			typePosition, typeStepID = position, step.ID
+		case strings.Contains(step.SQL, `ADD CONSTRAINT`) && strings.Contains(step.SQL, `cells_dedicated_capacity_check`):
+			checkPosition, checkStepID = position, step.ID
+			if !strings.Contains(step.SQL, `'dedicated'::global.cell_type`) {
+				t.Fatalf("constraint enum casts are not schema-bound: %s", step.SQL)
+			}
+		}
+	}
+	if typePosition < 0 || checkPosition < 0 || typePosition >= checkPosition {
+		t.Fatalf("enum type position=%d constraint position=%d", typePosition, checkPosition)
+	}
+	if !containsBootstrapID(schemaStepByID(whole.SchemaPlan, checkStepID).DependsOn, typeStepID) {
+		t.Fatalf("constraint step is missing direct enum dependency: %+v", schemaStepByID(whole.SchemaPlan, checkStepID))
+	}
+}
+
 func containsBootstrapID(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {

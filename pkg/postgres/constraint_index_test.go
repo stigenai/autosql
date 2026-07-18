@@ -37,6 +37,47 @@ func TestCellProvisioningConstraintIndexInventoryIsManaged(t *testing.T) {
 	}
 }
 
+func TestCheckConstraintQualifiesDeclaredEnumCastDependencies(t *testing.T) {
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "global"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "global", Name: "cells", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	cellType := renderResource(schema.KindEnum, schema.Name{Schema: "global", Name: "cell_type", Parent: ns.ID}, `{"values":["dedicated","isolated","shared"]}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	typeColumn := renderResource(schema.KindColumn, schema.Name{Schema: "global", Name: "type", Parent: table.ID}, `{"type":"global.cell_type","not_null":true,"ordinal":1}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: cellType.ID, Type: schema.DependencyUses})
+	check := renderResource(schema.KindCheckConstraint, schema.Name{Schema: "global", Name: "cells_dedicated_capacity_check", Parent: table.ID}, `{"definition":"CHECK (type = ANY (ARRAY['dedicated'::cell_type, 'isolated'::cell_type, 'shared'::cell_type]))","columns":["type"],"deferrable":false,"initially_deferred":false,"validated":true}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: typeColumn.ID, Type: schema.DependencyReferences}, schema.Dependency{Target: cellType.ID, Type: schema.DependencyUses})
+	resources := []schema.Resource{ns, table, cellType, typeColumn, check}
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: resources}}
+	current := desired
+	current.Graph.Resources = resources[:len(resources)-1]
+	changes := schema.ChangeSet{Version: schema.ChangeVersion, Changes: []schema.Change{{ID: "create", Operation: schema.OperationCreate, ResourceID: check.ID, After: &check}}}
+
+	out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Current: current, Desired: desired})
+	if err != nil || len(out) != 1 {
+		t.Fatalf("statements=%+v err=%v", out, err)
+	}
+	if !strings.Contains(out[0].SQL, `'dedicated'::global.cell_type`) || !strings.Contains(out[0].SQL, `'isolated'::global.cell_type`) || !strings.Contains(out[0].SQL, `'shared'::global.cell_type`) {
+		t.Fatalf("constraint casts are not bound to the declared enum dependency: %s", out[0].SQL)
+	}
+	otherType := renderResource(schema.KindEnum, schema.Name{Schema: "global", Name: "other_type", Parent: ns.ID}, `{"values":["dedicated"]}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	for _, fixture := range []struct {
+		name string
+		deps []schema.Dependency
+	}{
+		{"missing", []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}, {Target: typeColumn.ID, Type: schema.DependencyReferences}}},
+		{"mismatched", []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}, {Target: typeColumn.ID, Type: schema.DependencyReferences}, {Target: otherType.ID, Type: schema.DependencyUses}}},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			unsafe := check
+			unsafe.Dependencies = fixture.deps
+			unsafeDesired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, cellType, otherType, typeColumn, unsafe}}}
+			unsafeCurrent := unsafeDesired
+			unsafeCurrent.Graph.Resources = unsafeDesired.Graph.Resources[:len(unsafeDesired.Graph.Resources)-1]
+			unsafeChanges := schema.ChangeSet{Version: schema.ChangeVersion, Changes: []schema.Change{{ID: "create", Operation: schema.OperationCreate, ResourceID: unsafe.ID, After: &unsafe}}}
+			if rendered, renderErr := New().Render(context.Background(), plugin.RenderRequest{Changes: unsafeChanges, Current: unsafeCurrent, Desired: unsafeDesired}); renderErr == nil || len(rendered) != 0 {
+				t.Fatalf("unsafe constraint dependency rendered: statements=%+v err=%v", rendered, renderErr)
+			}
+		})
+	}
+}
+
 func TestConstraintAndIndexDefinitionsAreParserBounded(t *testing.T) {
 	ns := renderResource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
 	table := renderResource(schema.KindTable, schema.Name{Schema: "app", Name: "users", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
