@@ -276,7 +276,7 @@ func TestConstraintIndexCreateCommentsAndForeignKeyDependencies(t *testing.T) {
 	users := renderResource(schema.KindTable, schema.Name{Schema: "app", Name: "users", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
 	orders := renderResource(schema.KindTable, schema.Name{Schema: "app", Name: "orders", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
 	usersPK := renderResource(schema.KindPrimaryKey, schema.Name{Schema: "app", Name: "users_pkey", Parent: users.ID}, `{"definition":"PRIMARY KEY (id)","deferrable":false,"initially_deferred":false,"validated":true}`, schema.Dependency{Target: users.ID, Type: schema.DependencyContains})
-	fk := renderResource(schema.KindForeignKey, schema.Name{Schema: "app", Name: "orders_user_fkey", Parent: orders.ID}, `{"definition":"FOREIGN KEY (user_id) REFERENCES app.users(id) ON UPDATE CASCADE ON DELETE RESTRICT","deferrable":false,"initially_deferred":false,"validated":true}`, schema.Dependency{Target: orders.ID, Type: schema.DependencyContains}, schema.Dependency{Target: users.ID, Type: schema.DependencyReferences}, schema.Dependency{Target: usersPK.ID, Type: schema.DependencyReferences})
+	fk := renderResource(schema.KindForeignKey, schema.Name{Schema: "app", Name: "orders_user_fkey", Parent: orders.ID}, `{"definition":"FOREIGN KEY (user_id) REFERENCES users(id) ON UPDATE CASCADE ON DELETE RESTRICT","deferrable":false,"initially_deferred":false,"validated":true}`, schema.Dependency{Target: orders.ID, Type: schema.DependencyContains}, schema.Dependency{Target: users.ID, Type: schema.DependencyReferences}, schema.Dependency{Target: usersPK.ID, Type: schema.DependencyReferences})
 	fk.Annotations = map[string]string{"comment": "tenant ownership"}
 	index := renderResource(schema.KindIndex, schema.Name{Schema: "app", Name: "orders_user_idx", Parent: orders.ID}, `{"definition":"CREATE INDEX orders_user_idx ON app.orders USING btree (user_id)","method":"btree","unique":false,"valid":true,"ready":true}`, schema.Dependency{Target: orders.ID, Type: schema.DependencyContains})
 	index.Annotations = map[string]string{"comment": "join support"}
@@ -298,6 +298,7 @@ func TestConstraintIndexCreateCommentsAndForeignKeyDependencies(t *testing.T) {
 	joined := strings.Join(sql, "\n")
 	for _, want := range []string{
 		`ALTER TABLE "app"."orders" ADD CONSTRAINT "orders_user_fkey"`,
+		`REFERENCES app.users (id)`,
 		`CREATE INDEX orders_user_idx ON app.orders`,
 		`COMMENT ON CONSTRAINT "orders_user_fkey" ON "app"."orders" IS 'tenant ownership';`,
 		`COMMENT ON INDEX "app"."orders_user_idx" IS 'join support';`,

@@ -91,12 +91,16 @@ func renderConstraintCreate(resource schema.Resource, resources map[string]schem
 	if err != nil {
 		return "", "", err
 	}
+	schemaBound, err := schemaBindForeignKeyReference(&parsed, resource, resources)
+	if err != nil {
+		return "", "", err
+	}
 	managedType := false
 	for _, dependency := range resource.Dependencies {
 		target := resources[dependency.Target]
 		managedType = managedType || dependency.Type == schema.DependencyUses && (target.Kind == schema.KindEnum || target.Kind == schema.KindDomain || target.Kind == schema.KindComposite)
 	}
-	if !managedType {
+	if !managedType && !schemaBound {
 		parent, parentErr := constraintParentResource(resource, resources)
 		if parentErr != nil {
 			return "", "", parentErr
@@ -143,7 +147,48 @@ func renderConstraintCreate(resource schema.Resource, resources map[string]schem
 	if remainder == "" {
 		return "", "", unsupported(resource, "schema-bound constraint lost its definition")
 	}
+	parent, err := constraintParentResource(resource, resources)
+	if err != nil {
+		return "", "", err
+	}
+	sql = "ALTER TABLE " + qualified(parent.Name) + " ADD CONSTRAINT " + quote(resource.Name.Name) + " " + remainder
 	return sql, remainder, nil
+}
+
+func schemaBindForeignKeyReference(parsed *parsedConstraint, resource schema.Resource, resources map[string]schema.Resource) (bool, error) {
+	if resource.Kind != schema.KindForeignKey {
+		return false, nil
+	}
+	reference := parsed.constraint.GetPktable()
+	if reference == nil || reference.GetCatalogname() != "" || reference.GetRelname() == "" {
+		return false, unsupported(resource, "foreign key referenced table is not canonical")
+	}
+	target, err := foreignKeyReferencedTable(resource, reference, resources)
+	if err != nil {
+		return false, err
+	}
+	reference.Schemaname = target.Name.Schema
+	reference.Relname = target.Name.Name
+	return true, nil
+}
+
+func foreignKeyReferencedTable(resource schema.Resource, reference *pg_query.RangeVar, resources map[string]schema.Resource) (schema.Resource, error) {
+	seen := map[string]bool{}
+	var matches []schema.Resource
+	for _, dependency := range resource.Dependencies {
+		candidate, ok := resources[dependency.Target]
+		if dependency.Type == schema.DependencyReferences && ok && candidate.Kind == schema.KindTable && !seen[candidate.ID] {
+			seen[candidate.ID] = true
+			matches = append(matches, candidate)
+		}
+	}
+	if len(matches) != 1 {
+		return schema.Resource{}, unsupported(resource, "foreign key referenced table dependency is missing or ambiguous")
+	}
+	if reference.GetRelname() != matches[0].Name.Name || reference.GetSchemaname() != "" && reference.GetSchemaname() != matches[0].Name.Schema {
+		return schema.Resource{}, unsupported(resource, "foreign key referenced table does not match its exact references dependency")
+	}
+	return matches[0], nil
 }
 
 type parsedIndex struct {
@@ -427,41 +472,36 @@ func constraintIndexExpectedDependencies(resource schema.Resource, resources map
 	if reference == nil || reference.GetCatalogname() != "" || reference.GetRelname() == "" {
 		return nil, unsupported(resource, "foreign key referenced table is not canonical")
 	}
-	schemaName := reference.GetSchemaname()
-	if schemaName == "" {
-		schemaName = resource.Name.Schema
+	target, err := foreignKeyReferencedTable(resource, reference, resources)
+	if err != nil {
+		return nil, err
 	}
-	for id, candidate := range resources {
-		if candidate.Kind == schema.KindTable && candidate.Name.Schema == schemaName && candidate.Name.Name == reference.GetRelname() {
-			expected = append(expected, id)
-			if err := addColumns(candidate, "referenced_columns"); err != nil {
-				return nil, err
-			}
-			var keys []string
-			for keyID, key := range resources {
-				if (key.Kind == schema.KindPrimaryKey || key.Kind == schema.KindUniqueConstraint) && key.Name.Parent == candidate.ID && slices.Equal(stringSlice(spec(key), "columns"), stringSlice(spec(resource), "referenced_columns")) {
-					keys = append(keys, keyID)
-				}
-			}
-			if len(keys) == 0 {
-				return nil, unsupported(resource, "foreign key has no matching referenced primary or unique constraint")
-			}
-			selected := ""
-			for _, dependency := range resource.Dependencies {
-				if slices.Contains(keys, dependency.Target) {
-					selected = dependency.Target
-					break
-				}
-			}
-			if selected == "" && len(keys) == 1 {
-				selected = keys[0]
-			}
-			if selected == "" {
-				return nil, unsupported(resource, "foreign key referenced key dependency is ambiguous")
-			}
-			expected = append(expected, selected)
-			return expected, nil
+	expected = append(expected, target.ID)
+	if err := addColumns(target, "referenced_columns"); err != nil {
+		return nil, err
+	}
+	var keys []string
+	for keyID, key := range resources {
+		if (key.Kind == schema.KindPrimaryKey || key.Kind == schema.KindUniqueConstraint) && key.Name.Parent == target.ID && slices.Equal(stringSlice(spec(key), "columns"), stringSlice(spec(resource), "referenced_columns")) {
+			keys = append(keys, keyID)
 		}
 	}
-	return nil, unsupported(resource, "foreign key referenced table is missing from the desired graph")
+	if len(keys) == 0 {
+		return nil, unsupported(resource, "foreign key has no matching referenced primary or unique constraint")
+	}
+	selected := ""
+	for _, dependency := range resource.Dependencies {
+		if slices.Contains(keys, dependency.Target) {
+			selected = dependency.Target
+			break
+		}
+	}
+	if selected == "" && len(keys) == 1 {
+		selected = keys[0]
+	}
+	if selected == "" {
+		return nil, unsupported(resource, "foreign key referenced key dependency is ambiguous")
+	}
+	expected = append(expected, selected)
+	return expected, nil
 }

@@ -224,7 +224,7 @@ func TestCreateHelpersRemainDeterministicForInspectedKinds(t *testing.T) {
 		renderResource(schema.KindPrimaryKey, schema.Name{Schema: "app", Name: "users_pkey", Parent: table.ID}, `{"definition":"PRIMARY KEY (id)"}`),
 		renderResource(schema.KindUniqueConstraint, schema.Name{Schema: "app", Name: "users_id_key", Parent: table.ID}, `{"definition":"UNIQUE (id)"}`),
 		renderResource(schema.KindCheckConstraint, schema.Name{Schema: "app", Name: "users_id_check", Parent: table.ID}, `{"definition":"CHECK (id > 0)"}`),
-		renderResource(schema.KindForeignKey, schema.Name{Schema: "app", Name: "users_parent_fkey", Parent: table.ID}, `{"definition":"FOREIGN KEY (id) REFERENCES app.users(id)"}`),
+		renderResource(schema.KindForeignKey, schema.Name{Schema: "app", Name: "users_parent_fkey", Parent: table.ID}, `{"definition":"FOREIGN KEY (id) REFERENCES app.users(id)"}`, schema.Dependency{Target: table.ID, Type: schema.DependencyReferences}),
 		renderResource(schema.KindIndex, schema.Name{Schema: "app", Name: "users_idx", Parent: table.ID}, `{"definition":"(id)"}`),
 		renderResource(schema.KindView, schema.Name{Schema: "app", Name: "user_view", Parent: s.ID}, `{"definition":"SELECT 1 AS value"}`),
 		renderResource(schema.KindMaterializedView, schema.Name{Schema: "app", Name: "user_mv", Parent: s.ID}, `{"definition":"SELECT 1 AS value"}`),

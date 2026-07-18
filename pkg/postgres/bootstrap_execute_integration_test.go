@@ -420,6 +420,83 @@ func TestManagedBootstrapExecutesSchemaBoundIndexPredicateOutsideSearchPath(t *t
 	}
 }
 
+func TestManagedBootstrapExecutesSchemaBoundForeignKeyOutsideSearchPath(t *testing.T) {
+	maintenanceURL := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if maintenanceURL == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	target := bootstrapExecutionTarget(t, ctx, maintenanceURL, "autosql_bootstrap_fk_reference")
+	defer DropDatabaseURL(context.Background(), maintenanceURL, target.Name, true)
+	_ = DropDatabaseURL(ctx, maintenanceURL, target.Name, true)
+
+	namespace := renderResource(schema.KindSchema, schema.Name{Name: "global"}, `{}`)
+	channels := renderResource(schema.KindTable, schema.Name{Schema: "global", Name: "channels", Parent: namespace.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
+	channelID := renderResource(schema.KindColumn, schema.Name{Schema: "global", Name: "id", Parent: channels.ID}, `{"type":"bigint","not_null":true,"ordinal":1}`, schema.Dependency{Target: channels.ID, Type: schema.DependencyContains})
+	channelsPK := renderResource(schema.KindPrimaryKey, schema.Name{Schema: "global", Name: "channels_pkey", Parent: channels.ID}, `{"definition":"PRIMARY KEY (id)","columns":["id"],"deferrable":false,"initially_deferred":false,"validated":true}`, schema.Dependency{Target: channels.ID, Type: schema.DependencyContains}, schema.Dependency{Target: channelID.ID, Type: schema.DependencyReferences})
+	subscriptions := renderResource(schema.KindTable, schema.Name{Schema: "global", Name: "instance_subscriptions", Parent: namespace.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
+	subscriptionChannelID := renderResource(schema.KindColumn, schema.Name{Schema: "global", Name: "channel_id", Parent: subscriptions.ID}, `{"type":"bigint","not_null":true,"ordinal":1}`, schema.Dependency{Target: subscriptions.ID, Type: schema.DependencyContains})
+	foreignKey := renderResource(schema.KindForeignKey, schema.Name{Schema: "global", Name: "instance_subscriptions_channel_id_fkey", Parent: subscriptions.ID}, `{"definition":"FOREIGN KEY (channel_id) REFERENCES channels(id)","columns":["channel_id"],"referenced_columns":["id"],"deferrable":false,"initially_deferred":false,"validated":true}`, schema.Dependency{Target: subscriptions.ID, Type: schema.DependencyContains}, schema.Dependency{Target: subscriptionChannelID.ID, Type: schema.DependencyReferences}, schema.Dependency{Target: channels.ID, Type: schema.DependencyReferences}, schema.Dependency{Target: channelID.ID, Type: schema.DependencyReferences}, schema.Dependency{Target: channelsPK.ID, Type: schema.DependencyReferences})
+	desired, err := New().Normalize(ctx, schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{foreignKey, subscriptionChannelID, subscriptions, channelsPK, channelID, channels, namespace}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hcl, err := source.FormatHCL(desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err = source.LoadContext(ctx, source.Input{URI: "schema-bound-fk.hcl", Format: source.FormatHCLSource, Data: hcl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err = New().Normalize(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, resource := range desired.Graph.Resources {
+		if resource.ID == foreignKey.ID && !strings.Contains(stringValue(spec(resource), "definition"), "REFERENCES global.channels") {
+			t.Fatalf("foreign key target is not schema-bound: %s", stringValue(spec(resource), "definition"))
+		}
+	}
+	whole, err := PlanDatabaseBootstrap(ctx, target, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := ExecuteDatabaseBootstrapURL(ctx, maintenanceURL, whole, BootstrapExecutionHooks{})
+	if err != nil || !result.Completed {
+		t.Fatalf("schema-bound foreign key bootstrap result=%+v err=%v", result, err)
+	}
+	config, err := pgx.ParseConfig(maintenanceURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.Database = target.Name
+	conn, err := pgx.ConnectConfig(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	if _, err := conn.Exec(ctx, `insert into global.channels(id) values(1); insert into global.instance_subscriptions(channel_id) values(1)`); err != nil {
+		t.Fatal(err)
+	}
+	inspected, err := InspectConn(ctx, conn, Options{Schemas: []string{"global"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := New().Normalize(ctx, inspected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noOp, err := plan.Build(ctx, New(), current, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(noOp.Changes.Changes) != 0 || len(noOp.Steps) != 0 {
+		t.Fatalf("reinspected foreign key bootstrap did not converge: changes=%+v steps=%+v", noOp.Changes.Changes, noOp.Steps)
+	}
+}
+
 func TestWholeDatabaseBootstrapTransactionalFailureRollsBackAndIdentityIsBound(t *testing.T) {
 	maintenanceURL := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
 	if maintenanceURL == "" {
