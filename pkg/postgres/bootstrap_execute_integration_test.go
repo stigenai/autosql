@@ -16,6 +16,7 @@ import (
 	"autosql/pkg/bootstrap"
 	"autosql/pkg/plan"
 	"autosql/pkg/schema"
+	"autosql/pkg/source"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -654,10 +655,33 @@ func TestManagedBootstrapExecutesEnumCheckOutsideSearchPath(t *testing.T) {
 	cellType := renderResource(schema.KindEnum, schema.Name{Schema: "global", Name: "cell_type", Parent: namespace.ID}, `{"values":["dedicated","isolated","shared"]}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
 	id := renderResource(schema.KindColumn, schema.Name{Schema: "global", Name: "id", Parent: table.ID}, `{"type":"bigint","not_null":true,"ordinal":1}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains})
 	typeColumn := renderResource(schema.KindColumn, schema.Name{Schema: "global", Name: "type", Parent: table.ID}, `{"type":"global.cell_type","not_null":true,"ordinal":2}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: cellType.ID, Type: schema.DependencyUses})
-	check := renderResource(schema.KindCheckConstraint, schema.Name{Schema: "global", Name: "cells_dedicated_capacity_check", Parent: table.ID}, `{"definition":"CHECK (type = ANY (ARRAY['dedicated'::cell_type, 'isolated'::cell_type, 'shared'::cell_type]))","columns":["type"],"deferrable":false,"initially_deferred":false,"validated":true}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: typeColumn.ID, Type: schema.DependencyReferences}, schema.Dependency{Target: cellType.ID, Type: schema.DependencyUses})
-	desired, err := New().Normalize(ctx, schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{check, typeColumn, id, table, cellType, namespace}}})
+	// Legacy inspected HCL (including v0.1.19-era snapshots) predates the
+	// CHECK-to-type uses edge now required by the renderer.
+	check := renderResource(schema.KindCheckConstraint, schema.Name{Schema: "global", Name: "cells_dedicated_capacity_check", Parent: table.ID}, `{"definition":"CHECK (type = ANY (ARRAY['dedicated'::cell_type, 'isolated'::cell_type, 'shared'::cell_type]))","columns":["type"],"deferrable":false,"initially_deferred":false,"validated":true}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: typeColumn.ID, Type: schema.DependencyReferences})
+	legacy := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{check, typeColumn, id, table, cellType, namespace}}}
+	hcl, err := source.FormatHCL(legacy)
 	if err != nil {
 		t.Fatal(err)
+	}
+	legacy, err = source.LoadContext(ctx, source.Input{URI: "legacy-global.hcl", Format: source.FormatHCLSource, Data: hcl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err := New().Normalize(ctx, legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	derived := false
+	for _, resource := range desired.Graph.Resources {
+		if resource.ID != check.ID {
+			continue
+		}
+		for _, dependency := range resource.Dependencies {
+			derived = derived || dependency.Target == cellType.ID && dependency.Type == schema.DependencyUses
+		}
+	}
+	if !derived {
+		t.Fatal("legacy HCL CHECK constraint did not derive its exact enum dependency")
 	}
 	whole, err := PlanDatabaseBootstrap(ctx, target, desired, plan.Options{})
 	if err != nil {
@@ -682,6 +706,14 @@ func TestManagedBootstrapExecutesEnumCheckOutsideSearchPath(t *testing.T) {
 		t.Fatalf("schema-bound enum check rejected valid row: %v", err)
 	}
 	inspected, err := InspectConn(ctx, conn, Options{Schemas: []string{"global"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspectedHCL, err := source.FormatHCL(inspected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspected, err = source.LoadContext(ctx, source.Input{URI: "current-global.hcl", Format: source.FormatHCLSource, Data: inspectedHCL})
 	if err != nil {
 		t.Fatal(err)
 	}

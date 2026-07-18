@@ -163,6 +163,9 @@ func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Documen
 	if err := canonicalizeUsedTypes(&doc); err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
+	if err := canonicalizeConstraintTypeDependencies(&doc); err != nil {
+		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
+	}
 	if err := canonicalizeConstraintTypeCasts(&doc); err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
@@ -259,6 +262,41 @@ func canonicalizeUsedTypes(doc *schema.Document) error {
 		if uses > 1 {
 			return fmt.Errorf("column %s has ambiguous uses targets", r.Name.String())
 		}
+	}
+	return nil
+}
+
+func canonicalizeConstraintTypeDependencies(doc *schema.Document) error {
+	resources := make(map[string]schema.Resource, len(doc.Graph.Resources))
+	for _, resource := range doc.Graph.Resources {
+		resources[resource.ID] = resource
+	}
+	for index := range doc.Graph.Resources {
+		resource := &doc.Graph.Resources[index]
+		if resource.Kind != schema.KindCheckConstraint {
+			continue
+		}
+		parsed, err := parseConstraintDefinition(*resource, resources)
+		if err != nil {
+			// Normalization historically leaves unsupported constraint grammar to
+			// the scoped renderer. Preserve that contract when no dependency can
+			// be proven from a parser-bound expression.
+			continue
+		}
+		targets, err := expressionTypeDependencies(parsed.statement.ProtoReflect(), resource.Name.Schema, *resource, resources)
+		if err != nil {
+			return err
+		}
+		for _, target := range targets {
+			exists := false
+			for _, dependency := range resource.Dependencies {
+				exists = exists || dependency.Target == target && dependency.Type == schema.DependencyUses
+			}
+			if !exists {
+				resource.Dependencies = append(resource.Dependencies, schema.Dependency{Target: target, Type: schema.DependencyUses})
+			}
+		}
+		resources[resource.ID] = *resource
 	}
 	return nil
 }

@@ -78,6 +78,40 @@ func TestCheckConstraintQualifiesDeclaredEnumCastDependencies(t *testing.T) {
 	}
 }
 
+func TestNormalizeDerivesOnlyExactLegacyCheckTypeDependencies(t *testing.T) {
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "global"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "global", Name: "cells", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	cellType := renderResource(schema.KindEnum, schema.Name{Schema: "global", Name: "cell_type", Parent: ns.ID}, `{"values":["dedicated","isolated"]}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	otherType := renderResource(schema.KindEnum, schema.Name{Schema: "global", Name: "other_type", Parent: ns.ID}, `{"values":["dedicated"]}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	typeColumn := renderResource(schema.KindColumn, schema.Name{Schema: "global", Name: "type", Parent: table.ID}, `{"type":"global.cell_type","not_null":true,"ordinal":1}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: cellType.ID, Type: schema.DependencyUses})
+	legacy := renderResource(schema.KindCheckConstraint, schema.Name{Schema: "global", Name: "cells_type_check", Parent: table.ID}, `{"definition":"CHECK (type = ANY (ARRAY['dedicated'::cell_type, 'isolated'::cell_type]))","columns":["type"],"deferrable":false,"initially_deferred":false,"validated":true}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: typeColumn.ID, Type: schema.DependencyReferences})
+	resources := []schema.Resource{ns, table, cellType, otherType, typeColumn, legacy}
+	normalized, err := New().Normalize(context.Background(), schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: resources}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resourceMap := resourceMapForRender(normalized)
+	got := resourceMap[legacy.ID]
+	if err := validateSemanticDependencies(got, resourceMap); err != nil {
+		t.Fatalf("derived legacy dependency is not exact: %v", err)
+	}
+	if !strings.Contains(string(got.Spec), `global.cell_type`) {
+		t.Fatalf("derived legacy constraint was not schema-bound: %s", got.Spec)
+	}
+
+	mismatched := legacy
+	mismatched.Dependencies = append(mismatched.Dependencies, schema.Dependency{Target: otherType.ID, Type: schema.DependencyUses})
+	resources[len(resources)-1] = mismatched
+	normalized, err = New().Normalize(context.Background(), schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: resources}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resourceMap = resourceMapForRender(normalized)
+	if err := validateSemanticDependencies(resourceMap[mismatched.ID], resourceMap); err == nil {
+		t.Fatal("mismatched declared type dependency was silently repaired")
+	}
+}
+
 func TestConstraintAndIndexDefinitionsAreParserBounded(t *testing.T) {
 	ns := renderResource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
 	table := renderResource(schema.KindTable, schema.Name{Schema: "app", Name: "users", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
