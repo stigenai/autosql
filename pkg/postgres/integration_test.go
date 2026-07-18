@@ -961,6 +961,7 @@ create trigger tenant_assignments_capacity_trigger before insert on tenant_assig
 		values := specMap(resource.Spec)
 		definition := stringValue(values, "definition")
 		values["definition"] = strings.Replace(definition, namespace+".tenant_assignments", "tenant_assignments", 1)
+		values["definition"] = strings.Replace(stringValue(values, "definition"), namespace+".capacity_check", "capacity_check", 1)
 		resource.Spec, err = json.Marshal(values)
 		if err != nil {
 			t.Fatal(err)
@@ -973,6 +974,14 @@ create trigger tenant_assignments_capacity_trigger before insert on tenant_assig
 	desired, err = New().Normalize(ctx, desired)
 	if err != nil {
 		t.Fatal(err)
+	}
+	for _, resource := range desired.Graph.Resources {
+		if resource.Kind == schema.KindTrigger && resource.Name.Name == "tenant_assignments_capacity_trigger" {
+			definition := stringValue(spec(resource), "definition")
+			if !strings.Contains(definition, " ON "+namespace+".tenant_assignments ") || !strings.Contains(definition, "EXECUTE FUNCTION "+namespace+".capacity_check()") {
+				t.Fatalf("normalized trigger is not fully schema-bound: %s", definition)
+			}
+		}
 	}
 	if _, err = conn.Exec(ctx, `drop trigger tenant_assignments_capacity_trigger on autosql_unqualified_trigger.tenant_assignments`); err != nil {
 		t.Fatal(err)
@@ -1002,6 +1011,210 @@ create trigger tenant_assignments_capacity_trigger before insert on tenant_assig
 	noop, err := plan.Build(ctx, New(), actual, desired, plan.Options{})
 	if err != nil || len(noop.Steps) != 0 {
 		t.Fatalf("unqualified trigger no-op plan=%+v err=%v", noop, err)
+	}
+}
+
+func TestUnqualifiedMaterializedViewProvisionAndConverge(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	const namespace = "autosql_unqualified_view"
+	if _, err = conn.Exec(ctx, `drop schema if exists autosql_unqualified_view cascade;
+create schema autosql_unqualified_view;
+create type autosql_unqualified_view.status as enum ('active');
+create table autosql_unqualified_view.blocks(status autosql_unqualified_view.status);
+insert into autosql_unqualified_view.blocks values ('active');
+set search_path to autosql_unqualified_view, public;
+create materialized view autosql_unqualified_view.block_health_summary as select status::status as status from blocks`); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Exec(context.Background(), `drop schema if exists autosql_unqualified_view cascade`)
+	desired, err := InspectURL(ctx, url, Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for index := range desired.Graph.Resources {
+		resource := &desired.Graph.Resources[index]
+		if resource.Kind != schema.KindMaterializedView || resource.Name.Name != "block_health_summary" {
+			continue
+		}
+		values := specMap(resource.Spec)
+		definition := stringValue(values, "definition")
+		definition = strings.ReplaceAll(definition, namespace+".blocks", "blocks")
+		definition = strings.ReplaceAll(definition, namespace+".status", "status")
+		values["definition"] = definition
+		resource.Spec, err = json.Marshal(values)
+		if err != nil {
+			t.Fatal(err)
+		}
+		filtered := resource.Dependencies[:0]
+		for _, dependency := range resource.Dependencies {
+			if dependency.Type != schema.DependencyUses {
+				filtered = append(filtered, dependency)
+			}
+		}
+		resource.Dependencies = filtered
+		found = true
+	}
+	if !found {
+		t.Fatal("inspected materialized view is missing")
+	}
+	desired, err = New().Normalize(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = conn.Exec(ctx, `reset search_path; drop materialized view autosql_unqualified_view.block_health_summary`); err != nil {
+		t.Fatal(err)
+	}
+	current, err := InspectURL(ctx, url, Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err = New().Normalize(ctx, current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	migration, err := plan.Build(ctx, New(), current, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyDefaultMatrixPlan(t, ctx, conn, migration)
+	actual, err := InspectURL(ctx, url, Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err = New().Normalize(ctx, actual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertDocumentsEqual(t, actual, desired)
+	noop, err := plan.Build(ctx, New(), actual, desired, plan.Options{})
+	if err != nil || len(noop.Steps) != 0 {
+		t.Fatalf("unqualified materialized view no-op plan=%+v err=%v", noop, err)
+	}
+}
+
+func TestRoutineCustomTypeAndRuntimeSearchPathProvisionAndConverge(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	const namespace = "autosql_routine_binding"
+	if _, err = conn.Exec(ctx, `drop schema if exists autosql_routine_binding cascade;
+create schema autosql_routine_binding;
+create type autosql_routine_binding.state as enum ('active');
+create table autosql_routine_binding.state_values(value autosql_routine_binding.state);
+set search_path to autosql_routine_binding, public;
+create function autosql_routine_binding.echo_state(s state) returns state
+language plpgsql as $function$
+begin
+  -- runtime lookup intentionally remains bare
+  return (select value::state from state_values where value = s limit 1);
+end;
+$function$`); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Exec(context.Background(), `drop schema if exists autosql_routine_binding cascade`)
+	desired, err := InspectURL(ctx, url, Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for index := range desired.Graph.Resources {
+		resource := &desired.Graph.Resources[index]
+		if resource.Kind != schema.KindFunction || stringValue(spec(*resource), "name") != "echo_state" {
+			continue
+		}
+		values := specMap(resource.Spec)
+		values["definition"] = strings.ReplaceAll(stringValue(values, "definition"), namespace+".state", "state")
+		resource.Spec, err = json.Marshal(values)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found = true
+	}
+	if !found {
+		t.Fatal("inspected routine is missing")
+	}
+	desired, err = New().Normalize(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hcl, err := source.FormatHCL(desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err = source.LoadContext(ctx, source.Input{URI: "schema-bound-routine.hcl", Format: source.FormatHCLSource, Data: hcl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err = New().Normalize(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := map[string]string{}
+	for _, resource := range desired.Graph.Resources {
+		if resource.Kind == schema.KindFunction {
+			options["reviewed_routine_digests"] = stringValue(spec(resource), "body_digest")
+		}
+	}
+	if _, err = conn.Exec(ctx, `reset search_path; drop schema autosql_routine_binding cascade`); err != nil {
+		t.Fatal(err)
+	}
+	current, err := InspectURL(ctx, url, Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err = New().Normalize(ctx, current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	migration, err := plan.Build(ctx, New(), current, desired, plan.Options{Render: options})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyDefaultMatrixPlan(t, ctx, conn, migration)
+	if _, err = conn.Exec(ctx, `insert into autosql_routine_binding.state_values values ('active')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = conn.Exec(ctx, `set search_path to pg_catalog, public`); err != nil {
+		t.Fatal(err)
+	}
+	var value string
+	if err = conn.QueryRow(ctx, `select autosql_routine_binding.echo_state('active'::autosql_routine_binding.state)::text`).Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	if value != "active" {
+		t.Fatalf("runtime routine result=%q", value)
+	}
+	actual, err := InspectURL(ctx, url, Options{Schemas: []string{namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err = New().Normalize(ctx, actual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertDocumentsEqual(t, actual, desired)
+	noop, err := plan.Build(ctx, New(), actual, desired, plan.Options{Render: options})
+	if err != nil || len(noop.Steps) != 0 {
+		t.Fatalf("schema-bound routine no-op plan=%+v err=%v", noop, err)
 	}
 }
 

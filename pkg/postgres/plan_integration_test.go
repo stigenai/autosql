@@ -363,6 +363,7 @@ func TestFunctionReplaceRenameDropLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	current = normalizePostgresDocument(t, ctx, current)
 	if _, err = conn.Exec(ctx, createTwo); err != nil {
 		t.Fatal(err)
 	}
@@ -370,6 +371,7 @@ func TestFunctionReplaceRenameDropLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	desired = normalizePostgresDocument(t, ctx, desired)
 	if _, err = conn.Exec(ctx, createOne); err != nil {
 		t.Fatal(err)
 	}
@@ -382,6 +384,7 @@ func TestFunctionReplaceRenameDropLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	actual = normalizePostgresDocument(t, ctx, actual)
 	assertFingerprint(t, actual, desired)
 
 	if _, err = conn.Exec(ctx, `alter function autosql_function_lifecycle.bump(integer) rename to bump_v2`); err != nil {
@@ -391,6 +394,7 @@ func TestFunctionReplaceRenameDropLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	renamed = normalizePostgresDocument(t, ctx, renamed)
 	if _, err = conn.Exec(ctx, `alter function autosql_function_lifecycle.bump_v2(integer) rename to bump`); err != nil {
 		t.Fatal(err)
 	}
@@ -398,6 +402,7 @@ func TestFunctionReplaceRenameDropLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	current = normalizePostgresDocument(t, ctx, current)
 	var oldID, newID string
 	for _, resource := range current.Graph.Resources {
 		if resource.Kind == schema.KindFunction {
@@ -418,6 +423,7 @@ func TestFunctionReplaceRenameDropLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	actual = normalizePostgresDocument(t, ctx, actual)
 	assertFingerprint(t, actual, renamed)
 
 	withoutFunction := renamed
@@ -435,6 +441,7 @@ func TestFunctionReplaceRenameDropLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	finalState = normalizePostgresDocument(t, ctx, finalState)
 	assertFingerprint(t, finalState, withoutFunction)
 }
 
@@ -460,6 +467,7 @@ func TestProcedureBootstrapReplaceParity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	desired = normalizePostgresDocument(t, ctx, desired)
 	options := reviewedRoutineRenderOptions(desired)
 	if _, err = conn.Exec(ctx, `drop schema autosql_procedure_lifecycle cascade`); err != nil {
 		t.Fatal(err)
@@ -468,6 +476,7 @@ func TestProcedureBootstrapReplaceParity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	current = normalizePostgresDocument(t, ctx, current)
 	bootstrap, err := plan.Build(ctx, postgres.New(), current, desired, plan.Options{Render: options})
 	if err != nil {
 		t.Fatal(err)
@@ -477,6 +486,7 @@ func TestProcedureBootstrapReplaceParity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	actual = normalizePostgresDocument(t, ctx, actual)
 	assertFingerprint(t, actual, desired)
 
 	if _, err = conn.Exec(ctx, two); err != nil {
@@ -486,6 +496,7 @@ func TestProcedureBootstrapReplaceParity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	replaced = normalizePostgresDocument(t, ctx, replaced)
 	if _, err = conn.Exec(ctx, one); err != nil {
 		t.Fatal(err)
 	}
@@ -493,6 +504,7 @@ func TestProcedureBootstrapReplaceParity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	current = normalizePostgresDocument(t, ctx, current)
 	replace, err := plan.Build(ctx, postgres.New(), current, replaced, plan.Options{Render: reviewedRoutineRenderOptions(replaced)})
 	if err != nil {
 		t.Fatal(err)
@@ -502,6 +514,7 @@ func TestProcedureBootstrapReplaceParity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	actual = normalizePostgresDocument(t, ctx, actual)
 	assertFingerprint(t, actual, replaced)
 	noop, err := plan.Build(ctx, postgres.New(), actual, replaced, plan.Options{})
 	if err != nil || len(noop.Steps) != 0 {
@@ -3108,6 +3121,16 @@ func renameFixture(doc schema.Document, newSchemaName, newTableName string) (sch
 	out.Normalize()
 	return out, oldSchema.ID, newSchema.ID, oldTable.ID, newTable.ID
 }
+
+func normalizePostgresDocument(t *testing.T, ctx context.Context, document schema.Document) schema.Document {
+	t.Helper()
+	normalized, err := postgres.New().Normalize(ctx, document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return normalized
+}
+
 func applyTestPlan(t *testing.T, ctx context.Context, conn *pgx.Conn, p plan.Plan) {
 	t.Helper()
 	tx, err := conn.Begin(ctx)

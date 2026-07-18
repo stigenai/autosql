@@ -144,7 +144,7 @@ func PreflightProvisioning(ctx context.Context, doc schema.Document, options map
 						add(resource, "unsupported_spec_key", key, "routine field is outside the canonical inspected model", true)
 					}
 				}
-				if _, sourceErr := validateRoutineSource(resource, options); sourceErr != nil {
+				if _, sourceErr := validateRoutineSource(resource, resources, options); sourceErr != nil {
 					add(resource, "routine_source_trust", "definition", "routine source is not parser-proven and bound to explicit review authority", true)
 				}
 			}

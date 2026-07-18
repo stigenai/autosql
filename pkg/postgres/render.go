@@ -401,13 +401,13 @@ func renderCreate(r schema.Resource, resources map[string]schema.Resource, optio
 		if stringValue(s, "extension") != "" {
 			return nil, unsupported(r, "extension-owned routine must be provisioned by its extension")
 		}
-		parsed, e := validateRoutineSource(r, options)
+		parsed, e := validateRoutineSource(r, resources, options)
 		if e != nil {
 			return nil, e
 		}
 		out := []string{parsed.SQL}
 		if owner := stringValue(s, "owner"); owner != "" {
-			signature, signatureErr := routineSignature(r)
+			signature, signatureErr := routineSignature(r, resources)
 			if signatureErr != nil {
 				return nil, signatureErr
 			}
@@ -446,15 +446,15 @@ func renderCreate(r schema.Resource, resources map[string]schema.Resource, optio
 		if !allowedKeys(s, "definition", "owner") {
 			return nil, unsupported(r, "unknown view semantics")
 		}
-		d := stringValue(s, "definition")
-		if d == "" {
+		if stringValue(s, "definition") == "" {
 			return nil, unsupported(r, "view definition")
-		}
-		if e := validateSQLFragment(d); e != nil {
-			return nil, unsupported(r, "unsafe view definition: "+e.Error())
 		}
 		if e := validateProjectionShape(r, resources); e != nil {
 			return nil, unsupported(r, "output shape is not provable: "+e.Error())
+		}
+		d, e := schemaBindViewDefinition(r, resources)
+		if e != nil {
+			return nil, e
 		}
 		kind := "VIEW"
 		if r.Kind == schema.KindMaterializedView {
@@ -551,7 +551,7 @@ func renderDrop(r schema.Resource, resources map[string]schema.Resource, options
 		}
 		return []string{q + name}, nil
 	case schema.KindFunction, schema.KindProcedure:
-		signature, e := routineSignature(r)
+		signature, e := routineSignature(r, resources)
 		if e != nil {
 			return nil, e
 		}
@@ -604,7 +604,7 @@ func renderRename(before, after schema.Resource, resources map[string]schema.Res
 	case schema.KindIndex:
 		return []string{"ALTER INDEX " + old + " RENAME TO " + newName}, nil
 	case schema.KindFunction, schema.KindProcedure:
-		signature, e := routineSignature(before)
+		signature, e := routineSignature(before, resources)
 		if e != nil {
 			return nil, e
 		}
@@ -732,15 +732,15 @@ func renderAlter(before, after schema.Resource, resources map[string]schema.Reso
 		if !allowedKeys(bs, "definition") || !allowedKeys(as, "definition") {
 			return nil, unsupported(after, "unknown view semantics")
 		}
-		d := stringValue(as, "definition")
-		if d == "" {
+		if stringValue(as, "definition") == "" {
 			return nil, unsupported(after, "view definition")
-		}
-		if e := validateSQLFragment(d); e != nil {
-			return nil, unsupported(after, "unsafe view definition: "+e.Error())
 		}
 		if e := validateProjectionShape(after, resources); e != nil {
 			return nil, unsupported(after, "output shape is not provable: "+e.Error())
+		}
+		d, e := schemaBindViewDefinition(after, resources)
+		if e != nil {
+			return nil, e
 		}
 		if enabled(options, "__view_rebuild", false) {
 			drop, e := renderDrop(before, resources, options)
@@ -788,7 +788,7 @@ func renderAlter(before, after schema.Resource, resources map[string]schema.Reso
 		if stringValue(as, "extension") != "" {
 			return nil, unsupported(after, "extension-owned routine must be maintained by its extension")
 		}
-		parsed, e := validateRoutineSource(after, options)
+		parsed, e := validateRoutineSource(after, resources, options)
 		if e != nil {
 			return nil, e
 		}
@@ -807,7 +807,7 @@ func renderAlter(before, after schema.Resource, resources map[string]schema.Reso
 			if afterOwner == "" {
 				return nil, unsupported(after, "function owner removal")
 			}
-			signature, signatureErr := routineSignature(after)
+			signature, signatureErr := routineSignature(after, resources)
 			if signatureErr != nil {
 				return nil, signatureErr
 			}
@@ -1258,7 +1258,7 @@ func commentTarget(resource schema.Resource, resources map[string]schema.Resourc
 	case schema.KindIndex:
 		return "INDEX " + name, nil
 	case schema.KindFunction, schema.KindProcedure:
-		signature, err := routineSignature(resource)
+		signature, err := routineSignature(resource, resources)
 		if err != nil {
 			return "", err
 		}
@@ -2190,28 +2190,15 @@ func validateCoreColumnOrdinals(resources map[string]schema.Resource) error {
 	return nil
 }
 func validateSemanticDependencies(r schema.Resource, resources map[string]schema.Resource) error {
+	if r.Kind == schema.KindView || r.Kind == schema.KindMaterializedView {
+		return validateViewDependencies(r, resources)
+	}
+	if r.Kind == schema.KindFunction || r.Kind == schema.KindProcedure {
+		return validateRoutineDependencies(r, resources)
+	}
 	expectedType := schema.DependencyUses
 	var expected []string
 	switch r.Kind {
-	case schema.KindView, schema.KindMaterializedView:
-		expectedType = schema.DependencyReferences
-		definition := stringValue(spec(r), "definition")
-		if match := simpleViewMatch(definition); match != nil {
-			for id, candidate := range resources {
-				if (candidate.Kind == schema.KindTable || candidate.Kind == schema.KindView || candidate.Kind == schema.KindMaterializedView) && candidate.Name.Schema == match[2] && candidate.Name.Name == match[3] {
-					expected = append(expected, id)
-				}
-			}
-			if len(expected) != 1 {
-				return unsupported(r, "view source dependency is not provable")
-			}
-		} else if simpleLiteralMatch(definition) == nil {
-			var err error
-			expected, err = capturedViewDependencies(r, resources)
-			if err != nil {
-				return err
-			}
-		}
 	case schema.KindColumn:
 		if parent := resources[r.Name.Parent]; parent.Kind != schema.KindTable {
 			return nil
@@ -2367,14 +2354,8 @@ func validateViewQuery(definition string) error {
 }
 
 func parseViewQuery(definition string) (*pg_query.SelectStmt, error) {
-	if err := validateSQLFragment(definition); err != nil {
-		return nil, err
-	}
-	parsed, err := pg_query.Parse(definition)
-	if err != nil || parsed == nil || len(parsed.Stmts) != 1 || parsed.Stmts[0].GetStmt().GetSelectStmt() == nil {
-		return nil, fmt.Errorf("definition must parse as exactly one query statement")
-	}
-	return parsed.Stmts[0].GetStmt().GetSelectStmt(), nil
+	parsed, err := parseViewDefinition(definition)
+	return parsed.query, err
 }
 
 func typeReferenceMatches(typ, columnSchema string, name schema.Name) bool {
@@ -2442,6 +2423,11 @@ func validateCanonicalIdentity(r schema.Resource, resources map[string]schema.Re
 			}
 			if (r.Kind == schema.KindView || r.Kind == schema.KindMaterializedView) && dep.Type == schema.DependencyReferences {
 				if _, ok := resources[dep.Target]; ok {
+					continue
+				}
+			}
+			if (r.Kind == schema.KindView || r.Kind == schema.KindMaterializedView) && dep.Type == schema.DependencyUses {
+				if target, ok := resources[dep.Target]; ok && (target.Kind == schema.KindEnum || target.Kind == schema.KindDomain || target.Kind == schema.KindComposite) {
 					continue
 				}
 			}
