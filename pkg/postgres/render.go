@@ -387,8 +387,11 @@ func renderCreate(r schema.Resource, resources map[string]schema.Resource, optio
 				return nil, e
 			}
 		}
-		d := stringValue(s, "definition")
-		return []string{"ALTER TABLE " + parent + " ADD CONSTRAINT " + quote(r.Name.Name) + " " + d}, nil
+		sql, e := renderConstraintCreateSQL(r, resources)
+		if e != nil {
+			return nil, e
+		}
+		return []string{sql}, nil
 	case schema.KindIndex:
 		if err != nil {
 			return nil, err
@@ -2272,7 +2275,7 @@ func validateSemanticDependencies(r schema.Resource, resources map[string]schema
 			continue
 		}
 		dependentObject := r.Kind == schema.KindPrimaryKey || r.Kind == schema.KindUniqueConstraint || r.Kind == schema.KindCheckConstraint || r.Kind == schema.KindForeignKey || r.Kind == schema.KindIndex || r.Kind == schema.KindTrigger || r.Kind == schema.KindPolicy
-		if dep.Type == expectedType || dependentObject && dep.Type == schema.DependencyReferences {
+		if dep.Type == expectedType || dependentObject && dep.Type == schema.DependencyReferences || r.Kind == schema.KindCheckConstraint && dep.Type == schema.DependencyUses {
 			actual = append(actual, dep.Target)
 		}
 	}

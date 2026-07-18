@@ -638,6 +638,66 @@ func TestWholeDatabaseBootstrapResumesBeforeEveryExecutionPhase(t *testing.T) {
 	}
 }
 
+func TestManagedBootstrapExecutesEnumCheckOutsideSearchPath(t *testing.T) {
+	maintenanceURL := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if maintenanceURL == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	target := bootstrapExecutionTarget(t, ctx, maintenanceURL, "autosql_bootstrap_enum_check")
+	defer DropDatabaseURL(context.Background(), maintenanceURL, target.Name, true)
+	_ = DropDatabaseURL(ctx, maintenanceURL, target.Name, true)
+
+	namespace := renderResource(schema.KindSchema, schema.Name{Name: "global"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "global", Name: "cells", Parent: namespace.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
+	cellType := renderResource(schema.KindEnum, schema.Name{Schema: "global", Name: "cell_type", Parent: namespace.ID}, `{"values":["dedicated","isolated","shared"]}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
+	id := renderResource(schema.KindColumn, schema.Name{Schema: "global", Name: "id", Parent: table.ID}, `{"type":"bigint","not_null":true,"ordinal":1}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains})
+	typeColumn := renderResource(schema.KindColumn, schema.Name{Schema: "global", Name: "type", Parent: table.ID}, `{"type":"global.cell_type","not_null":true,"ordinal":2}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: cellType.ID, Type: schema.DependencyUses})
+	check := renderResource(schema.KindCheckConstraint, schema.Name{Schema: "global", Name: "cells_dedicated_capacity_check", Parent: table.ID}, `{"definition":"CHECK (type = ANY (ARRAY['dedicated'::cell_type, 'isolated'::cell_type, 'shared'::cell_type]))","columns":["type"],"deferrable":false,"initially_deferred":false,"validated":true}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: typeColumn.ID, Type: schema.DependencyReferences}, schema.Dependency{Target: cellType.ID, Type: schema.DependencyUses})
+	desired, err := New().Normalize(ctx, schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{check, typeColumn, id, table, cellType, namespace}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	whole, err := PlanDatabaseBootstrap(ctx, target, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := ExecuteDatabaseBootstrapURL(ctx, maintenanceURL, whole, BootstrapExecutionHooks{})
+	if err != nil || !result.Completed {
+		t.Fatalf("enum-check bootstrap result=%+v err=%v", result, err)
+	}
+
+	config, err := pgx.ParseConfig(maintenanceURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.Database = target.Name
+	conn, err := pgx.ConnectConfig(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	if _, err := conn.Exec(ctx, `insert into global.cells(id,type) values (1,'dedicated')`); err != nil {
+		t.Fatalf("schema-bound enum check rejected valid row: %v", err)
+	}
+	inspected, err := InspectConn(ctx, conn, Options{Schemas: []string{"global"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := New().Normalize(ctx, inspected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noOp, err := plan.Build(ctx, New(), current, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(noOp.Changes.Changes) != 0 || len(noOp.Steps) != 0 {
+		t.Fatalf("reinspected enum check did not converge: changes=%+v steps=%+v", noOp.Changes.Changes, noOp.Steps)
+	}
+}
+
 func bootstrapExecutionTarget(t *testing.T, ctx context.Context, maintenanceURL, prefix string) bootstrap.DatabaseTarget {
 	t.Helper()
 	config, err := pgx.ParseConfig(maintenanceURL)

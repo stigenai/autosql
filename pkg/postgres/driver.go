@@ -163,6 +163,9 @@ func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Documen
 	if err := canonicalizeUsedTypes(&doc); err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
+	if err := canonicalizeConstraintTypeCasts(&doc); err != nil {
+		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
+	}
 	if err := canonicalizeColumnOrdinals(&doc); err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
@@ -256,6 +259,39 @@ func canonicalizeUsedTypes(doc *schema.Document) error {
 		if uses > 1 {
 			return fmt.Errorf("column %s has ambiguous uses targets", r.Name.String())
 		}
+	}
+	return nil
+}
+
+func canonicalizeConstraintTypeCasts(doc *schema.Document) error {
+	resources := make(map[string]schema.Resource, len(doc.Graph.Resources))
+	for _, resource := range doc.Graph.Resources {
+		resources[resource.ID] = resource
+	}
+	for index := range doc.Graph.Resources {
+		resource := &doc.Graph.Resources[index]
+		if resource.Kind != schema.KindCheckConstraint {
+			continue
+		}
+		hasManagedType := false
+		for _, dependency := range resource.Dependencies {
+			target := resources[dependency.Target]
+			hasManagedType = hasManagedType || dependency.Type == schema.DependencyUses && (target.Kind == schema.KindEnum || target.Kind == schema.KindDomain || target.Kind == schema.KindComposite)
+		}
+		if !hasManagedType {
+			continue
+		}
+		_, definition, err := renderConstraintCreate(*resource, resources)
+		if err != nil {
+			return err
+		}
+		values := specMap(resource.Spec)
+		values["definition"] = definition
+		resource.Spec, err = json.Marshal(values)
+		if err != nil {
+			return err
+		}
+		resources[resource.ID] = *resource
 	}
 	return nil
 }
