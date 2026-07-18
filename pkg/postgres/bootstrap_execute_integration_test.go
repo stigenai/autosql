@@ -354,6 +354,72 @@ func TestManagedBootstrapExecutesEnumDefaultOutsideSearchPath(t *testing.T) {
 	}
 }
 
+func TestManagedBootstrapExecutesSchemaBoundIndexPredicateOutsideSearchPath(t *testing.T) {
+	maintenanceURL := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if maintenanceURL == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	namespace := renderResource(schema.KindSchema, schema.Name{Name: "global"}, `{}`)
+	cellType := renderResource(schema.KindEnum, schema.Name{Schema: "global", Name: "cell_type", Parent: namespace.ID}, `{"values":["shared","dedicated"]}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
+	cellStatus := renderResource(schema.KindEnum, schema.Name{Schema: "global", Name: "cell_status", Parent: namespace.ID}, `{"values":["active","inactive"]}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
+	table := renderResource(schema.KindTable, schema.Name{Schema: "global", Name: "cells", Parent: namespace.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
+	cellTypeColumn := renderResource(schema.KindColumn, schema.Name{Schema: "global", Name: "type", Parent: table.ID}, `{"type":"global.cell_type","not_null":true,"ordinal":1}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: cellType.ID, Type: schema.DependencyUses})
+	statusColumn := renderResource(schema.KindColumn, schema.Name{Schema: "global", Name: "status", Parent: table.ID}, `{"type":"global.cell_status","not_null":true,"ordinal":2}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: cellStatus.ID, Type: schema.DependencyUses})
+	index := renderResource(schema.KindIndex, schema.Name{Schema: "global", Name: "idx_cells_available_shared", Parent: table.ID}, `{"definition":"CREATE INDEX idx_cells_available_shared ON global.cells USING btree (type) WHERE ((type = 'shared'::cell_type) AND (status = 'active'::cell_status))","method":"btree","unique":false,"valid":true,"ready":true,"columns":["type"]}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: cellTypeColumn.ID, Type: schema.DependencyReferences})
+	desired, err := New().Normalize(ctx, schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{index, statusColumn, cellTypeColumn, table, cellStatus, cellType, namespace}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, concurrent := range []bool{false, true} {
+		t.Run(fmt.Sprintf("concurrent_%v", concurrent), func(t *testing.T) {
+			target := bootstrapExecutionTarget(t, ctx, maintenanceURL, fmt.Sprintf("autosql_bootstrap_index_cast_%v", concurrent))
+			defer DropDatabaseURL(context.Background(), maintenanceURL, target.Name, true)
+			_ = DropDatabaseURL(ctx, maintenanceURL, target.Name, true)
+			render := map[string]string{}
+			if concurrent {
+				render["concurrent_indexes"] = "true"
+			}
+			whole, planErr := PlanDatabaseBootstrap(ctx, target, desired, plan.Options{Render: render})
+			if planErr != nil {
+				t.Fatal(planErr)
+			}
+			result, executeErr := ExecuteDatabaseBootstrapURL(ctx, maintenanceURL, whole, BootstrapExecutionHooks{})
+			if executeErr != nil || !result.Completed {
+				t.Fatalf("schema-bound index bootstrap result=%+v err=%v", result, executeErr)
+			}
+			config, parseErr := pgx.ParseConfig(maintenanceURL)
+			if parseErr != nil {
+				t.Fatal(parseErr)
+			}
+			config.Database = target.Name
+			conn, connectErr := pgx.ConnectConfig(ctx, config)
+			if connectErr != nil {
+				t.Fatal(connectErr)
+			}
+			defer conn.Close(context.Background())
+			inspected, inspectErr := InspectConn(ctx, conn, Options{Schemas: []string{"global"}})
+			if inspectErr != nil {
+				t.Fatal(inspectErr)
+			}
+			current, normalizeErr := New().Normalize(ctx, inspected)
+			if normalizeErr != nil {
+				t.Fatal(normalizeErr)
+			}
+			noOp, buildErr := plan.Build(ctx, New(), current, desired, plan.Options{Render: render})
+			if buildErr != nil {
+				t.Fatal(buildErr)
+			}
+			if len(noOp.Changes.Changes) != 0 || len(noOp.Steps) != 0 {
+				t.Fatalf("reinspected index bootstrap did not converge: changes=%+v steps=%+v", noOp.Changes.Changes, noOp.Steps)
+			}
+		})
+	}
+}
+
 func TestWholeDatabaseBootstrapTransactionalFailureRollsBackAndIdentityIsBound(t *testing.T) {
 	maintenanceURL := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
 	if maintenanceURL == "" {
