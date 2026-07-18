@@ -124,7 +124,7 @@ func PrepareBootstrapAuthorizationInventory(ctx context.Context, target bootstra
 			if digest == "" && stringValue(values, "definition") == "" {
 				continue
 			}
-			signature, err := routineSignature(resource)
+			signature, err := routineSignature(resource, resources)
 			if err != nil {
 				return BootstrapAuthorizationInventory{}, err
 			}

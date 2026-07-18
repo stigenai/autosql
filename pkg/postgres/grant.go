@@ -105,7 +105,7 @@ func grantTargetSQL(target schema.Resource, resources map[string]schema.Resource
 	case schema.KindSequence:
 		return "SEQUENCE " + qualified(target.Name), privileges("USAGE", "SELECT", "UPDATE"), nil
 	case schema.KindFunction, schema.KindProcedure:
-		signature, err := routineSignature(target)
+		signature, err := routineSignature(target, resources)
 		if err != nil {
 			return "", nil, err
 		}

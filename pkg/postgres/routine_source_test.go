@@ -26,13 +26,13 @@ func reviewedRoutine(t *testing.T, definition, language string, security bool, c
 func TestRoutineSourceRequiresExactReviewDigest(t *testing.T) {
 	routine := reviewedRoutine(t, `CREATE FUNCTION app.run(value integer) RETURNS integer LANGUAGE sql AS $$ SELECT value + 1 $$`, "sql", false, nil)
 	digest := stringValue(spec(routine), "body_digest")
-	if _, err := validateRoutineSource(routine, nil); err == nil {
+	if _, err := validateRoutineSource(routine, nil, nil); err == nil {
 		t.Fatal("unreviewed catalog/authored routine was executable")
 	}
-	if _, err := validateRoutineSource(routine, map[string]string{"reviewed_routine_digests": "sha256:wrong"}); err == nil {
+	if _, err := validateRoutineSource(routine, nil, map[string]string{"reviewed_routine_digests": "sha256:wrong"}); err == nil {
 		t.Fatal("mismatched digest was executable")
 	}
-	parsed, err := validateRoutineSource(routine, map[string]string{"reviewed_routine_digests": digest})
+	parsed, err := validateRoutineSource(routine, nil, map[string]string{"reviewed_routine_digests": digest})
 	if err != nil || parsed.statement == nil {
 		t.Fatalf("reviewed routine=%+v err=%v", parsed, err)
 	}
@@ -40,7 +40,7 @@ func TestRoutineSourceRequiresExactReviewDigest(t *testing.T) {
 	tamperedValues := spec(tampered)
 	tamperedValues["definition"] = strings.Replace(stringValue(tamperedValues, "definition"), "+ 1", "+ 2", 1)
 	tampered.Spec, _ = json.Marshal(tamperedValues)
-	if _, err := validateRoutineSource(tampered, map[string]string{"reviewed_routine_digests": digest}); err == nil {
+	if _, err := validateRoutineSource(tampered, nil, map[string]string{"reviewed_routine_digests": digest}); err == nil {
 		t.Fatal("tampered routine was executable")
 	}
 }
@@ -50,7 +50,9 @@ func TestRoutineDefinitionNormalizationPreservesReviewedSource(t *testing.T) {
 	multiLineSource := "CREATE FUNCTION app.run(value integer)\r\nRETURNS integer\r\nLANGUAGE sql\r\nAS $function$\r\n  -- preserve this semantic line boundary\r\n  SELECT value + 1;\r\n$function$"
 	multiLine := reviewedRoutine(t, multiLineSource, "sql", false, nil)
 	definition := stringValue(spec(multiLine), "definition")
-	if definition != strings.ReplaceAll(multiLineSource, "\r\n", "\n") {
+	expected := strings.ReplaceAll(multiLineSource, "\r\n", "\n")
+	expected = strings.Replace(expected, "AS $function$", " SET search_path TO 'pg_catalog', 'app', 'public'\nAS $function$", 1)
+	if definition != expected {
 		t.Fatalf("routine source layout changed:\n%s", definition)
 	}
 	if strings.Contains(definition, "BEGIN --") || !strings.Contains(definition, "$function$\n  -- preserve this semantic line boundary\n") {
@@ -60,7 +62,7 @@ func TestRoutineDefinitionNormalizationPreservesReviewedSource(t *testing.T) {
 		t.Fatal("distinct reviewed routine sources shared a digest")
 	}
 	digest := stringValue(spec(multiLine), "body_digest")
-	parsed, err := validateRoutineSource(multiLine, map[string]string{"reviewed_routine_digests": digest})
+	parsed, err := validateRoutineSource(multiLine, nil, map[string]string{"reviewed_routine_digests": digest})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,21 +91,30 @@ func TestRoutineSourcePolicyRejectsHazardsBeforeSQL(t *testing.T) {
 	cases := map[string]schema.Resource{
 		"statement smuggling": reviewedRoutine(t, `CREATE FUNCTION app.run(value integer) RETURNS integer LANGUAGE sql AS $$ SELECT value $$; DROP TABLE app.users`, "sql", false, nil),
 		"unsafe language":     reviewedRoutine(t, `CREATE FUNCTION app.run(value integer) RETURNS integer LANGUAGE plpython3u AS $$ return value $$`, "plpython3u", false, nil),
-		"definer search path": reviewedRoutine(t, `CREATE FUNCTION app.run(value integer) RETURNS integer LANGUAGE sql SECURITY DEFINER AS $$ SELECT value $$`, "sql", true, nil),
 		"secret literal":      reviewedRoutine(t, `CREATE FUNCTION app.run(value integer) RETURNS integer LANGUAGE plpgsql AS $$ BEGIN password := 'cleartext'; RETURN value; END $$`, "plpgsql", false, nil),
 		"privileged body":     reviewedRoutine(t, `CREATE FUNCTION app.run(value integer) RETURNS integer LANGUAGE sql AS $$ SELECT pg_read_file('/etc/passwd')::integer $$`, "sql", false, nil),
 	}
 	for name, routine := range cases {
 		t.Run(name, func(t *testing.T) {
 			digest := stringValue(spec(routine), "body_digest")
-			if _, err := validateRoutineSource(routine, map[string]string{"reviewed_routine_digests": digest}); err == nil {
+			if _, err := validateRoutineSource(routine, nil, map[string]string{"reviewed_routine_digests": digest}); err == nil {
 				t.Fatal("hazardous routine was executable")
 			}
 		})
 	}
 	secure := reviewedRoutine(t, `CREATE FUNCTION app.run(value integer) RETURNS integer LANGUAGE plpgsql SECURITY DEFINER SET search_path TO pg_catalog, app AS $$ BEGIN RETURN value; END $$`, "plpgsql", true, []string{"search_path=pg_catalog, app"})
-	if _, err := validateRoutineSource(secure, map[string]string{"reviewed_routine_digests": stringValue(spec(secure), "body_digest")}); err != nil {
+	if _, err := validateRoutineSource(secure, nil, map[string]string{"reviewed_routine_digests": stringValue(spec(secure), "body_digest")}); err != nil {
 		t.Fatalf("bounded PL/pgSQL routine rejected: %v", err)
+	}
+	unsafeDefiner := secure
+	unsafeValues := specMap(unsafeDefiner.Spec)
+	unsafeDefinition := strings.Replace(stringValue(unsafeValues, "definition"), " SET search_path TO pg_catalog, app", "", 1)
+	unsafeValues["definition"] = unsafeDefinition
+	unsafeValues["configuration"] = []string{}
+	unsafeValues["body_digest"] = routineDefinitionDigest(unsafeDefinition)
+	unsafeDefiner.Spec, _ = json.Marshal(unsafeValues)
+	if _, err := validateRoutineSource(unsafeDefiner, nil, map[string]string{"reviewed_routine_digests": stringValue(unsafeValues, "body_digest")}); err == nil {
+		t.Fatal("SECURITY DEFINER routine without a fixed pg_catalog-first search_path was executable")
 	}
 }
 
@@ -112,13 +123,18 @@ func TestProcedureTransactionControlRequiresExplicitAuthority(t *testing.T) {
 	routine := reviewedRoutine(t, definition, "plpgsql", false, nil)
 	routine.Kind = schema.KindProcedure
 	routine.ID = schema.StableID(routine.Kind, routine.Name)
+	document, err := New().Normalize(context.Background(), schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{routine}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	routine = document.Graph.Resources[0]
 	digest := stringValue(spec(routine), "body_digest")
 	options := map[string]string{"reviewed_routine_digests": digest}
-	if _, err := validateRoutineSource(routine, options); err == nil {
+	if _, err := validateRoutineSource(routine, nil, options); err == nil {
 		t.Fatal("procedure transaction control was accepted without authority")
 	}
 	options["allow_transaction_control_procedures"] = "true"
-	if _, err := validateRoutineSource(routine, options); err != nil {
+	if _, err := validateRoutineSource(routine, nil, options); err != nil {
 		t.Fatalf("authorized transaction control rejected: %v", err)
 	}
 }

@@ -247,19 +247,24 @@ func inspectSnapshot(ctx context.Context, conn catalogQueryer, req plugin.Inspec
 }
 
 func (i *inspector) inspectRelationDependencies(ctx context.Context) error {
-	rows, err := i.conn.Query(ctx, `select distinct rw.ev_class::oid,d.refobjid::oid from pg_rewrite rw join pg_depend d on d.classid='pg_rewrite'::regclass and d.objid=rw.oid join pg_class v on v.oid=rw.ev_class where v.relkind in ('v','m') and d.refclassid='pg_class'::regclass and d.deptype='n' and d.refobjid<>rw.ev_class order by 1,2`)
+	rows, err := i.conn.Query(ctx, `select distinct rw.ev_class::oid,d.refclassid::regclass::text,d.refobjid::oid from pg_rewrite rw join pg_depend d on d.classid='pg_rewrite'::regclass and d.objid=rw.oid join pg_class v on v.oid=rw.ev_class where v.relkind in ('v','m') and d.refclassid in ('pg_class'::regclass,'pg_type'::regclass) and d.deptype='n' and not (d.refclassid='pg_class'::regclass and d.refobjid=rw.ev_class) order by 1,2,3`)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var from, to uint32
-		if err := rows.Scan(&from, &to); err != nil {
+		var catalog string
+		if err := rows.Scan(&from, &catalog, &to); err != nil {
 			return err
 		}
 		fromID, toID := i.byOID[from], i.byOID[to]
 		if fromID == "" || toID == "" {
 			continue
+		}
+		dependencyType := schema.DependencyReferences
+		if catalog == "pg_type" {
+			dependencyType = schema.DependencyUses
 		}
 		for idx := range i.resources {
 			if i.resources[idx].ID != fromID {
@@ -267,10 +272,10 @@ func (i *inspector) inspectRelationDependencies(ctx context.Context) error {
 			}
 			exists := false
 			for _, dep := range i.resources[idx].Dependencies {
-				exists = exists || dep.Target == toID && dep.Type == schema.DependencyReferences
+				exists = exists || dep.Target == toID && dep.Type == dependencyType
 			}
 			if !exists {
-				i.resources[idx].Dependencies = append(i.resources[idx].Dependencies, schema.Dependency{Target: toID, Type: schema.DependencyReferences})
+				i.resources[idx].Dependencies = append(i.resources[idx].Dependencies, schema.Dependency{Target: toID, Type: dependencyType})
 			}
 		}
 	}
