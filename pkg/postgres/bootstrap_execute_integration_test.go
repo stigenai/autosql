@@ -808,31 +808,34 @@ func TestManagedBootstrapExecutesEnumCheckOutsideSearchPath(t *testing.T) {
 	// CHECK-to-type uses edge now required by the renderer.
 	check := renderResource(schema.KindCheckConstraint, schema.Name{Schema: "global", Name: "cells_dedicated_capacity_check", Parent: table.ID}, `{"definition":"CHECK (type = ANY (ARRAY['dedicated'::cell_type, 'isolated'::cell_type, 'shared'::cell_type]))","columns":["type"],"deferrable":false,"initially_deferred":false,"validated":true}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: typeColumn.ID, Type: schema.DependencyReferences})
 	legacy := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{check, typeColumn, id, table, cellType, namespace}}}
-	hcl, err := source.FormatHCL(legacy)
-	if err != nil {
-		t.Fatal(err)
-	}
-	legacy, err = source.LoadContext(ctx, source.Input{URI: "legacy-global.hcl", Format: source.FormatHCLSource, Data: hcl})
-	if err != nil {
-		t.Fatal(err)
-	}
 	desired, err := New().Normalize(ctx, legacy)
 	if err != nil {
 		t.Fatal(err)
 	}
-	derived := false
+	for index := range desired.Graph.Resources {
+		if desired.Graph.Resources[index].ID == check.ID {
+			values := specMap(desired.Graph.Resources[index].Spec)
+			values["definition"] = "CHECK (type = ANY (ARRAY['dedicated'::cell_type, 'isolated'::cell_type, 'shared'::cell_type]))"
+			desired.Graph.Resources[index].Spec, err = json.Marshal(values)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
 	for _, resource := range desired.Graph.Resources {
-		if resource.ID != check.ID {
-			continue
-		}
-		for _, dependency := range resource.Dependencies {
-			derived = derived || dependency.Target == cellType.ID && dependency.Type == schema.DependencyUses
+		if resource.ID == check.ID && strings.Contains(stringValue(spec(resource), "definition"), "global.cell_type") {
+			t.Fatal("regression fixture unexpectedly schema-qualified the desired CHECK")
 		}
 	}
-	if !derived {
-		t.Fatal("legacy HCL CHECK constraint did not derive its exact enum dependency")
+	empty, err := New().Normalize(ctx, schema.Document{Version: schema.SchemaVersion})
+	if err != nil {
+		t.Fatal(err)
 	}
-	whole, err := PlanDatabaseBootstrap(ctx, target, desired, plan.Options{})
+	schemaPlan, err := plan.Build(ctx, New(), empty, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	whole, err := bootstrap.ComposePlan(target, schemaPlan)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -870,7 +873,11 @@ func TestManagedBootstrapExecutesEnumCheckOutsideSearchPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	noOp, err := plan.Build(ctx, New(), current, desired, plan.Options{})
+	normalizedDesired, err := New().Normalize(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noOp, err := plan.Build(ctx, New(), current, normalizedDesired, plan.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -22,12 +22,39 @@ func TestProjectInspectedBootstrapResourceDoesNotMutateSnapshot(t *testing.T) {
 	}
 	desired := actual
 	desired.Dependencies = actual.Dependencies[:1]
-	projected := projectInspectedBootstrapResource(actual, desired, map[string]bool{"managed": true})
+	projected := projectInspectedBootstrapResource(actual, desired, map[string]bool{"managed": true}, nil, nil)
 	if len(projected.Dependencies) != 1 || projected.Dependencies[0].Target != "managed" {
 		t.Fatalf("projected dependencies=%+v", projected.Dependencies)
 	}
 	if len(actual.Dependencies) != 2 || actual.Dependencies[1].Target != "unmanaged" {
 		t.Fatalf("projection mutated inspected snapshot: %+v", actual.Dependencies)
+	}
+}
+
+func TestProjectInspectedBootstrapCheckConstraintUsesSemanticBinding(t *testing.T) {
+	namespace := renderResource(schema.KindSchema, schema.Name{Name: "global"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "global", Name: "cells", Parent: namespace.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
+	cellType := renderResource(schema.KindEnum, schema.Name{Schema: "global", Name: "cell_type", Parent: namespace.ID}, `{"values":["dedicated","isolated","shared"]}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
+	typeColumn := renderResource(schema.KindColumn, schema.Name{Schema: "global", Name: "type", Parent: table.ID}, `{"type":"global.cell_type","not_null":true,"ordinal":1}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: cellType.ID, Type: schema.DependencyUses})
+	dependencies := []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}, {Target: typeColumn.ID, Type: schema.DependencyReferences}, {Target: cellType.ID, Type: schema.DependencyUses}}
+	desired := renderResource(schema.KindCheckConstraint, schema.Name{Schema: "global", Name: "cells_dedicated_capacity_check", Parent: table.ID}, `{"definition":"CHECK (type = ANY (ARRAY['dedicated'::cell_type, 'isolated'::cell_type]))","columns":["type"],"deferrable":false,"initially_deferred":false,"validated":true}`, dependencies...)
+	actual := desired
+	actual.Spec = []byte(`{"definition":"CHECK (type = ANY (ARRAY['dedicated'::global.cell_type, 'isolated'::global.cell_type]))","columns":["type"],"deferrable":false,"initially_deferred":false,"validated":true}`)
+	actualResources := resourceMapForRender(schema.Document{Graph: schema.Graph{Resources: []schema.Resource{namespace, table, cellType, typeColumn, actual}}})
+	desiredResources := resourceMapForRender(schema.Document{Graph: schema.Graph{Resources: []schema.Resource{namespace, table, cellType, typeColumn, desired}}})
+	managed := map[string]bool{namespace.ID: true, table.ID: true, cellType.ID: true, typeColumn.ID: true, desired.ID: true}
+
+	projected := projectInspectedBootstrapResource(actual, desired, managed, actualResources, desiredResources)
+	if stringValue(spec(projected), "definition") != stringValue(spec(desired), "definition") {
+		t.Fatalf("semantically identical CHECK was not projected to desired spelling: %s", projected.Spec)
+	}
+
+	drifted := actual
+	drifted.Spec = []byte(`{"definition":"CHECK (type = ANY (ARRAY['shared'::global.cell_type]))","columns":["type"],"deferrable":false,"initially_deferred":false,"validated":true}`)
+	actualResources[drifted.ID] = drifted
+	projected = projectInspectedBootstrapResource(drifted, desired, managed, actualResources, desiredResources)
+	if stringValue(spec(projected), "definition") == stringValue(spec(desired), "definition") {
+		t.Fatal("semantically different CHECK constraint was hidden")
 	}
 }
 
