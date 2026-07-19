@@ -75,6 +75,23 @@ For a fresh database, add `--bootstrap`. Bootstrap HCL must contain exactly one
 database transitions may also carry that block; it is treated as the database
 contract and excluded from in-database SQL planning.
 
+Bootstrap publish does not resolve or connect to `ProductionURL`. Simulation
+and the approval guardrail both execute against disposable databases on
+`DevelopmentURL`, prepared to match the declared target: external mode removes
+the template-created `public` schema before replay. Owner roles referenced by
+the database or schema HCL but not declared as managed `role` resources are
+leased on the development cluster as `NOLOGIN` roles when missing. AutoSQL
+coordinates concurrent leases, drops only roles it created, and drops them
+only after every participating workspace has released its lease; existing
+roles are never changed or removed. The development identity therefore needs `CREATEDB`
+and, when a referenced owner is absent, `CREATEROLE` (a development superuser
+also satisfies both). Auto-created roles are granted to the development
+identity for the lease. An existing owner role is never modified, so a
+non-superuser development identity must already be its member. These temporary
+development roles do not alter the production bootstrap contract: required
+external roles must still exist on the real target when its bootstrap is
+applied.
+
 The output directory is created atomically and contains:
 
 ```text

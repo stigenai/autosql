@@ -13,13 +13,11 @@ import (
 	"autosql/pkg/simulate"
 	"context"
 	"crypto/ed25519"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -38,12 +36,26 @@ var (
 type GenerateError struct {
 	Stage string
 	Kind  error
+	Cause error
 }
 
-func (e *GenerateError) Error() string { return fmt.Sprintf("%v: %s", e.Kind, e.Stage) }
-func (e *GenerateError) Unwrap() error { return e.Kind }
+func (e *GenerateError) Error() string {
+	if e.Cause != nil {
+		return fmt.Sprintf("%v: %s: %v", e.Kind, e.Stage, e.Cause)
+	}
+	return fmt.Sprintf("%v: %s", e.Kind, e.Stage)
+}
+func (e *GenerateError) Unwrap() []error {
+	if e.Cause == nil {
+		return []error{e.Kind}
+	}
+	return []error{e.Kind, e.Cause}
+}
 func generationFailure(stage string, kind error) error {
 	return &GenerateError{Stage: stage, Kind: kind}
+}
+func generationFailureCause(stage string, kind, cause error) error {
+	return &GenerateError{Stage: stage, Kind: kind, Cause: cause}
 }
 
 type GenerateRequest struct {
@@ -202,7 +214,10 @@ func (s GenerateService) buildGeneratedArtifact(ctx context.Context, r GenerateR
 		return out, err
 	}
 	sim, err := simulate.Run(ctx, simulationFactory, simulate.Request{Config: simulate.Config{DevelopmentURL: r.DevelopmentURL, DevelopmentIdentity: r.DevelopmentIdentity, ProductionIdentity: r.ProductionIdentity, CleanupTimeout: 20 * time.Second}, From: current, Plan: p})
-	if err != nil || !sim.Verified || sim.ToFingerprint != toFP {
+	if err != nil {
+		return out, generationFailureCause("simulate", ErrGenerateStage, simulate.Redacted(err))
+	}
+	if !sim.Verified || sim.ToFingerprint != toFP {
 		return out, generationFailure("simulate", ErrGenerateStage)
 	}
 	statements := executableStatements(p)
@@ -236,7 +251,8 @@ func (s GenerateService) buildGeneratedArtifact(ctx context.Context, r GenerateR
 	if err != nil {
 		return out, generationFailure("guardrail_bindings", ErrGenerateStage)
 	}
-	in := guardrail.Input{Changes: p.Changes, Safety: si, Policy: r.Policy, PolicyIdentity: r.PolicyIdentity, SchemaResources: schemaResources, MigrationResources: migrationResources, Precheck: checks, Approval: approval.Request{Plan: approval.Plan{Environment: r.Environment, Author: r.Author, ExpiresAt: r.ExpiresAt}, Approvals: append([]approval.Approval(nil), r.Approvals...), RequestedBy: r.Requester}, StatementBindings: bindings, Mutation: generationPlanMutation{url: workspaceURL, plan: p}}
+	mutation := &generationPlanMutation{url: workspaceURL, plan: p}
+	in := guardrail.Input{Changes: p.Changes, Safety: si, Policy: r.Policy, PolicyIdentity: r.PolicyIdentity, SchemaResources: schemaResources, MigrationResources: migrationResources, Precheck: checks, Approval: approval.Request{Plan: approval.Plan{Environment: r.Environment, Author: r.Author, ExpiresAt: r.ExpiresAt}, Approvals: append([]approval.Approval(nil), r.Approvals...), RequestedBy: r.Requester}, StatementBindings: bindings, Mutation: mutation}
 	if err = s.checkpoint(r, "guardrail"); err != nil {
 		return out, err
 	}
@@ -259,7 +275,7 @@ func (s GenerateService) buildGeneratedArtifact(ctx context.Context, r GenerateR
 	g.Approval.Authority = authority
 	g.Approval.Audit = r.ApprovalAudit
 	if _, err = g.Apply(ctx, in); err != nil {
-		return out, generationFailure("guardrail_approval_precheck", ErrGenerateStage)
+		return out, generationFailureCause("guardrail_approval_precheck", ErrGenerateStage, mutation.cause)
 	}
 	approved, err := trustedArtifactApproval(ctx, authority, in.Approval.Approvals, bundle, r.Environment)
 	if err != nil {
@@ -469,21 +485,25 @@ func shaJSON(v any) string { b, _ := json.Marshal(v); return sha(string(b)) }
 type replayWorkspace struct {
 	Document            schema.Document
 	URL, adminURL, name string
+	workspace           *simulate.PostgresWorkspace
 }
 
 func (w replayWorkspace) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	c, e := pgx.Connect(ctx, w.adminURL)
-	if e != nil {
-		return e
+	if w.workspace == nil {
+		c, err := pgx.Connect(ctx, w.adminURL)
+		if err != nil {
+			return err
+		}
+		defer c.Close(context.Background())
+		_, err = c.Exec(ctx, "DROP DATABASE IF EXISTS "+pgx.Identifier{w.name}.Sanitize()+" WITH (FORCE)")
+		return err
 	}
-	defer c.Close(context.Background())
-	_, e = c.Exec(ctx, "DROP DATABASE IF EXISTS "+pgx.Identifier{w.name}.Sanitize()+" WITH (FORCE)")
-	return e
+	return w.workspace.Cleanup(ctx)
 }
 func replaySnapshot(ctx context.Context, snap Snapshot, r GenerateRequest) (out replayWorkspace, err error) {
-	out, err = createReplayWorkspace(ctx, r)
+	out, err = createReplayWorkspace(ctx, r, simulate.PostgresFactory{NamePrefix: "autosql_sim_gen_replay"})
 	if err != nil {
 		return out, err
 	}
@@ -524,38 +544,12 @@ func replaySnapshot(ctx context.Context, snap Snapshot, r GenerateRequest) (out 
 	return out, nil
 }
 
-func createReplayWorkspace(ctx context.Context, r GenerateRequest) (out replayWorkspace, err error) {
-	u, e := url.Parse(r.DevelopmentURL)
-	if e != nil || u.Scheme == "" {
-		return out, e
+func createReplayWorkspace(ctx context.Context, r GenerateRequest, factory simulate.PostgresFactory) (replayWorkspace, error) {
+	workspace, err := factory.CreateWorkspace(ctx, simulate.Config{DevelopmentURL: r.DevelopmentURL, DevelopmentIdentity: r.DevelopmentIdentity, ProductionIdentity: r.ProductionIdentity, CleanupTimeout: 20 * time.Second})
+	if err != nil {
+		return replayWorkspace{}, err
 	}
-	admin, e := pgx.Connect(ctx, r.DevelopmentURL)
-	if e != nil {
-		return out, e
-	}
-	defer admin.Close(context.Background())
-	actual, e := simulate.ResolvePostgresIdentity(ctx, r.DevelopmentURL)
-	if e != nil || actual != r.DevelopmentIdentity || actual == r.ProductionIdentity {
-		return out, errors.New("development identity mismatch")
-	}
-	random := make([]byte, 12)
-	if _, e = rand.Read(random); e != nil {
-		return out, e
-	}
-	name := "autosql_gen_replay_" + hex.EncodeToString(random)
-	if _, e = admin.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()); e != nil {
-		return out, e
-	}
-	created := true
-	defer func() {
-		if err != nil && created {
-			_ = (replayWorkspace{adminURL: r.DevelopmentURL, name: name}).Close()
-		}
-	}()
-	du := *u
-	du.Path = "/" + name
-	created = false
-	return replayWorkspace{URL: du.String(), adminURL: r.DevelopmentURL, name: name}, nil
+	return replayWorkspace{URL: workspace.URL(), workspace: workspace}, nil
 }
 
 type replayDB struct{ url string }
