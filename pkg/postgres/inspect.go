@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"regexp"
 	"strings"
 	"time"
 
@@ -187,6 +188,7 @@ func inspectSnapshot(ctx context.Context, conn catalogQueryer, req plugin.Inspec
 		{"type dependencies", "USAGE on composite attribute types", i.inspectTypeDependencies},
 		{"sequences", "USAGE on the selected schemas", i.inspectSequences},
 		{"relations", "USAGE on schemas and SELECT on catalog metadata", i.inspectRelations},
+		{"partitions", "USAGE on schemas and SELECT on partition metadata", i.inspectPartitions},
 		{"relation dependencies", "USAGE on schemas and SELECT on catalog dependency metadata", i.inspectRelationDependencies},
 		{"columns", "USAGE on schemas and SELECT on catalog metadata", i.inspectColumns},
 		{"column default dependencies", "USAGE on schemas and SELECT on catalog dependency metadata", i.inspectColumnDefaultDependencies},
@@ -772,6 +774,61 @@ func (i *inspector) inspectRelations(ctx context.Context) error {
 		i.recordOID("pg_class", oid, id)
 	}
 	return rows.Err()
+}
+
+func (i *inspector) inspectPartitions(ctx context.Context) error {
+	rows, err := i.conn.Query(ctx, `select child.oid,parent.oid,pg_get_expr(child.relpartbound,child.oid,true),pg_get_partkeydef(parent.oid) from pg_inherits inh join pg_class child on child.oid=inh.inhrelid join pg_class parent on parent.oid=inh.inhparent join pg_namespace n on n.oid=child.relnamespace where child.relispartition and n.nspname <> 'information_schema' and n.nspname !~ '^pg_' order by child.oid`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var childOID, parentOID uint32
+		var bound, key string
+		if err := rows.Scan(&childOID, &parentOID, &bound, &key); err != nil {
+			return err
+		}
+		childID, parentID := i.byOID[childOID], i.byOID[parentOID]
+		if childID == "" || parentID == "" {
+			continue
+		}
+		strategy, columns, parseErr := parseInspectedPartitionKey(key)
+		if parseErr != nil {
+			return parseErr
+		}
+		for index := range i.resources {
+			resource := &i.resources[index]
+			if resource.ID == parentID {
+				values := specMap(resource.Spec)
+				values["partitioned"], values["partition_strategy"], values["partition_columns"] = true, strategy, columns
+				resource.Spec, _ = json.Marshal(values)
+			}
+			if resource.ID == childID {
+				values := specMap(resource.Spec)
+				values["partition_of"], values["partition_bound"] = parentID, bound
+				resource.Spec, _ = json.Marshal(values)
+				appendUniqueDependency(&resource.Dependencies, schema.Dependency{Target: parentID, Type: schema.DependencyReferences})
+			}
+		}
+	}
+	return rows.Err()
+}
+
+func parseInspectedPartitionKey(value string) (string, []string, error) {
+	match := regexp.MustCompile(`(?i)^\s*(RANGE|LIST|HASH)\s*\((.*)\)\s*$`).FindStringSubmatch(value)
+	if match == nil {
+		return "", nil, fmt.Errorf("unsupported inspected partition key %q", value)
+	}
+	parts := strings.Split(match[2], ",")
+	columns := make([]string, 0, len(parts))
+	for _, part := range parts {
+		column := strings.Trim(strings.TrimSpace(part), `"`)
+		if column == "" || strings.ContainsAny(column, " ()") {
+			return "", nil, fmt.Errorf("partition expression %q is outside the managed column-key grammar", part)
+		}
+		columns = append(columns, column)
+	}
+	return strings.ToLower(match[1]), columns, nil
 }
 
 func (i *inspector) inspectColumns(ctx context.Context) error {

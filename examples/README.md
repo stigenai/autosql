@@ -26,6 +26,8 @@ constitution for their exact meaning.
 
 - [`hcl-postgres`](hcl-postgres/README.md) exercises HCL authoring, semantic
   planning, PostgreSQL inspection, every advertised PostgreSQL resource kind,
+  typed variables/modules, deterministic expansion, reviewed rename intent,
+  author/canonical formatting,
   default expressions, deterministic round trips, and a complete 1,000+-resource
   empty-database bootstrap through
   [`run-complete-bootstrap.sh`](hcl-postgres/run-complete-bootstrap.sh).

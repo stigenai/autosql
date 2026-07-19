@@ -163,6 +163,11 @@ func TestSchemaInspectOutputFormats(t *testing.T) {
 			}
 		})
 	}
+	var author bytes.Buffer
+	code := Run(context.Background(), []string{"schema", "inspect", "--url", "env://AUTOSQL_INSPECT_URL", "--format", "hcl", "--hcl-style", "author"}, Streams{Out: &author, Err: &bytes.Buffer{}})
+	if code != 0 || !strings.Contains(author.String(), `schema "app"`) || strings.Contains(author.String(), `spec_json`) {
+		t.Fatalf("author HCL code=%d out=%s", code, author.String())
+	}
 }
 
 func TestSchemaLoadHCLSource(t *testing.T) {

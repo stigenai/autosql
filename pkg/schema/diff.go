@@ -17,6 +17,36 @@ var (
 )
 
 type RenameHint struct{ From, To string }
+
+const RenameHintsAnnotation = "autosql.io/rename-hints"
+
+func DocumentRenameHints(doc Document) ([]RenameHint, error) {
+	raw := strings.TrimSpace(doc.Annotations[RenameHintsAnnotation])
+	if raw == "" {
+		return nil, nil
+	}
+	var hints []RenameHint
+	if err := json.Unmarshal([]byte(raw), &hints); err != nil {
+		return nil, fmt.Errorf("invalid rename hints annotation: %w", err)
+	}
+	sort.Slice(hints, func(i, j int) bool {
+		return hints[i].From < hints[j].From || hints[i].From == hints[j].From && hints[i].To < hints[j].To
+	})
+	return hints, nil
+}
+
+func RenameHintsDigest(hints []RenameHint) (string, error) {
+	ordered := append([]RenameHint(nil), hints...)
+	sort.Slice(ordered, func(i, j int) bool {
+		return ordered[i].From < ordered[j].From || ordered[i].From == ordered[j].From && ordered[i].To < ordered[j].To
+	})
+	raw, err := json.Marshal(ordered)
+	if err != nil {
+		return "", err
+	}
+	return digest("rename-hints", raw), nil
+}
+
 type DiffOptions struct {
 	Include, Exclude []string
 	RenameHints      []RenameHint
@@ -32,6 +62,7 @@ func SemanticFingerprint(doc Document) (string, error) {
 	for i := range clone.Graph.Resources {
 		clone.Graph.Resources[i].Source = nil
 	}
+	delete(clone.Annotations, RenameHintsAnnotation)
 	clone.Normalize()
 	if err := clone.Validate(); err != nil {
 		return "", err

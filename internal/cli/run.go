@@ -145,7 +145,8 @@ func runSchemaInspect(parent context.Context, args []string, o output, redactor 
 	urlRef := fs.String("url", "", "database URL secret reference (env:// or file://)")
 	timeout := fs.Duration("timeout", 30*time.Second, "maximum command duration")
 	advanced := fs.Bool("advanced", false, "inspect roles and grants")
-	format := fs.String("format", "native", "native, sql, or json")
+	format := fs.String("format", "native", "native, sql, json, or hcl")
+	hclStyle := fs.String("hcl-style", "canonical", "HCL output style: canonical or author")
 	jsonFlag := fs.Bool("json", false, "emit JSON envelope")
 	var schemas, include, exclude stringList
 	fs.Var(&schemas, "schema", "schema to inspect (repeatable)")
@@ -183,6 +184,9 @@ func runSchemaInspect(parent context.Context, args []string, o output, redactor 
 	if *format != "native" && *format != "json" && *format != "sql" && *format != "hcl" {
 		return usageError(fmt.Errorf("invalid --format"))
 	}
+	if *hclStyle != "canonical" && *hclStyle != "author" {
+		return usageError(fmt.Errorf("invalid --hcl-style"))
+	}
 	human, err := doc.MarshalCanonical()
 	if err != nil {
 		return &Error{Kind: "validation", Message: err.Error(), Code: ExitValidation, Cause: err}
@@ -195,7 +199,7 @@ func runSchemaInspect(parent context.Context, args []string, o output, redactor 
 		}
 	}
 	if *format == "hcl" {
-		hcl, herr := source.FormatHCL(doc)
+		hcl, herr := source.FormatHCLWithOptions(doc, source.HCLFormatOptions{Style: source.HCLFormatStyle(*hclStyle)})
 		if herr != nil {
 			return &Error{Kind: "validation", Message: "HCL rendering failed", Code: ExitValidation, Cause: herr}
 		}
