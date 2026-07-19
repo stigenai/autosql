@@ -1,0 +1,20 @@
+apiVersion: autosql.io/v1alpha1
+kind: AutoSQLSchema
+metadata:
+  name: orders
+spec:
+  kind: VersionedMigration
+  generation: 1
+  source:
+    registryDigest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  artifactDigest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  databaseIdentity:
+    provider: azure_postgresql_entra
+    host: orders.postgres.database.azure.com
+    port: 5432
+    user: autosql
+    database: orders
+    tlsMode: verify-full
+    audience: api://AzureADTokenExchange
+    subject: system:serviceaccount:autosql-system:autosql-operator
+  requireApproval: true

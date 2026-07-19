@@ -1,25 +1,45 @@
-# Terraform / OpenTofu provider contract
+# Terraform and OpenTofu provider
 
-`pkg/integrations/terraform` is the protocol-neutral core for an AutoSQL
-Terraform or OpenTofu provider. A provider adapter can map these types to the
-Terraform Plugin Framework without changing the safety contract.
+The first-party Terraform Plugin Framework provider exposes `autosql_schema`
+and `autosql_migration` and delegates mutation to the released AutoSQL CLI.
 
-The `autosql_schema` and `autosql_migration` resources carry only opaque source,
-artifact, policy, target-snapshot, and connection references. Resolved database
-URLs and passwords are rejected and never serialized into state. The sensitive
-`connection_ref` attribute is still only a reference; it is not a credential.
+```hcl
+terraform {
+  required_providers {
+    autosql = { source = "stigenai/autosql", version = "~> 0.1" }
+  }
+}
 
-Plans are immutable bindings of:
+provider "autosql" {
+  apply_config_ref = "file:///run/secrets/autosql/apply.json"
+}
 
-- the AutoSQL artifact digest,
-- the policy/rule-pack digest, and
-- the target snapshot digest.
+resource "autosql_schema" "production" {
+  id              = "orders-production"
+  source_ref      = "file://${path.module}/orders.artifact.json"
+  artifact_digest = "sha256:..."
+  policy_digest   = "sha256:..."
+  target_snapshot = "sha256:..."
+  target_id       = "orders-primary"
+  environment     = "production"
+  connection_ref  = "env://AUTOSQL_DATABASE_URL"
+  approval_ref    = "file://${path.module}/orders.approval.json"
+  approval_digest = "sha256:..."
+}
+```
 
-Apply requires an exact approved plan digest, acquires a per-resource state
-lock, and delegates execution to the same deployment contract used by CLI and
-fleet workflows. Destroy maps to an explicitly approved destructive action.
+The provider hashes artifact and approval evidence before starting the CLI.
+Resolved database URLs are rejected; state contains only opaque references.
+Create and update run `autosql apply --artifact ... --no-edits`. Read verifies
+local material without contacting the database or resolving a credential.
 
-Import and refresh inspect live state while preserving the caller’s opaque
-connection reference. The provider never resolves a secret while constructing
-Terraform state. Offline plan validation therefore works in CI without a
-database connection; acceptance tests can inject a live inspector and runner.
+Removal forgets the Terraform ownership record by default. A database rollback
+requires all four `destroy_source_ref`, `destroy_artifact_digest`,
+`destroy_approval_ref`, and `destroy_approval_digest` fields. Partial
+destructive authorization fails closed.
+
+Import accepts a JSON object containing non-secret attributes and opaque
+references. Release archives follow Terraform Registry naming for Linux,
+macOS, and Windows on amd64 and arm64. Checksums are signed with the provider
+publishing key. Terraform and OpenTofu versions released in the prior 24 months
+are supported.

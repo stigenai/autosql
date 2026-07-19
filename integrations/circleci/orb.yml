@@ -1,0 +1,47 @@
+version: 2.1
+description: Verify and deploy immutable AutoSQL database artifacts
+display:
+  home_url: https://github.com/stigenai/autosql
+  source_url: https://github.com/stigenai/autosql
+executors:
+  autosql:
+    docker:
+      - image: ghcr.io/stigenai/autosql@sha256:0e748a1c8fbc51c2bfbdf00be13bf0484d5c6f6be8b45612550ec211d4cd0905
+commands:
+  verify:
+    parameters:
+      contract: {type: string}
+      contract-digest: {type: string}
+    steps:
+      - run:
+          name: Verify AutoSQL contract
+          command: autosql integration verify --contract << parameters.contract >> --contract-digest << parameters.contract-digest >> --json
+  deploy:
+    parameters:
+      contract: {type: string}
+      contract-digest: {type: string}
+    steps:
+      - run:
+          name: Apply AutoSQL artifact
+          command: autosql integration run --contract << parameters.contract >> --contract-digest << parameters.contract-digest >> --json
+jobs:
+  review:
+    executor: autosql
+    parameters:
+      contract: {type: string}
+      contract-digest: {type: string}
+    steps:
+      - checkout
+      - verify:
+          contract: << parameters.contract >>
+          contract-digest: << parameters.contract-digest >>
+  deploy:
+    executor: autosql
+    parameters:
+      contract: {type: string}
+      contract-digest: {type: string}
+    steps:
+      - checkout
+      - deploy:
+          contract: << parameters.contract >>
+          contract-digest: << parameters.contract-digest >>

@@ -1,5 +1,22 @@
 # Kubernetes operator contract
 
+Install the supported bundle from the signed OCI Helm chart:
+
+```sh
+helm install autosql oci://ghcr.io/stigenai/charts/autosql-operator \
+  --namespace autosql-system --create-namespace --version 0.1.0
+```
+
+The chart pins the controller by digest, includes the complete CRD, persistent
+state and artifact volumes, least-privilege RBAC, admission policy, and
+workload-identity service-account settings.
+
+The default installation watches only its release namespace and receives a
+namespaced Role; it cannot read Secrets from other namespaces. Set
+`rbac.clusterWide=true` only when one controller must reconcile multiple
+namespaces, and treat that as an explicit expansion of its secret-read trust
+boundary.
+
 The operator is built with controller-runtime 0.23 and Kubernetes client
 libraries 0.35, and is certified by envtest against Kubernetes 1.35.x.
 
@@ -12,8 +29,9 @@ workflow, including keys, CI approval freshness, generated
 the published AutoSQL image. `deploy/operator/crd.yaml` declares
 `AutoSQLSchema` resources. A resource may
 be declarative or versioned and may select exactly one inline, Secret, ConfigMap,
-URL, or immutable registry-digest source. Database URLs are always Secret key
-references. The controller writes only non-secret execution metadata to
+URL, or immutable registry-digest source. Database access uses either a Secret
+key reference or `databaseIdentity` for AWS RDS IAM, GCP Cloud SQL IAM, or
+Azure PostgreSQL Entra. The controller writes only non-secret execution metadata to
 status: conditions, generation, retry count, artifact/plan digests, target
 identity, operation and execution IDs, pending recovery step, and recovery
 guidance. It never copies secret values.

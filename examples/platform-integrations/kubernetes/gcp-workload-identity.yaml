@@ -1,0 +1,20 @@
+apiVersion: autosql.io/v1alpha1
+kind: AutoSQLSchema
+metadata:
+  name: orders
+spec:
+  kind: VersionedMigration
+  generation: 1
+  source:
+    registryDigest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  artifactDigest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  databaseIdentity:
+    provider: gcp_cloud_sql_iam
+    host: orders.example.internal
+    port: 5432
+    user: autosql@example-project.iam
+    database: orders
+    tlsMode: verify-full
+    audience: //iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/production/providers/kubernetes
+    subject: system:serviceaccount:autosql-system:autosql-operator
+  requireApproval: true

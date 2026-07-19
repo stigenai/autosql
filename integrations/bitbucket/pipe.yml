@@ -1,0 +1,13 @@
+name: AutoSQL
+description: Verify or apply an immutable AutoSQL artifact
+repository: https://github.com/stigenai/autosql
+image: ghcr.io/stigenai/autosql-bitbucket-pipe@sha256:0e748a1c8fbc51c2bfbdf00be13bf0484d5c6f6be8b45612550ec211d4cd0905
+vendor:
+  name: Stigen AI
+variables:
+  - name: MODE
+    default: verify
+    allowed-values: [verify, run]
+  - name: CONTRACT
+  - name: CONTRACT_DIGEST
+tags: [database, postgres, migration, schema]

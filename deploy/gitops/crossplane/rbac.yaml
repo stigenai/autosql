@@ -1,0 +1,21 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: crossplane:autosql-schema-composition
+  labels:
+    # Crossplane's aggregate ClusterRole selects this label. This grants only
+    # the composed AutoSQL resource surface, not Secrets or database access.
+    rbac.crossplane.io/aggregate-to-crossplane: "true"
+rules:
+  - apiGroups: ["autosql.io"]
+    resources: ["autosqlschemas"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["autosql.io"]
+    resources: ["autosqlschemas/status"]
+    # Crossplane's composition capability check requires the complete verb
+    # set for every composed subresource, even though this composition only
+    # observes AutoSQL status and copies selected fields to the XR.
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["autosql.io"]
+    resources: ["autosqlschemas/finalizers"]
+    verbs: ["update"]

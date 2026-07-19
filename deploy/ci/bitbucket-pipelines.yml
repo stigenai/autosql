@@ -1,15 +1,15 @@
+image: ghcr.io/stigenai/autosql@sha256:0e748a1c8fbc51c2bfbdf00be13bf0484d5c6f6be8b45612550ec211d4cd0905
 pipelines:
   default:
     - step:
         name: AutoSQL review
-        image: ghcr.io/example/autosql-ci@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
         script:
-          - autosql verify --contract-ref env://AUTOSQL_CONTRACT --mode review
+          - autosql integration verify --contract .autosql/review-contract.json --contract-digest "$AUTOSQL_REVIEW_CONTRACT_DIGEST" --json
   branches:
     main:
       - step:
           name: AutoSQL deploy
+          deployment: production
           oidc: true
-          image: ghcr.io/example/autosql-ci@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
           script:
-            - autosql verify --contract-ref env://AUTOSQL_CONTRACT --mode deploy --oidc
+            - autosql integration run --contract .autosql/deploy-contract.json --contract-digest "$AUTOSQL_DEPLOY_CONTRACT_DIGEST" --json

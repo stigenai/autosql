@@ -1,0 +1,6 @@
+AutoSQL operator {{ .Chart.AppVersion }} is installed in namespace {{ .Release.Namespace }}.
+
+Verify it with:
+  kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "autosql-operator.fullname" . }}
+
+The image is {{ if .Values.image.digest }}pinned to {{ .Values.image.repository }}@{{ .Values.image.digest }}{{ else }}using local conformance tag {{ .Values.image.repository }}:{{ .Values.image.tag }}{{ end }}.

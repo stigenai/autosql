@@ -1,0 +1,35 @@
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: OCIRepository
+metadata:
+  name: autosql-operator
+  namespace: flux-system
+spec:
+  interval: 10m
+  url: oci://ghcr.io/stigenai/charts/autosql-operator
+  ref:
+    tag: 0.1.0
+  layerSelector:
+    mediaType: application/vnd.cncf.helm.chart.content.v1.tar+gzip
+    operation: copy
+  verify:
+    provider: cosign
+    matchOIDCIdentity:
+      - issuer: ^https://token.actions.githubusercontent.com$
+        subject: ^https://github.com/stigenai/autosql/.github/workflows/release.yml@refs/tags/v.*$
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: autosql-operator
+  namespace: autosql-system
+spec:
+  interval: 10m
+  chartRef:
+    kind: OCIRepository
+    name: autosql-operator
+    namespace: flux-system
+  install:
+    crds: CreateReplace
+  upgrade:
+    crds: CreateReplace
+    cleanupOnFail: true

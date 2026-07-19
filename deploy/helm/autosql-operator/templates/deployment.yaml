@@ -1,0 +1,89 @@
+{{- if and .Values.image.digest .Values.image.tag }}{{ fail "image.digest and image.tag are mutually exclusive" }}{{ end }}
+{{- if not (or .Values.image.digest .Values.image.tag) }}{{ fail "image.digest or image.tag is required" }}{{ end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "autosql-operator.fullname" . }}
+  labels:
+    {{- include "autosql-operator.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "autosql-operator.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "autosql-operator.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        {{- with .Values.podLabels }}{{ toYaml . | nindent 8 }}{{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "autosql-operator.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: operator
+          image: "{{ .Values.image.repository }}{{ if .Values.image.digest }}@{{ .Values.image.digest }}{{ else }}:{{ .Values.image.tag }}{{ end }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["operator", "--leader-election={{ .Values.leaderElection }}"]
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - name: AUTOSQL_OPERATOR_STATE_FILE
+              value: /var/lib/autosql/operator/state.json
+            - name: AUTOSQL_OPERATOR_ARTIFACT_DIR
+              value: /var/lib/autosql/artifacts
+            - name: AUTOSQL_OPERATOR_WATCH_NAMESPACE
+              value: {{ default .Release.Namespace .Values.watchNamespace | quote }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/autosql/operator
+            - name: artifacts
+              mountPath: /var/lib/autosql/artifacts
+            {{- if .Values.workloadIdentity.audience }}
+            - name: workload-identity
+              mountPath: /var/run/secrets/autosql
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: {{ default (printf "%s-state" (include "autosql-operator.fullname" .)) .Values.stateStore.existingClaim }}
+        - name: artifacts
+          persistentVolumeClaim:
+            claimName: {{ default (printf "%s-artifacts" (include "autosql-operator.fullname" .)) .Values.artifactStore.existingClaim }}
+        {{- if .Values.workloadIdentity.audience }}
+        - name: workload-identity
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: {{ .Values.workloadIdentity.audience | quote }}
+                  expirationSeconds: {{ .Values.workloadIdentity.tokenExpirationSeconds }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints: {{ toYaml . | nindent 8 }}
+      {{- end }}

@@ -1,12 +1,24 @@
 stages:
-- stage: Review
-  jobs:
-  - job: AutoSQLReview
-    steps:
-    - script: autosql verify --contract-ref env://AUTOSQL_CONTRACT --mode review
-- stage: Deploy
-  dependsOn: Review
-  jobs:
-  - job: AutoSQLDeploy
-    steps:
-    - script: autosql verify --contract-ref env://AUTOSQL_CONTRACT --mode deploy --oidc
+  - stage: Review
+    jobs:
+      - job: AutoSQLReview
+        steps:
+          - task: AutoSQL@0
+            inputs:
+              mode: verify
+              contract: .autosql/review-contract.json
+              contractDigest: $(AUTOSQL_REVIEW_CONTRACT_DIGEST)
+  - stage: Deploy
+    dependsOn: Review
+    jobs:
+      - deployment: AutoSQLDeploy
+        environment: production
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AutoSQL@0
+                  inputs:
+                    mode: run
+                    contract: .autosql/deploy-contract.json
+                    contractDigest: $(AUTOSQL_DEPLOY_CONTRACT_DIGEST)

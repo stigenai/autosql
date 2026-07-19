@@ -11,7 +11,7 @@ spec:
       serviceAccountName: autosql-operator
       containers:
         - name: operator
-          image: ghcr.io/stigenai/autosql:latest
+          image: ghcr.io/stigenai/autosql@sha256:0e748a1c8fbc51c2bfbdf00be13bf0484d5c6f6be8b45612550ec211d4cd0905
           imagePullPolicy: IfNotPresent
           args: ["operator", "--leader-election"]
           securityContext:
@@ -21,6 +21,10 @@ spec:
           env:
             - name: AUTOSQL_OPERATOR_STATE_FILE
               value: /var/lib/autosql/operator/state.json
+            - name: AUTOSQL_OPERATOR_WATCH_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           volumeMounts:
             - name: operator-state
               mountPath: /var/lib/autosql

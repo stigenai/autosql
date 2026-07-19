@@ -1,0 +1,19 @@
+spec:
+  inputs:
+    stage: {default: test}
+    mode: {options: [verify, run], default: verify}
+    contract: {type: string}
+    contract_digest: {type: string}
+    image_digest:
+      type: string
+---
+autosql-$[[ inputs.mode ]]:
+  stage: $[[ inputs.stage ]]
+  image:
+    name: ghcr.io/stigenai/autosql@$[[ inputs.image_digest ]]
+    entrypoint: [""]
+  id_tokens:
+    AUTOSQL_OIDC_TOKEN:
+      aud: https://autosql.io
+  script:
+    - autosql integration $[[ inputs.mode ]] --contract "$[[ inputs.contract ]]" --contract-digest "$[[ inputs.contract_digest ]]" --json
