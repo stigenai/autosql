@@ -5,17 +5,19 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"autosql/internal/cli"
 	"autosql/pkg/approval"
 	"autosql/pkg/artifact"
 	"autosql/pkg/operator"
@@ -34,11 +36,20 @@ func TestGitOpsPublishBundleIsAcceptedAndAppliedByOperator(t *testing.T) {
 		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
 	}
 	ctx := context.Background()
+	binary := gitopsTestBinary(t)
 	developmentURL, developmentName := gitopsTestDatabase(t, ctx, base, "dev")
 	productionURL, productionName := gitopsTestDatabase(t, ctx, base, "target")
 	directory := t.TempDir()
 	desiredPath := filepath.Join(directory, "global.hcl")
-	desired := `database "` + productionName + `" {
+	bootstrapDesiredPath := filepath.Join(directory, "global-bootstrap.hcl")
+	routineDefinition := `CREATE OR REPLACE FUNCTION gitops_global.identity(value integer)
+ RETURNS integer
+ LANGUAGE plpgsql
+ IMMUTABLE
+ SET search_path TO 'pg_catalog', 'gitops_global', 'public'
+AS $function$ BEGIN RETURN value; END $function$`
+	routineDigest := sha256.Sum256([]byte(routineDefinition))
+	desired := fmt.Sprintf(`database %q {
   mode = "managed"
   endpoint = { host = "postgres.internal", port = 5432, tls_mode = "require" }
   maintenance_database = "postgres"
@@ -77,8 +88,51 @@ resource "index" "accounts_id_idx" {
     references(column_id("gitops_global", "accounts", "id")),
   ])
 }
-`
+`, productionName)
+	bootstrapDesired := desired + fmt.Sprintf(`
+resource "extension" "hstore" {
+  schema = "gitops_global"
+  parent = schema_id("gitops_global")
+  spec_json = jsonencode({
+    version = "1.8"
+    relocatable = true
+    trusted = true
+    superuser = true
+    requires = []
+    owner = ""
+  })
+  deps_json = jsonencode([contains(schema_id("gitops_global"))])
+  annotations_json = jsonencode({ comment = "data type for storing sets of (key, value) pairs" })
+}
+resource "function" "identity(value integer)" {
+  schema = "gitops_global"
+  parent = schema_id("gitops_global")
+  spec_json = jsonencode({
+    name = "identity"
+    identity_arguments = "value integer"
+    arguments = "value integer"
+    result = "integer"
+    returns_set = false
+    language = "plpgsql"
+    volatility = "i"
+    strict = false
+    security_definer = false
+    leakproof = false
+    parallel = "u"
+    cost = 100
+    rows = 0
+    configuration = ["search_path=pg_catalog, gitops_global, public"]
+    owner = "postgres"
+    definition = %q
+    body_digest = "sha256:%x"
+  })
+  deps_json = jsonencode([contains(schema_id("gitops_global"))])
+}
+`, routineDefinition, routineDigest)
 	if err := os.WriteFile(desiredPath, []byte(desired), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bootstrapDesiredPath, []byte(bootstrapDesired), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	parsedDesired, err := source.LoadContext(ctx, source.Input{URI: desiredPath, Format: source.FormatHCLSource, Data: []byte(desired)})
@@ -141,11 +195,7 @@ resource "index" "accounts_id_idx" {
 	if err := os.WriteFile(configPath, configBytes, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	var stdout, stderr bytes.Buffer
-	code := cli.RunWithServices(ctx, []string{"operator", "artifact", "publish", "--file", desiredPath, "--config", configPath, "--output-dir", bundleDir, "--source-revision", "git:0123456789abcdef", "--json"}, cli.Streams{Out: &stdout, Err: &stderr}, cli.Services{ReadPlan: cli.DefaultReadPlan{}})
-	if code != 0 {
-		t.Fatalf("publish code=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
-	}
+	stdout, stderr := runGitOpsTestBinary(t, ctx, binary, "operator", "artifact", "publish", "--file", desiredPath, "--config", configPath, "--output-dir", bundleDir, "--source-revision", "git:0123456789abcdef", "--json")
 	var envelope struct {
 		Data struct {
 			ArtifactDigest    string `json:"artifact_digest"`
@@ -153,8 +203,8 @@ resource "index" "accounts_id_idx" {
 			ConcurrentIndexes bool   `json:"concurrent_indexes"`
 		} `json:"data"`
 	}
-	if err := json.Unmarshal(stdout.Bytes(), &envelope); err != nil || envelope.Data.ArtifactDigest == "" || envelope.Data.PostgresVersion != 16 || !envelope.Data.ConcurrentIndexes {
-		t.Fatalf("publish output=%s err=%v", stdout.String(), err)
+	if err := json.Unmarshal(stdout, &envelope); err != nil || envelope.Data.ArtifactDigest == "" || envelope.Data.PostgresVersion != 16 || !envelope.Data.ConcurrentIndexes {
+		t.Fatalf("publish output=%s stderr=%s err=%v", stdout, stderr, err)
 	}
 	artifactBytes, err := os.ReadFile(filepath.Join(bundleDir, "artifacts", envelope.Data.ArtifactDigest+".json"))
 	if err != nil {
@@ -182,19 +232,14 @@ resource "index" "accounts_id_idx" {
 		}
 	}
 	bootstrapBundleDir := filepath.Join(directory, "bootstrap-release")
-	stdout.Reset()
-	stderr.Reset()
-	bootstrapCode := cli.RunWithServices(ctx, []string{"operator", "artifact", "publish", "--file", desiredPath, "--config", configPath, "--output-dir", bootstrapBundleDir, "--source-revision", "git:0123456789abcdef", "--bootstrap", "--json"}, cli.Streams{Out: &stdout, Err: &stderr}, cli.Services{ReadPlan: cli.DefaultReadPlan{}})
-	if bootstrapCode != 0 {
-		t.Fatalf("bootstrap publish code=%d stdout=%s stderr=%s", bootstrapCode, stdout.String(), stderr.String())
-	}
+	stdout, stderr = runGitOpsTestBinary(t, ctx, binary, "operator", "artifact", "publish", "--file", bootstrapDesiredPath, "--config", configPath, "--output-dir", bootstrapBundleDir, "--source-revision", "git:0123456789abcdef", "--bootstrap", "--json")
 	var bootstrapEnvelope struct {
 		Data struct {
 			ArtifactDigest string `json:"artifact_digest"`
 		} `json:"data"`
 	}
-	if err = json.Unmarshal(stdout.Bytes(), &bootstrapEnvelope); err != nil || bootstrapEnvelope.Data.ArtifactDigest == "" {
-		t.Fatalf("bootstrap publish output=%s err=%v", stdout.String(), err)
+	if err = json.Unmarshal(stdout, &bootstrapEnvelope); err != nil || bootstrapEnvelope.Data.ArtifactDigest == "" {
+		t.Fatalf("bootstrap publish output=%s stderr=%s err=%v", stdout, stderr, err)
 	}
 	bootstrapBytes, err := os.ReadFile(filepath.Join(bootstrapBundleDir, "artifacts", bootstrapEnvelope.Data.ArtifactDigest+".json"))
 	if err != nil {
@@ -222,6 +267,33 @@ resource "index" "accounts_id_idx" {
 		t.Fatalf("operator did not apply complete schema: %d resources", len(document.Graph.Resources))
 	}
 	_ = developmentName
+}
+
+func gitopsTestBinary(t *testing.T) string {
+	t.Helper()
+	directory, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Clean(filepath.Join(directory, "..", ".."))
+	binary := filepath.Join(t.TempDir(), "autosql")
+	command := exec.Command("go", "build", "-o", binary, "./cmd/autosql")
+	command.Dir = root
+	if output, buildErr := command.CombinedOutput(); buildErr != nil {
+		t.Fatalf("build autosql binary: %v\n%s", buildErr, output)
+	}
+	return binary
+}
+
+func runGitOpsTestBinary(t *testing.T, ctx context.Context, binary string, args ...string) ([]byte, []byte) {
+	t.Helper()
+	command := exec.CommandContext(ctx, binary, args...)
+	var stdout, stderr bytes.Buffer
+	command.Stdout, command.Stderr = &stdout, &stderr
+	if err := command.Run(); err != nil {
+		t.Fatalf("autosql %s: %v\nstdout=%s\nstderr=%s", strings.Join(args, " "), err, stdout.String(), stderr.String())
+	}
+	return stdout.Bytes(), stderr.Bytes()
 }
 
 func gitopsTestDatabase(t *testing.T, ctx context.Context, base, label string) (string, string) {

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"autosql/pkg/approval"
+	"autosql/pkg/postgres"
 )
 
 func TestAutomationApprovalProviderBindsFreshProofToBundleAndEnvironment(t *testing.T) {
@@ -41,5 +42,35 @@ func TestAutomationApprovalProviderBindsFreshProofToBundleAndEnvironment(t *test
 				t.Fatal("tampered automation approval verified")
 			}
 		})
+	}
+}
+
+func TestOperatorBootstrapArtifactRenderBindsCompleteInventory(t *testing.T) {
+	inventory := postgres.BootstrapAuthorizationInventory{
+		Routines: []postgres.BootstrapRoutineAuthorization{
+			{SourceDigest: "sha256:b", UnsafeLanguageAuthorizationRequired: true},
+			{SourceDigest: "sha256:a", PrivilegedRoutineAuthorizationRequired: true, TransactionControlAuthorizationRequired: true},
+		},
+		Extensions: []postgres.BootstrapExtensionAuthorization{
+			{Name: "pgcrypto", Version: "1.3", Schema: "app"},
+			{Name: "hstore", Version: "1.8", Schema: "app", UntrustedExtensionAuthorizationRequired: true},
+		},
+	}
+	render := operatorBootstrapArtifactRender(inventory, map[string]string{"postgres_version": "16", "concurrent_indexes": "true"})
+	want := map[string]string{
+		"postgres_version": "16", "concurrent_indexes": "true",
+		"reviewed_routine_digests": "sha256:a,sha256:b", "extension_allowlist": "hstore,pgcrypto",
+		"extension_version.hstore": "1.8", "extension_schemas.hstore": "app",
+		"extension_version.pgcrypto": "1.3", "extension_schemas.pgcrypto": "app",
+		"allow_unsafe_routine_languages": "true", "allow_privileged_routines": "true",
+		"allow_transaction_control_procedures": "true", "allow_untrusted_extensions": "true",
+	}
+	if len(render) != len(want) {
+		t.Fatalf("render=%v want=%v", render, want)
+	}
+	for key, value := range want {
+		if render[key] != value {
+			t.Fatalf("render[%q]=%q want %q", key, render[key], value)
+		}
 	}
 }
