@@ -159,34 +159,26 @@ func sameResolvedEndpoint(dev *url.URL, production string) bool {
 }
 func (p *postgresIsolation) Identity() string { return p.identity }
 func (p *postgresIsolation) Materialize(ctx context.Context, doc schema.Document) error {
-	statements, e := postgres.RenderDocument(ctx, doc, nil)
-	if e != nil {
-		return e
-	}
-	conn, e := pgx.Connect(ctx, p.dbURL)
-	if e != nil {
-		return e
-	}
-	defer conn.Close(context.Background())
-	tx, e := conn.Begin(ctx)
-	if e != nil {
-		return e
-	}
-	for _, s := range statements {
-		if _, e = tx.Exec(ctx, s.SQL); e != nil {
-			tx.Rollback(ctx)
-			return e
-		}
-	}
-	if e = tx.Commit(ctx); e != nil {
-		return e
-	}
 	seen := map[string]bool{}
 	for _, r := range doc.Graph.Resources {
 		if r.Kind == schema.KindSchema && !seen[r.Name.Name] {
 			p.schemas = append(p.schemas, r.Name.Name)
 			seen[r.Name.Name] = true
 		}
+	}
+	baseline := schema.Document{Version: doc.Version, Graph: schema.Graph{Extra: doc.Graph.Extra}, Annotations: doc.Annotations, Extra: doc.Extra}
+	for _, resource := range doc.Graph.Resources {
+		if resource.Kind == schema.KindSchema && resource.Name.Name == "public" && resource.Name.Schema == "" {
+			baseline.Graph.Resources = append(baseline.Graph.Resources, schema.Resource{ID: resource.ID, Kind: resource.Kind, Name: resource.Name, Spec: []byte(`{}`)})
+			break
+		}
+	}
+	pl, e := plan.Build(ctx, postgres.New(), baseline, doc, plan.Options{})
+	if e != nil {
+		return e
+	}
+	if e = p.Execute(ctx, pl); e != nil {
+		return e
 	}
 	if len(p.schemas) == 0 {
 		return nil
@@ -219,18 +211,27 @@ func (p *postgresIsolation) Execute(ctx context.Context, pl plan.Plan) error {
 	}
 	defer conn.Close(context.Background())
 	for _, phase := range pl.Phases {
-		if phase.Transaction != plan.TransactionRequired {
-			return ErrConfig
+		if phase.Transaction == plan.TransactionProhibited {
+			for _, id := range phase.StepIDs {
+				for _, s := range pl.Steps {
+					if s.ID == id && s.Kind == plan.StepExecutable {
+						if _, e = conn.Exec(ctx, s.SQL); e != nil {
+							return e
+						}
+					}
+				}
+			}
+			continue
 		}
-		tx, e := conn.Begin(ctx)
-		if e != nil {
-			return e
+		tx, beginErr := conn.Begin(ctx)
+		if beginErr != nil {
+			return beginErr
 		}
 		for _, id := range phase.StepIDs {
 			for _, s := range pl.Steps {
 				if s.ID == id && s.Kind == plan.StepExecutable {
 					if _, e = tx.Exec(ctx, s.SQL); e != nil {
-						tx.Rollback(ctx)
+						_ = tx.Rollback(ctx)
 						return e
 					}
 				}

@@ -1,0 +1,16 @@
+apiVersion: autosql.io/v1alpha1
+kind: AutoSQLSchema
+metadata:
+  name: cell
+spec:
+  kind: DeclarativeSchema
+  generation: 1
+  source:
+    format: hcl
+    configMapRef: {name: autosql-cell-schema, key: cell.hcl}
+  # Replace this valid placeholder with release.json.artifact_digest.
+  artifactDigest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  databaseURL: {name: autosql-cell-database, key: url}
+  postgresVersion: 16
+  concurrentIndexes: true
+  requireApproval: true

@@ -218,7 +218,23 @@ func verifyDeclarativeResource(ctx context.Context, resource operator.Resource, 
 	if err != nil {
 		return verifiedBootstrapPlan{}, errors.New("normalize declarative target")
 	}
-	generated, err := plan.Build(ctx, postgres.New(), target, desired, plan.Options{})
+	options := plan.Options{Render: operatorBootstrapRenderOptions(resource.Spec)}
+	generated, err := plan.Build(ctx, postgres.New(), target, desired, options)
+	for _, candidate := range desired.Graph.Resources {
+		if candidate.Kind != schema.KindDatabase {
+			continue
+		}
+		databaseTarget, targetErr := postgres.DatabaseTargetFromResource(candidate)
+		if targetErr != nil {
+			return verifiedBootstrapPlan{}, errors.New("declarative database target is invalid")
+		}
+		transition, transitionErr := postgres.PlanDatabaseTransition(ctx, databaseTarget, target, desired, options)
+		if transitionErr != nil {
+			return verifiedBootstrapPlan{}, errors.New("declarative database transition planning failed")
+		}
+		generated, err = transition.SchemaPlan, nil
+		break
+	}
 	if err != nil || generated.Digest != a.Plan.Digest {
 		return verifiedBootstrapPlan{}, errors.New("declarative source does not match approved plan")
 	}

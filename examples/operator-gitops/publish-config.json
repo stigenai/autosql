@@ -1,0 +1,52 @@
+{
+  "DevelopmentURL": "env://AUTOSQL_DEV_DATABASE_URL",
+  "ProductionURL": "env://AUTOSQL_TARGET_DATABASE_URL",
+  "Environment": "production",
+  "DatabaseIdentity": "cell",
+  "Author": "schema-maintainers",
+  "Requester": "gitops-release-bot",
+  "PostgresVersion": 16,
+  "ConcurrentIndexes": true,
+  "Schemas": ["public"],
+  "PolicyFile": "examples/operator-gitops/policy.json",
+  "PolicyIdentity": "platform-database-policy/v1",
+  "ApprovalPolicy": {
+    "Environments": {
+      "production": {
+        "Allowed": true,
+        "Requirements": [
+          {
+            "MinimumRisk": 0,
+            "ApproverCount": 1,
+            "Roles": ["release-automation"]
+          }
+        ]
+      }
+    }
+  },
+  "AutomationApprovalKeyID": "operator-ci-approval-2026-07",
+  "AutomationApprovalIdentity": "github-actions",
+  "AutomationApprovalRoles": ["release-automation"],
+  "AutomationApprovalPrivateKeyReference": "env://AUTOSQL_OPERATOR_APPROVAL_KEY",
+  "ApprovalTTL": "10m",
+  "ArtifactLifetime": "24h",
+  "GenerationApprovalAuditPath": "dist/audit/cell-generation-approval.jsonl",
+  "ApprovalAuditPath": "/var/lib/autosql/approval.jsonl",
+  "LifecycleAuditPath": "/var/lib/autosql/lifecycle.jsonl",
+  "GeneratorKeyID": "operator-generator-2026-07",
+  "GeneratorPurpose": "operator-generator",
+  "GeneratorPrivateKeyReference": "env://AUTOSQL_OPERATOR_GENERATOR_KEY",
+  "SigningKeyID": "operator-release-2026-07",
+  "SigningIssuer": "platform-security",
+  "SigningIdentity": "gitops-release-automation",
+  "SigningPurpose": "operator-release",
+  "SigningStatus": "active",
+  "SigningPrivateKeyReference": "env://AUTOSQL_OPERATOR_RELEASE_KEY",
+  "SigningNotBefore": "2026-07-01T00:00:00Z",
+  "SigningNotAfter": "2026-10-01T00:00:00Z",
+  "OperatorArtifactDirectory": "/release/artifacts",
+  "Metadata": {
+    "autosql.owner": "platform-engineering",
+    "autosql.workflow": "flux"
+  }
+}

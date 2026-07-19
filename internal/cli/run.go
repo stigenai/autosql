@@ -99,6 +99,10 @@ func RunWithServices(ctx context.Context, args []string, streams Streams, servic
 		err = runDatabasePrepare(ctx, args[2:], o, redactor)
 	case len(args) >= 2 && args[0] == "database" && args[1] == "bootstrap":
 		err = runDatabaseBootstrap(ctx, args[2:], o, redactor)
+	case len(args) >= 3 && args[0] == "operator" && args[1] == "artifact" && args[2] == "publish":
+		err = runOperatorArtifactPublish(ctx, args[3:], o, services.ReadPlan)
+	case len(args) >= 3 && args[0] == "operator" && args[1] == "key" && args[2] == "generate":
+		err = runOperatorKeyGenerate(args[3:], o)
 	case len(args) >= 2 && args[0] == "migrate" && args[1] == "status":
 		err = runMigrateStatus(ctx, args[2:], o, redactor)
 	case len(args) >= 2 && args[0] == "migrate" && args[1] == "apply":
@@ -355,7 +359,7 @@ func usageBase() string {
 }
 func usage() string {
 	base := strings.Replace(usageBase(), "\n  migrate generate", "\n  database bootstrap prepare --file path [--include-routine-source] [--json|--hcl]\n  database bootstrap preflight --file path --maintenance-url env://NAME --extension-allowlist names --extension-version name=version --extension-schema name=schema [--json]\n  database bootstrap authorize --file path --authorization-signing-key env://NAME --authorization-key-id id --authorization-issuer issuer --authorization-signer signer --output path [--json]\n  database bootstrap --file path --maintenance-url env://NAME|file://path [--authorization-manifest path --authorization-public-key env://NAME --authorization-issuer issuer --authorization-signer signer] [--json]\n  migrate generate", 1)
-	return base + "\n  migrate start-status --file path --url env://NAME --target id --env name [--json]"
+	return base + "\n  operator key generate --private-output path --public-output path [--json]\n  operator artifact publish --file path --config path --output-dir path --source-revision revision [--bootstrap] [--json]\n  migrate start-status --file path --url env://NAME --target id --env name [--json]"
 }
 func contains(args []string, want string) bool {
 	for _, a := range args {
@@ -390,6 +394,12 @@ func commandName(args []string) string {
 	}
 	if len(args) >= 2 && args[0] == "database" && args[1] == "bootstrap" {
 		return "database bootstrap"
+	}
+	if len(args) >= 3 && args[0] == "operator" && args[1] == "artifact" && args[2] == "publish" {
+		return "operator artifact publish"
+	}
+	if len(args) >= 3 && args[0] == "operator" && args[1] == "key" && args[2] == "generate" {
+		return "operator key generate"
 	}
 	if len(args) >= 2 && args[0] == "plan" && (args[1] == "edit" || args[1] == "review") {
 		return "plan " + args[1]

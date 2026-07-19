@@ -172,7 +172,7 @@ func (PostgreSQLAnalyzer) Analyze(_ context.Context, in Input) ([]Diagnostic, er
 		if blockingIndex {
 			add(RuleIndexBuild, SeverityWarning, "index is built without CONCURRENTLY", "Writes are blocked for the duration of the index build.", "Use CREATE INDEX CONCURRENTLY outside a transaction and monitor progress.", LockShare, true)
 		}
-		if concurrentIndex {
+		if concurrentIndex && (st.Transactional == nil || *st.Transactional) {
 			out = append(out, Diagnostic{Rule: RuleTransaction, Severity: SeverityError, Message: "concurrent index operation cannot run in a transaction block", Object: obj, Source: st.Source, Impact: "Execution in the migration transaction fails.", Remediation: "Run this statement in an explicitly non-transactional migration step.", Confidence: confidence, Assumptions: assumptions})
 		}
 		if hasCommand(st.SQL, enumAddValueCommand) {

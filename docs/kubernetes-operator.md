@@ -3,6 +3,11 @@
 The operator is built with controller-runtime 0.23 and Kubernetes client
 libraries 0.35, and is certified by envtest against Kubernetes 1.35.x.
 
+For the complete non-interactive HCL → signed artifact → OCI/Flux volume
+workflow, including keys, CI approval freshness, generated
+`AUTOSQL_APPLY_CONFIG`, and digest semantics, see
+[GitOps operator artifacts](operator-gitops.md).
+
 `autosql operator --leader-election` starts the controller-runtime adapter in
 the published AutoSQL image. `deploy/operator/crd.yaml` declares
 `AutoSQLSchema` resources. A resource may

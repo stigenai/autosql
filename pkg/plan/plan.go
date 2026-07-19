@@ -304,7 +304,8 @@ func (p Plan) SafetyStatements() []safety.Statement {
 		if step.Kind == StepTopology {
 			continue
 		}
-		out = append(out, safety.Statement{SQL: step.SQL, ChangeID: step.ChangeID})
+		transactional := step.Transaction == TransactionRequired
+		out = append(out, safety.Statement{SQL: step.SQL, ChangeID: step.ChangeID, Transactional: &transactional})
 	}
 	return out
 }
