@@ -122,11 +122,17 @@ type OperatorArtifactResult struct {
 }
 
 type generationPlanMutation struct {
-	url  string
-	plan plan.Plan
+	url   string
+	plan  plan.Plan
+	cause error
 }
 
-func (m generationPlanMutation) ApplyAuthorized(ctx context.Context, checks precheck.Plan) ([]precheck.Result, error) {
+func (m *generationPlanMutation) ApplyAuthorized(ctx context.Context, checks precheck.Plan) (results []precheck.Result, err error) {
+	defer func() {
+		if err != nil {
+			m.cause = simulate.RedactedCause(err)
+		}
+	}()
 	validation := checks
 	validation.Statements = nil
 	for index := range validation.Assertions {
@@ -140,7 +146,7 @@ func (m generationPlanMutation) ApplyAuthorized(ctx context.Context, checks prec
 	for index := range validation.Assertions {
 		validation.Assertions[index].PlanDigest = digest
 	}
-	results, err := precheck.GuardedApply(ctx, replayDB{url: m.url}, validation)
+	results, err = precheck.GuardedApply(ctx, replayDB{url: m.url}, validation)
 	if err != nil {
 		return results, err
 	}
@@ -224,13 +230,16 @@ func (s GenerateService) BuildOperatorArtifact(ctx context.Context, request Oper
 	if err != nil {
 		return OperatorArtifactResult{}, generationFailure("desired", ErrGenerateConfig)
 	}
-	workspace, err := createReplayWorkspace(ctx, r)
+	factory := operatorSimulationFactory(request.BootstrapTarget, desired)
+	replayFactory := factory
+	replayFactory.NamePrefix = "autosql_sim_gen_replay"
+	workspace, err := createReplayWorkspace(ctx, r, replayFactory)
 	if err != nil {
-		return OperatorArtifactResult{}, generationFailure("workspace", ErrGenerateStage)
+		return OperatorArtifactResult{}, generationFailureCause("workspace", ErrGenerateStage, simulate.Redacted(err))
 	}
 	defer workspace.Close()
 	if err = materializeOperatorCurrent(ctx, workspace.URL, current); err != nil {
-		return OperatorArtifactResult{}, generationFailure("materialize", ErrGenerateStage)
+		return OperatorArtifactResult{}, generationFailureCause("materialize", ErrGenerateStage, simulate.RedactedCause(err))
 	}
 	metadata := cloneStrings(r.Metadata)
 	metadata["autosql.operator.gitops"] = "v1"
@@ -238,19 +247,56 @@ func (s GenerateService) BuildOperatorArtifact(ctx context.Context, request Oper
 	if request.BootstrapTarget != nil {
 		metadata["autosql.operator.mode"] = "bootstrap"
 	}
-	built, err := s.buildGeneratedArtifact(ctx, r, current, desired, workspace.URL, nil, options, prebuilt, metadata, operatorSimulationFactory(request.BootstrapTarget))
+	built, err := s.buildGeneratedArtifact(ctx, r, current, desired, workspace.URL, nil, options, prebuilt, metadata, factory)
 	if err != nil {
 		return OperatorArtifactResult{}, err
 	}
 	return OperatorArtifactResult{Artifact: built.Artifact, Bytes: built.Bytes, SchemaPolicyResources: built.SchemaPolicyResources, MigrationPolicyResources: built.MigrationPolicyResources}, nil
 }
 
-func operatorSimulationFactory(target *bootstrap.DatabaseTarget) simulate.PostgresFactory {
+func operatorSimulationFactory(target *bootstrap.DatabaseTarget, desired schema.Document) simulate.PostgresFactory {
 	factory := simulate.PostgresFactory{NamePrefix: "autosql_sim_generate"}
 	if target != nil && target.Normalize().Mode == bootstrap.ExternalDatabase {
 		factory.DropPublicSchema = true
 	}
+	factory.RequiredRoles = operatorRequiredOwnerRoles(target, desired)
 	return factory
+}
+
+func operatorRequiredOwnerRoles(target *bootstrap.DatabaseTarget, desired schema.Document) []string {
+	declared := map[string]bool{}
+	for _, resource := range desired.Graph.Resources {
+		if resource.Kind == schema.KindRole {
+			declared[resource.Name.Name] = true
+		}
+	}
+	owners := map[string]bool{}
+	if target != nil {
+		owner := strings.TrimSpace(target.Normalize().Owner)
+		if owner != "" && !declared[owner] {
+			owners[owner] = true
+		}
+	}
+	for _, resource := range desired.Graph.Resources {
+		if resource.Kind == schema.KindRole || resource.Kind == schema.KindDatabase {
+			continue
+		}
+		var specification map[string]any
+		if json.Unmarshal(resource.Spec, &specification) != nil {
+			continue
+		}
+		owner, _ := specification["owner"].(string)
+		owner = strings.TrimSpace(owner)
+		if owner != "" && !declared[owner] {
+			owners[owner] = true
+		}
+	}
+	roles := make([]string, 0, len(owners))
+	for owner := range owners {
+		roles = append(roles, owner)
+	}
+	sort.Strings(roles)
+	return roles
 }
 
 // operatorBootstrapArtifactRender reconstructs only the deterministic render
