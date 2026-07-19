@@ -22,8 +22,11 @@ type PostgresFactory struct {
 	// NamePrefix scopes generated databases for ownership and cleanup checks.
 	// It must remain an unquoted PostgreSQL-safe AutoSQL namespace; 38 bytes
 	// leaves room for the separator and 96-bit random suffix within NAMEDATALEN.
-	NamePrefix  string
-	AfterCreate func() error
+	NamePrefix string
+	// DropPublicSchema makes the isolated database match an external bootstrap
+	// target, whose documented precondition is an empty, public-less database.
+	DropPublicSchema bool
+	AfterCreate      func() error
 }
 
 var safeSimulationPrefix = regexp.MustCompile(`^autosql_sim(?:_[a-z0-9]+)*$`)
@@ -90,6 +93,12 @@ func (f PostgresFactory) Create(ctx context.Context, c Config) (Isolation, error
 	if e == nil && f.AfterCreate != nil {
 		e = f.AfterCreate()
 	}
+	copy := *u
+	copy.Path = "/" + name
+	copy.RawQuery = u.RawQuery
+	if e == nil && f.DropPublicSchema {
+		e = dropPublicSchema(ctx, copy.String())
+	}
 	if e != nil {
 		timeout := c.CleanupTimeout
 		if timeout <= 0 {
@@ -104,10 +113,17 @@ func (f PostgresFactory) Create(ctx context.Context, c Config) (Isolation, error
 		}
 		return nil, primary
 	}
-	copy := *u
-	copy.Path = "/" + name
-	copy.RawQuery = u.RawQuery
 	return &postgresIsolation{adminURL: c.DevelopmentURL, dbURL: copy.String(), name: name, identity: actual + "/" + name}, nil
+}
+
+func dropPublicSchema(ctx context.Context, databaseURL string) error {
+	conn, err := pgx.Connect(ctx, databaseURL)
+	if err != nil {
+		return err
+	}
+	defer conn.Close(context.Background())
+	_, err = conn.Exec(ctx, "DROP SCHEMA public")
+	return err
 }
 func ResolvePostgresIdentity(ctx context.Context, developmentURL string) (string, error) {
 	conn, e := pgx.Connect(ctx, developmentURL)
