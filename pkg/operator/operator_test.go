@@ -51,6 +51,41 @@ func TestReconcileIsIdempotentAndApprovalGated(t *testing.T) {
 		t.Fatalf("duplicate apply calls=%d err=%v", calls, e)
 	}
 }
+
+func TestSuspendedResourceDoesNotApplyAndResumes(t *testing.T) {
+	s := NewMemoryStore()
+	calls := 0
+	r := Reconciler{Store: s, Apply: func(context.Context, Resource, string) (ApplyResult, error) {
+		calls++
+		return ApplyResult{}, nil
+	}}
+	obj := resource()
+	obj.Spec.RequireApproval = false
+	obj.Spec.Suspend = true
+	st, err := r.Reconcile(context.Background(), obj, true)
+	if err != nil || calls != 0 || len(st.Conditions) == 0 || st.Conditions[len(st.Conditions)-1].Reason != "Suspended" {
+		t.Fatalf("suspended status=%#v calls=%d err=%v", st, calls, err)
+	}
+	obj.Spec.Suspend = false
+	st, err = r.Reconcile(context.Background(), obj, true)
+	if err != nil || calls != 1 || st.Conditions[len(st.Conditions)-1].Reason != "Applied" {
+		t.Fatalf("resumed status=%#v calls=%d err=%v", st, calls, err)
+	}
+}
+
+func TestConditionsRemainUniqueAcrossRetries(t *testing.T) {
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	st := Status{}
+	for i := 0; i < 100; i++ {
+		st = condition(st, Failed, "ApplyFailed", "temporary", 1, now.Add(time.Duration(i)*time.Second))
+	}
+	if len(st.Conditions) != 1 {
+		t.Fatalf("conditions grew across identical retries: %#v", st.Conditions)
+	}
+	if !st.Conditions[0].LastTransitionTime.Equal(now) {
+		t.Fatalf("identical condition changed transition time: %s", st.Conditions[0].LastTransitionTime)
+	}
+}
 func TestRestartUsesPersistentRecord(t *testing.T) {
 	s := NewMemoryStore()
 	calls := 0

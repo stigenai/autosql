@@ -1,0 +1,20 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/azure-pipelines-task-lib/master/tasks.schema.json",
+  "id": "862dc09e-c366-4e7e-a261-8c2cf9b5658c",
+  "name": "AutoSQL",
+  "friendlyName": "AutoSQL",
+  "description": "Verify or deploy an immutable AutoSQL artifact",
+  "author": "Stigen AI",
+  "helpMarkDown": "https://github.com/stigenai/autosql",
+  "category": "Deploy",
+  "version": {"Major": 0, "Minor": 1, "Patch": 0},
+  "instanceNameFormat": "AutoSQL $(mode)",
+  "inputs": [
+    {"name": "mode", "type": "pickList", "label": "Mode", "defaultValue": "verify", "options": {"verify": "Verify", "run": "Run"}, "required": true},
+    {"name": "contract", "type": "filePath", "label": "Contract", "required": true},
+    {"name": "contractDigest", "type": "string", "label": "Contract digest", "required": true},
+    {"name": "binaryVersion", "type": "string", "label": "AutoSQL version", "defaultValue": "v0.1.32", "required": true},
+    {"name": "binarySha256", "type": "string", "label": "AutoSQL archive SHA-256", "defaultValue": "c48d2d84d6635f768b7b3e43b880407a1ad047ae39b82ef695aff665b8c68521", "required": true}
+  ],
+  "execution": {"Node20_1": {"target": "index.js"}}
+}

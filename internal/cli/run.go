@@ -95,6 +95,10 @@ func RunWithServices(ctx context.Context, args []string, streams Streams, servic
 		err = runSchemaInspect(ctx, args[2:], o, redactor)
 	case len(args) >= 2 && args[0] == "schema" && args[1] == "diff":
 		err = runSchemaDiff(ctx, args[2:], o, services.ReadPlan)
+	case len(args) >= 2 && args[0] == "integration" && args[1] == "verify":
+		err = runIntegration(ctx, args[2:], o, services, false)
+	case len(args) >= 2 && args[0] == "integration" && args[1] == "run":
+		err = runIntegration(ctx, args[2:], o, services, true)
 	case len(args) >= 2 && args[0] == "database" && args[1] == "prepare":
 		err = runDatabasePrepare(ctx, args[2:], o, redactor)
 	case len(args) >= 2 && args[0] == "database" && args[1] == "bootstrap":
@@ -359,7 +363,7 @@ func usageBase() string {
 }
 func usage() string {
 	base := strings.Replace(usageBase(), "\n  migrate generate", "\n  database bootstrap prepare --file path [--include-routine-source] [--json|--hcl]\n  database bootstrap preflight --file path --maintenance-url env://NAME --extension-allowlist names --extension-version name=version --extension-schema name=schema [--json]\n  database bootstrap authorize --file path --authorization-signing-key env://NAME --authorization-key-id id --authorization-issuer issuer --authorization-signer signer --output path [--json]\n  database bootstrap --file path --maintenance-url env://NAME|file://path [--authorization-manifest path --authorization-public-key env://NAME --authorization-issuer issuer --authorization-signer signer] [--json]\n  migrate generate", 1)
-	return base + "\n  operator key generate --private-output path --public-output path [--json]\n  operator artifact publish --file path --config path --output-dir path --source-revision revision [--bootstrap] [--json]\n  migrate start-status --file path --url env://NAME --target id --env name [--json]"
+	return base + "\n  integration verify|run --contract path --contract-digest sha256:... [--json]\n  operator key generate --private-output path --public-output path [--json]\n  operator artifact publish --file path --config path --output-dir path --source-revision revision [--bootstrap] [--json]\n  migrate start-status --file path --url env://NAME --target id --env name [--json]"
 }
 func contains(args []string, want string) bool {
 	for _, a := range args {
@@ -388,6 +392,9 @@ func commandName(args []string) string {
 	}
 	if len(args) >= 2 && args[0] == "schema" && args[1] == "diff" {
 		return "schema diff"
+	}
+	if len(args) >= 2 && args[0] == "integration" && (args[1] == "verify" || args[1] == "run") {
+		return "integration " + args[1]
 	}
 	if len(args) >= 2 && args[0] == "database" && args[1] == "prepare" {
 		return "database prepare"

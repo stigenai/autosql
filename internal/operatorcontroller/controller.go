@@ -18,6 +18,7 @@ import (
 	"autosql/pkg/artifact"
 	"autosql/pkg/bootstrap"
 	"autosql/pkg/operator"
+	"autosql/pkg/workloadidentity"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -26,13 +27,34 @@ import (
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
+	controllercache "sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 var GroupVersionKind = schema.GroupVersionKind{Group: "autosql.io", Version: "v1alpha1", Kind: "AutoSQLSchema"}
+
+var resolveWorkloadIdentityURL = func(ctx context.Context, binding workloadidentity.Binding) (string, time.Time, error) {
+	var source *workloadidentity.Source
+	var err error
+	switch binding.Provider {
+	case workloadidentity.AWSRDS:
+		source, err = workloadidentity.NewAWS(ctx, binding)
+	case workloadidentity.GCPCloud:
+		source, err = workloadidentity.NewGCP(ctx, binding)
+	case workloadidentity.AzurePG:
+		source, err = workloadidentity.NewAzure(binding)
+	default:
+		err = errors.New("unsupported workload identity provider")
+	}
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	return source.ConnectionURL(ctx)
+}
 
 // Controller adapts AutoSQL's deterministic reconciler to an unstructured CRD.
 // Apply is injected so production deployments can use the signed-artifact
@@ -53,11 +75,16 @@ type Controller struct {
 // Run starts the production controller-runtime manager. ArtifactApply keeps
 // the actual mutation behind AutoSQL's signed-artifact production boundary.
 func Run(ctx context.Context, leaderElection bool) error {
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	options := ctrl.Options{
 		Scheme:           NewScheme(),
 		LeaderElection:   leaderElection,
 		LeaderElectionID: "autosql-operator.autosql.io",
-	})
+	}
+	if namespace := strings.TrimSpace(os.Getenv("AUTOSQL_OPERATOR_WATCH_NAMESPACE")); namespace != "" {
+		options.Cache.DefaultNamespaces = map[string]controllercache.Config{namespace: {}}
+		options.LeaderElectionNamespace = namespace
+	}
+	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), options)
 	if err != nil {
 		return err
 	}
@@ -91,7 +118,7 @@ func (c *Controller) SetupWithManager(mgr manager.Manager) error {
 	forObject := &unstructured.Unstructured{}
 	forObject.SetGroupVersionKind(GroupVersionKind)
 	return builder.ControllerManagedBy(mgr).
-		For(forObject).
+		For(forObject, builder.WithPredicates(predicate.Or(predicate.GenerationChangedPredicate{}, predicate.AnnotationChangedPredicate{}))).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(c.requestsForSecret)).
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(c.requestsForConfigMap)).
 		Complete(c)
@@ -162,6 +189,16 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	if err != nil {
 		return reconcile.Result{}, c.writeFailure(ctx, obj, err)
 	}
+	r := operator.Reconciler{Store: c.Store, Leader: c.Leader, Apply: c.Apply, Now: c.Now}
+	// Suspension must not resolve Secrets, mint workload credentials, or verify
+	// remote artifacts. It is a control-plane pause with a status-only result.
+	if resource.Spec.Suspend {
+		status, reconcileErr := r.Reconcile(ctx, resource, approved)
+		if updateErr := writeStatus(ctx, c.Client, obj, status); updateErr != nil {
+			return reconcile.Result{}, updateErr
+		}
+		return reconcile.Result{}, reconcileErr
+	}
 	// Authenticate the immutable release before resolving any Kubernetes
 	// runtime reference. The opaque verified token is carried into Apply, so
 	// neither a second file read nor an artifact swap can occur after Secrets
@@ -180,7 +217,6 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	if err := c.resolveReferences(ctx, obj.GetNamespace(), &resource); err != nil {
 		return reconcile.Result{}, c.writeFailure(ctx, obj, err)
 	}
-	r := operator.Reconciler{Store: c.Store, Leader: c.Leader, Apply: c.Apply, Now: c.Now}
 	status, err := r.Reconcile(ctx, resource, approved)
 	if updateErr := writeStatus(ctx, c.Client, obj, status); updateErr != nil {
 		return reconcile.Result{}, updateErr
@@ -268,6 +304,18 @@ func (c *Controller) resolveReferences(ctx context.Context, namespace string, re
 		resource.ResolvedDatabaseURL = string(value)
 		resource.DatabaseBinding = referenceBinding(secret.ResourceVersion, nil)
 	}
+	if resource.Spec.DatabaseIdentity != nil {
+		url, _, err := resolveWorkloadIdentityURL(ctx, *resource.Spec.DatabaseIdentity)
+		if err != nil {
+			return fmt.Errorf("database workload identity unavailable")
+		}
+		resource.ResolvedDatabaseURL = url
+		digest, err := resource.Spec.DatabaseIdentity.Digest()
+		if err != nil {
+			return fmt.Errorf("database workload identity invalid")
+		}
+		resource.DatabaseBinding = operator.RuntimeReferenceBinding{ResourceVersion: digest, ContentDigest: digest}
+	}
 	if resource.Spec.MaintenanceDatabaseURL != nil {
 		secret := &corev1.Secret{}
 		if err := c.read(ctx, types.NamespacedName{Namespace: namespace, Name: resource.Spec.MaintenanceDatabaseURL.Name}, secret); err != nil {
@@ -330,6 +378,7 @@ func resourceFromObject(obj *unstructured.Unstructured) (operator.Resource, bool
 	generation, _, _ := unstructured.NestedInt64(spec, "generation")
 	artifactDigest, _, _ := unstructured.NestedString(spec, "artifactDigest")
 	requireApproval, _, _ := unstructured.NestedBool(spec, "requireApproval")
+	suspend, _, _ := unstructured.NestedBool(spec, "suspend")
 	createDatabase, _, _ := unstructured.NestedBool(spec, "createDatabase")
 	postgresVersion, _, _ := unstructured.NestedInt64(spec, "postgresVersion")
 	concurrentIndexes, _, _ := unstructured.NestedBool(spec, "concurrentIndexes")
@@ -342,6 +391,24 @@ func resourceFromObject(obj *unstructured.Unstructured) (operator.Resource, bool
 	databaseURL := &operator.SecretKeyRef{}
 	databaseURL.Name, _, _ = unstructured.NestedString(database, "name")
 	databaseURL.Key, _, _ = unstructured.NestedString(database, "key")
+	if databaseURL.Name == "" && databaseURL.Key == "" {
+		databaseURL = nil
+	}
+	var databaseIdentity *workloadidentity.Binding
+	if value, found, nestedErr := unstructured.NestedMap(spec, "databaseIdentity"); nestedErr != nil {
+		return operator.Resource{}, false, fmt.Errorf("databaseIdentity is invalid")
+	} else if found {
+		raw, marshalErr := json.Marshal(value)
+		if marshalErr != nil {
+			return operator.Resource{}, false, fmt.Errorf("databaseIdentity is invalid")
+		}
+		databaseIdentity = &workloadidentity.Binding{}
+		decoder := json.NewDecoder(strings.NewReader(string(raw)))
+		decoder.DisallowUnknownFields()
+		if decodeErr := decoder.Decode(databaseIdentity); decodeErr != nil {
+			return operator.Resource{}, false, fmt.Errorf("databaseIdentity is invalid")
+		}
+	}
 	maintenanceDatabase, _, _ := unstructured.NestedMap(spec, "maintenanceDatabaseURL")
 	maintenanceDatabaseURL := &operator.SecretKeyRef{}
 	maintenanceDatabaseURL.Name, _, _ = unstructured.NestedString(maintenanceDatabase, "name")
@@ -392,8 +459,8 @@ func resourceFromObject(obj *unstructured.Unstructured) (operator.Resource, bool
 	}
 	approved := strings.EqualFold(obj.GetAnnotations()["autosql.io/approved"], "true")
 	return operator.Resource{Name: obj.GetNamespace() + "/" + obj.GetName(), MetadataGeneration: obj.GetGeneration(), Spec: operator.Spec{
-		Kind: operator.ResourceKind(kind), Generation: generation, Source: source,
-		ArtifactDigest: artifactDigest, DatabaseURL: databaseURL, MaintenanceDatabaseURL: maintenanceDatabaseURL, DatabaseTarget: databaseTarget, BootstrapAuthority: authority, BootstrapAuthorization: authorization, CreateDatabase: createDatabase, PostgresVersion: int(postgresVersion), ConcurrentIndexes: concurrentIndexes, RequireApproval: requireApproval,
+		Kind: operator.ResourceKind(kind), Generation: generation, Suspend: suspend, Source: source,
+		ArtifactDigest: artifactDigest, DatabaseURL: databaseURL, DatabaseIdentity: databaseIdentity, MaintenanceDatabaseURL: maintenanceDatabaseURL, DatabaseTarget: databaseTarget, BootstrapAuthority: authority, BootstrapAuthorization: authorization, CreateDatabase: createDatabase, PostgresVersion: int(postgresVersion), ConcurrentIndexes: concurrentIndexes, RequireApproval: requireApproval,
 	}, Status: statusFromObject(obj)}, approved, nil
 }
 

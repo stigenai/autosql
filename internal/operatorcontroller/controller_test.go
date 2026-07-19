@@ -20,6 +20,7 @@ import (
 	"autosql/pkg/postgres"
 	"autosql/pkg/precheck"
 	autosqlschema "autosql/pkg/schema"
+	"autosql/pkg/workloadidentity"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -43,6 +44,35 @@ func testObject() *unstructured.Unstructured {
 	}}
 	o.SetGroupVersionKind(GroupVersionKind)
 	return o
+}
+
+func TestResolveReferencesUsesTransientWorkloadIdentity(t *testing.T) {
+	previous := resolveWorkloadIdentityURL
+	t.Cleanup(func() { resolveWorkloadIdentityURL = previous })
+	resolveWorkloadIdentityURL = func(_ context.Context, binding workloadidentity.Binding) (string, time.Time, error) {
+		if binding.Provider != workloadidentity.AWSRDS || binding.Audience != "sts.amazonaws.com" || binding.Host != "db.example.test" {
+			t.Fatalf("binding=%+v", binding)
+		}
+		return "postgresql://autosql:super-secret-token@db.example.test:5432/app?sslmode=verify-full", time.Now().Add(15 * time.Minute), nil
+	}
+	identity := workloadidentity.Binding{Provider: workloadidentity.AWSRDS, Host: "db.example.test", Port: 5432, User: "autosql", Database: "app", TLSMode: "verify-full", Region: "us-east-1", Audience: "sts.amazonaws.com", Subject: "system:serviceaccount:autosql:operator"}
+	resource := operator.Resource{Spec: operator.Spec{Kind: operator.Versioned, Source: operator.Source{RegistryDigest: "sha256:" + strings.Repeat("a", 64)}, DatabaseIdentity: &identity}}
+	if err := (&Controller{}).resolveReferences(context.Background(), "autosql", &resource); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(resource.ResolvedDatabaseURL, "super-secret-token") {
+		t.Fatal("transient connection was not resolved")
+	}
+	raw, err := json.Marshal(resource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "super-secret-token") {
+		t.Fatalf("token persisted: %s", raw)
+	}
+	if resource.DatabaseBinding.ContentDigest == "" || strings.Contains(resource.DatabaseBinding.ContentDigest, "super-secret-token") {
+		t.Fatalf("unsafe binding=%+v", resource.DatabaseBinding)
+	}
 }
 
 func TestReconcileUpdatesStatusAndHonorsApproval(t *testing.T) {
@@ -97,6 +127,37 @@ func TestReconcileUpdatesStatusAndHonorsApproval(t *testing.T) {
 	}
 	if got := got.Object["status"].(map[string]any)["executionID"]; got != "exec-1" {
 		t.Fatalf("execution ID status=%v", got)
+	}
+}
+
+func TestSuspendedReconcileDoesNotResolveRuntimeReferences(t *testing.T) {
+	obj := testObject()
+	obj.Object["spec"].(map[string]any)["suspend"] = true
+	scheme := NewScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(obj).WithStatusSubresource(obj).Build()
+	calls := 0
+	c := &Controller{Client: cl, Store: operator.NewMemoryStore(), Apply: func(context.Context, operator.Resource, string) (operator.ApplyResult, error) {
+		calls++
+		return operator.ApplyResult{}, nil
+	}}
+	if _, err := c.Reconcile(context.Background(), requestFor(obj)); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Fatalf("suspended reconciliation applied %d times", calls)
+	}
+	got := &unstructured.Unstructured{}
+	got.SetGroupVersionKind(GroupVersionKind)
+	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: "app", Name: "orders"}, got); err != nil {
+		t.Fatal(err)
+	}
+	conditions, _, err := unstructured.NestedSlice(got.Object, "status", "conditions")
+	if err != nil || len(conditions) != 1 {
+		t.Fatalf("suspended conditions=%#v err=%v", conditions, err)
+	}
+	condition, ok := conditions[0].(map[string]any)
+	if !ok || condition["type"] != string(operator.Ready) || condition["reason"] != "Suspended" || condition["status"] != "True" {
+		t.Fatalf("suspended condition=%#v", conditions[0])
 	}
 }
 

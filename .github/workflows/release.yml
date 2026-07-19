@@ -14,8 +14,66 @@ env:
   IMAGE: ghcr.io/stigenai/autosql
 
 jobs:
+  publication-preflight:
+    name: verify native publisher identities
+    runs-on: ubuntu-24.04
+    env:
+      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+      TERRAFORM_PROVIDER_GITHUB_TOKEN: ${{ secrets.TERRAFORM_PROVIDER_GITHUB_TOKEN }}
+      TERRAFORM_REGISTRY_GPG_PRIVATE_KEY: ${{ secrets.TERRAFORM_REGISTRY_GPG_PRIVATE_KEY }}
+      TERRAFORM_REGISTRY_GPG_PASSPHRASE: ${{ secrets.TERRAFORM_REGISTRY_GPG_PASSPHRASE }}
+      CIRCLECI_CLI_TOKEN: ${{ secrets.CIRCLECI_CLI_TOKEN }}
+      GITLAB_CATALOG_TOKEN: ${{ secrets.GITLAB_CATALOG_TOKEN }}
+      GITLAB_CATALOG_REPOSITORY_URL: ${{ secrets.GITLAB_CATALOG_REPOSITORY_URL }}
+      GITLAB_CATALOG_PROJECT_ID: ${{ secrets.GITLAB_CATALOG_PROJECT_ID }}
+      GITLAB_API_URL: ${{ secrets.GITLAB_API_URL }}
+      AZURE_DEVOPS_EXT_PAT: ${{ secrets.AZURE_DEVOPS_EXT_PAT }}
+      AZURE_DEVOPS_PUBLISHER: ${{ secrets.AZURE_DEVOPS_PUBLISHER }}
+      BITBUCKET_PIPE_TOKEN: ${{ secrets.BITBUCKET_PIPE_TOKEN }}
+      BITBUCKET_PIPE_USERNAME: ${{ secrets.BITBUCKET_PIPE_USERNAME }}
+      BITBUCKET_PIPE_REPOSITORY_URL: ${{ secrets.BITBUCKET_PIPE_REPOSITORY_URL }}
+    steps:
+      - name: Require every native publisher identity
+        run: |
+          set -eu
+          for name in GHCR_TOKEN TERRAFORM_PROVIDER_GITHUB_TOKEN TERRAFORM_REGISTRY_GPG_PRIVATE_KEY TERRAFORM_REGISTRY_GPG_PASSPHRASE CIRCLECI_CLI_TOKEN GITLAB_CATALOG_TOKEN GITLAB_CATALOG_REPOSITORY_URL GITLAB_CATALOG_PROJECT_ID GITLAB_API_URL AZURE_DEVOPS_EXT_PAT AZURE_DEVOPS_PUBLISHER BITBUCKET_PIPE_TOKEN BITBUCKET_PIPE_USERNAME BITBUCKET_PIPE_REPOSITORY_URL; do
+            eval "value=\${$name:-}"
+            test -n "$value" || { echo "required native publisher configuration is missing: $name" >&2; exit 1; }
+          done
+
+  conformance:
+    name: integration conformance
+    needs: publication-preflight
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+      - uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1.12.0
+        with:
+          cluster_name: autosql-conformance
+          node_image: kindest/node:v1.35.0
+      - name: Build current operator image
+        run: |
+          set -eu
+          docker build -f Dockerfile.autosql -t autosql:conformance .
+          kind load docker-image autosql:conformance --name autosql-conformance
+      - name: Test shared contracts, provider and chart
+        run: |
+          set -eu
+          go test ./pkg/integration ./pkg/integrations/... ./pkg/workloadidentity ./internal/terraformprovider ./internal/operatorcontroller
+          deploy/helm/autosql-operator/tests/render.sh
+          helm install autosql deploy/helm/autosql-operator --namespace autosql-system --create-namespace --set image.repository=autosql --set image.digest= --set image.tag=conformance --set image.pullPolicy=Never --wait --timeout 3m
+          helm upgrade autosql deploy/helm/autosql-operator --namespace autosql-system --set image.repository=autosql --set image.digest= --set image.tag=conformance --set image.pullPolicy=Never --set-string 'podAnnotations.autosql\.io/conformance=upgrade' --wait --timeout 3m
+          kubectl -n autosql-system rollout status deployment/autosql-autosql-operator --timeout=2m
+          deploy/gitops/tests/live.sh autosql-conformance
+
   binaries:
     name: binary (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: conformance
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -44,11 +102,107 @@ jobs:
           mkdir -p dist
           go build -trimpath -ldflags="-s -w -X autosql/internal/cli.Version=${VERSION}" -o "dist/${name}" ./cmd/autosql
           tar -C dist -czf "dist/${name}.tar.gz" "${name}"
-          rm "dist/${name}"
+          rm -f "dist/${name}"
           (cd dist && sha256sum "${name}.tar.gz" > "${name}.sha256")
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  provider:
+    name: provider (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: conformance
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [linux, darwin, windows]
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build provider archive
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -eu
+          version="${VERSION#v}"
+          suffix=""
+          test "$GOOS" != windows || suffix=.exe
+          binary="terraform-provider-autosql_v${version}${suffix}"
+          archive="terraform-provider-autosql_${version}_${GOOS}_${GOARCH}.zip"
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w -X autosql/internal/cli.Version=${VERSION}" -o "dist/${binary}" ./cmd/terraform-provider-autosql
+          (cd dist && zip "$archive" "$binary" && rm -f "$binary")
+      - uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: dist
+          format: spdx-json
+          output-file: dist/terraform-provider-autosql_${{ matrix.goos }}_${{ matrix.goarch }}.spdx.json
+          upload-artifact: false
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: provider-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  integration-packages:
+    name: package integrations
+    needs: [conformance, binaries, container, bitbucket-pipe]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-linux-amd64
+          path: binary
+      - name: Package native integrations
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -eu
+          version="${VERSION#v}"
+          mkdir -p dist
+          digest='${{ needs.container.outputs.digest }}'
+          sed -i "s/^version: .*/version: ${version}/; s/^appVersion: .*/appVersion: ${version}/" deploy/helm/autosql-operator/Chart.yaml
+          sed -i "s#digest: sha256:[0-9a-f]*#digest: ${digest}#" deploy/helm/autosql-operator/values.yaml
+          sed -i "s#ghcr.io/stigenai/autosql@sha256:[0-9a-f]*#ghcr.io/stigenai/autosql@${digest}#g" integrations/circleci/orb.yml deploy/ci/bitbucket-pipelines.yml deploy/ci/argocd-application.yaml deploy/gitops/argocd.yaml
+          sed -i "s#^image: ghcr.io/stigenai/autosql-bitbucket-pipe@sha256:[0-9a-f]*#image: ghcr.io/stigenai/autosql-bitbucket-pipe@${{ needs.bitbucket-pipe.outputs.digest }}#" integrations/bitbucket/pipe.yml
+          sed -i "s/targetRevision: [0-9.]*/targetRevision: ${version}/g; s/tag: [0-9.]*/tag: ${version}/g" deploy/ci/argocd-application.yaml deploy/gitops/argocd.yaml deploy/gitops/flux.yaml
+          checksum="$(cut -d' ' -f1 "binary/autosql-${VERSION}-linux-amd64.sha256")"
+          sed -i "s/\"defaultValue\": \"v[0-9.]*\"/\"defaultValue\": \"${VERSION}\"/; s/\"defaultValue\": \"[0-9a-f]\{64\}\"/\"defaultValue\": \"${checksum}\"/" integrations/azure-devops/tasks/autosql/task.json
+          IFS=. read -r major minor patch <<EOF
+          ${version}
+          EOF
+          jq --argjson major "$major" --argjson minor "$minor" --argjson patch "$patch" '.version = {Major: $major, Minor: $minor, Patch: $patch}' integrations/azure-devops/tasks/autosql/task.json > task.json
+          mv -f task.json integrations/azure-devops/tasks/autosql/task.json
+          jq --arg version "$version" '.version = $version' integrations/azure-devops/vss-extension.json > extension.json
+          mv -f extension.json integrations/azure-devops/vss-extension.json
+          npm ci --omit=dev --ignore-scripts --prefix integrations/azure-devops/tasks/autosql
+          helm package deploy/helm/autosql-operator --destination dist
+          tar -czf "dist/autosql-github-action-${version}.tar.gz" integrations/github .github/workflows/autosql-reusable.yml
+          tar -czf "dist/autosql-gitlab-component-${version}.tar.gz" templates/autosql integrations/gitlab
+          tar -czf "dist/autosql-circleci-orb-${version}.tar.gz" integrations/circleci
+          tar -czf "dist/autosql-bitbucket-pipe-${version}.tar.gz" integrations/bitbucket
+          tar -czf "dist/autosql-azure-devops-${version}.tar.gz" integrations/azure-devops
+          tar -czf "dist/autosql-gitops-${version}.tar.gz" deploy/gitops
+          (cd dist && sha256sum -- ./* > SHA256SUMS.integrations)
+      - uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: dist/autosql-integrations.spdx.json
+          upload-artifact: false
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: integration-packages
           path: dist/*
           if-no-files-found: error
 
@@ -56,9 +210,11 @@ jobs:
     name: publish multi-architecture container
     needs: binaries
     runs-on: ubuntu-24.04
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: release-linux-*
           path: dist
@@ -69,15 +225,15 @@ jobs:
           mkdir -p image/amd64 image/arm64
           tar -xzf "dist/autosql-${GITHUB_REF_NAME}-linux-amd64.tar.gz" -C image/amd64
           tar -xzf "dist/autosql-${GITHUB_REF_NAME}-linux-arm64.tar.gz" -C image/arm64
-          mv "image/amd64/autosql-${GITHUB_REF_NAME}-linux-amd64" image/amd64/autosql
-          mv "image/arm64/autosql-${GITHUB_REF_NAME}-linux-arm64" image/arm64/autosql
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+          mv -f "image/amd64/autosql-${GITHUB_REF_NAME}-linux-amd64" image/amd64/autosql
+          mv -f "image/arm64/autosql-${GITHUB_REF_NAME}-linux-arm64" image/arm64/autosql
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GHCR_TOKEN }}
-      - uses: docker/metadata-action@v5
+      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         id: meta
         with:
           images: ${{ env.IMAGE }}
@@ -85,7 +241,8 @@ jobs:
             type=ref,event=tag
             type=raw,value=latest
             type=sha
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        id: push
         with:
           context: .
           file: Dockerfile.release
@@ -95,17 +252,166 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           provenance: true
           sbom: true
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+      - name: Sign immutable container index
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+  bitbucket-pipe:
+    name: publish Bitbucket Pipe image
+    needs: [conformance, container]
+    runs-on: ubuntu-24.04
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        id: push
+        with:
+          context: integrations/bitbucket
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/stigenai/autosql-bitbucket-pipe:${{ github.ref_name }}
+          build-args: AUTOSQL_IMAGE=${{ env.IMAGE }}@${{ needs.container.outputs.digest }}
+          provenance: true
+          sbom: true
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+      - name: Sign immutable Pipe image
+        run: cosign sign --yes "ghcr.io/stigenai/autosql-bitbucket-pipe@${{ steps.push.outputs.digest }}"
+
+  publish-chart:
+    name: publish signed Helm OCI chart
+    needs: integration-packages
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: integration-packages
+          path: dist
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+      - name: Publish and sign chart
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          set -eu
+          echo "$GH_TOKEN" | helm registry login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+          digest="$(helm push dist/autosql-operator-*.tgz oci://ghcr.io/stigenai/charts 2>&1 | sed -n 's/^Digest: //p')"
+          test -n "$digest"
+          cosign sign --yes "ghcr.io/stigenai/charts/autosql-operator@${digest}"
+
+  publish-native-catalogs:
+    name: publish ${{ matrix.platform }} catalog
+    needs: integration-packages
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: circleci
+            archive: autosql-circleci-orb
+          - platform: gitlab
+            archive: autosql-gitlab-component
+          - platform: bitbucket
+            archive: autosql-bitbucket-pipe
+          - platform: azure
+            archive: autosql-azure-devops
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: integration-packages
+          path: dist
+      - name: Extract native package
+        run: |
+          mkdir -p native
+          tar -xzf "dist/${{ matrix.archive }}-${GITHUB_REF_NAME#v}.tar.gz" -C native
+      - name: Install CircleCI CLI
+        if: matrix.platform == 'circleci'
+        run: |
+          set -eu
+          base=https://github.com/CircleCI-Public/circleci-cli/releases/download/v0.1.38646
+          curl --fail --silent --show-error --location "$base/circleci-cli_0.1.38646_linux_amd64.tar.gz" --output circleci.tar.gz
+          curl --fail --silent --show-error --location "$base/circleci-cli_0.1.38646_checksums.txt" --output checksums.txt
+          grep 'circleci-cli_0.1.38646_linux_amd64.tar.gz$' checksums.txt | sha256sum --check -
+          tar -xzf circleci.tar.gz
+          sudo install -m 0755 circleci-cli_0.1.38646_linux_amd64/circleci /usr/local/bin/circleci
+      - name: Install Azure extension CLI
+        if: matrix.platform == 'azure'
+        run: npm install --global tfx-cli@0.23.4
+      - name: Publish native package
+        env:
+          CIRCLECI_CLI_TOKEN: ${{ secrets.CIRCLECI_CLI_TOKEN }}
+          CIRCLECI_ORB_NAMESPACE: stigenai
+          GITLAB_CATALOG_TOKEN: ${{ secrets.GITLAB_CATALOG_TOKEN }}
+          GITLAB_CATALOG_REPOSITORY_URL: ${{ secrets.GITLAB_CATALOG_REPOSITORY_URL }}
+          GITLAB_CATALOG_PROJECT_ID: ${{ secrets.GITLAB_CATALOG_PROJECT_ID }}
+          GITLAB_API_URL: ${{ secrets.GITLAB_API_URL }}
+          AZURE_DEVOPS_EXT_PAT: ${{ secrets.AZURE_DEVOPS_EXT_PAT }}
+          AZURE_DEVOPS_PUBLISHER: ${{ secrets.AZURE_DEVOPS_PUBLISHER }}
+          BITBUCKET_PIPE_TOKEN: ${{ secrets.BITBUCKET_PIPE_TOKEN }}
+          BITBUCKET_PIPE_USERNAME: ${{ secrets.BITBUCKET_PIPE_USERNAME }}
+          BITBUCKET_PIPE_REPOSITORY_URL: ${{ secrets.BITBUCKET_PIPE_REPOSITORY_URL }}
+        run: scripts/publish-native-integration.sh "${{ matrix.platform }}" "$GITHUB_REF_NAME" native
+
+  publish-terraform-provider:
+    name: publish Terraform/OpenTofu provider
+    needs: provider
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: provider-*
+          path: provider-dist
+          merge-multiple: true
+      - name: Sign provider checksums
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.TERRAFORM_REGISTRY_GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.TERRAFORM_REGISTRY_GPG_PASSPHRASE }}
+        run: |
+          set -eu
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          (cd provider-dist && sha256sum terraform-provider-autosql_*.zip > terraform-provider-autosql_SHA256SUMS)
+          gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --detach-sign provider-dist/terraform-provider-autosql_SHA256SUMS
+      - name: Publish provider repository and release
+        env:
+          GH_TOKEN: ${{ secrets.TERRAFORM_PROVIDER_GITHUB_TOKEN }}
+          TERRAFORM_PROVIDER_REPOSITORY: stigenai/terraform-provider-autosql
+        run: scripts/publish-terraform-provider.sh "$GITHUB_REF_NAME" provider-dist .
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: provider-publish
+          path: provider-dist/*
+          if-no-files-found: error
 
   release:
     name: attach binaries to release
-    needs: binaries
+    needs: [binaries, provider, integration-packages, container, bitbucket-pipe, publish-chart, publish-native-catalogs, publish-terraform-provider]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: release-*
+          pattern: '*'
           path: dist
           merge-multiple: true
+      - name: Sign integration checksums
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.TERRAFORM_REGISTRY_GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.TERRAFORM_REGISTRY_GPG_PASSPHRASE }}
+        run: |
+          set -eu
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --detach-sign "dist/SHA256SUMS.integrations"
       - name: Publish release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,13 @@
+apiVersion: v2
+name: autosql-operator
+description: AutoSQL PostgreSQL schema and migration operator
+type: application
+version: 0.1.0
+appVersion: 0.1.32
+kubeVersion: ">=1.30.0-0 <1.36.0-0"
+home: https://github.com/stigenai/autosql
+sources:
+  - https://github.com/stigenai/autosql
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/signKey: cosign.keyless

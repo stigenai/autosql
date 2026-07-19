@@ -1,0 +1,12 @@
+{
+  "manifestVersion": 1,
+  "id": "autosql",
+  "name": "AutoSQL",
+  "version": "0.1.0",
+  "publisher": "stigenai",
+  "public": true,
+  "targets": [{"id": "Microsoft.VisualStudio.Services"}],
+  "categories": ["Azure Pipelines"],
+  "contributions": [{"id": "autosql-task", "type": "ms.vss-distributed-task.task", "targets": ["ms.vss-distributed-task.tasks"], "properties": {"name": "tasks/autosql"}}],
+  "files": [{"path": "tasks"}]
+}

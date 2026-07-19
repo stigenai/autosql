@@ -1,0 +1,6 @@
+apiVersion: pkg.crossplane.io/v1beta1
+kind: Function
+metadata:
+  name: function-patch-and-transform
+spec:
+  package: xpkg.crossplane.io/crossplane-contrib/function-patch-and-transform@sha256:c05a9add149bfa6fd0e6fc485e669d60a5d50c2f816b8303af4d5a89586795d0

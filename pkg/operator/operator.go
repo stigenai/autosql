@@ -17,6 +17,7 @@ import (
 
 	"autosql/pkg/artifact"
 	"autosql/pkg/bootstrap"
+	"autosql/pkg/workloadidentity"
 )
 
 var digestRE = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
@@ -58,9 +59,11 @@ type BootstrapAuthorizationRef struct {
 type Spec struct {
 	Kind                   ResourceKind               `json:"kind" yaml:"kind"`
 	Generation             int64                      `json:"generation" yaml:"generation"`
+	Suspend                bool                       `json:"suspend,omitempty" yaml:"suspend,omitempty"`
 	Source                 Source                     `json:"source" yaml:"source"`
 	ArtifactDigest         string                     `json:"artifactDigest,omitempty" yaml:"artifactDigest,omitempty"`
 	DatabaseURL            *SecretKeyRef              `json:"databaseURL,omitempty" yaml:"databaseURL,omitempty"`
+	DatabaseIdentity       *workloadidentity.Binding  `json:"databaseIdentity,omitempty" yaml:"databaseIdentity,omitempty"`
 	MaintenanceDatabaseURL *SecretKeyRef              `json:"maintenanceDatabaseURL,omitempty" yaml:"maintenanceDatabaseURL,omitempty"`
 	DatabaseTarget         *bootstrap.DatabaseTarget  `json:"databaseTarget,omitempty" yaml:"databaseTarget,omitempty"`
 	BootstrapAuthority     *bootstrap.Contract        `json:"bootstrapAuthority,omitempty" yaml:"bootstrapAuthority,omitempty"`
@@ -229,7 +232,20 @@ func (r *Reconciler) Reconcile(ctx context.Context, obj Resource, approved bool)
 	key := applyKey(obj)
 	old, _ := r.Store.Load(obj.Name)
 	st := old.Status
+	if obj.Spec.Suspend {
+		st.ObservedGeneration = obj.Spec.Generation
+		if obj.MetadataGeneration > 0 {
+			st.ObservedGeneration = obj.MetadataGeneration
+		}
+		st = condition(st, Ready, "Suspended", "reconciliation is suspended", obj.Spec.Generation, now)
+		_ = r.Store.Save(obj.Name, Record{Status: st, AppliedKey: old.AppliedKey, ApplyingKey: old.ApplyingKey})
+		return st, nil
+	}
 	if old.AppliedKey == key && (st.AuthorizationExpiresAt.IsZero() || now.Before(st.AuthorizationExpiresAt)) {
+		if len(st.Conditions) > 0 && st.Conditions[len(st.Conditions)-1].Type == Ready && st.Conditions[len(st.Conditions)-1].Reason == "Suspended" {
+			st = condition(st, Ready, "Applied", "resource is converged", obj.Spec.Generation, now)
+			_ = r.Store.Save(obj.Name, Record{Status: st, AppliedKey: old.AppliedKey, ApplyingKey: old.ApplyingKey})
+		}
 		return st, nil
 	}
 	if err := validate(obj.Spec); err != nil {
@@ -329,8 +345,16 @@ func validate(s Spec) error {
 	if s.Source.RegistryDigest != "" && !digestRE.MatchString(s.Source.RegistryDigest) {
 		return errors.New("registryDigest must be a sha256 digest")
 	}
-	if s.DatabaseURL == nil || s.DatabaseURL.Name == "" || s.DatabaseURL.Key == "" {
-		return errors.New("databaseURL secret reference is required")
+	if (s.DatabaseURL == nil) == (s.DatabaseIdentity == nil) {
+		return errors.New("exactly one of databaseURL or databaseIdentity is required")
+	}
+	if s.DatabaseURL != nil && (s.DatabaseURL.Name == "" || s.DatabaseURL.Key == "") {
+		return errors.New("databaseURL secret reference is incomplete")
+	}
+	if s.DatabaseIdentity != nil {
+		if err := s.DatabaseIdentity.Validate(); err != nil {
+			return fmt.Errorf("invalid databaseIdentity: %w", err)
+		}
 	}
 	if s.CreateDatabase && s.BootstrapAuthority == nil {
 		return errors.New("createDatabase requires bootstrapAuthority")
@@ -396,6 +420,7 @@ func applyKey(obj Resource) string {
 		Source                 Source                     `json:"source"`
 		ArtifactDigest         string                     `json:"artifact_digest"`
 		DatabaseURL            *SecretKeyRef              `json:"database_url"`
+		DatabaseIdentity       *workloadidentity.Binding  `json:"database_identity,omitempty"`
 		MaintenanceDatabaseURL *SecretKeyRef              `json:"maintenance_database_url,omitempty"`
 		DatabaseTarget         *bootstrap.DatabaseTarget  `json:"database_target,omitempty"`
 		BootstrapAuthority     *bootstrap.Contract        `json:"bootstrap_authority,omitempty"`
@@ -409,7 +434,7 @@ func applyKey(obj Resource) string {
 		MaintenanceBinding     RuntimeReferenceBinding    `json:"maintenance_binding,omitempty"`
 		ManifestBinding        RuntimeReferenceBinding    `json:"manifest_binding,omitempty"`
 		PublicKeyBinding       RuntimeReferenceBinding    `json:"public_key_binding,omitempty"`
-	}{obj.Spec.Kind, obj.Spec.Generation, obj.Spec.Source, obj.Spec.ArtifactDigest, obj.Spec.DatabaseURL, obj.Spec.MaintenanceDatabaseURL, obj.Spec.DatabaseTarget, obj.Spec.BootstrapAuthority, obj.Spec.BootstrapAuthorization, obj.Spec.CreateDatabase, obj.Spec.PostgresVersion, obj.Spec.ConcurrentIndexes, obj.MetadataGeneration, obj.SourceBinding, obj.DatabaseBinding, obj.MaintenanceDatabaseBinding, obj.AuthorizationManifestBinding, obj.AuthorizationPublicKeyBinding})
+	}{obj.Spec.Kind, obj.Spec.Generation, obj.Spec.Source, obj.Spec.ArtifactDigest, obj.Spec.DatabaseURL, obj.Spec.DatabaseIdentity, obj.Spec.MaintenanceDatabaseURL, obj.Spec.DatabaseTarget, obj.Spec.BootstrapAuthority, obj.Spec.BootstrapAuthorization, obj.Spec.CreateDatabase, obj.Spec.PostgresVersion, obj.Spec.ConcurrentIndexes, obj.MetadataGeneration, obj.SourceBinding, obj.DatabaseBinding, obj.MaintenanceDatabaseBinding, obj.AuthorizationManifestBinding, obj.AuthorizationPublicKeyBinding})
 	digest := sha256.Sum256(raw)
 	return fmt.Sprintf("%s/%d/%s/%s", obj.Spec.Kind, obj.Spec.Generation, obj.Spec.ArtifactDigest, hex.EncodeToString(digest[:]))
 }
@@ -431,15 +456,21 @@ func UpdateCondition(status Status, typ ConditionType, reason, message string, g
 	return condition(status, typ, reason, message, generation, at)
 }
 func condition(s Status, typ ConditionType, reason, msg string, g int64, at time.Time) Status {
+	next := Condition{Type: typ, Status: "True", Reason: reason, Message: msg, ObservedGeneration: g, LastTransitionTime: at}
+	conditions := make([]Condition, 0, len(s.Conditions)+1)
 	for i := range s.Conditions {
-		if typ == Authorization {
-			if s.Conditions[i].Type == Authorization {
-				s.Conditions[i].Status = "False"
+		current := s.Conditions[i]
+		if current.Type == typ {
+			if current.Status == next.Status && current.Reason == next.Reason && current.Message == next.Message && current.ObservedGeneration == next.ObservedGeneration {
+				next.LastTransitionTime = current.LastTransitionTime
 			}
-		} else if s.Conditions[i].Type != Authorization {
-			s.Conditions[i].Status = "False"
+			continue
 		}
+		if typ != Authorization && current.Type != Authorization {
+			current.Status = "False"
+		}
+		conditions = append(conditions, current)
 	}
-	s.Conditions = append(s.Conditions, Condition{Type: typ, Status: "True", Reason: reason, Message: msg, ObservedGeneration: g, LastTransitionTime: at})
+	s.Conditions = append(conditions, next)
 	return s
 }

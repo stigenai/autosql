@@ -1,0 +1,31 @@
+{{- if not .Values.artifactStore.existingClaim }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "autosql-operator.fullname" . }}-artifacts
+  annotations:
+    helm.sh/resource-policy: keep
+  labels:
+    {{- include "autosql-operator.labels" . | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: {{ .Values.artifactStore.size }}
+---
+{{- end }}
+{{- if not .Values.stateStore.existingClaim }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "autosql-operator.fullname" . }}-state
+  annotations:
+    helm.sh/resource-policy: keep
+  labels:
+    {{- include "autosql-operator.labels" . | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: {{ .Values.stateStore.size }}
+{{- end }}

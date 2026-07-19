@@ -1,0 +1,22 @@
+name: AutoSQL
+description: Verify or apply an immutable AutoSQL database artifact
+author: Stigen AI
+branding: {icon: database, color: blue}
+inputs:
+  mode: {description: verify or run, required: false, default: verify}
+  contract: {description: path to the integration contract JSON, required: true}
+  contract-digest: {description: expected sha256 binding digest, required: true}
+  version: {description: released AutoSQL semver; defaults to the action tag, required: false}
+  binary-sha256: {description: independently reviewed SHA-256 of the released runner archive, required: true}
+runs:
+  using: composite
+  steps:
+    - name: Run released AutoSQL
+      shell: bash
+      env:
+        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_CONTRACT: ${{ inputs.contract }}
+        INPUT_CONTRACT_DIGEST: ${{ inputs.contract-digest }}
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_BINARY_SHA256: ${{ inputs.binary-sha256 }}
+      run: ${{ github.action_path }}/run.sh

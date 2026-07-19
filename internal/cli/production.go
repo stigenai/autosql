@@ -26,6 +26,7 @@ import (
 	"autosql/pkg/schema"
 	"autosql/pkg/secret"
 	"autosql/pkg/simulate"
+	"autosql/pkg/workloadidentity"
 )
 
 type applyConfig struct {
@@ -44,6 +45,7 @@ type applyConfig struct {
 	TrustedMigrations                                                                                                                                                         map[string]migrationTrust
 	ApprovalPolicy                                                                                                                                                            approval.Policy
 	RepairPolicyDigest, RepairApprovalDigest, RepairDestructiveApprovalDigest                                                                                                 string
+	WorkloadIdentity                                                                                                                                                          *workloadidentity.Binding
 }
 type migrationTrust struct {
 	Expected                 artifact.ExpectedBindings
@@ -113,6 +115,57 @@ func productionServices(connector executor.Connector) (Services, error) {
 	return productionServicesWithURL(connector, "")
 }
 
+var resolveProductionWorkloadIdentity = func(ctx context.Context, binding workloadidentity.Binding) (string, error) {
+	var source *workloadidentity.Source
+	var err error
+	switch binding.Provider {
+	case workloadidentity.AWSRDS:
+		source, err = workloadidentity.NewAWS(ctx, binding)
+	case workloadidentity.GCPCloud:
+		source, err = workloadidentity.NewGCP(ctx, binding)
+	case workloadidentity.AzurePG:
+		source, err = workloadidentity.NewAzure(binding)
+	default:
+		err = workloadidentity.ErrIdentity
+	}
+	if err != nil {
+		return "", workloadidentity.ErrIdentity
+	}
+	url, _, err := source.ConnectionURL(ctx)
+	if err != nil {
+		return "", workloadidentity.ErrIdentity
+	}
+	return url, nil
+}
+
+func resolveApplyDatabaseURL(ctx context.Context, c applyConfig, override string, resolver *secret.Resolver) (string, error) {
+	if strings.TrimSpace(override) != "" {
+		return override, nil
+	}
+	if (strings.TrimSpace(c.DatabaseURL) == "") == (c.WorkloadIdentity == nil) {
+		return "", errors.New("exactly one database credential source is required")
+	}
+	if c.WorkloadIdentity != nil {
+		url, err := resolveProductionWorkloadIdentity(ctx, *c.WorkloadIdentity)
+		if err != nil {
+			return "", errors.New("resolve database workload identity")
+		}
+		if resolver != nil && resolver.Redactor != nil {
+			resolver.Redactor.Add(url)
+		}
+		return url, nil
+	}
+	ref := secret.Reference(c.DatabaseURL)
+	if err := ref.Validate(); err != nil {
+		return "", errors.New("invalid database URL reference")
+	}
+	url, err := resolver.Resolve(ctx, ref)
+	if err != nil {
+		return "", errors.New("resolve database URL")
+	}
+	return url, nil
+}
+
 func productionServicesWithURL(connector executor.Connector, databaseURLOverride string) (Services, error) {
 	path := os.Getenv("AUTOSQL_APPLY_CONFIG")
 	if path == "" {
@@ -134,16 +187,9 @@ func productionServicesWithURL(connector executor.Connector, databaseURLOverride
 		return Services{}, errors.New("invalid apply public key")
 	}
 	resolver := secret.NewResolver()
-	url := databaseURLOverride
-	if url == "" {
-		ref := secret.Reference(c.DatabaseURL)
-		if err = ref.Validate(); err != nil {
-			return Services{}, errors.New("invalid database URL reference")
-		}
-		url, err = resolver.Resolve(context.Background(), ref)
-		if err != nil {
-			return Services{}, errors.New("resolve database URL")
-		}
+	url, err := resolveApplyDatabaseURL(context.Background(), c, databaseURLOverride, resolver)
+	if err != nil {
+		return Services{}, err
 	}
 	authority := staticAuthority{actors: map[string]approval.Identity{c.Author: {ID: c.Author}, c.Requester: {ID: c.Requester}}, verified: map[string]approval.Identity{}}
 	for _, trusted := range c.TrustedMigrations {

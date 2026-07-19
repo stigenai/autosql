@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: autosql-operator
+  namespace: autosql-system
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/autosql-production
+---
+apiVersion: autosql.io/v1alpha1
+kind: AutoSQLSchema
+metadata:
+  name: orders
+spec:
+  kind: VersionedMigration
+  generation: 1
+  source:
+    registryDigest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  artifactDigest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  databaseIdentity:
+    provider: aws_rds_iam
+    host: orders.cluster-example.us-east-1.rds.amazonaws.com
+    port: 5432
+    user: autosql
+    database: orders
+    tlsMode: verify-full
+    region: us-east-1
+    audience: sts.amazonaws.com
+    subject: arn:aws:iam::123456789012:role/autosql-production
+  requireApproval: true
