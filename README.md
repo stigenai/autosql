@@ -141,7 +141,7 @@ output. See [the CLI contract](docs/cli-contract.md) and
 - [Registry, inventory, backup, drift, and audit](docs/schema-registry-observability.md)
 - [Fleet orchestration](docs/fleet-orchestration.md)
 - [Provider and CI contracts](docs/schema-provider-protocol.md) · [CI changesets](docs/ci-changeset-contract.md)
-- [CI/CD packaging and Kubernetes](docs/ci-cd-integrations.md) · [operator](docs/kubernetes-operator.md)
+- [CI/CD packaging and Kubernetes](docs/ci-cd-integrations.md) · [operator](docs/kubernetes-operator.md) · [operator GitOps artifacts](docs/operator-gitops.md)
 - [ORM, deployment, and developer integrations](docs/integrations.md)
 - [Terraform/OpenTofu provider contract](docs/terraform-provider.md)
 - [Dynamic and composite sources](docs/dynamic-sources.md)

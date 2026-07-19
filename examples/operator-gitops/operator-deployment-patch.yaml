@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: autosql-operator
+spec:
+  template:
+    spec:
+      securityContext:
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+      initContainers:
+        - name: pull-autosql-release
+          image: ghcr.io/oras-project/oras:v1.3.0
+          args:
+            - pull
+            - ghcr.io/acme/autosql-cell:sha256-REPLACE_WITH_ARTIFACT_HEX
+            - --output
+            - /release
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+          volumeMounts:
+            - {name: autosql-release, mountPath: /release}
+      containers:
+        - name: operator
+          env:
+            - {name: AUTOSQL_APPLY_CONFIG, value: /release/apply-config.json}
+            - {name: AUTOSQL_OPERATOR_ARTIFACT_DIR, value: /release/artifacts}
+          volumeMounts:
+            - {name: autosql-release, mountPath: /release, readOnly: true}
+      volumes:
+        - name: autosql-release
+          emptyDir: {}

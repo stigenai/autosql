@@ -87,9 +87,10 @@ type Object struct {
 // Statement preserves rendered SQL and its source mapping. SQL is not emitted
 // by reports because it may contain credentials or sensitive literals.
 type Statement struct {
-	ChangeID string                 `json:"change_id"`
-	SQL      string                 `json:"-"`
-	Source   *schema.SourceLocation `json:"source,omitempty"`
+	ChangeID      string                 `json:"change_id"`
+	SQL           string                 `json:"-"`
+	Source        *schema.SourceLocation `json:"source,omitempty"`
+	Transactional *bool                  `json:"transactional,omitempty"`
 }
 
 // TableStatistics is optional target metadata. An absent entry intentionally

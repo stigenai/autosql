@@ -335,6 +335,19 @@ func TestConcurrentIndexTransactionRestriction(t *testing.T) {
 	}
 }
 
+func TestConcurrentIndexNonTransactionalPlanIsAccepted(t *testing.T) {
+	r := resource(schema.KindIndex, "idx_accounts", `{}`)
+	cs := schema.ChangeSet{Version: schema.ChangeVersion, Changes: []schema.Change{change("idx", schema.OperationCreate, nil, r)}}
+	transactional := false
+	ds, err := (Runner{Analyzers: Builtins()}).Run(context.Background(), Input{Changes: cs, Statements: []Statement{{ChangeID: "idx", SQL: "CREATE INDEX CONCURRENTLY idx_accounts ON accounts(id)", Transactional: &transactional}}, Target: Target{Version: 16}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := rules(ds); got != "" {
+		t.Fatalf("rules=%s", got)
+	}
+}
+
 func TestSuppressionScopeReasonAndExpiry(t *testing.T) {
 	r := resource(schema.KindTable, "customers", `{}`)
 	cs := schema.ChangeSet{Version: schema.ChangeVersion, Changes: []schema.Change{change("drop", schema.OperationDrop, r, nil)}}
