@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"sort"
 	"strings"
 	"time"
 
@@ -187,9 +188,17 @@ func (s GenerateService) BuildOperatorArtifact(ctx context.Context, request Oper
 	var prebuilt *plan.Plan
 	options := plan.Options{Render: cloneStrings(request.Render)}
 	if request.BootstrapTarget != nil {
+		inventory, err := postgres.PrepareBootstrapAuthorizationInventory(ctx, *request.BootstrapTarget, desired, postgres.BootstrapAuthorizationInventoryOptions{Render: options.Render})
+		if err != nil {
+			return OperatorArtifactResult{}, generationFailure("bootstrap_inventory", ErrGenerateStage)
+		}
+		options.Render = operatorBootstrapArtifactRender(inventory, options.Render)
 		whole, err := postgres.PlanDatabaseBootstrap(ctx, *request.BootstrapTarget, desired, options)
 		if err != nil {
 			return OperatorArtifactResult{}, generationFailure("bootstrap_plan", ErrGenerateStage)
+		}
+		if whole.Digest != inventory.PlanDigest || whole.SchemaPlan.Digest != inventory.PlanSummary.SchemaPlanDigest {
+			return OperatorArtifactResult{}, generationFailure("bootstrap_inventory_binding", ErrGenerateStage)
 		}
 		current = bootstrapIntrinsicDocument(*request.BootstrapTarget, desired)
 		desired = documentWithoutDatabase(desired)
@@ -233,6 +242,49 @@ func (s GenerateService) BuildOperatorArtifact(ctx context.Context, request Oper
 		return OperatorArtifactResult{}, err
 	}
 	return OperatorArtifactResult{Artifact: built.Artifact, Bytes: built.Bytes, SchemaPolicyResources: built.SchemaPolicyResources, MigrationPolicyResources: built.MigrationPolicyResources}, nil
+}
+
+// operatorBootstrapArtifactRender reconstructs only the deterministic render
+// inputs bound by a prepared inventory. Keeping this inside the signed
+// artifact pipeline preserves postgres.PrepareBootstrapAuthorizationInventory's
+// review-only public contract: it still cannot be passed to the executor.
+func operatorBootstrapArtifactRender(inventory postgres.BootstrapAuthorizationInventory, base map[string]string) map[string]string {
+	render := cloneStrings(base)
+	routineDigests, extensionNames := map[string]bool{}, map[string]bool{}
+	for _, routine := range inventory.Routines {
+		routineDigests[routine.SourceDigest] = true
+		if routine.UnsafeLanguageAuthorizationRequired {
+			render["allow_unsafe_routine_languages"] = "true"
+		}
+		if routine.PrivilegedRoutineAuthorizationRequired {
+			render["allow_privileged_routines"] = "true"
+		}
+		if routine.TransactionControlAuthorizationRequired {
+			render["allow_transaction_control_procedures"] = "true"
+		}
+	}
+	for _, extension := range inventory.Extensions {
+		extensionNames[extension.Name] = true
+		render["extension_version."+extension.Name] = extension.Version
+		render["extension_schemas."+extension.Name] = extension.Schema
+		if extension.UntrustedExtensionAuthorizationRequired {
+			render["allow_untrusted_extensions"] = "true"
+		}
+	}
+	render["reviewed_routine_digests"] = sortedOperatorAuthorizationValues(routineDigests)
+	render["extension_allowlist"] = sortedOperatorAuthorizationValues(extensionNames)
+	return render
+}
+
+func sortedOperatorAuthorizationValues(values map[string]bool) string {
+	items := make([]string, 0, len(values))
+	for value := range values {
+		if strings.TrimSpace(value) != "" {
+			items = append(items, value)
+		}
+	}
+	sort.Strings(items)
+	return strings.Join(items, ",")
 }
 
 func materializeOperatorCurrent(ctx context.Context, databaseURL string, desired schema.Document) error {
