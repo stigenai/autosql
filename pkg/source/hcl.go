@@ -820,22 +820,39 @@ func expressionValue(expr hcl.Expression, data []byte, variables HCLVariables) (
 
 func expressionValueWithSymbols(expr hcl.Expression, data []byte, variables HCLVariables, symbols map[string]any) (any, error) {
 	ctx := &hcl.EvalContext{Variables: map[string]cty.Value{}, Functions: hclFunctions()}
-	varValues := map[string]cty.Value{}
-	for k, v := range variables {
-		if k == hclLocalsVariable {
+	// Symbol roots contain the complete resource graph. Converting every root
+	// for every literal attribute makes canonical documents quadratic in size.
+	referencedRoots := map[string]bool{}
+	for _, traversal := range expr.Variables() {
+		referencedRoots[traversal.RootName()] = true
+	}
+	if referencedRoots["var"] {
+		varValues := map[string]cty.Value{}
+		for name, value := range variables {
+			if name == hclLocalsVariable {
+				continue
+			}
+			converted, err := ctyValue(value)
+			if err != nil {
+				return nil, err
+			}
+			varValues[name] = converted
+		}
+		if len(varValues) > 0 {
+			ctx.Variables["var"] = cty.ObjectVal(varValues)
+		}
+	}
+	for name, value := range variables {
+		if name == hclLocalsVariable || !referencedRoots[name] {
 			continue
 		}
-		cv, e := ctyValue(v)
-		if e != nil {
-			return nil, e
+		converted, err := ctyValue(value)
+		if err != nil {
+			return nil, err
 		}
-		ctx.Variables[k] = cv
-		varValues[k] = cv
+		ctx.Variables[name] = converted
 	}
-	if len(varValues) > 0 {
-		ctx.Variables["var"] = cty.ObjectVal(varValues)
-	}
-	if locals, ok := variables[hclLocalsVariable].(map[string]any); ok && len(locals) > 0 {
+	if locals, ok := variables[hclLocalsVariable].(map[string]any); referencedRoots["local"] && ok && len(locals) > 0 {
 		converted, err := ctyValue(locals)
 		if err != nil {
 			return nil, err
@@ -843,6 +860,9 @@ func expressionValueWithSymbols(expr hcl.Expression, data []byte, variables HCLV
 		ctx.Variables["local"] = converted
 	}
 	for name, value := range symbols {
+		if !referencedRoots[name] {
+			continue
+		}
 		converted, err := ctyValue(value)
 		if err != nil {
 			return nil, err
