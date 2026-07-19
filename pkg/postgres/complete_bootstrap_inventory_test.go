@@ -95,7 +95,7 @@ func TestSyntheticScaleBootstrapInventoryManifest(t *testing.T) {
 		Name: schema.Name{Name: target.Name}, Spec: targetSpec,
 	})
 	completeHCL.Normalize()
-	hcl, err := source.FormatHCL(completeHCL)
+	hcl, err := source.FormatAuthorHCL(completeHCL)
 	if err != nil {
 		t.Fatal(err)
 	}

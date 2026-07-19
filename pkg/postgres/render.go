@@ -198,13 +198,19 @@ func renderChange(change schema.Change, resources map[string]schema.Resource, op
 	membershipRename := change.Operation == schema.OperationRename && r.Kind == schema.KindMembership
 	membershipRoleAlter := change.Operation == schema.OperationAlter && r.Kind == schema.KindMembership && options["__membership_has_role_rename"] == "true" && membershipOptionsEqual(*change.Before, *change.After)
 	projectionChild := r.Kind == schema.KindColumn && isManagedProjectionParent(r.Name.Parent, resources)
+	inheritedPartitionColumn := false
+	if r.Kind == schema.KindColumn {
+		if parent, ok := resources[r.Name.Parent]; ok && parent.Kind == schema.KindTable && stringValue(spec(parent), "partition_of") != "" {
+			inheritedPartitionColumn = true
+		}
+	}
 	commentOnlyAlter := change.Operation == schema.OperationAlter && change.Before != nil && change.After != nil && !resourceSQLSemanticsChanged(*change.Before, *change.After) && change.Before.Annotations["comment"] != change.After.Annotations["comment"]
-	if !parentOnlyRename && !membershipRename && !membershipRoleAlter && !projectionChild && !commentOnlyAlter {
+	if !parentOnlyRename && !membershipRename && !membershipRoleAlter && !projectionChild && !inheritedPartitionColumn && !commentOnlyAlter {
 		if err := plugin.RequireManagedOperation(New().Info(), r.Kind, change.Operation); err != nil {
 			return nil, err
 		}
 	}
-	if parentOnlyRename || membershipRename || membershipRoleAlter || projectionChild {
+	if parentOnlyRename || membershipRename || membershipRoleAlter || projectionChild || inheritedPartitionColumn {
 		out := []plugin.Statement{{ChangeID: change.ID, Transactional: true, Kind: plugin.StatementTopology}}
 		comments, err := renderCommentChange(change, resources)
 		if err != nil {
@@ -342,14 +348,11 @@ func renderCreate(r schema.Resource, resources map[string]schema.Resource, optio
 		}
 		return appendOwnerCreate([]string{q}, r, "SEQUENCE"), nil
 	case schema.KindTable:
-		if !allowedKeys(s, "partitioned", "persistence", "row_security", "force_row_security", "owner") {
+		if !allowedKeys(s, "partitioned", "partition_strategy", "partition_columns", "partition_of", "partition_bound", "persistence", "row_security", "force_row_security", "owner") {
 			return nil, unsupported(r, "unknown table semantics")
 		}
 		if e := validateTableSpec(s); e != nil {
 			return nil, unsupported(r, e.Error())
-		}
-		if boolValue(s, "partitioned") {
-			return nil, unsupported(r, "partitioned table requires an explicit partition strategy")
 		}
 		prefix := "CREATE "
 		switch stringValue(s, "persistence") {
@@ -357,7 +360,50 @@ func renderCreate(r schema.Resource, resources map[string]schema.Resource, optio
 		default:
 			return nil, unsupported(r, "temporary/unlogged table persistence is outside the managed matrix")
 		}
-		out := []string{prefix + "TABLE " + name + " ()"}
+		create := prefix + "TABLE " + name
+		if parentID := stringValue(s, "partition_of"); parentID != "" {
+			parent, ok := resources[parentID]
+			if !ok || parent.Kind != schema.KindTable || !boolValue(spec(parent), "partitioned") {
+				return nil, unsupported(r, "partition parent is missing or is not partitioned")
+			}
+			bound := strings.TrimSpace(stringValue(s, "partition_bound"))
+			if bound == "" || strings.Contains(bound, ";") {
+				return nil, unsupported(r, "partition bound is required and must be one SQL clause")
+			}
+			create += " PARTITION OF " + qualified(parent.Name) + " " + bound
+		} else if boolValue(s, "partitioned") {
+			strategy := strings.ToUpper(stringValue(s, "partition_strategy"))
+			columns := stringSlice(s, "partition_columns")
+			if (strategy != "RANGE" && strategy != "LIST" && strategy != "HASH") || len(columns) == 0 {
+				return nil, unsupported(r, "partitioned table requires a range, list, or hash strategy and columns")
+			}
+			children := childResources(r.ID, schema.KindColumn, resources)
+			sort.Slice(children, func(i, j int) bool {
+				return numberAsInt(spec(children[i]), "ordinal") < numberAsInt(spec(children[j]), "ordinal")
+			})
+			definitions := make([]string, 0, len(children))
+			for _, column := range children {
+				definition, columnErr := columnDefinition(column, resources)
+				if columnErr != nil {
+					return nil, columnErr
+				}
+				definitions = append(definitions, quote(column.Name.Name)+" "+definition)
+			}
+			create += " (" + strings.Join(definitions, ", ") + ") PARTITION BY " + strategy + " (" + quoteHCLLikeIdentifiers(columns) + ")"
+		} else {
+			create += " ()"
+		}
+		if boolValue(s, "partitioned") || stringValue(s, "partition_of") != "" {
+			parsed, parseErr := pg_query.Parse(create)
+			if parseErr != nil || parsed == nil || len(parsed.Stmts) != 1 || parsed.Stmts[0].GetStmt().GetCreateStmt() == nil {
+				return nil, unsupported(r, "partition definition must parse as exactly one CREATE TABLE statement")
+			}
+			created := parsed.Stmts[0].GetStmt().GetCreateStmt().GetRelation()
+			if created == nil || created.GetSchemaname() != r.Name.Schema || created.GetRelname() != r.Name.Name {
+				return nil, unsupported(r, "partition definition changed table identity")
+			}
+		}
+		out := []string{create}
 		if boolValue(s, "row_security") {
 			out = append(out, "ALTER TABLE "+name+" ENABLE ROW LEVEL SECURITY")
 		}
@@ -372,6 +418,9 @@ func renderCreate(r schema.Resource, resources map[string]schema.Resource, optio
 		def, e := columnDefinition(r, resources)
 		if e != nil {
 			return nil, e
+		}
+		if table, ok := resources[r.Name.Parent]; ok && table.Kind == schema.KindTable && (boolValue(spec(table), "partitioned") || stringValue(spec(table), "partition_of") != "") {
+			return []string{"ALTER TABLE " + parent + " ADD COLUMN IF NOT EXISTS " + quote(r.Name.Name) + " " + def}, nil
 		}
 		return []string{"ALTER TABLE " + parent + " ADD COLUMN " + quote(r.Name.Name) + " " + def}, nil
 	case schema.KindPrimaryKey, schema.KindUniqueConstraint, schema.KindCheckConstraint, schema.KindForeignKey:
@@ -895,7 +944,7 @@ func renderAlter(before, after schema.Resource, resources map[string]schema.Reso
 		}
 		return []string{q}, nil
 	case schema.KindTable:
-		if !allowedKeys(bs, "partitioned", "persistence", "row_security", "force_row_security", "owner") || !allowedKeys(as, "partitioned", "persistence", "row_security", "force_row_security", "owner") {
+		if !allowedKeys(bs, "partitioned", "partition_strategy", "partition_columns", "partition_of", "partition_bound", "persistence", "row_security", "force_row_security", "owner") || !allowedKeys(as, "partitioned", "partition_strategy", "partition_columns", "partition_of", "partition_bound", "persistence", "row_security", "force_row_security", "owner") {
 			return nil, unsupported(after, "unknown table semantics")
 		}
 		if e := validateTableSpec(bs); e != nil {
@@ -904,7 +953,7 @@ func renderAlter(before, after schema.Resource, resources map[string]schema.Reso
 		if e := validateTableSpec(as); e != nil {
 			return nil, unsupported(after, e.Error())
 		}
-		if stringValue(bs, "persistence") != stringValue(as, "persistence") || boolValue(bs, "partitioned") != boolValue(as, "partitioned") {
+		if stringValue(bs, "persistence") != stringValue(as, "persistence") || boolValue(bs, "partitioned") != boolValue(as, "partitioned") || stringValue(bs, "partition_strategy") != stringValue(as, "partition_strategy") || fmt.Sprint(bs["partition_columns"]) != fmt.Sprint(as["partition_columns"]) || stringValue(bs, "partition_of") != stringValue(as, "partition_of") || stringValue(bs, "partition_bound") != stringValue(as, "partition_bound") {
 			return nil, unsupported(after, "table storage alteration")
 		}
 		var out []string
@@ -1407,7 +1456,37 @@ func validateTableSpec(values map[string]any) error {
 			return fmt.Errorf("table persistence must be a string")
 		}
 	}
+	if boolValue(values, "partitioned") {
+		strategy := strings.ToLower(stringValue(values, "partition_strategy"))
+		if strategy != "range" && strategy != "list" && strategy != "hash" {
+			return fmt.Errorf("partition_strategy must be range, list, or hash")
+		}
+		if len(stringSlice(values, "partition_columns")) == 0 {
+			return fmt.Errorf("partition_columns must be a non-empty string list")
+		}
+	}
+	if stringValue(values, "partition_of") != "" && strings.TrimSpace(stringValue(values, "partition_bound")) == "" {
+		return fmt.Errorf("partition_bound is required for a table partition")
+	}
 	return nil
+}
+
+func childResources(parent string, kind schema.Kind, resources map[string]schema.Resource) []schema.Resource {
+	children := []schema.Resource{}
+	for _, resource := range resources {
+		if resource.Kind == kind && resource.Name.Parent == parent {
+			children = append(children, resource)
+		}
+	}
+	return children
+}
+
+func quoteHCLLikeIdentifiers(values []string) string {
+	quoted := make([]string, len(values))
+	for index, value := range values {
+		quoted[index] = quote(value)
+	}
+	return strings.Join(quoted, ", ")
 }
 func cloneOptions(in map[string]string) map[string]string {
 	out := map[string]string{}
@@ -1688,13 +1767,13 @@ func validateManagedDocuments(request plugin.RenderRequest) error {
 						}
 					}
 				case schema.KindTable:
-					if !allowedKeys(s, "partitioned", "persistence", "row_security", "force_row_security", "owner") {
+					if !allowedKeys(s, "partitioned", "partition_strategy", "partition_columns", "partition_of", "partition_bound", "persistence", "row_security", "force_row_security", "owner") {
 						return unsupported(r, "unknown table semantics")
 					}
 					if e := validateTableSpec(s); e != nil {
 						return unsupported(r, e.Error())
 					}
-					if boolValue(s, "partitioned") || stringValue(s, "persistence") != "p" && stringValue(s, "persistence") != "" {
+					if stringValue(s, "persistence") != "p" && stringValue(s, "persistence") != "" {
 						return unsupported(r, "table storage is outside managed matrix")
 					}
 				case schema.KindEnum:
@@ -2428,6 +2507,16 @@ func validateCanonicalIdentity(r schema.Resource, resources map[string]schema.Re
 			}
 			if (r.Kind == schema.KindView || r.Kind == schema.KindMaterializedView) && dep.Type == schema.DependencyUses {
 				if target, ok := resources[dep.Target]; ok && (target.Kind == schema.KindEnum || target.Kind == schema.KindDomain || target.Kind == schema.KindComposite) {
+					continue
+				}
+			}
+			if r.Kind == schema.KindTable && stringValue(spec(r), "partition_of") == dep.Target && dep.Type == schema.DependencyReferences {
+				if target, ok := resources[dep.Target]; ok && target.Kind == schema.KindTable && boolValue(spec(target), "partitioned") {
+					continue
+				}
+			}
+			if r.Kind == schema.KindTable && boolValue(spec(r), "partitioned") && (dep.Type == schema.DependencyUses || dep.Type == schema.DependencyReferences) {
+				if _, ok := resources[dep.Target]; ok {
 					continue
 				}
 			}

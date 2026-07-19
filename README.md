@@ -13,7 +13,9 @@ the world changes during execution.
 
 ## Capabilities
 
-- **Desired state and safety:** deterministic inspection, semantic diffs,
+- **Author-first desired state and safety:** native PostgreSQL HCL blocks,
+  symbolic references, typed expressions and modules, reviewed rename intent,
+  deterministic inspection, semantic diffs,
   dependency-ordered plans, advanced migration lint, policy checks, approvals,
   simulation, and guarded apply. Findings include evidence, confidence,
   impact, remediation, affected objects, and machine-readable properties.

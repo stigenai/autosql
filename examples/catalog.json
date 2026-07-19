@@ -33,6 +33,11 @@
           "level": "contract",
           "path": "examples/hcl-postgres/example_test.go",
           "command": "go test ./examples/hcl-postgres"
+        },
+        {
+          "level": "example",
+          "path": "examples/hcl-postgres/author-modules/main.hcl",
+          "command": "go test ./examples/hcl-postgres -run AuthorLanguageModule"
         }
       ]
     },
@@ -115,7 +120,11 @@
         "domain.literal_check",
         "sequence.lifecycle",
         "sequence.options",
-        "table.permanent_nonpartitioned",
+        "table.permanent",
+        "table.partitioned.range",
+        "table.partitioned.list",
+        "table.partitioned.hash",
+        "table.partition",
         "table.rls",
         "table.child_columns",
         "column.type_safe_casts",

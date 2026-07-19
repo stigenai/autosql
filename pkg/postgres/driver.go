@@ -98,7 +98,7 @@ func (*Driver) Info() plugin.Info {
 		schema.KindEnum:             {Kind: schema.KindEnum, Mode: plugin.Managed, Operations: all, Features: []string{"enum.lifecycle", "enum.append_values"}},
 		schema.KindDomain:           {Kind: schema.KindDomain, Mode: plugin.Managed, Operations: all, Features: []string{"domain.lifecycle", "domain.core_base_type", "domain.literal_check", "owner.lifecycle"}},
 		schema.KindSequence:         {Kind: schema.KindSequence, Mode: plugin.Managed, Operations: all, Features: []string{"sequence.lifecycle", "sequence.options"}},
-		schema.KindTable:            {Kind: schema.KindTable, Mode: plugin.Managed, Operations: all, Features: []string{"table.permanent_nonpartitioned", "table.rls", "table.child_columns"}},
+		schema.KindTable:            {Kind: schema.KindTable, Mode: plugin.Managed, Operations: all, Features: []string{"table.permanent", "table.partitioned.range", "table.partitioned.list", "table.partitioned.hash", "table.partition", "table.rls", "table.child_columns"}},
 		schema.KindColumn:           {Kind: schema.KindColumn, Mode: plugin.Managed, Operations: all, Features: []string{"column.type_safe_casts", "column.default", "column.not_null", "column.ordinal_metadata", "column.identity_create", "column.generated_external_routines", "column.generated_stored_create"}},
 		schema.KindPrimaryKey:       {Kind: schema.KindPrimaryKey, Mode: plugin.Managed, Operations: all, Features: []string{"constraint.primary_key", "constraint.lifecycle", "alter.explicit_rebuild"}},
 		schema.KindUniqueConstraint: {Kind: schema.KindUniqueConstraint, Mode: plugin.Managed, Operations: all, Features: []string{"constraint.unique", "constraint.lifecycle", "alter.explicit_rebuild"}},
@@ -176,6 +176,9 @@ func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Documen
 	if err := canonicalizeRoutineBindings(&doc); err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
+	if err := canonicalizePartitionTables(&doc); err != nil {
+		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
+	}
 	if err := canonicalizeColumnOrdinals(&doc); err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
@@ -211,6 +214,71 @@ func canonicalizeTriggerDefinitions(doc *schema.Document) {
 		resource.Spec = normalized
 		resources[resource.ID] = *resource
 	}
+}
+
+func canonicalizePartitionTables(doc *schema.Document) error {
+	resources := make(map[string]schema.Resource, len(doc.Graph.Resources))
+	columns := map[string][]schema.Resource{}
+	for _, resource := range doc.Graph.Resources {
+		resources[resource.ID] = resource
+		if resource.Kind == schema.KindColumn {
+			columns[resource.Name.Parent] = append(columns[resource.Name.Parent], resource)
+		}
+	}
+	for index := range doc.Graph.Resources {
+		table := &doc.Graph.Resources[index]
+		if table.Kind != schema.KindTable {
+			continue
+		}
+		values := specMap(table.Spec)
+		parentID := stringValue(values, "partition_of")
+		if parentID == "" {
+			if boolValue(values, "partitioned") {
+				for _, column := range columns[table.ID] {
+					for _, dependency := range column.Dependencies {
+						if dependency.Type != schema.DependencyContains {
+							appendUniqueDependency(&table.Dependencies, dependency)
+						}
+					}
+				}
+			}
+			continue
+		}
+		parent, ok := resources[parentID]
+		if !ok || parent.Kind != schema.KindTable || !boolValue(spec(parent), "partitioned") {
+			return fmt.Errorf("partition %s references a missing or nonpartitioned parent", table.Name.String())
+		}
+		appendUniqueDependency(&table.Dependencies, schema.Dependency{Target: parentID, Type: schema.DependencyReferences})
+		if len(columns[table.ID]) != 0 {
+			continue
+		}
+		parentColumns := append([]schema.Resource(nil), columns[parentID]...)
+		sort.Slice(parentColumns, func(i, j int) bool {
+			return numberAsInt(spec(parentColumns[i]), "ordinal") < numberAsInt(spec(parentColumns[j]), "ordinal")
+		})
+		for _, sourceColumn := range parentColumns {
+			clone := sourceColumn
+			clone.Name = schema.Name{Schema: table.Name.Schema, Parent: table.ID, Name: sourceColumn.Name.Name}
+			clone.ID = schema.StableID(schema.KindColumn, clone.Name)
+			clone.Dependencies = []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}}
+			for _, dependency := range sourceColumn.Dependencies {
+				if dependency.Type != schema.DependencyContains {
+					appendUniqueDependency(&clone.Dependencies, dependency)
+				}
+			}
+			doc.Graph.Resources = append(doc.Graph.Resources, clone)
+		}
+	}
+	return nil
+}
+
+func appendUniqueDependency(dependencies *[]schema.Dependency, candidate schema.Dependency) {
+	for _, dependency := range *dependencies {
+		if dependency.Target == candidate.Target && dependency.Type == candidate.Type {
+			return
+		}
+	}
+	*dependencies = append(*dependencies, candidate)
 }
 
 func canonicalizeUsedTypes(doc *schema.Document) error {

@@ -68,6 +68,31 @@ func TestAdvancedHCLCoversEveryPostgresCapability(t *testing.T) {
 	}
 }
 
+func TestAdvancedCatalogAuthorFormatIsStableAndLossless(t *testing.T) {
+	doc := loadHCL(t, context.Background(), "advanced.hcl")
+	formatted, err := source.FormatAuthorHCL(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(formatted), `table "accounts"`) || !strings.Contains(string(formatted), `resource "`) {
+		t.Fatalf("advanced author output did not retain native blocks plus canonical fallback")
+	}
+	back, err := source.ParseHCL("advanced-author.hcl", formatted, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changes, diffErr := schema.Diff(doc, back, schema.DiffOptions{}); diffErr != nil || len(changes.Changes) != 0 {
+		t.Fatalf("advanced author round trip changes=%+v err=%v", changes.Changes, diffErr)
+	}
+	again, err := source.FormatAuthorHCL(back)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(formatted) != string(again) {
+		t.Fatal("advanced author formatting is not stable")
+	}
+}
+
 func TestFriendlyAdvancedHCLUsesHelpersWithoutEscapedJSONOrLiteralIDs(t *testing.T) {
 	doc := loadHCL(t, context.Background(), "friendly-advanced.hcl")
 	want := map[schema.Kind]bool{
@@ -81,6 +106,41 @@ func TestFriendlyAdvancedHCLUsesHelpersWithoutEscapedJSONOrLiteralIDs(t *testing
 	}
 	if len(want) != 0 {
 		t.Fatalf("friendly helper example is missing kinds: %+v", want)
+	}
+}
+
+func TestAuthorLanguageModuleAndRenameExamples(t *testing.T) {
+	ctx := context.Background()
+	loader := source.HCLLoader{}
+	doc, err := loader.Load(ctx, "author-modules/main.hcl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantTables := map[string]bool{"accounts": true, "audit_log": true, "queue_east": true, "queue_west": true}
+	for _, resource := range doc.Graph.Resources {
+		if resource.Kind == schema.KindTable {
+			delete(wantTables, resource.Name.Name)
+		}
+	}
+	if len(wantTables) != 0 {
+		t.Fatalf("author module example is missing tables: %v", wantTables)
+	}
+	formatted, err := source.FormatAuthorHCL(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	back, err := source.ParseHCL("author-modules-formatted.hcl", formatted, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changes, err := schema.Diff(doc, back, schema.DiffOptions{}); err != nil || len(changes.Changes) != 0 {
+		t.Fatalf("author module format round trip changes=%+v err=%v", changes.Changes, err)
+	}
+
+	rename := loadHCL(t, ctx, "rename-intent.hcl")
+	hints, err := schema.DocumentRenameHints(rename)
+	if err != nil || len(hints) != 2 {
+		t.Fatalf("rename example hints=%+v err=%v", hints, err)
 	}
 }
 

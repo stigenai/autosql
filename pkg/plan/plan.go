@@ -72,16 +72,17 @@ type Phase struct {
 }
 
 type Plan struct {
-	Version         string           `json:"version"`
-	PlannerVersion  string           `json:"planner_version"`
-	Driver          DriverIdentity   `json:"driver"`
-	FromFingerprint string           `json:"from_fingerprint"`
-	ToFingerprint   string           `json:"to_fingerprint"`
-	Changes         schema.ChangeSet `json:"changes"`
-	Replay          []string         `json:"replay,omitempty"`
-	Steps           []Step           `json:"steps"`
-	Phases          []Phase          `json:"phases"`
-	Digest          string           `json:"digest"`
+	Version           string           `json:"version"`
+	PlannerVersion    string           `json:"planner_version"`
+	Driver            DriverIdentity   `json:"driver"`
+	FromFingerprint   string           `json:"from_fingerprint"`
+	ToFingerprint     string           `json:"to_fingerprint"`
+	RenameHintsDigest string           `json:"rename_hints_digest,omitempty"`
+	Changes           schema.ChangeSet `json:"changes"`
+	Replay            []string         `json:"replay,omitempty"`
+	Steps             []Step           `json:"steps"`
+	Phases            []Phase          `json:"phases"`
+	Digest            string           `json:"digest"`
 }
 
 type Options struct {
@@ -98,6 +99,11 @@ func Build(ctx context.Context, driver plugin.Driver, current, desired schema.Do
 	if err := desired.Validate(); err != nil {
 		return Plan{}, fmt.Errorf("%w: desired graph: %v", ErrInvalidPlan, err)
 	}
+	hints, err := schema.DocumentRenameHints(desired)
+	if err != nil {
+		return Plan{}, fmt.Errorf("%w: %v", ErrInvalidPlan, err)
+	}
+	options.Diff.RenameHints = append(options.Diff.RenameHints, hints...)
 	if !documentMetadataEqual(current, desired) {
 		return Plan{}, fmt.Errorf("%w: document or graph metadata differs and has no renderable transition", ErrUnsupportedTransition)
 	}
@@ -122,6 +128,12 @@ func Build(ctx context.Context, driver plugin.Driver, current, desired schema.Do
 		return Plan{}, err
 	}
 	p := Plan{Version: Version, PlannerVersion: PlannerVersion, Driver: DriverIdentity{Name: driver.Info().Name, Version: driver.Info().Version}, FromFingerprint: from, ToFingerprint: to, Changes: changes, Steps: steps}
+	if len(options.Diff.RenameHints) > 0 {
+		p.RenameHintsDigest, err = schema.RenameHintsDigest(options.Diff.RenameHints)
+		if err != nil {
+			return Plan{}, err
+		}
+	}
 	p.Phases = phases(steps)
 	p.Digest, err = digestPlan(p)
 	if err != nil {
@@ -184,7 +196,7 @@ func (p Plan) Validate() error {
 			}
 		}
 	}
-	want, err := digestPlan(Plan{Version: p.Version, PlannerVersion: p.PlannerVersion, Driver: p.Driver, FromFingerprint: p.FromFingerprint, ToFingerprint: p.ToFingerprint, Changes: p.Changes, Replay: p.Replay, Steps: p.Steps, Phases: p.Phases})
+	want, err := digestPlan(Plan{Version: p.Version, PlannerVersion: p.PlannerVersion, Driver: p.Driver, FromFingerprint: p.FromFingerprint, ToFingerprint: p.ToFingerprint, RenameHintsDigest: p.RenameHintsDigest, Changes: p.Changes, Replay: p.Replay, Steps: p.Steps, Phases: p.Phases})
 	if err != nil || want != p.Digest {
 		return fmt.Errorf("%w: digest mismatch", ErrInvalidPlan)
 	}
@@ -216,7 +228,7 @@ func AppendReplay(p Plan, sql []string) (Plan, error) {
 	}
 	p.Steps = steps
 	p.Phases = phases(steps)
-	p.Digest, err = digestPlan(Plan{Version: p.Version, PlannerVersion: p.PlannerVersion, Driver: p.Driver, FromFingerprint: p.FromFingerprint, ToFingerprint: p.ToFingerprint, Changes: p.Changes, Replay: p.Replay, Steps: p.Steps, Phases: p.Phases})
+	p.Digest, err = digestPlan(Plan{Version: p.Version, PlannerVersion: p.PlannerVersion, Driver: p.Driver, FromFingerprint: p.FromFingerprint, ToFingerprint: p.ToFingerprint, RenameHintsDigest: p.RenameHintsDigest, Changes: p.Changes, Replay: p.Replay, Steps: p.Steps, Phases: p.Phases})
 	if err != nil {
 		return Plan{}, err
 	}
@@ -241,8 +253,11 @@ func documentMetadataEqual(a, b schema.Document) bool {
 		DocumentExtra map[string]json.RawMessage `json:"document_extra,omitempty"`
 		GraphExtra    map[string]json.RawMessage `json:"graph_extra,omitempty"`
 	}
-	am, _ := json.Marshal(metadata{a.Annotations, a.Extra, a.Graph.Extra})
-	bm, _ := json.Marshal(metadata{b.Annotations, b.Extra, b.Graph.Extra})
+	aAnnotations, bAnnotations := cloneMap(a.Annotations), cloneMap(b.Annotations)
+	delete(aAnnotations, schema.RenameHintsAnnotation)
+	delete(bAnnotations, schema.RenameHintsAnnotation)
+	am, _ := json.Marshal(metadata{aAnnotations, a.Extra, a.Graph.Extra})
+	bm, _ := json.Marshal(metadata{bAnnotations, b.Extra, b.Graph.Extra})
 	return string(am) == string(bm)
 }
 

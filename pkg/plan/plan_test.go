@@ -6,6 +6,7 @@ import (
 	"errors"
 	"math/rand"
 	"reflect"
+	"strings"
 	"testing"
 
 	"autosql/pkg/guardrail"
@@ -72,6 +73,29 @@ func TestUnsupportedReturnsZeroPlan(t *testing.T) {
 	p, err := plan.Build(context.Background(), postgres.New(), current, desired, plan.Options{})
 	if !errors.Is(err, plan.ErrUnsupportedTransition) || !reflect.DeepEqual(p, plan.Plan{}) {
 		t.Fatalf("plan=%+v err=%v", p, err)
+	}
+}
+
+func TestBuildBindsDocumentRenameIntentIntoSignedDigest(t *testing.T) {
+	namespace := resource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
+	before := resource(schema.KindTable, schema.Name{Schema: "app", Name: "old_accounts", Parent: namespace.ID}, `{}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
+	after := resource(schema.KindTable, schema.Name{Schema: "app", Name: "accounts", Parent: namespace.ID}, `{}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
+	current := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{namespace, before}}}
+	raw, err := json.Marshal([]schema.RenameHint{{From: before.ID, To: after.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired := schema.Document{Version: schema.SchemaVersion, Annotations: map[string]string{schema.RenameHintsAnnotation: string(raw)}, Graph: schema.Graph{Resources: []schema.Resource{namespace, after}}}
+	p, err := plan.Build(context.Background(), postgres.New(), current, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.RenameHintsDigest == "" || len(p.Changes.Changes) != 1 || p.Changes.Changes[0].Operation != schema.OperationRename {
+		t.Fatalf("plan rename evidence=%+v changes=%+v", p.RenameHintsDigest, p.Changes.Changes)
+	}
+	p.RenameHintsDigest = "sha256:" + strings.Repeat("0", 64)
+	if !errors.Is(p.Validate(), plan.ErrInvalidPlan) {
+		t.Fatal("tampered rename digest validated")
 	}
 }
 
