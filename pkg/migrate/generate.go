@@ -143,7 +143,7 @@ func (s GenerateService) Generate(ctx context.Context, r GenerateRequest) (Gener
 	metadata["autosql.migration.from"] = fromFP
 	metadata["autosql.migration.to"] = toFP
 	metadata["autosql.migration.rename_hints"] = canonicalHints
-	built, err := s.buildGeneratedArtifact(ctx, r, current, desired, workspace.URL, hints, plan.Options{}, nil, metadata)
+	built, err := s.buildGeneratedArtifact(ctx, r, current, desired, workspace.URL, hints, plan.Options{}, nil, metadata, simulate.PostgresFactory{NamePrefix: "autosql_sim_generate"})
 	if err != nil {
 		return out, err
 	}
@@ -172,7 +172,7 @@ type generatedArtifact struct {
 	SchemaPolicyResources, MigrationPolicyResources []policy.Resource
 }
 
-func (s GenerateService) buildGeneratedArtifact(ctx context.Context, r GenerateRequest, current, desired schema.Document, workspaceURL string, hints []schema.RenameHint, options plan.Options, prebuilt *plan.Plan, metadata map[string]string) (generatedArtifact, error) {
+func (s GenerateService) buildGeneratedArtifact(ctx context.Context, r GenerateRequest, current, desired schema.Document, workspaceURL string, hints []schema.RenameHint, options plan.Options, prebuilt *plan.Plan, metadata map[string]string, simulationFactory simulate.Factory) (generatedArtifact, error) {
 	var out generatedArtifact
 	fromFP, err := schema.SemanticFingerprint(current)
 	if err != nil {
@@ -201,7 +201,7 @@ func (s GenerateService) buildGeneratedArtifact(ctx context.Context, r GenerateR
 	if err = s.checkpoint(r, "simulate"); err != nil {
 		return out, err
 	}
-	sim, err := simulate.Run(ctx, simulate.PostgresFactory{NamePrefix: "autosql_sim_generate"}, simulate.Request{Config: simulate.Config{DevelopmentURL: r.DevelopmentURL, DevelopmentIdentity: r.DevelopmentIdentity, ProductionIdentity: r.ProductionIdentity, CleanupTimeout: 20 * time.Second}, From: current, Plan: p})
+	sim, err := simulate.Run(ctx, simulationFactory, simulate.Request{Config: simulate.Config{DevelopmentURL: r.DevelopmentURL, DevelopmentIdentity: r.DevelopmentIdentity, ProductionIdentity: r.ProductionIdentity, CleanupTimeout: 20 * time.Second}, From: current, Plan: p})
 	if err != nil || !sim.Verified || sim.ToFingerprint != toFP {
 		return out, generationFailure("simulate", ErrGenerateStage)
 	}

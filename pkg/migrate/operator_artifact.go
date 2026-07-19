@@ -18,6 +18,7 @@ import (
 	"autosql/pkg/postgres"
 	"autosql/pkg/precheck"
 	"autosql/pkg/schema"
+	"autosql/pkg/simulate"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -237,11 +238,19 @@ func (s GenerateService) BuildOperatorArtifact(ctx context.Context, request Oper
 	if request.BootstrapTarget != nil {
 		metadata["autosql.operator.mode"] = "bootstrap"
 	}
-	built, err := s.buildGeneratedArtifact(ctx, r, current, desired, workspace.URL, nil, options, prebuilt, metadata)
+	built, err := s.buildGeneratedArtifact(ctx, r, current, desired, workspace.URL, nil, options, prebuilt, metadata, operatorSimulationFactory(request.BootstrapTarget))
 	if err != nil {
 		return OperatorArtifactResult{}, err
 	}
 	return OperatorArtifactResult{Artifact: built.Artifact, Bytes: built.Bytes, SchemaPolicyResources: built.SchemaPolicyResources, MigrationPolicyResources: built.MigrationPolicyResources}, nil
+}
+
+func operatorSimulationFactory(target *bootstrap.DatabaseTarget) simulate.PostgresFactory {
+	factory := simulate.PostgresFactory{NamePrefix: "autosql_sim_generate"}
+	if target != nil && target.Normalize().Mode == bootstrap.ExternalDatabase {
+		factory.DropPublicSchema = true
+	}
+	return factory
 }
 
 // operatorBootstrapArtifactRender reconstructs only the deterministic render

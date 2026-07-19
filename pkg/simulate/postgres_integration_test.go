@@ -133,6 +133,49 @@ func TestPostgresSimulationConcurrentIsolationAndCleanup(t *testing.T) {
 		t.Fatalf("prefix=%s remaining=%d err=%v", prefix, remaining, e)
 	}
 }
+
+func TestPostgresSimulationPubliclessBootstrapCreatesManagedPublicSchema(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx := context.Background()
+	empty := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{}}}
+	empty, err := postgres.New().Normalize(ctx, empty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := schema.Name{Name: "public"}
+	public := schema.Resource{ID: schema.StableID(schema.KindSchema, name), Kind: schema.KindSchema, Name: name, Spec: json.RawMessage(`{}`)}
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{public}}}
+	desired, err = postgres.New().Normalize(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := plan.Build(ctx, postgres.New(), empty, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var createsPublic bool
+	for _, step := range p.Steps {
+		createsPublic = createsPublic || strings.Contains(step.SQL, `CREATE SCHEMA "public"`)
+	}
+	if !createsPublic {
+		t.Fatal("bootstrap fixture did not create the public schema")
+	}
+	devIdentity, err := ResolvePostgresIdentity(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix := uniqueSimulationPrefix(t)
+	result, err := Run(ctx, PostgresFactory{NamePrefix: prefix, DropPublicSchema: true}, Request{Config: Config{DevelopmentURL: url, DevelopmentIdentity: devIdentity, ProductionIdentity: "production.example:5432/prod", CleanupTimeout: 15 * time.Second}, From: empty, Plan: p})
+	if err != nil || !result.Verified {
+		t.Fatalf("public-less bootstrap simulation result=%+v err=%v", result, err)
+	}
+	if got := countSimulationDatabases(t, url, prefix); got != 0 {
+		t.Fatalf("simulation cleanup left %d databases", got)
+	}
+}
 func TestPostgresFactoryRejectsProductionIdentityAndRemoteByDefault(t *testing.T) {
 	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
 	if url == "" {

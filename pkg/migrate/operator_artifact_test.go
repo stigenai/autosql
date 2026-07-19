@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"autosql/pkg/approval"
+	"autosql/pkg/bootstrap"
 	"autosql/pkg/postgres"
 )
 
@@ -42,6 +43,20 @@ func TestAutomationApprovalProviderBindsFreshProofToBundleAndEnvironment(t *test
 				t.Fatal("tampered automation approval verified")
 			}
 		})
+	}
+}
+
+func TestOperatorSimulationFactoryMatchesBootstrapTargetPrecondition(t *testing.T) {
+	external := bootstrap.DatabaseTarget{Mode: bootstrap.ExternalDatabase}
+	if factory := operatorSimulationFactory(&external); !factory.DropPublicSchema {
+		t.Fatal("external bootstrap simulation retained the default public schema")
+	}
+	managed := bootstrap.DatabaseTarget{Mode: bootstrap.ManagedDatabase}
+	if factory := operatorSimulationFactory(&managed); factory.DropPublicSchema {
+		t.Fatal("managed bootstrap simulation removed the intrinsic public schema")
+	}
+	if factory := operatorSimulationFactory(nil); factory.DropPublicSchema {
+		t.Fatal("ordinary transition simulation removed the default public schema")
 	}
 }
 
