@@ -584,11 +584,18 @@ func verifyBootstrapState(ctx context.Context, conn *pgx.Conn, whole bootstrap.P
 	for _, resource := range inspected.Graph.Resources {
 		actualByID[resource.ID] = resource
 	}
+	desiredByID := make(map[string]schema.Resource, len(actualByID)+len(expected))
+	for id, resource := range actualByID {
+		desiredByID[id] = resource
+	}
+	for id, resource := range expected {
+		desiredByID[id] = resource
+	}
 	var mismatches []string
 	for id, desired := range expected {
 		actual, exists := actualByID[id]
 		if exists {
-			actual = projectInspectedBootstrapResource(actual, desired, managedIDs)
+			actual = projectInspectedBootstrapResource(actual, desired, managedIDs, actualByID, desiredByID)
 		}
 		desiredFingerprint, _ := schema.ResourceFingerprint(desired)
 		actualFingerprint, _ := schema.ResourceFingerprint(actual)
@@ -613,7 +620,7 @@ func verifyBootstrapState(ctx context.Context, conn *pgx.Conn, whole bootstrap.P
 	var filtered []schema.Resource
 	for _, resource := range inspected.Graph.Resources {
 		if desired, keep := expected[resource.ID]; keep {
-			resource = projectInspectedBootstrapResource(resource, desired, managedIDs)
+			resource = projectInspectedBootstrapResource(resource, desired, managedIDs, actualByID, desiredByID)
 			filtered = append(filtered, resource)
 		}
 	}
@@ -687,7 +694,7 @@ func firstStringDifference(a, b string) int {
 	return limit
 }
 
-func projectInspectedBootstrapResource(actual, desired schema.Resource, desiredIDs map[string]bool) schema.Resource {
+func projectInspectedBootstrapResource(actual, desired schema.Resource, desiredIDs map[string]bool, actualResources, desiredResources map[string]schema.Resource) schema.Resource {
 	// Do not reuse the inspected resource's backing array here. Verification
 	// projects the same snapshot both resource-by-resource and as a complete
 	// document; an in-place filter would corrupt the latter projection's input.
@@ -731,9 +738,22 @@ func projectInspectedBootstrapResource(actual, desired schema.Resource, desiredI
 				}
 			}
 		}
+		if actual.Kind == schema.KindCheckConstraint && desired.Kind == schema.KindCheckConstraint {
+			_, actualOK := actualSpec["definition"].(string)
+			desiredDefinition, desiredOK := desiredSpec["definition"].(string)
+			if actualOK && desiredOK && bootstrapCheckDefinitionsEquivalent(actual, desired, actualResources, desiredResources) {
+				actualSpec["definition"] = desiredDefinition
+			}
+		}
 		actual.Spec, _ = json.Marshal(actualSpec)
 	}
 	return actual
+}
+
+func bootstrapCheckDefinitionsEquivalent(actual, desired schema.Resource, actualResources, desiredResources map[string]schema.Resource) bool {
+	_, actualDefinition, actualErr := renderConstraintCreate(actual, actualResources)
+	_, desiredDefinition, desiredErr := renderConstraintCreate(desired, desiredResources)
+	return actualErr == nil && desiredErr == nil && actualDefinition == desiredDefinition
 }
 
 func verifyBootstrapPhasePreconditions(ctx context.Context, conn *pgx.Conn, whole bootstrap.Plan, phase bootstrap.BootstrapPhase, steps map[string]bootstrap.BootstrapStep, confirmed map[string]bool) error {
