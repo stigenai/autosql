@@ -183,6 +183,43 @@ func TestAdoptionEquivalenceAgainstPostgres(t *testing.T) {
 	}
 }
 
+func TestAdoptionEquivalenceWithMaterializedViewAgainstPostgres(t *testing.T) {
+	url := strings.TrimSpace(os.Getenv("AUTOSQL_OPERATOR_PG_URL"))
+	if url == "" {
+		t.Skip("AUTOSQL_OPERATOR_PG_URL is not set")
+	}
+	ctx := context.Background()
+	const schemaName = "autosql_operator_adopt_matview_test"
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	quoted := pgx.Identifier{schemaName}.Sanitize()
+	if _, err = conn.Exec(ctx, "drop schema if exists "+quoted+" cascade; create schema "+quoted+"; create table "+quoted+".orders (id bigint); create materialized view "+quoted+".order_ids as select id from "+quoted+".orders"); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Exec(context.Background(), "drop schema if exists "+quoted+" cascade")
+	desiredSQL := "create schema " + schemaName + "; create table " + schemaName + ".orders (id bigint); create materialized view " + schemaName + ".order_ids as select id from " + schemaName + ".orders;"
+	desired, err := source.LoadContext(ctx, source.Input{URI: "operator:inline", Format: source.FormatSQL, Data: []byte(desiredSQL)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err = postgres.New().Normalize(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	approved, err := plan.Build(ctx, postgres.New(), desired, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resource := operator.Resource{Spec: operator.Spec{Kind: operator.Declarative, AdoptionPolicy: operator.AdoptIfEquivalent, Source: operator.Source{Format: "sql", Inline: desiredSQL}}, ResolvedSource: desiredSQL, ResolvedDatabaseURL: url}
+	artifact := artifact.Artifact{Plan: approved, DatabaseIdentity: "adoption-matview-test", TargetEnvironment: "test"}
+	if _, err = verifyAdoptionResource(ctx, resource, artifact); err != nil {
+		t.Fatalf("equivalent database with materialized view rejected: %v", err)
+	}
+}
+
 func TestVerifyBootstrapAuthorizationUsesSignedPlanBoundToken(t *testing.T) {
 	ctx := context.Background()
 	namespace := schema.Resource{Kind: schema.KindSchema, Name: schema.Name{Name: "app"}, Spec: []byte(`{}`)}
