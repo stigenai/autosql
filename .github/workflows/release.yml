@@ -117,6 +117,7 @@ jobs:
   provider:
     name: provider (${{ matrix.goos }}/${{ matrix.goarch }})
     needs: conformance
+    if: ${{ vars.PUBLISH_TERRAFORM_PROVIDER == 'true' }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -416,12 +417,11 @@ jobs:
 
   release:
     name: attach binaries to release
-    needs: [binaries, provider, integration-packages, container, bitbucket-pipe, publish-chart, publish-native-catalogs, publish-terraform-provider]
+    needs: [binaries, integration-packages, container, bitbucket-pipe, publish-chart, publish-native-catalogs, publish-terraform-provider]
     if: >-
       ${{
         always() &&
         needs.binaries.result == 'success' &&
-        needs.provider.result == 'success' &&
         needs.integration-packages.result == 'success' &&
         needs.container.result == 'success' &&
         needs.bitbucket-pipe.result == 'success' &&
