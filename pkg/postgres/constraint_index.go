@@ -156,7 +156,7 @@ func renderConstraintCreate(resource schema.Resource, resources map[string]schem
 	return sql, remainder, nil
 }
 
-// canonicalizeCheckExpressionCasts folds PostgreSQL's equivalent renderings
+// canonicalizeExpressionCasts folds PostgreSQL's equivalent renderings
 // of an array of scalar text casts into one array-level text[] cast. Older
 // server/client combinations commonly deparsed
 //
@@ -166,49 +166,51 @@ func renderConstraintCreate(resource schema.Resource, resources map[string]schem
 //
 //	ARRAY[value::varchar, ...]::text[].
 //
-// Keeping one parser-proven spelling prevents cosmetic CHECK-expression
-// changes from producing a different resource fingerprint or blocking
-// adoption. The rewrite is deliberately limited to non-empty arrays whose
-// every element has the same plain scalar text cast.
-func canonicalizeCheckExpressionCasts(doc *schema.Document) error {
+// Keeping one parser-proven spelling prevents cosmetic CHECK, index-key and
+// partial-index-predicate changes from producing a different resource
+// fingerprint or blocking adoption. The rewrite is deliberately limited to
+// non-empty arrays whose every element has the same plain scalar text cast.
+func canonicalizeExpressionCasts(doc *schema.Document) error {
 	resources := make(map[string]schema.Resource, len(doc.Graph.Resources))
 	for _, resource := range doc.Graph.Resources {
 		resources[resource.ID] = resource
 	}
 	for index := range doc.Graph.Resources {
 		resource := &doc.Graph.Resources[index]
-		if resource.Kind != schema.KindCheckConstraint {
+		if resource.Kind != schema.KindCheckConstraint && resource.Kind != schema.KindIndex {
 			continue
 		}
-		parsed, err := parseConstraintDefinition(*resource, resources)
-		if err != nil {
-			// Preserve the existing normalization contract for constraint grammar
-			// that is accepted only by a more narrowly scoped renderer.
-			continue
-		}
-		var nodes []*pg_query.Node
-		walkPostgresMessages(parsed.constraint.GetRawExpr().ProtoReflect(), func(message protoreflect.Message) {
-			if node, ok := message.Interface().(*pg_query.Node); ok {
-				nodes = append(nodes, node)
+		var root protoreflect.Message
+		var canonicalDefinition func() (string, error)
+		switch resource.Kind {
+		case schema.KindCheckConstraint:
+			parsed, err := parseConstraintDefinition(*resource, resources)
+			if err == nil && parsed.constraint.GetRawExpr() != nil {
+				root = parsed.constraint.GetRawExpr().ProtoReflect()
+				canonicalDefinition = func() (string, error) { return deparseConstraintDefinition(parsed) }
 			}
-		})
-		changed := false
-		for _, node := range nodes {
-			changed = foldScalarTextArrayCasts(node) || changed
-		}
-		if !changed {
-			for _, node := range nodes {
-				cast := node.GetTypeCast()
-				if cast != nil && cast.GetArg().GetAArrayExpr() != nil && plainTextArrayType(cast.GetTypeName()) {
-					changed = true
-					break
+		case schema.KindIndex:
+			parsed, err := parseIndexDefinition(*resource, resources)
+			if err == nil {
+				root = parsed.statement.ProtoReflect()
+				canonicalDefinition = func() (string, error) {
+					definition, deparseErr := pg_query.Deparse(parsed.tree)
+					if deparseErr != nil {
+						return "", unsupported(*resource, "index expression could not be canonicalized")
+					}
+					return definition, nil
 				}
 			}
 		}
-		if !changed {
+		if canonicalDefinition == nil {
+			// Preserve the existing normalization contract for CHECK and index expression grammar
+			// that is accepted only by a more narrowly scoped renderer.
 			continue
 		}
-		definition, err := deparseConstraintDefinition(parsed)
+		if !canonicalizeTextArrayCasts(root) {
+			continue
+		}
+		definition, err := canonicalDefinition()
 		if err != nil {
 			return err
 		}
@@ -221,6 +223,29 @@ func canonicalizeCheckExpressionCasts(doc *schema.Document) error {
 		resources[resource.ID] = *resource
 	}
 	return nil
+}
+
+func canonicalizeTextArrayCasts(root protoreflect.Message) bool {
+	var nodes []*pg_query.Node
+	walkPostgresMessages(root, func(message protoreflect.Message) {
+		if node, ok := message.Interface().(*pg_query.Node); ok {
+			nodes = append(nodes, node)
+		}
+	})
+	changed := false
+	for _, node := range nodes {
+		changed = foldScalarTextArrayCasts(node) || changed
+	}
+	if !changed {
+		for _, node := range nodes {
+			cast := node.GetTypeCast()
+			if cast != nil && cast.GetArg().GetAArrayExpr() != nil && plainTextArrayType(cast.GetTypeName()) {
+				changed = true
+				break
+			}
+		}
+	}
+	return changed
 }
 
 func foldScalarTextArrayCasts(node *pg_query.Node) bool {
