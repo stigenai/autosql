@@ -285,7 +285,8 @@ func adoptionSchemas(desired schema.Document) ([]string, error) {
 }
 
 func lockAdoptionRelations(ctx context.Context, tx pgx.Tx, schemas []string) error {
-	rows, err := tx.Query(ctx, `select n.nspname,c.relname from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname=any($1) and c.relkind in ('r','p','v','m','f') order by n.nspname,c.relname`, schemas)
+	// PostgreSQL rejects LOCK TABLE for materialized views (relkind 'm').
+	rows, err := tx.Query(ctx, `select n.nspname,c.relname from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname=any($1) and c.relkind in ('r','p','v','f') order by n.nspname,c.relname`, schemas)
 	if err != nil {
 		return errors.New("list adoption relations")
 	}
