@@ -55,8 +55,9 @@ jobs:
       - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
       - uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1.12.0
         with:
+          version: v0.32.0
           cluster_name: autosql-conformance
-          node_image: kindest/node:v1.35.0
+          node_image: kindest/node:v1.35.5@sha256:ce977ae6d65918d0b58a5f8b5e940429c2ce42fa3a5619ec2bbc60b949c0ac95
       - name: Build current operator image
         run: |
           set -eu
