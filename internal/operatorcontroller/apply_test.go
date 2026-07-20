@@ -75,6 +75,114 @@ func TestDeclarativePlanVerificationAgainstPostgres(t *testing.T) {
 	}
 }
 
+func TestArtifactApplyAdoptsWithoutCallingMutationService(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	parsed := artifact.Artifact{Digest: digest, DatabaseIdentity: "orders", TargetEnvironment: "production", Plan: plan.Plan{Digest: "sha256:" + strings.Repeat("b", 64)}}
+	directory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(directory, digest+".json"), []byte("adoption artifact"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AUTOSQL_OPERATOR_ARTIFACT_DIR", directory)
+	oldParse, oldVerify, oldAdopt := parseOperatorArtifact, verifyProductionOperatorArtifact, verifyOperatorAdoptionResource
+	t.Cleanup(func() {
+		parseOperatorArtifact, verifyProductionOperatorArtifact, verifyOperatorAdoptionResource = oldParse, oldVerify, oldAdopt
+	})
+	parseOperatorArtifact = func([]byte) (artifact.Artifact, error) { return parsed, nil }
+	verifyProductionOperatorArtifact = func(databaseURL string, candidate artifact.Artifact) (artifact.Artifact, error) {
+		if databaseURL != "postgres://runtime-target" || candidate.Digest != digest {
+			t.Fatalf("verification binding lost: url=%q artifact=%+v", databaseURL, candidate)
+		}
+		return candidate, nil
+	}
+	verifyOperatorAdoptionResource = func(_ context.Context, resource operator.Resource, candidate artifact.Artifact) (verifiedAdoption, error) {
+		if resource.Spec.AdoptionPolicy != operator.AdoptIfEquivalent || candidate.Digest != digest {
+			t.Fatalf("adoption input=%+v artifact=%+v", resource.Spec, candidate)
+		}
+		return verifiedAdoption{SourceDigest: "sha256:" + strings.Repeat("c", 64)}, nil
+	}
+	resource := operator.Resource{Spec: operator.Spec{Kind: operator.Declarative, AdoptionPolicy: operator.AdoptIfEquivalent, Source: operator.Source{Format: "hcl", Inline: `schema "app" {}`}}, ResolvedSource: `schema "app" {}`, ResolvedDatabaseURL: "postgres://runtime-target"}
+	outcome, err := ArtifactApply(context.Background(), resource, digest)
+	if err != nil || outcome.Status != "adopted" || outcome.AppliedSteps != 0 || outcome.SourceDigest == "" || outcome.PlanDigest != parsed.Plan.Digest {
+		t.Fatalf("outcome=%+v err=%v", outcome, err)
+	}
+
+	verifyOperatorAdoptionResource = func(context.Context, operator.Resource, artifact.Artifact) (verifiedAdoption, error) {
+		return verifiedAdoption{}, errors.New("live database does not match desired schema; adoption refused")
+	}
+	outcome, err = ArtifactApply(context.Background(), resource, digest)
+	if err == nil || outcome.Status != "failed" || outcome.AppliedSteps != 0 {
+		t.Fatalf("mismatch outcome=%+v err=%v", outcome, err)
+	}
+}
+
+func TestRequireNoOpAdoptionPlan(t *testing.T) {
+	fingerprint := "sha256:" + strings.Repeat("d", 64)
+	valid := plan.Plan{FromFingerprint: fingerprint, ToFingerprint: fingerprint}
+	if err := requireNoOpAdoptionPlan(valid); err != nil {
+		t.Fatalf("valid no-op rejected: %v", err)
+	}
+	for name, mutate := range map[string]func(*plan.Plan){
+		"different fingerprint": func(p *plan.Plan) { p.ToFingerprint = "sha256:" + strings.Repeat("e", 64) },
+		"change": func(p *plan.Plan) {
+			p.Changes.Changes = []schema.Change{{ID: "change"}}
+		},
+		"step":   func(p *plan.Plan) { p.Steps = []plan.Step{{ID: "step"}} },
+		"phase":  func(p *plan.Plan) { p.Phases = []plan.Phase{{ID: "phase"}} },
+		"replay": func(p *plan.Plan) { p.Replay = []string{"side-effect"} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := valid
+			mutate(&candidate)
+			if err := requireNoOpAdoptionPlan(candidate); err == nil {
+				t.Fatal("non-no-op adoption plan accepted")
+			}
+		})
+	}
+}
+
+func TestAdoptionEquivalenceAgainstPostgres(t *testing.T) {
+	url := strings.TrimSpace(os.Getenv("AUTOSQL_OPERATOR_PG_URL"))
+	if url == "" {
+		t.Skip("AUTOSQL_OPERATOR_PG_URL is not set")
+	}
+	ctx := context.Background()
+	const schemaName = "autosql_operator_adopt_test"
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	quoted := pgx.Identifier{schemaName}.Sanitize()
+	if _, err = conn.Exec(ctx, "drop schema if exists "+quoted+" cascade; create schema "+quoted+"; create table "+quoted+".orders (id bigint)"); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Exec(context.Background(), "drop schema if exists "+quoted+" cascade")
+	desiredSQL := "create schema " + schemaName + "; create table " + schemaName + ".orders (id bigint);"
+	desired, err := source.LoadContext(ctx, source.Input{URI: "operator:inline", Format: source.FormatSQL, Data: []byte(desiredSQL)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err = postgres.New().Normalize(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	approved, err := plan.Build(ctx, postgres.New(), desired, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resource := operator.Resource{Spec: operator.Spec{Kind: operator.Declarative, AdoptionPolicy: operator.AdoptIfEquivalent, Source: operator.Source{Format: "sql", Inline: desiredSQL}}, ResolvedSource: desiredSQL, ResolvedDatabaseURL: url}
+	artifact := artifact.Artifact{Plan: approved, DatabaseIdentity: "adoption-test", TargetEnvironment: "test"}
+	if _, err = verifyAdoptionResource(ctx, resource, artifact); err != nil {
+		t.Fatalf("equivalent database rejected: %v", err)
+	}
+	if _, err = conn.Exec(ctx, "alter table "+quoted+".orders add column drifted text"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = verifyAdoptionResource(ctx, resource, artifact); err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("drifted database adoption error=%v", err)
+	}
+}
+
 func TestVerifyBootstrapAuthorizationUsesSignedPlanBoundToken(t *testing.T) {
 	ctx := context.Background()
 	namespace := schema.Resource{Kind: schema.KindSchema, Name: schema.Name{Name: "app"}, Spec: []byte(`{}`)}

@@ -35,6 +35,7 @@ spec:
                 kind: {type: string, enum: [DeclarativeSchema, VersionedMigration]}
                 generation: {type: integer, format: int64, minimum: 1, default: 1}
                 suspend: {type: boolean, default: false}
+                adoptionPolicy: {type: string, enum: [IfEquivalent]}
                 source:
                   type: object
                   minProperties: 1
@@ -208,6 +209,10 @@ spec:
                   message: createDatabase conflicts with external databaseTarget mode
                 - rule: "!has(self.bootstrapAuthorization) || (self.kind == 'DeclarativeSchema' && has(self.databaseTarget) && (has(self.source.inline) || has(self.source.secretRef) || has(self.source.configMapRef)))"
                   message: bootstrapAuthorization requires databaseTarget and a controller-resolvable DeclarativeSchema source
+                - rule: "!has(self.adoptionPolicy) || (self.adoptionPolicy == 'IfEquivalent' && self.kind == 'DeclarativeSchema' && (has(self.source.inline) || has(self.source.secretRef) || has(self.source.configMapRef)))"
+                  message: adoptionPolicy requires a controller-resolvable DeclarativeSchema source
+                - rule: "!has(self.adoptionPolicy) || (!self.createDatabase && !has(self.databaseTarget) && !has(self.maintenanceDatabaseURL) && !has(self.bootstrapAuthority) && !has(self.bootstrapAuthorization))"
+                  message: adoptionPolicy cannot create or bootstrap a database
             status:
               type: object
               properties:

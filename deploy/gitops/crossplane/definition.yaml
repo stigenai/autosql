@@ -27,6 +27,7 @@ spec:
                 databaseSecretName: {type: string, minLength: 1}
                 databaseSecretKey: {type: string, minLength: 1}
                 suspend: {type: boolean, default: false}
+                adoptionPolicy: {type: string, enum: [IfEquivalent]}
             status:
               type: object
               properties:

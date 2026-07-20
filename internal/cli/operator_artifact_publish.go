@@ -61,6 +61,7 @@ type operatorReleaseManifest struct {
 	Schemas           []string `json:"schemas"`
 	PostgresVersion   int      `json:"postgres_version"`
 	ConcurrentIndexes bool     `json:"concurrent_indexes"`
+	AdoptionPolicy    string   `json:"adoption_policy,omitempty"`
 }
 
 func runOperatorArtifactPublish(ctx context.Context, args []string, o output, reader ReadPlanService) error {
@@ -70,12 +71,16 @@ func runOperatorArtifactPublish(ctx context.Context, args []string, o output, re
 	outputDir := fs.String("output-dir", "", "new release bundle directory")
 	sourceRevision := fs.String("source-revision", "", "immutable source revision (for example the Git commit SHA)")
 	bootstrapMode := fs.Bool("bootstrap", false, "build an empty-database bootstrap artifact")
+	adoptMode := fs.Bool("adopt", false, "build a credential-free adoption artifact for an equivalent existing database")
 	jsonFlag := fs.Bool("json", false, "emit JSON")
 	if err := fs.Parse(args); err != nil {
 		return usageError(err)
 	}
 	if fs.NArg() != 0 || *file == "" || *configPath == "" || *outputDir == "" || *sourceRevision == "" {
 		return usageError(errors.New("--file, --config, --output-dir, and --source-revision are required"))
+	}
+	if *bootstrapMode && *adoptMode {
+		return usageError(errors.New("--bootstrap and --adopt are mutually exclusive"))
 	}
 	if reader == nil {
 		return &Error{Kind: "config", Message: "schema reader is unavailable", Code: ExitConfig}
@@ -90,7 +95,7 @@ func runOperatorArtifactPublish(ctx context.Context, args []string, o output, re
 	if err = decoder.Decode(&config); err != nil {
 		return &Error{Kind: "config", Message: "parse operator publish configuration failed", Code: ExitConfig}
 	}
-	if err = validateOperatorPublishConfig(config, *bootstrapMode); err != nil {
+	if err = validateOperatorPublishConfig(config, *bootstrapMode, *adoptMode); err != nil {
 		return &Error{Kind: "config", Message: err.Error(), Code: ExitConfig}
 	}
 	policyRaw, err := os.ReadFile(config.PolicyFile)
@@ -149,6 +154,9 @@ func runOperatorArtifactPublish(ctx context.Context, args []string, o output, re
 			return &Error{Kind: "config", Message: "bootstrap DatabaseIdentity must equal the database block name", Code: ExitConfig}
 		}
 		bootstrapTarget = &target
+	} else if *adoptMode {
+		productionIdentity = "operator-adopt/" + config.DatabaseIdentity
+		current = desired
 	} else {
 		productionURL, resolveErr := resolver.Resolve(ctx, config.ProductionURL)
 		if resolveErr != nil {
@@ -189,7 +197,7 @@ func runOperatorArtifactPublish(ctx context.Context, args []string, o output, re
 	if *config.ConcurrentIndexes {
 		render["concurrent_indexes"] = "true"
 	}
-	result, err := (migrate.GenerateService{}).BuildOperatorArtifact(ctx, migrate.OperatorArtifactRequest{Generation: generation, Current: current, Desired: desired, BootstrapTarget: bootstrapTarget, Render: render})
+	result, err := (migrate.GenerateService{}).BuildOperatorArtifact(ctx, migrate.OperatorArtifactRequest{Generation: generation, Current: current, Desired: desired, BootstrapTarget: bootstrapTarget, Adopt: *adoptMode, Render: render})
 	if err != nil {
 		return &Error{Kind: "migration", Message: err.Error(), Code: ExitMigration, Cause: err}
 	}
@@ -201,6 +209,9 @@ func runOperatorArtifactPublish(ctx context.Context, args []string, o output, re
 	trust := migrationTrust{Expected: artifact.ExpectedBindings{PlanDigest: result.Artifact.Plan.Digest, GeneratedPlanDigest: result.Artifact.Plan.Digest, ChecksDigest: result.Artifact.Checks.Digest, GuardrailDigest: result.Artifact.GuardrailDigest, SourceRevision: result.Artifact.SourceRevision, Environment: result.Artifact.TargetEnvironment, DatabaseIdentity: result.Artifact.DatabaseIdentity, ApprovalIdentity: result.Artifact.Approval.Identity, ApprovalProofDigest: result.Artifact.Approval.ProofDigest}, ValidationContextDigests: contexts, ValidationAttestations: attestations, Schemas: append([]string(nil), config.Schemas...), Policy: *policyDocument, PolicyIdentity: config.PolicyIdentity, SchemaPolicyResources: result.SchemaPolicyResources, MigrationPolicyResources: result.MigrationPolicyResources, ApprovalIdentities: map[string]approval.Identity{result.Artifact.Approval.ProofDigest: {ID: config.AutomationApprovalIdentity, Roles: append([]string(nil), config.AutomationApprovalRoles...)}}}
 	apply := applyConfig{DatabaseURL: string(config.ProductionURL), Environment: config.Environment, KeyID: config.SigningKeyID, PublicKey: base64.RawStdEncoding.EncodeToString(signingKey.Public().(ed25519.PublicKey)), Issuer: config.SigningIssuer, Signer: config.SigningIdentity, Author: config.Author, Requester: config.Requester, ApprovalAuditPath: config.ApprovalAuditPath, LifecycleAuditPath: config.LifecycleAuditPath, ArtifactDirectory: config.OperatorArtifactDirectory, PostgresVersion: config.PostgresVersion, KeyStatus: config.SigningStatus, KeyPurpose: config.SigningPurpose, KeyNotBefore: config.SigningNotBefore.UTC(), KeyNotAfter: config.SigningNotAfter.UTC(), NoEdits: true, GeneratorKeyID: config.GeneratorKeyID, GeneratorPublicKey: base64.RawStdEncoding.EncodeToString(generatorKey.Public().(ed25519.PublicKey)), GeneratorPurpose: config.GeneratorPurpose, TrustedMigrations: map[string]migrationTrust{result.Artifact.Digest: trust}, ApprovalPolicy: config.ApprovalPolicy}
 	manifest := operatorReleaseManifest{Version: "autosql.operator-release/v1", ArtifactDigest: result.Artifact.Digest, RegistryDigest: result.Artifact.Digest, ArtifactFile: filepath.ToSlash(filepath.Join("artifacts", result.Artifact.Digest+".json")), ApplyConfigFile: "apply-config.json", OCITag: strings.Replace(result.Artifact.Digest, ":", "-", 1), Environment: config.Environment, DatabaseIdentity: config.DatabaseIdentity, SourceRevision: *sourceRevision, Schemas: append([]string(nil), config.Schemas...), PostgresVersion: config.PostgresVersion, ConcurrentIndexes: *config.ConcurrentIndexes}
+	if *adoptMode {
+		manifest.AdoptionPolicy = "IfEquivalent"
+	}
 	if err = writeOperatorReleaseBundle(*outputDir, result.Bytes, apply, manifest); err != nil {
 		return &Error{Kind: "conflict", Message: "publish operator release bundle failed", Code: ExitConflict, Cause: err}
 	}
@@ -208,10 +219,10 @@ func runOperatorArtifactPublish(ctx context.Context, args []string, o output, re
 	return o.success(manifest, result.Artifact.Digest)
 }
 
-func validateOperatorPublishConfig(config operatorPublishConfig, bootstrapMode bool) error {
+func validateOperatorPublishConfig(config operatorPublishConfig, bootstrapMode, adoptMode bool) error {
 	approvalTTL, approvalErr := time.ParseDuration(config.ApprovalTTL)
 	lifetime, lifetimeErr := time.ParseDuration(config.ArtifactLifetime)
-	if config.DevelopmentURL.Validate() != nil || (!bootstrapMode && config.ProductionURL.Validate() != nil) || config.Environment == "" || config.DatabaseIdentity == "" || config.Author == "" || config.Requester == "" || config.Author == config.Requester || config.PostgresVersion < 14 || config.PostgresVersion > 18 || config.ConcurrentIndexes == nil || len(config.Schemas) == 0 || config.PolicyFile == "" || config.PolicyIdentity == "" || len(config.ApprovalPolicy.Environments) == 0 || config.AutomationApprovalKeyID == "" || config.AutomationApprovalIdentity == "" || config.AutomationApprovalIdentity == config.Author || config.AutomationApprovalIdentity == config.Requester || len(config.AutomationApprovalRoles) == 0 || config.AutomationApprovalPrivateKeyReference == "" || approvalErr != nil || approvalTTL <= 0 || lifetimeErr != nil || lifetime <= 0 || approvalTTL >= lifetime || config.GenerationApprovalAuditPath == "" || config.ApprovalAuditPath == "" || config.LifecycleAuditPath == "" || config.GeneratorKeyID == "" || config.GeneratorPurpose == "" || config.GeneratorPrivateKeyReference == "" || config.SigningKeyID == "" || config.SigningIssuer == "" || config.SigningIdentity == "" || config.SigningPurpose == "" || config.SigningStatus != "active" || config.SigningPrivateKeyReference == "" || config.SigningNotBefore.IsZero() || !config.SigningNotAfter.After(config.SigningNotBefore) || config.OperatorArtifactDirectory == "" {
+	if bootstrapMode && adoptMode || config.DevelopmentURL.Validate() != nil || (!bootstrapMode && !adoptMode && config.ProductionURL.Validate() != nil) || config.Environment == "" || config.DatabaseIdentity == "" || config.Author == "" || config.Requester == "" || config.Author == config.Requester || config.PostgresVersion < 14 || config.PostgresVersion > 18 || config.ConcurrentIndexes == nil || len(config.Schemas) == 0 || config.PolicyFile == "" || config.PolicyIdentity == "" || len(config.ApprovalPolicy.Environments) == 0 || config.AutomationApprovalKeyID == "" || config.AutomationApprovalIdentity == "" || config.AutomationApprovalIdentity == config.Author || config.AutomationApprovalIdentity == config.Requester || len(config.AutomationApprovalRoles) == 0 || config.AutomationApprovalPrivateKeyReference == "" || approvalErr != nil || approvalTTL <= 0 || lifetimeErr != nil || lifetime <= 0 || approvalTTL >= lifetime || config.GenerationApprovalAuditPath == "" || config.ApprovalAuditPath == "" || config.LifecycleAuditPath == "" || config.GeneratorKeyID == "" || config.GeneratorPurpose == "" || config.GeneratorPrivateKeyReference == "" || config.SigningKeyID == "" || config.SigningIssuer == "" || config.SigningIdentity == "" || config.SigningPurpose == "" || config.SigningStatus != "active" || config.SigningPrivateKeyReference == "" || config.SigningNotBefore.IsZero() || !config.SigningNotAfter.After(config.SigningNotBefore) || config.OperatorArtifactDirectory == "" {
 		return errors.New("operator publish configuration is incomplete or invalid")
 	}
 	if config.GeneratorKeyID == config.SigningKeyID || config.GeneratorPurpose == config.SigningPurpose || config.AutomationApprovalKeyID == config.GeneratorKeyID || config.AutomationApprovalKeyID == config.SigningKeyID {

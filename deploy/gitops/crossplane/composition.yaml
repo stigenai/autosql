@@ -53,6 +53,11 @@ spec:
               - type: FromCompositeFieldPath
                 fromFieldPath: spec.suspend
                 toFieldPath: spec.suspend
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.adoptionPolicy
+                toFieldPath: spec.adoptionPolicy
+                policy:
+                  fromFieldPath: Optional
               - type: ToCompositeFieldPath
                 fromFieldPath: status.conditions
                 toFieldPath: status.autosqlConditions

@@ -23,10 +23,13 @@ import (
 var digestRE = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
 type ResourceKind string
+type AdoptionPolicy string
 
 const (
 	Declarative ResourceKind = "DeclarativeSchema"
 	Versioned   ResourceKind = "VersionedMigration"
+
+	AdoptIfEquivalent AdoptionPolicy = "IfEquivalent"
 )
 
 type Source struct {
@@ -69,6 +72,7 @@ type Spec struct {
 	BootstrapAuthority     *bootstrap.Contract        `json:"bootstrapAuthority,omitempty" yaml:"bootstrapAuthority,omitempty"`
 	BootstrapAuthorization *BootstrapAuthorizationRef `json:"bootstrapAuthorization,omitempty" yaml:"bootstrapAuthorization,omitempty"`
 	CreateDatabase         bool                       `json:"createDatabase,omitempty" yaml:"createDatabase,omitempty"`
+	AdoptionPolicy         AdoptionPolicy             `json:"adoptionPolicy,omitempty" yaml:"adoptionPolicy,omitempty"`
 	PostgresVersion        int                        `json:"postgresVersion,omitempty" yaml:"postgresVersion,omitempty"`
 	ConcurrentIndexes      bool                       `json:"concurrentIndexes,omitempty" yaml:"concurrentIndexes,omitempty"`
 	RequireApproval        bool                       `json:"requireApproval,omitempty" yaml:"requireApproval,omitempty"`
@@ -243,7 +247,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, obj Resource, approved bool)
 	}
 	if old.AppliedKey == key && (st.AuthorizationExpiresAt.IsZero() || now.Before(st.AuthorizationExpiresAt)) {
 		if len(st.Conditions) > 0 && st.Conditions[len(st.Conditions)-1].Type == Ready && st.Conditions[len(st.Conditions)-1].Reason == "Suspended" {
-			st = condition(st, Ready, "Applied", "resource is converged", obj.Spec.Generation, now)
+			reason, message := "Applied", "resource is converged"
+			if obj.Spec.AdoptionPolicy == AdoptIfEquivalent {
+				reason, message = "Adopted", "existing database matches desired schema; no SQL executed"
+			}
+			st = condition(st, Ready, reason, message, obj.Spec.Generation, now)
 			_ = r.Store.Save(obj.Name, Record{Status: st, AppliedKey: old.AppliedKey, ApplyingKey: old.ApplyingKey})
 		}
 		return st, nil
@@ -264,7 +272,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, obj Resource, approved bool)
 		_ = r.Store.Save(obj.Name, Record{Status: st, ApplyingKey: key})
 		return st, nil
 	}
-	st = condition(st, Applying, "ApplyStarted", "applying artifact", obj.Spec.Generation, now)
+	applyingReason, applyingMessage := "ApplyStarted", "applying artifact"
+	if obj.Spec.AdoptionPolicy == AdoptIfEquivalent {
+		applyingReason, applyingMessage = "AdoptionStarted", "verifying existing database against desired schema"
+	}
+	st = condition(st, Applying, applyingReason, applyingMessage, obj.Spec.Generation, now)
 	st.OperationID = operationID(key)
 	st.RecoveryState = "pending"
 	_ = r.Store.Save(obj.Name, Record{Status: st, ApplyingKey: key})
@@ -304,7 +316,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, obj Resource, approved bool)
 	st.RecoveryState = "none"
 	st.AuthorizationExpiresAt = outcome.AuthorizationExpiresAt.UTC()
 	st.AppliedFingerprint = appliedFingerprint(obj, outcome)
-	st = condition(st, Ready, "Applied", "resource is converged", obj.Spec.Generation, now)
+	readyReason, readyMessage := "Applied", "resource is converged"
+	if obj.Spec.AdoptionPolicy == AdoptIfEquivalent {
+		readyReason, readyMessage = "Adopted", "existing database matches desired schema; no SQL executed"
+	}
+	st = condition(st, Ready, readyReason, readyMessage, obj.Spec.Generation, now)
 	_ = r.Store.Save(obj.Name, Record{Status: st, AppliedKey: key, ApplyingKey: key})
 	return st, nil
 }
@@ -341,6 +357,20 @@ func validate(s Spec) error {
 	}
 	if s.Source.Format != "" && s.Source.Inline == "" && s.Source.SecretRef == nil && s.Source.ConfigMapRef == nil {
 		return errors.New("source format applies only to inline, Secret, or ConfigMap content")
+	}
+	if s.AdoptionPolicy != "" {
+		if s.AdoptionPolicy != AdoptIfEquivalent {
+			return errors.New("adoptionPolicy must be IfEquivalent")
+		}
+		if s.Kind != Declarative {
+			return errors.New("adoptionPolicy requires DeclarativeSchema")
+		}
+		if s.Source.Inline == "" && s.Source.SecretRef == nil && s.Source.ConfigMapRef == nil {
+			return errors.New("adoptionPolicy requires an inline, Secret, or ConfigMap desired source")
+		}
+		if s.CreateDatabase || s.DatabaseTarget != nil || s.MaintenanceDatabaseURL != nil || s.BootstrapAuthority != nil || s.BootstrapAuthorization != nil {
+			return errors.New("adoptionPolicy cannot create or bootstrap a database")
+		}
 	}
 	if s.Source.RegistryDigest != "" && !digestRE.MatchString(s.Source.RegistryDigest) {
 		return errors.New("registryDigest must be a sha256 digest")
@@ -426,6 +456,7 @@ func applyKey(obj Resource) string {
 		BootstrapAuthority     *bootstrap.Contract        `json:"bootstrap_authority,omitempty"`
 		BootstrapAuthorization *BootstrapAuthorizationRef `json:"bootstrap_authorization,omitempty"`
 		CreateDatabase         bool                       `json:"create_database,omitempty"`
+		AdoptionPolicy         AdoptionPolicy             `json:"adoption_policy,omitempty"`
 		PostgresVersion        int                        `json:"postgres_version,omitempty"`
 		ConcurrentIndexes      bool                       `json:"concurrent_indexes,omitempty"`
 		MetadataGeneration     int64                      `json:"metadata_generation"`
@@ -434,7 +465,7 @@ func applyKey(obj Resource) string {
 		MaintenanceBinding     RuntimeReferenceBinding    `json:"maintenance_binding,omitempty"`
 		ManifestBinding        RuntimeReferenceBinding    `json:"manifest_binding,omitempty"`
 		PublicKeyBinding       RuntimeReferenceBinding    `json:"public_key_binding,omitempty"`
-	}{obj.Spec.Kind, obj.Spec.Generation, obj.Spec.Source, obj.Spec.ArtifactDigest, obj.Spec.DatabaseURL, obj.Spec.DatabaseIdentity, obj.Spec.MaintenanceDatabaseURL, obj.Spec.DatabaseTarget, obj.Spec.BootstrapAuthority, obj.Spec.BootstrapAuthorization, obj.Spec.CreateDatabase, obj.Spec.PostgresVersion, obj.Spec.ConcurrentIndexes, obj.MetadataGeneration, obj.SourceBinding, obj.DatabaseBinding, obj.MaintenanceDatabaseBinding, obj.AuthorizationManifestBinding, obj.AuthorizationPublicKeyBinding})
+	}{obj.Spec.Kind, obj.Spec.Generation, obj.Spec.Source, obj.Spec.ArtifactDigest, obj.Spec.DatabaseURL, obj.Spec.DatabaseIdentity, obj.Spec.MaintenanceDatabaseURL, obj.Spec.DatabaseTarget, obj.Spec.BootstrapAuthority, obj.Spec.BootstrapAuthorization, obj.Spec.CreateDatabase, obj.Spec.AdoptionPolicy, obj.Spec.PostgresVersion, obj.Spec.ConcurrentIndexes, obj.MetadataGeneration, obj.SourceBinding, obj.DatabaseBinding, obj.MaintenanceDatabaseBinding, obj.AuthorizationManifestBinding, obj.AuthorizationPublicKeyBinding})
 	digest := sha256.Sum256(raw)
 	return fmt.Sprintf("%s/%d/%s/%s", obj.Spec.Kind, obj.Spec.Generation, obj.Spec.ArtifactDigest, hex.EncodeToString(digest[:]))
 }

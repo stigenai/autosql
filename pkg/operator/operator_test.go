@@ -173,6 +173,55 @@ func TestPostgresRenderContractInvalidatesApplyKey(t *testing.T) {
 	}
 }
 
+func TestAdoptionPolicyIsExplicitFailClosedAndDigestBound(t *testing.T) {
+	obj := resource()
+	obj.Spec.RequireApproval = false
+	obj.Spec.Source = Source{Format: "hcl", Inline: `schema "app" {}`}
+	obj.Spec.AdoptionPolicy = AdoptIfEquivalent
+	base := applyKey(obj)
+	calls := 0
+	reconciler := Reconciler{Store: NewMemoryStore(), Apply: func(_ context.Context, got Resource, _ string) (ApplyResult, error) {
+		calls++
+		if got.Spec.AdoptionPolicy != AdoptIfEquivalent {
+			t.Fatalf("adoption policy lost: %+v", got.Spec)
+		}
+		return ApplyResult{Status: "adopted", PlanDigest: "sha256:" + strings.Repeat("a", 64), SourceDigest: "sha256:" + strings.Repeat("b", 64)}, nil
+	}}
+	status, err := reconciler.Reconcile(context.Background(), obj, true)
+	if err != nil || calls != 1 || status.AppliedSteps != 0 || status.Conditions[len(status.Conditions)-1].Reason != "Adopted" || !strings.Contains(status.Conditions[len(status.Conditions)-1].Message, "no SQL") {
+		t.Fatalf("adoption status=%+v calls=%d err=%v", status, calls, err)
+	}
+	obj.Spec.AdoptionPolicy = ""
+	if applyKey(obj) == base {
+		t.Fatal("adoption policy was omitted from the apply key")
+	}
+}
+
+func TestAdoptionPolicyRejectsUnsafeCombinations(t *testing.T) {
+	valid := resource().Spec
+	valid.RequireApproval = false
+	valid.Source = Source{Format: "hcl", Inline: `schema "app" {}`}
+	valid.AdoptionPolicy = AdoptIfEquivalent
+	for name, mutate := range map[string]func(*Spec){
+		"unknown policy":      func(s *Spec) { s.AdoptionPolicy = "Always" },
+		"versioned migration": func(s *Spec) { s.Kind = Versioned },
+		"unresolved source":   func(s *Spec) { s.Source = Source{URL: "https://schemas.example.test/app.hcl"} },
+		"database creation":   func(s *Spec) { s.CreateDatabase = true },
+		"database target":     func(s *Spec) { s.DatabaseTarget = &bootstrap.DatabaseTarget{} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := valid
+			mutate(&candidate)
+			if err := validate(candidate); err == nil {
+				t.Fatalf("unsafe adoption combination accepted: %+v", candidate)
+			}
+		})
+	}
+	if err := validate(valid); err != nil {
+		t.Fatalf("valid adoption rejected: %v", err)
+	}
+}
+
 func TestAuthorizationExpiryForcesReverification(t *testing.T) {
 	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
 	calls := 0

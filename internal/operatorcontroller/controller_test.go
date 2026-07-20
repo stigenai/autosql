@@ -218,9 +218,18 @@ func TestResourceFromObjectParsesExplicitSourceFormat(t *testing.T) {
 	spec["source"] = map[string]any{"format": "hcl", "inline": `schema "app" {}`}
 	spec["postgresVersion"] = int64(18)
 	spec["concurrentIndexes"] = true
+	spec["adoptionPolicy"] = "IfEquivalent"
 	resource, _, err := resourceFromObject(obj)
-	if err != nil || resource.Spec.Source.Format != "hcl" || resource.Spec.PostgresVersion != 18 || !resource.Spec.ConcurrentIndexes {
+	if err != nil || resource.Spec.Source.Format != "hcl" || resource.Spec.PostgresVersion != 18 || !resource.Spec.ConcurrentIndexes || resource.Spec.AdoptionPolicy != operator.AdoptIfEquivalent {
 		t.Fatalf("resource=%+v err=%v", resource.Spec.Source, err)
+	}
+}
+
+func TestResourceFromObjectRejectsNonStringAdoptionPolicy(t *testing.T) {
+	obj := testObject()
+	obj.Object["spec"].(map[string]any)["adoptionPolicy"] = true
+	if _, _, err := resourceFromObject(obj); err == nil || !strings.Contains(err.Error(), "adoptionPolicy must be a string") {
+		t.Fatalf("non-string adoption policy error=%v", err)
 	}
 }
 
@@ -386,6 +395,31 @@ func (s *runtimeReferenceReadSpy) Get(ctx context.Context, key client.ObjectKey,
 		s.reads++
 	}
 	return s.Client.Get(ctx, key, object, options...)
+}
+
+func TestAdoptionAuthenticatesReleaseBeforeDatabaseSecret(t *testing.T) {
+	obj := testObject()
+	spec := obj.Object["spec"].(map[string]any)
+	spec["kind"] = "DeclarativeSchema"
+	spec["source"] = map[string]any{"format": "hcl", "inline": `schema "app" {}`}
+	spec["adoptionPolicy"] = "IfEquivalent"
+	spec["requireApproval"] = false
+	base := fake.NewClientBuilder().WithScheme(NewScheme()).WithObjects(obj).WithStatusSubresource(obj).Build()
+	spy := &runtimeReferenceReadSpy{Client: base}
+	verified := 0
+	controller := &Controller{Client: spy, Reader: spy, Store: operator.NewMemoryStore(), VerifyRelease: func(string) (artifact.VerifiedArtifact, error) {
+		verified++
+		return artifact.VerifiedArtifact{}, fmt.Errorf("invalid adoption release")
+	}, Apply: func(context.Context, operator.Resource, string) (operator.ApplyResult, error) {
+		t.Fatal("invalid adoption release reached apply")
+		return operator.ApplyResult{}, nil
+	}}
+	if _, err := controller.Reconcile(context.Background(), requestFor(obj)); err == nil || !strings.Contains(err.Error(), "invalid adoption release") {
+		t.Fatalf("adoption verification error=%v", err)
+	}
+	if verified != 1 || spy.reads != 0 {
+		t.Fatalf("verified=%d runtime reference reads=%d", verified, spy.reads)
+	}
 }
 
 func TestInvalidSourceContractPerformsNoRuntimeReferenceReadsOrMutation(t *testing.T) {
