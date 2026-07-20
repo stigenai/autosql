@@ -19,27 +19,28 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+      PUBLISH_TERRAFORM_PROVIDER: ${{ vars.PUBLISH_TERRAFORM_PROVIDER }}
       TERRAFORM_PROVIDER_GITHUB_TOKEN: ${{ secrets.TERRAFORM_PROVIDER_GITHUB_TOKEN }}
       TERRAFORM_REGISTRY_GPG_PRIVATE_KEY: ${{ secrets.TERRAFORM_REGISTRY_GPG_PRIVATE_KEY }}
       TERRAFORM_REGISTRY_GPG_PASSPHRASE: ${{ secrets.TERRAFORM_REGISTRY_GPG_PASSPHRASE }}
+      PUBLISH_CIRCLECI: ${{ vars.PUBLISH_CIRCLECI }}
       CIRCLECI_CLI_TOKEN: ${{ secrets.CIRCLECI_CLI_TOKEN }}
+      PUBLISH_GITLAB: ${{ vars.PUBLISH_GITLAB }}
       GITLAB_CATALOG_TOKEN: ${{ secrets.GITLAB_CATALOG_TOKEN }}
       GITLAB_CATALOG_REPOSITORY_URL: ${{ secrets.GITLAB_CATALOG_REPOSITORY_URL }}
       GITLAB_CATALOG_PROJECT_ID: ${{ secrets.GITLAB_CATALOG_PROJECT_ID }}
       GITLAB_API_URL: ${{ secrets.GITLAB_API_URL }}
+      PUBLISH_AZURE_DEVOPS: ${{ vars.PUBLISH_AZURE_DEVOPS }}
       AZURE_DEVOPS_EXT_PAT: ${{ secrets.AZURE_DEVOPS_EXT_PAT }}
       AZURE_DEVOPS_PUBLISHER: ${{ secrets.AZURE_DEVOPS_PUBLISHER }}
+      PUBLISH_BITBUCKET: ${{ vars.PUBLISH_BITBUCKET }}
       BITBUCKET_PIPE_TOKEN: ${{ secrets.BITBUCKET_PIPE_TOKEN }}
       BITBUCKET_PIPE_USERNAME: ${{ secrets.BITBUCKET_PIPE_USERNAME }}
       BITBUCKET_PIPE_REPOSITORY_URL: ${{ secrets.BITBUCKET_PIPE_REPOSITORY_URL }}
     steps:
-      - name: Require every native publisher identity
-        run: |
-          set -eu
-          for name in GHCR_TOKEN TERRAFORM_PROVIDER_GITHUB_TOKEN TERRAFORM_REGISTRY_GPG_PRIVATE_KEY TERRAFORM_REGISTRY_GPG_PASSPHRASE CIRCLECI_CLI_TOKEN GITLAB_CATALOG_TOKEN GITLAB_CATALOG_REPOSITORY_URL GITLAB_CATALOG_PROJECT_ID GITLAB_API_URL AZURE_DEVOPS_EXT_PAT AZURE_DEVOPS_PUBLISHER BITBUCKET_PIPE_TOKEN BITBUCKET_PIPE_USERNAME BITBUCKET_PIPE_REPOSITORY_URL; do
-            eval "value=\${$name:-}"
-            test -n "$value" || { echo "required native publisher configuration is missing: $name" >&2; exit 1; }
-          done
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Require core and enabled publisher identities
+        run: scripts/release-preflight.sh
 
   conformance:
     name: integration conformance
@@ -317,24 +318,34 @@ jobs:
         include:
           - platform: circleci
             archive: autosql-circleci-orb
+            enabled: ${{ vars.PUBLISH_CIRCLECI == 'true' }}
           - platform: gitlab
             archive: autosql-gitlab-component
+            enabled: ${{ vars.PUBLISH_GITLAB == 'true' }}
           - platform: bitbucket
             archive: autosql-bitbucket-pipe
+            enabled: ${{ vars.PUBLISH_BITBUCKET == 'true' }}
           - platform: azure
             archive: autosql-azure-devops
+            enabled: ${{ vars.PUBLISH_AZURE_DEVOPS == 'true' }}
     steps:
+      - name: Report disabled publisher
+        if: ${{ !matrix.enabled }}
+        run: echo "${{ matrix.platform }} publication is disabled"
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        if: matrix.enabled
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: matrix.enabled
         with:
           name: integration-packages
           path: dist
       - name: Extract native package
+        if: matrix.enabled
         run: |
           mkdir -p native
           tar -xzf "dist/${{ matrix.archive }}-${GITHUB_REF_NAME#v}.tar.gz" -C native
       - name: Install CircleCI CLI
-        if: matrix.platform == 'circleci'
+        if: matrix.enabled && matrix.platform == 'circleci'
         run: |
           set -eu
           base=https://github.com/CircleCI-Public/circleci-cli/releases/download/v0.1.38646
@@ -344,9 +355,10 @@ jobs:
           tar -xzf circleci.tar.gz
           sudo install -m 0755 circleci-cli_0.1.38646_linux_amd64/circleci /usr/local/bin/circleci
       - name: Install Azure extension CLI
-        if: matrix.platform == 'azure'
+        if: matrix.enabled && matrix.platform == 'azure'
         run: npm install --global tfx-cli@0.23.4
       - name: Publish native package
+        if: matrix.enabled
         env:
           CIRCLECI_CLI_TOKEN: ${{ secrets.CIRCLECI_CLI_TOKEN }}
           CIRCLECI_ORB_NAMESPACE: stigenai
@@ -364,6 +376,7 @@ jobs:
   publish-terraform-provider:
     name: publish Terraform/OpenTofu provider
     needs: provider
+    if: ${{ vars.PUBLISH_TERRAFORM_PROVIDER == 'true' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -397,6 +410,18 @@ jobs:
   release:
     name: attach binaries to release
     needs: [binaries, provider, integration-packages, container, bitbucket-pipe, publish-chart, publish-native-catalogs, publish-terraform-provider]
+    if: >-
+      ${{
+        always() &&
+        needs.binaries.result == 'success' &&
+        needs.provider.result == 'success' &&
+        needs.integration-packages.result == 'success' &&
+        needs.container.result == 'success' &&
+        needs.bitbucket-pipe.result == 'success' &&
+        needs.publish-chart.result == 'success' &&
+        needs.publish-native-catalogs.result == 'success' &&
+        (needs.publish-terraform-provider.result == 'success' || needs.publish-terraform-provider.result == 'skipped')
+      }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -405,6 +430,7 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Sign integration checksums
+        if: ${{ vars.PUBLISH_TERRAFORM_PROVIDER == 'true' }}
         env:
           GPG_PRIVATE_KEY: ${{ secrets.TERRAFORM_REGISTRY_GPG_PRIVATE_KEY }}
           GPG_PASSPHRASE: ${{ secrets.TERRAFORM_REGISTRY_GPG_PASSPHRASE }}
