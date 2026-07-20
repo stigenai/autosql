@@ -240,7 +240,11 @@ func (s GenerateService) BuildOperatorArtifact(ctx context.Context, request Oper
 	if err != nil {
 		return OperatorArtifactResult{}, generationFailure("desired", ErrGenerateConfig)
 	}
+	if request.Adopt {
+		options.Render = operatorAdoptionArtifactRender(desired, options.Render)
+	}
 	factory := operatorSimulationFactory(request.BootstrapTarget, desired)
+	factory.Render = cloneStrings(options.Render)
 	replayFactory := factory
 	replayFactory.NamePrefix = "autosql_sim_gen_replay"
 	workspace, err := createReplayWorkspace(ctx, r, replayFactory)
@@ -248,7 +252,7 @@ func (s GenerateService) BuildOperatorArtifact(ctx context.Context, request Oper
 		return OperatorArtifactResult{}, generationFailureCause("workspace", ErrGenerateStage, simulate.Redacted(err))
 	}
 	defer workspace.Close()
-	if err = materializeOperatorCurrent(ctx, workspace.URL, current); err != nil {
+	if err = materializeOperatorCurrent(ctx, workspace.URL, current, options); err != nil {
 		return OperatorArtifactResult{}, generationFailureCause("materialize", ErrGenerateStage, simulate.RedactedCause(err))
 	}
 	metadata := cloneStrings(r.Metadata)
@@ -346,6 +350,43 @@ func operatorBootstrapArtifactRender(inventory postgres.BootstrapAuthorizationIn
 	return render
 }
 
+// operatorAdoptionArtifactRender authorizes only the exact safe provisioning
+// inputs already bound into the normalized desired document. The normal
+// PostgreSQL renderer still rejects unsafe routine languages, privileged
+// routine bodies, and untrusted extensions unless those separate controls are
+// explicitly enabled.
+func operatorAdoptionArtifactRender(desired schema.Document, base map[string]string) map[string]string {
+	render := cloneStrings(base)
+	routineDigests, extensionNames := map[string]bool{}, map[string]bool{}
+	for _, resource := range desired.Graph.Resources {
+		var specification map[string]any
+		if json.Unmarshal(resource.Spec, &specification) != nil {
+			continue
+		}
+		value := func(key string) string {
+			text, _ := specification[key].(string)
+			return strings.TrimSpace(text)
+		}
+		switch resource.Kind {
+		case schema.KindFunction, schema.KindProcedure:
+			if digest := value("body_digest"); digest != "" {
+				routineDigests[digest] = true
+			}
+		case schema.KindExtension:
+			name := strings.TrimSpace(resource.Name.Name)
+			if name == "" {
+				continue
+			}
+			extensionNames[name] = true
+			render["extension_version."+name] = value("version")
+			render["extension_schemas."+name] = strings.TrimSpace(resource.Name.Schema)
+		}
+	}
+	render["reviewed_routine_digests"] = sortedOperatorAuthorizationValues(routineDigests)
+	render["extension_allowlist"] = sortedOperatorAuthorizationValues(extensionNames)
+	return render
+}
+
 func sortedOperatorAuthorizationValues(values map[string]bool) string {
 	items := make([]string, 0, len(values))
 	for value := range values {
@@ -357,7 +398,7 @@ func sortedOperatorAuthorizationValues(values map[string]bool) string {
 	return strings.Join(items, ",")
 }
 
-func materializeOperatorCurrent(ctx context.Context, databaseURL string, desired schema.Document) error {
+func materializeOperatorCurrent(ctx context.Context, databaseURL string, desired schema.Document, options plan.Options) error {
 	baseline := schema.Document{Version: desired.Version, Graph: schema.Graph{Extra: desired.Graph.Extra}, Annotations: desired.Annotations, Extra: desired.Extra}
 	for _, resource := range desired.Graph.Resources {
 		if resource.Kind == schema.KindSchema && resource.Name.Name == "public" && resource.Name.Schema == "" {
@@ -365,7 +406,7 @@ func materializeOperatorCurrent(ctx context.Context, databaseURL string, desired
 			break
 		}
 	}
-	pl, err := plan.Build(ctx, postgres.New(), baseline, desired, plan.Options{})
+	pl, err := plan.Build(ctx, postgres.New(), baseline, desired, options)
 	if err != nil {
 		return err
 	}

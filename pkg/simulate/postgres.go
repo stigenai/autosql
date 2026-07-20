@@ -31,7 +31,11 @@ type PostgresFactory struct {
 	// intentionally not managed by the schema document. Missing roles are
 	// leased as NOLOGIN roles for the lifetime of the isolated workspace.
 	RequiredRoles []string
-	AfterCreate   func() error
+	// Render carries provisioning authorizations that the caller already
+	// validated into scratch materialization. Controls absent from this map
+	// remain disabled by the PostgreSQL renderer.
+	Render      map[string]string
+	AfterCreate func() error
 }
 
 var safeSimulationPrefix = regexp.MustCompile(`^autosql_sim(?:_[a-z0-9]+)*$`)
@@ -40,6 +44,7 @@ type PostgresWorkspace struct {
 	adminURL, dbURL, name, identity string
 	schemas                         []string
 	roleLease                       *postgresRoleLease
+	render                          map[string]string
 }
 
 func (f PostgresFactory) Create(ctx context.Context, c Config) (Isolation, error) {
@@ -142,7 +147,11 @@ func (f PostgresFactory) CreateWorkspace(ctx context.Context, c Config) (*Postgr
 	}
 	cleanupRoles = false
 	closeAdmin = roles == nil
-	return &PostgresWorkspace{adminURL: c.DevelopmentURL, dbURL: copy.String(), name: name, identity: actual + "/" + name, roleLease: roles}, nil
+	render := make(map[string]string, len(f.Render))
+	for key, value := range f.Render {
+		render[key] = value
+	}
+	return &PostgresWorkspace{adminURL: c.DevelopmentURL, dbURL: copy.String(), name: name, identity: actual + "/" + name, roleLease: roles, render: render}, nil
 }
 
 func preparePostgresDatabase(ctx context.Context, databaseURL string, dropPublic bool) error {
@@ -360,7 +369,7 @@ func (p *PostgresWorkspace) Materialize(ctx context.Context, doc schema.Document
 			break
 		}
 	}
-	pl, e := plan.Build(ctx, postgres.New(), baseline, doc, plan.Options{})
+	pl, e := plan.Build(ctx, postgres.New(), baseline, doc, plan.Options{Render: p.render})
 	if e != nil {
 		return e
 	}
