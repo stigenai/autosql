@@ -14,16 +14,19 @@ import (
 	"autosql/internal/cli"
 	"autosql/pkg/artifact"
 	"autosql/pkg/bootstrap"
+	"autosql/pkg/executor"
 	"autosql/pkg/operator"
 	"autosql/pkg/plan"
 	"autosql/pkg/postgres"
 	"autosql/pkg/schema"
 	"autosql/pkg/source"
+	"github.com/jackc/pgx/v5"
 )
 
 var executeOperatorDatabaseBootstrapURL = postgres.ExecuteDatabaseBootstrapURL
 var parseOperatorArtifact = artifact.Parse
 var verifyOperatorDeclarativeResource = verifyDeclarativeResource
+var verifyOperatorAdoptionResource = verifyAdoptionResource
 var verifyOperatorReleaseBeforeReferences = verifyOperatorReleaseArtifact
 
 var verifyProductionOperatorArtifact = func(databaseURL string, parsed artifact.Artifact) (artifact.Artifact, error) {
@@ -98,6 +101,22 @@ func ArtifactApply(ctx context.Context, resource operator.Resource, digest strin
 			return operator.ApplyResult{}, err
 		}
 	}
+	if resource.Spec.AdoptionPolicy == operator.AdoptIfEquivalent {
+		if verifiedErr != nil {
+			verifiedArtifact, err := verifyProductionOperatorArtifact(resource.ResolvedDatabaseURL, a)
+			if err != nil || verifiedArtifact.Digest != a.Digest || verifiedArtifact.Plan.Digest != a.Plan.Digest {
+				return operator.ApplyResult{}, errors.New("operator artifact verification failed")
+			}
+			a = verifiedArtifact
+		}
+		adoption, err := verifyOperatorAdoptionResource(ctx, resource, a)
+		outcome := operator.ApplyResult{Status: "adopted", PlanDigest: a.Plan.Digest, SourceDigest: adoption.SourceDigest, TargetIdentity: a.DatabaseIdentity, AppliedSteps: 0}
+		if err != nil {
+			outcome.Status = "failed"
+			return outcome, err
+		}
+		return outcome, nil
+	}
 	if resource.Spec.Kind == operator.Declarative && resource.ResolvedSource != "" &&
 		(resource.Spec.Source.Inline != "" || resource.Spec.Source.SecretRef != nil || resource.Spec.Source.ConfigMapRef != nil) {
 		bootstrapResult, err := verifyOperatorDeclarativeResource(ctx, resource, a)
@@ -160,6 +179,158 @@ func ArtifactApply(ctx context.Context, resource operator.Resource, digest strin
 		return outcome, fmt.Errorf("artifact apply returned status %q", result.Status)
 	}
 	return outcome, nil
+}
+
+type verifiedAdoption struct {
+	SourceDigest string
+}
+
+// verifyAdoptionResource proves equivalence without executing application SQL.
+// The target advisory lock orders cooperating AutoSQL writers, while ACCESS
+// SHARE locks fence DDL against every existing selected relation through the
+// final catalog inspection and transaction commit.
+func verifyAdoptionResource(ctx context.Context, resource operator.Resource, approved artifact.Artifact) (verifiedAdoption, error) {
+	if resource.Spec.AdoptionPolicy != operator.AdoptIfEquivalent || resource.Spec.Kind != operator.Declarative {
+		return verifiedAdoption{}, errors.New("operator adoption requires DeclarativeSchema IfEquivalent mode")
+	}
+	if strings.TrimSpace(resource.ResolvedDatabaseURL) == "" || strings.TrimSpace(resource.ResolvedSource) == "" {
+		return verifiedAdoption{}, errors.New("operator adoption references are unresolved")
+	}
+	desired, err := loadOperatorDeclarativeSource(ctx, resource.ResolvedSource, resource.Spec.Source.Format)
+	if err != nil {
+		return verifiedAdoption{}, err
+	}
+	desired, err = postgres.New().Normalize(ctx, desired)
+	if err != nil {
+		return verifiedAdoption{}, errors.New("normalize adoption desired schema")
+	}
+	schemas, err := adoptionSchemas(desired)
+	if err != nil {
+		return verifiedAdoption{}, err
+	}
+	sourceDigest, err := schema.SemanticFingerprint(desired)
+	if err != nil {
+		return verifiedAdoption{}, errors.New("fingerprint adoption desired schema")
+	}
+	if err = requireNoOpAdoptionPlan(approved.Plan); err != nil {
+		return verifiedAdoption{}, err
+	}
+	lockKey, err := executor.LockKey(approved.DatabaseIdentity, approved.TargetEnvironment)
+	if err != nil {
+		return verifiedAdoption{}, errors.New("operator adoption artifact target is invalid")
+	}
+	conn, err := pgx.Connect(ctx, resource.ResolvedDatabaseURL)
+	if err != nil {
+		return verifiedAdoption{}, errors.New("connect adoption target")
+	}
+	defer conn.Close(context.WithoutCancel(ctx))
+	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return verifiedAdoption{}, errors.New("begin adoption inspection")
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
+	var locked bool
+	if err = tx.QueryRow(ctx, `select pg_try_advisory_xact_lock(hashtextextended($1,0::bigint))`, lockKey).Scan(&locked); err != nil {
+		return verifiedAdoption{}, errors.New("lock adoption target")
+	}
+	if !locked {
+		return verifiedAdoption{}, errors.New("operator adoption target is busy")
+	}
+	if err = lockAdoptionRelations(ctx, tx, schemas); err != nil {
+		return verifiedAdoption{}, err
+	}
+	generated, err := buildAdoptionPlan(ctx, tx, schemas, desired, resource.Spec)
+	if err != nil {
+		return verifiedAdoption{}, err
+	}
+	if generated.Digest != approved.Plan.Digest {
+		return verifiedAdoption{}, errors.New("live database does not match desired schema; adoption refused")
+	}
+	if err = requireNoOpAdoptionPlan(generated); err != nil {
+		return verifiedAdoption{}, errors.New("live database does not match desired schema; adoption refused")
+	}
+	final, err := buildAdoptionPlan(ctx, tx, schemas, desired, resource.Spec)
+	if err != nil {
+		return verifiedAdoption{}, err
+	}
+	if final.Digest != generated.Digest || final.Digest != approved.Plan.Digest {
+		return verifiedAdoption{}, errors.New("database schema changed during adoption; retry from a stable state")
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return verifiedAdoption{}, errors.New("commit adoption evidence")
+	}
+	return verifiedAdoption{SourceDigest: sourceDigest}, nil
+}
+
+func adoptionSchemas(desired schema.Document) ([]string, error) {
+	seen := map[string]bool{}
+	var schemas []string
+	for _, resource := range desired.Graph.Resources {
+		if resource.Kind == schema.KindDatabase {
+			return nil, errors.New("operator adoption does not accept a database block")
+		}
+		name := resource.Name.Schema
+		if resource.Kind == schema.KindSchema {
+			name = resource.Name.Name
+		}
+		if name != "" && !seen[name] {
+			seen[name] = true
+			schemas = append(schemas, name)
+		}
+	}
+	if len(schemas) == 0 {
+		return nil, errors.New("operator adoption requires at least one declared schema")
+	}
+	return schemas, nil
+}
+
+func lockAdoptionRelations(ctx context.Context, tx pgx.Tx, schemas []string) error {
+	rows, err := tx.Query(ctx, `select n.nspname,c.relname from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname=any($1) and c.relkind in ('r','p','v','m','f') order by n.nspname,c.relname`, schemas)
+	if err != nil {
+		return errors.New("list adoption relations")
+	}
+	var names []string
+	for rows.Next() {
+		var namespace, name string
+		if err = rows.Scan(&namespace, &name); err != nil {
+			rows.Close()
+			return errors.New("read adoption relation")
+		}
+		names = append(names, pgx.Identifier{namespace, name}.Sanitize())
+	}
+	rows.Close()
+	if err = rows.Err(); err != nil {
+		return errors.New("list adoption relations")
+	}
+	if len(names) > 0 {
+		if _, err = tx.Exec(ctx, `lock table `+strings.Join(names, ",")+` in access share mode`); err != nil {
+			return errors.New("lock adoption relations")
+		}
+	}
+	return nil
+}
+
+func buildAdoptionPlan(ctx context.Context, tx pgx.Tx, schemas []string, desired schema.Document, spec operator.Spec) (plan.Plan, error) {
+	current, err := postgres.InspectTx(ctx, tx, postgres.Options{Schemas: schemas})
+	if err != nil {
+		return plan.Plan{}, errors.New("inspect adoption target")
+	}
+	current, err = postgres.New().Normalize(ctx, current)
+	if err != nil {
+		return plan.Plan{}, errors.New("normalize adoption target")
+	}
+	generated, err := plan.Build(ctx, postgres.New(), current, desired, plan.Options{Render: operatorBootstrapRenderOptions(spec)})
+	if err != nil {
+		return plan.Plan{}, errors.New("compare adoption target with desired schema")
+	}
+	return generated, nil
+}
+
+func requireNoOpAdoptionPlan(candidate plan.Plan) error {
+	if candidate.FromFingerprint == "" || candidate.FromFingerprint != candidate.ToFingerprint || len(candidate.Changes.Changes) != 0 || len(candidate.Steps) != 0 || len(candidate.Phases) != 0 || len(candidate.Replay) != 0 {
+		return errors.New("adoption artifact must contain an exact no-op plan")
+	}
+	return nil
 }
 
 // artifactIdentityMatchesBootstrapTarget deliberately uses exact comparison.

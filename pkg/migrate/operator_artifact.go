@@ -112,6 +112,7 @@ type OperatorArtifactRequest struct {
 	Generation       GenerateRequest
 	Current, Desired schema.Document
 	BootstrapTarget  *bootstrap.DatabaseTarget
+	Adopt            bool
 	Render           map[string]string
 }
 
@@ -194,6 +195,15 @@ func (s GenerateService) BuildOperatorArtifact(ctx context.Context, request Oper
 	current, desired := request.Current, request.Desired
 	var prebuilt *plan.Plan
 	options := plan.Options{Render: cloneStrings(request.Render)}
+	if request.Adopt {
+		if request.BootstrapTarget != nil || hasDatabaseResource(desired) {
+			return OperatorArtifactResult{}, generationFailure("adoption_target", ErrGenerateConfig)
+		}
+		// Adoption artifacts are intentionally published without production
+		// access. Planning desired -> desired produces the signed no-op assertion
+		// that the operator must reproduce from its locked live inspection.
+		current = desired
+	}
 	if request.BootstrapTarget != nil {
 		inventory, err := postgres.PrepareBootstrapAuthorizationInventory(ctx, *request.BootstrapTarget, desired, postgres.BootstrapAuthorizationInventoryOptions{Render: options.Render})
 		if err != nil {
@@ -246,10 +256,15 @@ func (s GenerateService) BuildOperatorArtifact(ctx context.Context, request Oper
 	metadata["autosql.operator.mode"] = "transition"
 	if request.BootstrapTarget != nil {
 		metadata["autosql.operator.mode"] = "bootstrap"
+	} else if request.Adopt {
+		metadata["autosql.operator.mode"] = "adopt"
 	}
 	built, err := s.buildGeneratedArtifact(ctx, r, current, desired, workspace.URL, nil, options, prebuilt, metadata, factory)
 	if err != nil {
 		return OperatorArtifactResult{}, err
+	}
+	if request.Adopt && (built.Artifact.Plan.FromFingerprint != built.Artifact.Plan.ToFingerprint || len(built.Artifact.Plan.Changes.Changes) != 0 || len(built.Artifact.Plan.Steps) != 0 || len(built.Artifact.Plan.Phases) != 0 || len(built.Artifact.Plan.Replay) != 0) {
+		return OperatorArtifactResult{}, generationFailure("adoption_plan", ErrGenerateStage)
 	}
 	return OperatorArtifactResult{Artifact: built.Artifact, Bytes: built.Bytes, SchemaPolicyResources: built.SchemaPolicyResources, MigrationPolicyResources: built.MigrationPolicyResources}, nil
 }

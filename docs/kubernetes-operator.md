@@ -36,6 +36,14 @@ status: conditions, generation, retry count, artifact/plan digests, target
 identity, operation and execution IDs, pending recovery step, and recovery
 guidance. It never copies secret values.
 
+Populated databases can be adopted explicitly with
+`spec.adoptionPolicy: IfEquivalent` on a controller-resolvable
+`DeclarativeSchema` source. Adoption accepts only a signed desired-to-desired
+no-op artifact (publish it with `autosql operator artifact publish --adopt`),
+proves the locked live schema yields the same plan, and reports
+`Ready/Adopted` without executing application SQL. Mismatches and bootstrap or
+database-creation combinations are refused.
+
 Declarative inline, Secret, and ConfigMap content may set `source.format` to
 `sql` or `hcl`. Setting it is recommended and makes parser selection part of
 the generation fingerprint. For compatibility, resources that omit `format`

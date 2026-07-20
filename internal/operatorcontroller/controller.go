@@ -203,7 +203,7 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	// runtime reference. The opaque verified token is carried into Apply, so
 	// neither a second file read nor an artifact swap can occur after Secrets
 	// become visible to reconciliation.
-	if resource.Spec.Kind == operator.Declarative && resource.Spec.DatabaseTarget != nil {
+	if resource.Spec.Kind == operator.Declarative && (resource.Spec.DatabaseTarget != nil || resource.Spec.AdoptionPolicy == operator.AdoptIfEquivalent) {
 		verifyRelease := verifyOperatorReleaseBeforeReferences
 		if c.VerifyRelease != nil {
 			verifyRelease = c.VerifyRelease
@@ -382,6 +382,10 @@ func resourceFromObject(obj *unstructured.Unstructured) (operator.Resource, bool
 	createDatabase, _, _ := unstructured.NestedBool(spec, "createDatabase")
 	postgresVersion, _, _ := unstructured.NestedInt64(spec, "postgresVersion")
 	concurrentIndexes, _, _ := unstructured.NestedBool(spec, "concurrentIndexes")
+	adoptionPolicy, _, adoptionPolicyErr := unstructured.NestedString(spec, "adoptionPolicy")
+	if adoptionPolicyErr != nil {
+		return operator.Resource{}, false, fmt.Errorf("adoptionPolicy must be a string")
+	}
 	sourceMap, _, _ := unstructured.NestedMap(spec, "source")
 	source, err := sourceFromMap(sourceMap)
 	if err != nil {
@@ -460,7 +464,7 @@ func resourceFromObject(obj *unstructured.Unstructured) (operator.Resource, bool
 	approved := strings.EqualFold(obj.GetAnnotations()["autosql.io/approved"], "true")
 	return operator.Resource{Name: obj.GetNamespace() + "/" + obj.GetName(), MetadataGeneration: obj.GetGeneration(), Spec: operator.Spec{
 		Kind: operator.ResourceKind(kind), Generation: generation, Suspend: suspend, Source: source,
-		ArtifactDigest: artifactDigest, DatabaseURL: databaseURL, DatabaseIdentity: databaseIdentity, MaintenanceDatabaseURL: maintenanceDatabaseURL, DatabaseTarget: databaseTarget, BootstrapAuthority: authority, BootstrapAuthorization: authorization, CreateDatabase: createDatabase, PostgresVersion: int(postgresVersion), ConcurrentIndexes: concurrentIndexes, RequireApproval: requireApproval,
+		ArtifactDigest: artifactDigest, DatabaseURL: databaseURL, DatabaseIdentity: databaseIdentity, MaintenanceDatabaseURL: maintenanceDatabaseURL, DatabaseTarget: databaseTarget, BootstrapAuthority: authority, BootstrapAuthorization: authorization, CreateDatabase: createDatabase, AdoptionPolicy: operator.AdoptionPolicy(adoptionPolicy), PostgresVersion: int(postgresVersion), ConcurrentIndexes: concurrentIndexes, RequireApproval: requireApproval,
 	}, Status: statusFromObject(obj)}, approved, nil
 }
 

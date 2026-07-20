@@ -363,7 +363,7 @@ func usageBase() string {
 }
 func usage() string {
 	base := strings.Replace(usageBase(), "\n  migrate generate", "\n  database bootstrap prepare --file path [--include-routine-source] [--json|--hcl]\n  database bootstrap preflight --file path --maintenance-url env://NAME --extension-allowlist names --extension-version name=version --extension-schema name=schema [--json]\n  database bootstrap authorize --file path --authorization-signing-key env://NAME --authorization-key-id id --authorization-issuer issuer --authorization-signer signer --output path [--json]\n  database bootstrap --file path --maintenance-url env://NAME|file://path [--authorization-manifest path --authorization-public-key env://NAME --authorization-issuer issuer --authorization-signer signer] [--json]\n  migrate generate", 1)
-	return base + "\n  integration verify|run --contract path --contract-digest sha256:... [--json]\n  operator key generate --private-output path --public-output path [--json]\n  operator artifact publish --file path --config path --output-dir path --source-revision revision [--bootstrap] [--json]\n  migrate start-status --file path --url env://NAME --target id --env name [--json]"
+	return base + "\n  integration verify|run --contract path --contract-digest sha256:... [--json]\n  operator key generate --private-output path --public-output path [--json]\n  operator artifact publish --file path --config path --output-dir path --source-revision revision [--bootstrap|--adopt] [--json]\n  migrate start-status --file path --url env://NAME --target id --env name [--json]"
 }
 func contains(args []string, want string) bool {
 	for _, a := range args {

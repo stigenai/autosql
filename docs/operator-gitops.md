@@ -3,7 +3,8 @@
 `autosql operator artifact publish` is the supported non-interactive path from
 committed HCL to the immutable artifact required by `AutoSQLSchema`. It performs
 the complete production ceremony in one process: load and normalize HCL,
-inspect the current target (or model an empty target with `--bootstrap`), plan,
+inspect the current target (or model an empty target with `--bootstrap`, or
+publish a desired-to-desired assertion with `--adopt`), plan,
 replay against an isolated development database, run safety and policy gates,
 issue a short-lived plan-bound CI approval, generator-attest, release-sign, and
 atomically publish an operator bundle.
@@ -27,8 +28,10 @@ autosql operator key generate \
   --public-output .secrets/operator-ci-approval.pub
 ```
 
-Put the three private values and both database URLs in the CI secret store.
-They must reach AutoSQL only through `env://NAME` or `file://path` references.
+Put the three private values and the database URLs needed by the selected mode
+in the CI secret store. A normal transition needs development and production;
+`--bootstrap` and `--adopt` need development only. Values that are present must
+reach AutoSQL only through `env://NAME` or `file://path` references.
 The public files are safe to commit or distribute in a trust bundle.
 
 The generator and release roles have distinct key IDs and purposes, which the
@@ -91,6 +94,41 @@ non-superuser development identity must already be its member. These temporary
 development roles do not alter the production bootstrap contract: required
 external roles must still exist on the real target when its bootstrap is
 applied.
+
+### Adopt an equivalent populated database
+
+For an existing database that is already expected to match the desired HCL,
+add `--adopt`. This path does not resolve or inspect `ProductionURL`; it signs a
+desired-to-desired no-op plan using the development database only. The release
+manifest reports `"adoption_policy":"IfEquivalent"`.
+
+Set the same explicit policy on the resource:
+
+```yaml
+spec:
+  kind: DeclarativeSchema
+  adoptionPolicy: IfEquivalent
+  source:
+    format: hcl
+    configMapRef: {name: desired-schema, key: schema.hcl}
+  artifactDigest: sha256:<digest from release.json>
+  databaseURL: {name: production-database, key: url}
+```
+
+At reconciliation time the operator verifies the signed artifact before
+reading runtime Secrets, takes the canonical target advisory lock and
+`ACCESS SHARE` locks on selected existing relations, and inspects the live
+schemas twice in one transaction. It records `Ready/Adopted` with zero applied
+steps only when the locked live-to-desired plan exactly equals the approved
+no-op plan. Any difference, database block, bootstrap setting, concurrent
+schema change, or non-no-op artifact fails closed without executing application
+SQL. After successful adoption, remove `adoptionPolicy` only together with a
+new generation and the normal artifact intended for ongoing reconciliation.
+
+`--bootstrap` and `--adopt` are mutually exclusive. An adoption source must be
+inline or backed by a namespaced Secret or ConfigMap so the controller can
+reconstruct the exact desired document; URL and registry-only sources are not
+accepted for adoption.
 
 The output directory is created atomically and contains:
 
