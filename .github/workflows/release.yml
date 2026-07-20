@@ -438,9 +438,18 @@ jobs:
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: '*'
+          pattern: release-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: integration-packages
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: ${{ vars.PUBLISH_TERRAFORM_PROVIDER == 'true' }}
+        with:
+          name: provider-publish
+          path: dist
       - name: Sign integration checksums
         if: ${{ vars.PUBLISH_TERRAFORM_PROVIDER == 'true' }}
         env:
