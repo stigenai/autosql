@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -153,6 +154,167 @@ func renderConstraintCreate(resource schema.Resource, resources map[string]schem
 	}
 	sql = "ALTER TABLE " + qualified(parent.Name) + " ADD CONSTRAINT " + quote(resource.Name.Name) + " " + remainder
 	return sql, remainder, nil
+}
+
+// canonicalizeCheckExpressionCasts folds PostgreSQL's equivalent renderings
+// of an array of scalar text casts into one array-level text[] cast. Older
+// server/client combinations commonly deparsed
+//
+//	ARRAY[value::varchar::text, ...]
+//
+// while newer combinations deparse the same expression as
+//
+//	ARRAY[value::varchar, ...]::text[].
+//
+// Keeping one parser-proven spelling prevents cosmetic CHECK-expression
+// changes from producing a different resource fingerprint or blocking
+// adoption. The rewrite is deliberately limited to non-empty arrays whose
+// every element has the same plain scalar text cast.
+func canonicalizeCheckExpressionCasts(doc *schema.Document) error {
+	resources := make(map[string]schema.Resource, len(doc.Graph.Resources))
+	for _, resource := range doc.Graph.Resources {
+		resources[resource.ID] = resource
+	}
+	for index := range doc.Graph.Resources {
+		resource := &doc.Graph.Resources[index]
+		if resource.Kind != schema.KindCheckConstraint {
+			continue
+		}
+		parsed, err := parseConstraintDefinition(*resource, resources)
+		if err != nil {
+			// Preserve the existing normalization contract for constraint grammar
+			// that is accepted only by a more narrowly scoped renderer.
+			continue
+		}
+		var nodes []*pg_query.Node
+		walkPostgresMessages(parsed.constraint.GetRawExpr().ProtoReflect(), func(message protoreflect.Message) {
+			if node, ok := message.Interface().(*pg_query.Node); ok {
+				nodes = append(nodes, node)
+			}
+		})
+		changed := false
+		for _, node := range nodes {
+			changed = foldScalarTextArrayCasts(node) || changed
+		}
+		if !changed {
+			for _, node := range nodes {
+				cast := node.GetTypeCast()
+				if cast != nil && cast.GetArg().GetAArrayExpr() != nil && plainTextArrayType(cast.GetTypeName()) {
+					changed = true
+					break
+				}
+			}
+		}
+		if !changed {
+			continue
+		}
+		definition, err := deparseConstraintDefinition(parsed)
+		if err != nil {
+			return err
+		}
+		values := specMap(resource.Spec)
+		values["definition"] = definition
+		resource.Spec, err = json.Marshal(values)
+		if err != nil {
+			return err
+		}
+		resources[resource.ID] = *resource
+	}
+	return nil
+}
+
+func foldScalarTextArrayCasts(node *pg_query.Node) bool {
+	array := node.GetAArrayExpr()
+	if array == nil || len(array.GetElements()) == 0 {
+		return false
+	}
+	var scalarType *pg_query.TypeName
+	elements := make([]*pg_query.Node, len(array.GetElements()))
+	for index, element := range array.GetElements() {
+		cast := element.GetTypeCast()
+		if cast == nil || cast.GetArg() == nil || !plainScalarTextType(cast.GetTypeName()) {
+			return false
+		}
+		if scalarType == nil {
+			scalarType = cast.GetTypeName()
+		}
+		elements[index] = cast.GetArg()
+	}
+	array.Elements = elements
+	names := make([]*pg_query.Node, 0, len(scalarType.GetNames()))
+	for _, name := range scalarType.GetNames() {
+		names = append(names, &pg_query.Node{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: name.GetString_().GetSval()}}})
+	}
+	arrayType := &pg_query.TypeName{Names: names, ArrayBounds: []*pg_query.Node{pg_query.MakeIntNode(-1)}}
+	node.Reset()
+	node.Node = &pg_query.Node_TypeCast{TypeCast: &pg_query.TypeCast{
+		Arg:      &pg_query.Node{Node: &pg_query.Node_AArrayExpr{AArrayExpr: array}},
+		TypeName: arrayType,
+	}}
+	return true
+}
+
+func plainScalarTextType(name *pg_query.TypeName) bool {
+	return plainTextType(name, 0)
+}
+
+func plainTextArrayType(name *pg_query.TypeName) bool {
+	return plainTextType(name, 1)
+}
+
+func plainTextType(name *pg_query.TypeName, dimensions int) bool {
+	if name == nil || name.GetSetof() || name.GetPctType() || len(name.GetTypmods()) != 0 || len(name.GetArrayBounds()) != dimensions {
+		return false
+	}
+	parts := make([]string, 0, len(name.GetNames()))
+	for _, part := range name.GetNames() {
+		value := part.GetString_()
+		if value == nil {
+			return false
+		}
+		parts = append(parts, value.GetSval())
+	}
+	return len(parts) == 1 && parts[0] == "text" || len(parts) == 2 && parts[0] == "pg_catalog" && parts[1] == "text"
+}
+
+func deparseConstraintDefinition(parsed parsedConstraint) (string, error) {
+	sql, err := pg_query.Deparse(parsed.tree)
+	if err != nil {
+		return "", unsupported(schema.Resource{Kind: schema.KindCheckConstraint}, "constraint definition could not be canonicalized")
+	}
+	marker := " ADD CONSTRAINT "
+	position := strings.Index(sql, marker)
+	if position < 0 {
+		return "", unsupported(schema.Resource{Kind: schema.KindCheckConstraint}, "canonicalized constraint changed statement shape")
+	}
+	remainder := strings.TrimSpace(sql[position+len(marker):])
+	if remainder == "" {
+		return "", unsupported(schema.Resource{Kind: schema.KindCheckConstraint}, "canonicalized constraint lost its identity")
+	}
+	if remainder[0] == '"' {
+		cursor := 1
+		for cursor < len(remainder) {
+			if remainder[cursor] != '"' {
+				cursor++
+				continue
+			}
+			if cursor+1 < len(remainder) && remainder[cursor+1] == '"' {
+				cursor += 2
+				continue
+			}
+			cursor++
+			remainder = strings.TrimSpace(remainder[cursor:])
+			break
+		}
+	} else if cursor := strings.IndexByte(remainder, ' '); cursor >= 0 {
+		remainder = strings.TrimSpace(remainder[cursor+1:])
+	} else {
+		remainder = ""
+	}
+	if remainder == "" {
+		return "", unsupported(schema.Resource{Kind: schema.KindCheckConstraint}, "canonicalized constraint lost its definition")
+	}
+	return remainder, nil
 }
 
 func schemaBindForeignKeyReference(parsed *parsedConstraint, resource schema.Resource, resources map[string]schema.Resource) (bool, error) {
