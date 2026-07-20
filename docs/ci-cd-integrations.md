@@ -65,28 +65,30 @@ for at least two minor releases and are announced in release notes.
 
 ## Native publication
 
-Tag releases run a fail-closed preflight before publishing anything. The
-organization must configure these protected GitHub Actions secrets:
+Tag releases run a fail-closed preflight before publishing anything. GitHub
+Release, GHCR images, and the Helm OCI chart are enabled by default and require
+`GHCR_TOKEN`. Other catalogs are disabled until their repository variable is
+set to exactly `true`. Configure the matching protected GitHub Actions secrets
+before enabling each target:
 
-- `TERRAFORM_PROVIDER_GITHUB_TOKEN` for the public
+- `PUBLISH_TERRAFORM_PROVIDER`: `TERRAFORM_PROVIDER_GITHUB_TOKEN` for the public
   `stigenai/terraform-provider-autosql` repository;
-- `TERRAFORM_REGISTRY_GPG_PRIVATE_KEY` and
+- `PUBLISH_TERRAFORM_PROVIDER`: `TERRAFORM_REGISTRY_GPG_PRIVATE_KEY` and
   `TERRAFORM_REGISTRY_GPG_PASSPHRASE` for provider and integration checksums;
-- `CIRCLECI_CLI_TOKEN` for the `stigenai/autosql` orb;
-- `GITLAB_CATALOG_TOKEN`, `GITLAB_CATALOG_REPOSITORY_URL`,
+- `PUBLISH_CIRCLECI`: `CIRCLECI_CLI_TOKEN` for the `stigenai/autosql` orb;
+- `PUBLISH_GITLAB`: `GITLAB_CATALOG_TOKEN`, `GITLAB_CATALOG_REPOSITORY_URL`,
   `GITLAB_CATALOG_PROJECT_ID`, and `GITLAB_API_URL` for the catalog project;
-- `BITBUCKET_PIPE_TOKEN`, `BITBUCKET_PIPE_USERNAME`, and
+- `PUBLISH_BITBUCKET`: `BITBUCKET_PIPE_TOKEN`, `BITBUCKET_PIPE_USERNAME`, and
   `BITBUCKET_PIPE_REPOSITORY_URL` for the tagged Pipe repository;
-- `AZURE_DEVOPS_EXT_PAT` and `AZURE_DEVOPS_PUBLISHER` for the public
+- `PUBLISH_AZURE_DEVOPS`: `AZURE_DEVOPS_EXT_PAT` and `AZURE_DEVOPS_PUBLISHER` for the public
   Marketplace extension;
-- `GHCR_TOKEN` for signed container, Pipe-image, and Helm OCI publication.
 
 The GitLab project must be marked as a CI/CD Catalog resource. The Terraform,
 GitLab, and Bitbucket repositories must already exist, be public, and protect
 their default branches. Tokens should be environment-scoped, minimum-role
 publisher credentials with rotation and revocation owned by the organization.
 
-The gate builds all native packages first, signs their checksum manifest,
-publishes versioned catalog entries, and only then creates the main GitHub
-release. Missing configuration fails during preflight rather than leaving a
-partially published release.
+The gate builds all native packages first, publishes each enabled catalog, and
+only then creates the main GitHub release. Terraform signing is skipped with
+Terraform publication. Missing configuration for an enabled target fails
+during preflight rather than leaving a partially published release.
