@@ -236,3 +236,122 @@ func TestOperatorBootstrapArtifactRenderBindsCompleteInventory(t *testing.T) {
 		}
 	}
 }
+
+func TestOperatorAdoptionArtifactRenderBindsExactSafeProvisioningInputs(t *testing.T) {
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{
+		{Kind: schema.KindFunction, Name: schema.Name{Schema: "app", Name: "normalize(text)"}, Spec: []byte(`{"body_digest":"sha256:b"}`)},
+		{Kind: schema.KindProcedure, Name: schema.Name{Schema: "audit", Name: "record()"}, Spec: []byte(`{"body_digest":"sha256:a"}`)},
+		{Kind: schema.KindExtension, Name: schema.Name{Schema: "app", Name: "pg_trgm"}, Spec: []byte(`{"version":"1.6"}`)},
+		{Kind: schema.KindExtension, Name: schema.Name{Schema: "audit", Name: "btree_gist"}, Spec: []byte(`{"version":"1.7"}`)},
+	}}}
+	render := operatorAdoptionArtifactRender(desired, map[string]string{
+		"postgres_version": "17", "reviewed_routine_digests": "sha256:stale", "extension_allowlist": "stale",
+	})
+	want := map[string]string{
+		"postgres_version":          "17",
+		"reviewed_routine_digests":  "sha256:a,sha256:b",
+		"extension_allowlist":       "btree_gist,pg_trgm",
+		"extension_version.pg_trgm": "1.6", "extension_schemas.pg_trgm": "app",
+		"extension_version.btree_gist": "1.7", "extension_schemas.btree_gist": "audit",
+	}
+	if len(render) != len(want) {
+		t.Fatalf("render=%v want=%v", render, want)
+	}
+	for key, value := range want {
+		if render[key] != value {
+			t.Fatalf("render[%q]=%q want %q", key, render[key], value)
+		}
+	}
+	for _, forbidden := range []string{"allow_unsafe_routine_languages", "allow_privileged_routines", "allow_untrusted_extensions"} {
+		if render[forbidden] != "" {
+			t.Fatalf("adoption implicitly enabled %s", forbidden)
+		}
+	}
+}
+
+func TestOperatorAdoptionArtifactRoundTripsComplexHCL(t *testing.T) {
+	developmentURL := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if developmentURL == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, developmentURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	fixture := `
+drop extension if exists pg_trgm cascade;
+drop extension if exists btree_gist cascade;
+drop schema if exists autosql_adopt_app cascade;
+drop schema if exists autosql_adopt_audit cascade;
+create schema autosql_adopt_app;
+create schema autosql_adopt_audit;
+create extension pg_trgm with schema autosql_adopt_app;
+create extension btree_gist with schema autosql_adopt_app;
+create table autosql_adopt_app.widgets(id bigint primary key, label text not null);
+create index widgets_label_idx on autosql_adopt_app.widgets(label);
+create function autosql_adopt_app.normalize_label(value text) returns text language sql immutable as $$ select lower(value) $$;
+create table autosql_adopt_audit.events(
+  id bigint primary key,
+  widget_id bigint references autosql_adopt_app.widgets(id)
+);
+create index events_widget_idx on autosql_adopt_audit.events(widget_id);
+create materialized view autosql_adopt_audit.widget_counts as
+select w.id, count(e.id)::bigint as event_count
+from autosql_adopt_app.widgets w
+left join autosql_adopt_audit.events e on e.widget_id = w.id
+group by w.id;
+`
+	if _, err = conn.Exec(ctx, fixture); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Exec(context.Background(), `drop extension if exists pg_trgm cascade; drop extension if exists btree_gist cascade; drop schema if exists autosql_adopt_app cascade; drop schema if exists autosql_adopt_audit cascade`)
+	desired, err := postgres.InspectURL(ctx, developmentURL, postgres.Options{Schemas: []string{"autosql_adopt_app", "autosql_adopt_audit"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hcl, err := source.FormatHCL(desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err = source.LoadContext(ctx, source.Input{URI: "issue-59.hcl", Format: source.FormatHCLSource, Data: hcl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err = postgres.New().Normalize(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := generationFixture(t, t.TempDir(), developmentURL, developmentURL)
+	request.Desired = desired
+	request.ProductionIdentity = "operator-adopt/issue-59"
+	request.DatabaseIdentity = "issue-59"
+	workspace, err := operatorSimulationFactory(nil, desired).CreateWorkspace(ctx, simulate.Config{
+		DevelopmentURL:      developmentURL,
+		DevelopmentIdentity: request.DevelopmentIdentity,
+		ProductionIdentity:  request.ProductionIdentity,
+		CleanupTimeout:      15 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = materializeOperatorCurrent(ctx, workspace.URL(), desired, plan.Options{Render: operatorAdoptionArtifactRender(desired, map[string]string{"postgres_version": "17"})}); err != nil {
+		_ = workspace.Cleanup(context.Background())
+		t.Fatalf("materialize complex adoption schema: %v", err)
+	}
+	if err = workspace.Cleanup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	result, err := (GenerateService{}).BuildOperatorArtifact(ctx, OperatorArtifactRequest{
+		Generation: request, Current: desired, Desired: desired, Adopt: true,
+		Render: map[string]string{"postgres_version": "17"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Artifact.Plan.FromFingerprint != result.Artifact.Plan.ToFingerprint || len(result.Artifact.Plan.Changes.Changes) != 0 || len(result.Artifact.Plan.Steps) != 0 {
+		t.Fatalf("adoption artifact was not a no-op: %+v", result.Artifact.Plan)
+	}
+}

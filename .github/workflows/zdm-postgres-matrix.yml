@@ -81,6 +81,8 @@ jobs:
         run: scripts/test-live-serial.sh ./internal/operatorcontroller -run '^TestArtifactApplyCreatesFreshDatabaseAgainstPostgresWithRealSignatures$'
       - name: Test GitOps artifact publish through operator apply
         run: scripts/test-live-serial.sh ./internal/operatorcontroller -run '^TestGitOpsPublishBundleIsAcceptedAndAppliedByOperator$'
+      - name: Test credential-free operator adoption round trip
+        run: scripts/test-live-serial.sh ./pkg/migrate -run '^TestOperatorAdoptionArtifactRoundTripsComplexHCL$'
       - name: Benchmark complete bootstrap pipeline
         if: matrix.version == 16
         run: go test ./pkg/postgres -run '^$' -bench '^BenchmarkCompleteBootstrapPipeline$' -benchtime=3x -count=1 | tee bootstrap-bench.txt
