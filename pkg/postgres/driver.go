@@ -170,7 +170,7 @@ func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Documen
 	if err := canonicalizeConstraintIndexBindings(&doc); err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
-	if err := canonicalizeCheckExpressionCasts(&doc); err != nil {
+	if err := canonicalizeExpressionCasts(&doc); err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
 	if err := canonicalizeViewBindings(&doc); err != nil {
