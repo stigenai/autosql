@@ -22,6 +22,36 @@ jobs:
           export KUBEBUILDER_ASSETS
           AUTOSQL_OPERATOR_ENVTEST=1 go test -count=1 ./internal/operatorcontroller \
             -run TestEnvtestReconcilesCRAndWritesStatus
+  release-conformance:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+        with:
+          version: v4.2.3
+      - uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1.12.0
+        with:
+          version: v0.32.0
+          cluster_name: autosql-conformance
+          node_image: kindest/node:v1.35.5@sha256:ce977ae6d65918d0b58a5f8b5e940429c2ce42fa3a5619ec2bbc60b949c0ac95
+      - name: Build current operator image
+        run: |
+          set -eu
+          docker build -f Dockerfile.autosql -t autosql:conformance .
+          kind load docker-image autosql:conformance --name autosql-conformance
+      - name: Test release conformance
+        run: |
+          set -eu
+          go test ./pkg/integration ./pkg/integrations/... ./pkg/workloadidentity ./internal/terraformprovider ./internal/operatorcontroller
+          deploy/helm/autosql-operator/tests/render.sh
+          helm install autosql deploy/helm/autosql-operator --namespace autosql-system --create-namespace --set image.repository=autosql --set image.digest= --set image.tag=conformance --set image.pullPolicy=Never --wait --timeout 3m
+          helm upgrade autosql deploy/helm/autosql-operator --namespace autosql-system --set image.repository=autosql --set image.digest= --set image.tag=conformance --set image.pullPolicy=Never --set-string 'podAnnotations.autosql\.io/conformance=upgrade' --wait --timeout 3m
+          kubectl -n autosql-system rollout status deployment/autosql-autosql-operator --timeout=2m
+          deploy/gitops/tests/live.sh autosql-conformance
   changeset:
     runs-on: ubuntu-24.04
     steps:
