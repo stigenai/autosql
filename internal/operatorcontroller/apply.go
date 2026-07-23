@@ -71,6 +71,13 @@ func verifyOperatorReleaseArtifact(digest string) (artifact.VerifiedArtifact, er
 	}
 	verified, err := cli.VerifyProductionArtifactForApply(a, true)
 	if err != nil {
+		// Preserve an expired-lifetime cause so the controller can distinguish a
+		// still-authentic artifact whose freshness window merely lapsed from a
+		// genuine authenticity failure (tamper, revoked key, binding mismatch).
+		// Every other cause is flattened to keep verification details opaque.
+		if errors.Is(err, artifact.ErrExpired) {
+			return artifact.VerifiedArtifact{}, fmt.Errorf("operator artifact verification failed: %w", artifact.ErrExpired)
+		}
 		return artifact.VerifiedArtifact{}, errors.New("operator artifact verification failed")
 	}
 	return verified, nil

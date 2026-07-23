@@ -210,6 +210,17 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		}
 		verified, verifyErr := verifyRelease(resource.Spec.ArtifactDigest)
 		if verifyErr != nil {
+			// A converged resource must not regress to Failed solely because its
+			// already-applied immutable artifact's freshness window lapsed. Release
+			// verification authorizes a *mutating* apply; none is pending once the
+			// applied digest matches the desired artifact at the observed
+			// generation, and the artifact stays authentic (its content digest was
+			// confirmed on load and fully verified at first apply). Only an expired
+			// lifetime is tolerated — every other cause (tamper, revoked key,
+			// changed digest, drift needing a fresh plan) still fails closed.
+			if errors.Is(verifyErr, artifact.ErrExpired) && c.holdsConvergedArtifact(resource, obj) {
+				return reconcile.Result{}, c.holdConverged(ctx, obj, resource)
+			}
 			return reconcile.Result{}, c.writeFailure(ctx, obj, verifyErr)
 		}
 		resource.VerifiedReleaseArtifact = verified
@@ -645,6 +656,56 @@ func writeStatus(ctx context.Context, cl client.Client, obj *unstructured.Unstru
 	}
 	obj.Object["status"] = value
 	return cl.Status().Update(ctx, obj)
+}
+
+// effectiveGeneration returns the generation the reconciler records as
+// ObservedGeneration: the Kubernetes metadata generation when present, else the
+// spec generation. It mirrors operator.Reconcile so convergence comparisons use
+// the same value the last successful apply persisted.
+func effectiveGeneration(resource operator.Resource) int64 {
+	if resource.MetadataGeneration > 0 {
+		return resource.MetadataGeneration
+	}
+	return resource.Spec.Generation
+}
+
+// holdsConvergedArtifact reports whether persisted status proves the desired
+// immutable artifact was already applied at the current generation, so no
+// mutating apply is pending. It gates the expired-lifetime tolerance in
+// Reconcile: an authentic artifact whose freshness window lapsed only holds a
+// resource that has already converged on it, never one awaiting a first apply.
+func (c *Controller) holdsConvergedArtifact(resource operator.Resource, obj *unstructured.Unstructured) bool {
+	if resource.Spec.Kind != operator.Declarative || resource.Spec.Suspend || resource.Spec.ArtifactDigest == "" {
+		return false
+	}
+	st := statusFromObject(obj)
+	if st.AppliedDigest != resource.Spec.ArtifactDigest || st.ObservedGeneration != effectiveGeneration(resource) {
+		return false
+	}
+	now := time.Now().UTC()
+	if c.Now != nil {
+		now = c.Now().UTC()
+	}
+	// Mirror operator.Reconcile: an elapsed bootstrap authorization window is a
+	// genuine re-authorization, not a converged hold.
+	return st.AuthorizationExpiresAt.IsZero() || now.Before(st.AuthorizationExpiresAt)
+}
+
+// holdConverged reasserts Ready for a resource that has converged on an
+// authentic artifact whose lifetime lapsed, clearing any prior Failed condition
+// without touching the database. condition() flips every other non-authorization
+// condition to False, so asserting Ready alone resolves the stale failure.
+func (c *Controller) holdConverged(ctx context.Context, obj *unstructured.Unstructured, resource operator.Resource) error {
+	now := time.Now().UTC()
+	if c.Now != nil {
+		now = c.Now().UTC()
+	}
+	reason, message := "Applied", "resource is converged"
+	if resource.Spec.AdoptionPolicy == operator.AdoptIfEquivalent {
+		reason, message = "Adopted", "existing database matches desired schema; no SQL executed"
+	}
+	status := operator.UpdateCondition(statusFromObject(obj), operator.Ready, reason, message, effectiveGeneration(resource), now)
+	return writeStatus(ctx, c.Client, obj, status)
 }
 
 func (c *Controller) writeFailure(ctx context.Context, obj *unstructured.Unstructured, err error) error {
