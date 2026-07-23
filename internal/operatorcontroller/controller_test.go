@@ -511,6 +511,41 @@ func TestReconcileFailsClosedOnNonExpiryVerificationError(t *testing.T) {
 	}
 }
 
+// TestReconcileHoldPreservesAuthorizationRequeue guards that an expired-lifetime
+// hold still schedules the authorization-boundary requeue the normal path would,
+// so the resource is re-evaluated before its authorization window lapses.
+func TestReconcileHoldPreservesAuthorizationRequeue(t *testing.T) {
+	now := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	authExpiry := now.Add(10 * time.Minute)
+	obj := testObject()
+	obj.SetGeneration(3)
+	spec := obj.Object["spec"].(map[string]any)
+	spec["kind"] = "DeclarativeSchema"
+	spec["source"] = map[string]any{"format": "hcl", "inline": `schema "app" {}`}
+	spec["adoptionPolicy"] = "IfEquivalent"
+	spec["requireApproval"] = false
+	digest := spec["artifactDigest"].(string)
+	obj.Object["status"] = map[string]any{
+		"observedGeneration":     int64(3),
+		"appliedDigest":          digest,
+		"authorizationExpiresAt": authExpiry.Format(time.RFC3339Nano),
+	}
+	cl := fake.NewClientBuilder().WithScheme(NewScheme()).WithObjects(obj).WithStatusSubresource(obj).Build()
+	controller := &Controller{Client: cl, Store: operator.NewMemoryStore(), Now: func() time.Time { return now }, VerifyRelease: func(string) (artifact.VerifiedArtifact, error) {
+		return artifact.VerifiedArtifact{}, fmt.Errorf("operator artifact verification failed: %w", artifact.ErrExpired)
+	}, Apply: func(context.Context, operator.Resource, string) (operator.ApplyResult, error) {
+		t.Fatal("hold reached apply")
+		return operator.ApplyResult{}, nil
+	}}
+	res, err := controller.Reconcile(context.Background(), requestFor(obj))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := authExpiry.Sub(now) - 30*time.Second; res.RequeueAfter != want {
+		t.Fatalf("hold dropped authorization requeue: got %v want %v", res.RequeueAfter, want)
+	}
+}
+
 func TestInvalidSourceContractPerformsNoRuntimeReferenceReadsOrMutation(t *testing.T) {
 	obj := testObject()
 	spec := obj.Object["spec"].(map[string]any)

@@ -219,7 +219,7 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 			// lifetime is tolerated — every other cause (tamper, revoked key,
 			// changed digest, drift needing a fresh plan) still fails closed.
 			if errors.Is(verifyErr, artifact.ErrExpired) && c.holdsConvergedArtifact(resource, obj) {
-				return reconcile.Result{}, c.holdConverged(ctx, obj, resource)
+				return c.holdConverged(ctx, obj, resource)
 			}
 			return reconcile.Result{}, c.writeFailure(ctx, obj, verifyErr)
 		}
@@ -694,8 +694,11 @@ func (c *Controller) holdsConvergedArtifact(resource operator.Resource, obj *uns
 // holdConverged reasserts Ready for a resource that has converged on an
 // authentic artifact whose lifetime lapsed, clearing any prior Failed condition
 // without touching the database. condition() flips every other non-authorization
-// condition to False, so asserting Ready alone resolves the stale failure.
-func (c *Controller) holdConverged(ctx context.Context, obj *unstructured.Unstructured, resource operator.Resource) error {
+// condition to False, so asserting Ready alone resolves the stale failure. It
+// preserves the authorization-boundary requeue the normal reconcile path
+// schedules, so a hold with a future authorization window is re-evaluated just
+// before that window lapses rather than waiting for an unrelated watch/resync.
+func (c *Controller) holdConverged(ctx context.Context, obj *unstructured.Unstructured, resource operator.Resource) (reconcile.Result, error) {
 	now := time.Now().UTC()
 	if c.Now != nil {
 		now = c.Now().UTC()
@@ -705,7 +708,17 @@ func (c *Controller) holdConverged(ctx context.Context, obj *unstructured.Unstru
 		reason, message = "Adopted", "existing database matches desired schema; no SQL executed"
 	}
 	status := operator.UpdateCondition(statusFromObject(obj), operator.Ready, reason, message, effectiveGeneration(resource), now)
-	return writeStatus(ctx, c.Client, obj, status)
+	if updateErr := writeStatus(ctx, c.Client, obj, status); updateErr != nil {
+		return reconcile.Result{}, updateErr
+	}
+	if !status.AuthorizationExpiresAt.IsZero() {
+		remaining := status.AuthorizationExpiresAt.Sub(now) - 30*time.Second
+		if remaining < time.Second {
+			remaining = time.Second
+		}
+		return reconcile.Result{RequeueAfter: remaining}, nil
+	}
+	return reconcile.Result{}, nil
 }
 
 func (c *Controller) writeFailure(ctx context.Context, obj *unstructured.Unstructured, err error) error {
