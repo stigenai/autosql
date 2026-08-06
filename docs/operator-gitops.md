@@ -58,6 +58,42 @@ trusted literals. `GenerationApprovalAuditPath` is a CI workspace path;
 `*URL` and `*PrivateKeyReference` value is a secret reference; never put the
 resolved value in JSON.
 
+### Pre-approved destructive changes
+
+The safety analyzer fails artifact generation on any error-severity finding
+(such as `AUTOSQL001` for a dropped object), and that fail-closed default is
+the point. When a destructive change has been approved out of band — for
+example by a schema-review gate on the pull request that removed the object
+from the desired schema — record that approval as a `SafetySuppressions`
+entry in the publish configuration:
+
+```json
+"SafetySuppressions": [
+  {
+    "rule": "AUTOSQL001",
+    "object_id": "table:c70cf6af6407e9724d23c606",
+    "reason": "schema-destructive-approved on stigenai/infra-blocks#2108"
+  }
+]
+```
+
+Each suppression is a narrow audit record: exactly one `rule` and one
+`object_id` (the stable, name-derived resource ID that diagnostics report),
+with a mandatory `reason` that should reference the approving decision. An
+optional `expires_at` stops the suppression automatically. Suppressed
+findings stay in the artifact's diagnostics, in the safety attestation's
+`suppressions_digest`, and in the signed guardrail bundle, so the approval
+trail is preserved end to end. A suppression that matches nothing fails
+closed the same way as no suppression: the finding still blocks publication.
+
+Suppressions are also copied into the release bundle's trusted-migration
+entry (`apply-config.json`). Verified apply — the CLI and the operator alike
+— rebuilds its guardrail from that entry, so it reconstructs the identical
+bundle digest and its own safety re-run reaches the same suppressed
+verdicts. An apply configuration that predates this field carries no
+suppressions and refuses a suppressed artifact, which keeps older operators
+fail-closed until they are upgraded.
+
 ```sh
 export AUTOSQL_DEV_DATABASE_URL="$CI_AUTOSQL_DEV_DATABASE_URL"
 export AUTOSQL_TARGET_DATABASE_URL="$CI_AUTOSQL_TARGET_DATABASE_URL"

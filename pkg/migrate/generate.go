@@ -72,6 +72,12 @@ type GenerateRequest struct {
 	ApprovalAudit                                                    approval.AuditTrail
 	Approvals                                                        []approval.Approval
 	PrecheckAssertions                                               []precheck.Assertion
+	// SafetySuppressions carries pre-approved safety findings (for example a
+	// human-approved destructive change) into the analyzer. Each suppression
+	// is a narrow audit record: exactly one rule and one stable object ID,
+	// with a mandatory reason. Suppressed findings remain in the artifact's
+	// diagnostics and are bound into the guardrail bundle digest.
+	SafetySuppressions                                               []safety.Suppression
 	CreatedAt, ExpiresAt                                             time.Time
 	GeneratorKeyID, GeneratorPurpose, SigningKeyID                   string
 	GeneratorPrivateKey, SigningPrivateKey                           ed25519.PrivateKey
@@ -297,7 +303,7 @@ func (s GenerateService) buildGeneratedArtifact(ctx context.Context, r GenerateR
 		Identity       string
 		Checks, Bundle string
 	}{r.Policy, r.PolicyIdentity, checks.Digest, bundle})
-	atts := []artifact.ValidationAttestation{{Stage: "replay_simulation", Implementation: "autosql/pkg/migrate.GenerateService", Version: "1", ConfigDigest: simConfig, ResultDigest: toFP, At: created, ExpiresAt: attExpiry, Simulation: &artifact.SimulationAttestation{TargetIdentity: r.ProductionIdentity, DevelopmentIdentity: r.DevelopmentIdentity, FromFingerprint: fromFP, ToFingerprint: toFP, DatabaseVersion: fmt.Sprint(r.PostgresVersion), ConfigDigest: simConfig}}, {Stage: "safety", Implementation: "autosql/pkg/safety.Runner", Version: "1", ConfigDigest: safetyConfig, ResultDigest: shaJSON(diagnostics), At: created, ExpiresAt: attExpiry, Safety: &artifact.SafetyAttestation{Analyzers: []string{"compatibility", "postgresql-operational"}, Threshold: string(safety.SeverityError), SuppressionsDigest: shaJSON([]safety.Diagnostic{}), DiagnosticsDigest: shaJSON(diagnostics), ConfigDigest: safetyConfig}}, {Stage: "policy_precheck_guardrail", Implementation: "autosql/pkg/guardrail.Guardrail", Version: "1", ConfigDigest: policyConfig, ResultDigest: bundle, At: created, ExpiresAt: attExpiry, Policy: &artifact.PolicyAttestation{DocumentDigest: shaJSON(r.Policy), LimitsDigest: shaJSON(g.Policy.Limits), ResourcesDigest: shaJSON([]any{in.SchemaResources, in.MigrationResources}), ConfigDigest: policyConfig}, Precheck: &artifact.PrecheckGuardrailAttestation{ChecksDigest: checks.Digest, GuardrailDigest: bundle, ConfigDigest: policyConfig}}}
+	atts := []artifact.ValidationAttestation{{Stage: "replay_simulation", Implementation: "autosql/pkg/migrate.GenerateService", Version: "1", ConfigDigest: simConfig, ResultDigest: toFP, At: created, ExpiresAt: attExpiry, Simulation: &artifact.SimulationAttestation{TargetIdentity: r.ProductionIdentity, DevelopmentIdentity: r.DevelopmentIdentity, FromFingerprint: fromFP, ToFingerprint: toFP, DatabaseVersion: fmt.Sprint(r.PostgresVersion), ConfigDigest: simConfig}}, {Stage: "safety", Implementation: "autosql/pkg/safety.Runner", Version: "1", ConfigDigest: safetyConfig, ResultDigest: shaJSON(diagnostics), At: created, ExpiresAt: attExpiry, Safety: &artifact.SafetyAttestation{Analyzers: []string{"compatibility", "postgresql-operational"}, Threshold: string(safety.SeverityError), SuppressionsDigest: shaJSON(append([]safety.Suppression{}, r.SafetySuppressions...)), DiagnosticsDigest: shaJSON(diagnostics), ConfigDigest: safetyConfig}}, {Stage: "policy_precheck_guardrail", Implementation: "autosql/pkg/guardrail.Guardrail", Version: "1", ConfigDigest: policyConfig, ResultDigest: bundle, At: created, ExpiresAt: attExpiry, Policy: &artifact.PolicyAttestation{DocumentDigest: shaJSON(r.Policy), LimitsDigest: shaJSON(g.Policy.Limits), ResourcesDigest: shaJSON([]any{in.SchemaResources, in.MigrationResources}), ConfigDigest: policyConfig}, Precheck: &artifact.PrecheckGuardrailAttestation{ChecksDigest: checks.Digest, GuardrailDigest: bundle, ConfigDigest: policyConfig}}}
 	if err = a.SetValidationAttestations(atts); err != nil {
 		return out, generationFailure("attest", ErrGenerateStage)
 	}
@@ -323,6 +329,11 @@ func validateGenerateRequest(r GenerateRequest) error {
 	}
 	if err := r.Desired.Validate(); err != nil || len(r.Policy.Rules) == 0 {
 		return generationFailure("desired_or_policy", ErrGenerateConfig)
+	}
+	for _, suppression := range r.SafetySuppressions {
+		if err := suppression.Validate(); err != nil {
+			return generationFailure("safety_suppression", ErrGenerateConfig)
+		}
 	}
 	return nil
 }
@@ -362,7 +373,7 @@ func generationChecks(p plan.Plan, statements []string, assertions []precheck.As
 	return c, e
 }
 func generationGuardrail(r GenerateRequest) guardrail.Guardrail {
-	return guardrail.Guardrail{Config: guardrail.Config{Environment: r.Environment, FailOn: safety.SeverityError, Risk: guardrail.RiskConfig{Baseline: approval.RiskLow}}, Safety: safety.Runner{Analyzers: safety.Builtins()}, Policy: policy.Evaluator{}, Approval: approval.Gate{Policy: r.ApprovalPolicy}}
+	return guardrail.Guardrail{Config: guardrail.Config{Environment: r.Environment, FailOn: safety.SeverityError, Risk: guardrail.RiskConfig{Baseline: approval.RiskLow}}, Safety: safety.Runner{Analyzers: safety.Builtins(), Suppressions: append([]safety.Suppression(nil), r.SafetySuppressions...)}, Policy: policy.Evaluator{}, Approval: approval.Gate{Policy: r.ApprovalPolicy}}
 }
 func schemaPolicyResources(d schema.Document) []policy.Resource {
 	out := make([]policy.Resource, 0, len(d.Graph.Resources))

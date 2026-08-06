@@ -21,6 +21,11 @@ type VerifiedArtifactApplyService struct {
 	PolicyFor             func(artifact.Artifact) (artifact.VerifyPolicy, error)
 	InstallPolicy         func(string, artifact.VerifyPolicy)
 	Guardrail             guardrail.Guardrail
+	// GuardrailFor returns the guardrail configured for one artifact — in
+	// particular carrying the trusted release manifest's safety suppressions
+	// so the recomputed bundle and the safety re-run match the published
+	// artifact. Nil falls back to Guardrail.
+	GuardrailFor          func(artifact.Artifact) guardrail.Guardrail
 	Input                 func(artifact.Artifact) (guardrail.Input, error)
 	Mutation              func(artifact.VerifiedArtifact) (guardrail.AuthorizedMutation, error)
 	MutationLocked        func(artifact.VerifiedArtifact, executor.Session, executor.Tx) (guardrail.AuthorizedMutation, error)
@@ -157,7 +162,11 @@ func (s VerifiedArtifactApplyService) Apply(ctx context.Context, request ApplyRe
 	if err != nil || in.Precheck.Digest != verifiedPayload.Checks.Digest || in.Precheck.ChangeDigest != artifactChangeDigest || !reflect.DeepEqual(in.Precheck.Statements, verifiedPayload.Checks.Statements) {
 		return ApplyResult{Status: "refused"}, errors.New("artifact guardrail input binding mismatch")
 	}
-	bundleDigest, err := s.Guardrail.BundleDigest(in)
+	effectiveGuardrail := s.Guardrail
+	if s.GuardrailFor != nil {
+		effectiveGuardrail = s.GuardrailFor(a)
+	}
+	bundleDigest, err := effectiveGuardrail.BundleDigest(in)
 	if err != nil || bundleDigest != verifiedPayload.GuardrailDigest || in.Approval.Plan.Digest != verifiedPayload.GuardrailDigest {
 		return ApplyResult{Status: "refused"}, errors.New("artifact guardrail bundle binding mismatch")
 	}
@@ -166,7 +175,7 @@ func (s VerifiedArtifactApplyService) Apply(ctx context.Context, request ApplyRe
 		return ApplyResult{Status: "refused"}, err
 	}
 	in.Mutation = mutation
-	_, err = s.Guardrail.Apply(ctx, in)
+	_, err = effectiveGuardrail.Apply(ctx, in)
 	if err != nil {
 		result := ApplyResult{}
 		if errors.Is(err, executor.ErrPartial) {
