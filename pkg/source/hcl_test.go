@@ -2,7 +2,10 @@ package source
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -102,6 +105,113 @@ func TestHCLVariablesAndImports(t *testing.T) {
 	files["/tmp/child.hcl"] = []byte(`import "root" { source = "root.hcl" }`)
 	if _, err = l.Load(context.Background(), "/tmp/root.hcl"); !errors.Is(err, ErrImportCycle) {
 		t.Fatalf("cycle=%v", err)
+	}
+}
+
+func TestHCLModulesHaveExplicitInputsAndTypedOutputs(t *testing.T) {
+	files := map[string][]byte{
+		"/tmp/root.hcl": []byte(`
+module "core" {
+  source = "core.hcl"
+  inputs = { schema_name = "app" }
+}
+table "audit" { schema = module.core.schema_name }
+`),
+		"/tmp/core.hcl": []byte(`
+variable "schema_name" { type = string }
+table "users" { schema = var.schema_name }
+output "schema_name" {
+  type  = string
+  value = var.schema_name
+}
+`),
+	}
+	loader := HCLLoader{Variables: HCLVariables{"schema_name": "leaked"}, ReadFile: func(path string) ([]byte, error) {
+		data, ok := files[path]
+		if !ok {
+			return nil, errors.New("missing")
+		}
+		return data, nil
+	}}
+	doc, err := loader.Load(context.Background(), "/tmp/root.hcl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"users", "audit"} {
+		found := false
+		for _, resource := range doc.Graph.Resources {
+			if resource.Kind == schema.KindTable && resource.Name.Name == name {
+				found = resource.Name.Schema == "app"
+			}
+		}
+		if !found {
+			t.Fatalf("module output/input did not configure %s: %+v", name, doc.Graph.Resources)
+		}
+	}
+
+	files["/tmp/root.hcl"] = []byte(`module "core" { source = "core.hcl" }`)
+	if _, err := loader.Load(context.Background(), "/tmp/root.hcl"); err == nil || !strings.Contains(err.Error(), "schema_name is required") {
+		t.Fatalf("root variable leaked into module: %v", err)
+	}
+	files["/tmp/root.hcl"] = []byte(`
+module "core" {
+  source = "core.hcl"
+  inputs = { schema_name = "app", undeclared = true }
+}
+`)
+	if _, err := loader.Load(context.Background(), "/tmp/root.hcl"); err == nil || !strings.Contains(err.Error(), "undeclared inputs: undeclared") {
+		t.Fatalf("unknown module input accepted: %v", err)
+	}
+}
+
+func TestHCLDirectoryCompositionIsDeterministicAndDuplicatesAreClear(t *testing.T) {
+	directory := t.TempDir()
+	moduleDir := filepath.Join(directory, "schema")
+	if err := os.Mkdir(moduleDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		filepath.Join(directory, "root.hcl"): `module "schema" {
+  source = "schema"
+  inputs = { schema_name = "app" }
+}`,
+		filepath.Join(moduleDir, "z.hcl"): `table "zebra" { schema = var.schema_name }`,
+		filepath.Join(moduleDir, "a.hcl"): `variable "schema_name" { type = string }
+table "accounts" { schema = var.schema_name }`,
+	}
+	for name, contents := range files {
+		if err := os.WriteFile(name, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	loader := HCLLoader{}
+	first, err := loader.Load(context.Background(), filepath.Join(directory, "root.hcl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := loader.Load(context.Background(), filepath.Join(directory, "root.hcl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	one, _ := first.MarshalCanonical()
+	two, _ := second.MarshalCanonical()
+	if string(one) != string(two) {
+		t.Fatal("directory composition changed normalized graph")
+	}
+
+	duplicateRoot := filepath.Join(directory, "duplicates.hcl")
+	left, right := filepath.Join(directory, "left.hcl"), filepath.Join(directory, "right.hcl")
+	if err := os.WriteFile(duplicateRoot, []byte(`import "left" { source = "left.hcl" }
+import "right" { source = "right.hcl" }`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{left, right} {
+		if err := os.WriteFile(name, []byte(`table "same" { schema = "app" }`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := loader.Load(context.Background(), duplicateRoot); err == nil || !strings.Contains(err.Error(), "duplicate resource identity") || !strings.Contains(err.Error(), left) || !strings.Contains(err.Error(), right) {
+		t.Fatalf("duplicate diagnostic=%v", err)
 	}
 }
 
@@ -222,4 +332,278 @@ extension "hstore" {
 			}
 		}
 	}
+}
+
+func TestHCLSymbolicReferencesResolveIndependentOfDeclarationOrder(t *testing.T) {
+	doc, err := ParseHCL("references.hcl", []byte(`
+table "accounts" {
+  schema = schema.app
+  dependencies = [references(table.organizations)]
+  owner = role.app_owner
+
+  column "id" {
+    type = "bigint"
+  }
+  column "organization_id" {
+    type = "bigint"
+  }
+  column "status" {
+    type = enum.account_status
+  }
+  index "accounts_organization_idx" {
+    columns = [column.organization_id]
+  }
+}
+
+enum "account_status" {
+  schema = schema.app
+  values = ["pending", "active"]
+}
+
+table "organizations" {
+  schema = schema.app
+  column "id" {
+    type = "bigint"
+  }
+}
+
+schema "app" {}
+role "app_owner" {}
+`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resources := map[schema.Kind]map[string]schema.Resource{}
+	for _, resource := range doc.Graph.Resources {
+		if resources[resource.Kind] == nil {
+			resources[resource.Kind] = map[string]schema.Resource{}
+		}
+		resources[resource.Kind][resource.Name.Name] = resource
+	}
+	accounts := resources[schema.KindTable]["accounts"]
+	organizations := resources[schema.KindTable]["organizations"]
+	owner := resources[schema.KindRole]["app_owner"]
+	status := resources[schema.KindEnum]["account_status"]
+	statusColumn := resources[schema.KindColumn]["status"]
+	organizationColumn := resources[schema.KindColumn]["organization_id"]
+	index := resources[schema.KindIndex]["accounts_organization_idx"]
+	if accounts.ID == "" || organizations.ID == "" || status.ID == "" || index.ID == "" {
+		t.Fatalf("missing symbolic resources: %+v", resources)
+	}
+	assertHCLDependency(t, accounts, organizations.ID, schema.DependencyReferences)
+	assertHCLDependency(t, accounts, owner.ID, schema.DependencyOwns)
+	assertHCLDependency(t, statusColumn, status.ID, schema.DependencyUses)
+	assertHCLDependency(t, index, organizationColumn.ID, schema.DependencyReferences)
+	if got := stringValueForHCLTest(statusColumn.Spec, "type"); got != "app.account_status" {
+		t.Fatalf("symbolic enum type=%q", got)
+	}
+	var indexSpec map[string]any
+	if err := json.Unmarshal(index.Spec, &indexSpec); err != nil {
+		t.Fatal(err)
+	}
+	columns, _ := indexSpec["columns"].([]any)
+	if len(columns) != 1 || columns[0] != organizationColumn.Name.Name {
+		t.Fatalf("symbolic index columns=%v want=%s", columns, organizationColumn.Name.Name)
+	}
+}
+
+func TestHCLSymbolicReferencesSupportQualifiedLookup(t *testing.T) {
+	doc, err := ParseHCL("qualified.hcl", []byte(`schema "app" {}
+schema "audit" {}
+table "users" { schema = schema.app }
+table "users" { schema = schema.audit }
+role "reader" {
+  object = table.app.users
+}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reader, appUsers schema.Resource
+	for _, resource := range doc.Graph.Resources {
+		if resource.Kind == schema.KindRole {
+			reader = resource
+		}
+		if resource.Kind == schema.KindTable && resource.Name.Schema == "app" {
+			appUsers = resource
+		}
+	}
+	assertHCLDependency(t, reader, appUsers.ID, schema.DependencyReferences)
+}
+
+func TestHCLSymbolicReferencesFailClosed(t *testing.T) {
+	tests := []struct {
+		name string
+		hcl  string
+		want string
+	}{
+		{
+			name: "missing",
+			hcl: `schema "app" {}
+table "accounts" {
+  schema = schema.app
+  dependencies = [references(table.missing)]
+}`,
+			want: "symbolic reference evaluation failed",
+		},
+		{
+			name: "ambiguous",
+			hcl: `schema "app" {}
+schema "audit" {}
+table "users" { schema = schema.app }
+table "users" { schema = schema.audit }
+role "reader" { object = table.users }`,
+			want: "symbolic reference evaluation failed",
+		},
+		{
+			name: "wrong kind",
+			hcl: `schema "app" {}
+table "users" {
+  schema = schema.app
+  index "bad" { columns = [table.users] }
+}`,
+			want: "columns must contain only column references",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := ParseHCL("fail-closed.hcl", []byte(test.hcl), nil)
+			if err == nil || !strings.Contains(err.Error(), test.want) || !strings.Contains(err.Error(), "fail-closed.hcl") {
+				t.Fatalf("error=%v want filename and %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestHCLSymbolicReferencesResolveAcrossImports(t *testing.T) {
+	files := map[string][]byte{
+		"/tmp/root.hcl": []byte(`import "types" { source = "types.hcl" }
+table "accounts" {
+  schema = schema.app
+  column "status" {
+    type = enum.account_status
+  }
+}`),
+		"/tmp/types.hcl": []byte(`schema "app" {}
+enum "account_status" {
+  schema = schema.app
+  values = ["pending", "active"]
+}`),
+	}
+	loader := HCLLoader{ReadFile: func(path string) ([]byte, error) {
+		value, ok := files[path]
+		if !ok {
+			return nil, errors.New("missing fixture")
+		}
+		return value, nil
+	}}
+	doc, err := loader.Load(context.Background(), "/tmp/root.hcl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var enumResource, column schema.Resource
+	for _, resource := range doc.Graph.Resources {
+		switch resource.Kind {
+		case schema.KindEnum:
+			enumResource = resource
+		case schema.KindColumn:
+			column = resource
+		}
+	}
+	assertHCLDependency(t, column, enumResource.ID, schema.DependencyUses)
+	if column.Source == nil || column.Source.URI != "/tmp/root.hcl" || enumResource.Source == nil || enumResource.Source.URI != "/tmp/types.hcl" {
+		t.Fatalf("cross-file provenance column=%+v enum=%+v", column.Source, enumResource.Source)
+	}
+}
+
+func TestHCLSymbolicReferenceCyclesFailClosed(t *testing.T) {
+	_, err := ParseHCL("cycle.hcl", []byte(`schema "app" {}
+table "a" {
+  schema = schema.app
+  dependencies = [references(table.b)]
+}
+table "b" {
+  schema = schema.app
+  dependencies = [references(table.a)]
+}`), nil)
+	if err == nil || !strings.Contains(err.Error(), "dependency cycle") || !strings.Contains(err.Error(), "cycle.hcl") {
+		t.Fatalf("cycle error=%v", err)
+	}
+}
+
+func TestHCLTypedSQLExpressionConstructors(t *testing.T) {
+	doc, err := ParseHCL("expressions.hcl", []byte(`schema "app" {}
+enum "status" {
+  schema = schema.app
+  values = ["pending", "active"]
+}
+table "jobs" {
+  schema = schema.app
+  column "state" {
+    type = enum.status
+    default = enum_value(enum.status, "pending")
+  }
+  column "labels" {
+    type = "text[]"
+    default = cast(sql_array([literal("one"), literal("two")]), "text[]")
+  }
+  column "created_at" {
+    type = "timestamptz"
+    default = sql("now()")
+  }
+}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var status schema.Resource
+	columns := map[string]schema.Resource{}
+	for _, resource := range doc.Graph.Resources {
+		if resource.Kind == schema.KindEnum {
+			status = resource
+		}
+		if resource.Kind == schema.KindColumn {
+			columns[resource.Name.Name] = resource
+		}
+	}
+	if got := stringValueForHCLTest(columns["state"].Spec, "default"); got != "'pending'::app.status" {
+		t.Fatalf("enum default=%q", got)
+	}
+	assertHCLDependency(t, columns["state"], status.ID, schema.DependencyUses)
+	if got := stringValueForHCLTest(columns["labels"].Spec, "default"); got != "(ARRAY['one', 'two'])::text[]" {
+		t.Fatalf("array default=%q", got)
+	}
+	if got := stringValueForHCLTest(columns["created_at"].Spec, "default"); got != "now()" {
+		t.Fatalf("SQL default=%q", got)
+	}
+}
+
+func TestHCLTypedSQLExpressionsRejectInvalidComposition(t *testing.T) {
+	for name, input := range map[string]string{
+		"empty SQL":      `schema "app" {} table "t" { schema = schema.app column "v" { type = "text" default = sql("") } }`,
+		"raw cast input": `schema "app" {} table "t" { schema = schema.app column "v" { type = "text" default = cast("x", "text") } }`,
+		"wrong enum ref": `schema "app" {} table "t" { schema = schema.app column "v" { type = "text" default = enum_value(table.t, "x") } }`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseHCL("invalid-expression.hcl", []byte(input), nil); err == nil || !strings.Contains(err.Error(), "invalid-expression.hcl") {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+}
+
+func assertHCLDependency(t *testing.T, resource schema.Resource, target string, dependencyType schema.DependencyType) {
+	t.Helper()
+	for _, dependency := range resource.Dependencies {
+		if dependency.Target == target && dependency.Type == dependencyType {
+			return
+		}
+	}
+	t.Fatalf("resource %s missing %s dependency on %s: %+v", resource.ID, dependencyType, target, resource.Dependencies)
+}
+
+func stringValueForHCLTest(raw json.RawMessage, key string) string {
+	var value map[string]any
+	_ = json.Unmarshal(raw, &value)
+	result, _ := value[key].(string)
+	return result
 }

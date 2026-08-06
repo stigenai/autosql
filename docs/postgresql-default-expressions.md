@@ -21,6 +21,7 @@ checks the emitted defaults and dependency order.
 | Text | `'pending'`, `'pending'::text` | `character(n)` and `character varying(n)` values must fit their declared length. |
 | Bit string | `'1010'::bit(4)` | Values contain only `0` and `1` and must fit the declared fixed or varying length. |
 | UUID | `'550e8400-e29b-41d4-a716-446655440000'::uuid` | Must be a complete UUID literal. |
+| Network address | `'10.0.0.0/8'::cidr`, `'192.0.2.1/24'::inet`, `'08:00:2b:01:02:03'::macaddr` | CIDR host bits must be clear, INET accepts bounded IPv4/IPv6 address or prefix forms without zones, and MACADDR must contain exactly six bytes. |
 | JSON/JSONB | `'{}'::jsonb`, `'[]'::jsonb` | The string must contain valid JSON and the cast must match the column family. |
 | Date/time | `'2026-07-15'::date`, `'12:30:00'::time`, timestamp literals | The value must parse exactly as its target temporal type. |
 | Interval | `'1 day 00:05:00'::interval` | Supports a signed day/time form with valid minute and second fields and up to six fractional digits. |
@@ -28,6 +29,45 @@ checks the emitted defaults and dependency order.
 Literal casts may use a compatible narrower core type, such as an integer cast
 for a bigint column or a shorter character cast for a wider character column.
 AutoSQL checks both the cast type and the destination type before rendering.
+
+## Bounded arithmetic defaults
+
+Numeric columns support unary `+` and `-` and the binary operators `+`, `-`,
+`*`, `/`, and `%`. Parentheses, numeric core-type casts, and PostgreSQL's
+standard precedence and left associativity are preserved by a typed expression
+tree and rendered to one canonical spelling. For example, the DBOS millisecond
+timestamp default is supported directly:
+
+```sql
+(extract(epoch from CURRENT_TIMESTAMP) OPERATOR(pg_catalog.*) 1000)::bigint
+```
+
+Every arithmetic operator is canonically rendered as
+`OPERATOR(pg_catalog.<symbol>)`. This binds execution to PostgreSQL's built-in
+operator even if an untrusted schema earlier in `search_path` defines the same
+symbol. Explicit operators from any other schema are rejected. `extract` is
+accepted only in PostgreSQL's `extract(epoch from ...)` syntax,
+and its source is limited to stable transaction-time builtins such as `now()`
+and `CURRENT_TIMESTAMP`. Inspection normalizes those aliases and PostgreSQL's
+implicit numeric cast, so apply/reinspect converges to a no-op on PostgreSQL
+14–18. Literal zero divisors, other operators, explicit `OPERATOR(...)`
+selection, column references, subqueries, and non-allowlisted functions fail
+closed. Validation follows PostgreSQL numeric promotion, integer division,
+numeric-to-integer cast rounding, modulo operand support, and intermediate plus
+destination bounds. Consequently nested typed zero divisors such as
+`1 / (1 / 2)` and `1 / (0.4::integer)`, `real % real`, and an overflowing
+`smallint` default such as `32767 + 1` are rejected before any DDL is emitted.
+`real` and `double precision` results are rounded after every operation before
+they are reused, matching PostgreSQL's typed evaluation. Integer MIN `% -1` is
+also rejected as a deliberately fail-closed overflow edge.
+
+Dynamic arithmetic carries conservative numeric ranges through every operator.
+The allowlisted transaction-time `extract(epoch ...)` source is bounded wider
+than PostgreSQL's complete timestamp range; casts and fixed-width destinations
+must prove that both range endpoints fit. This admits the DBOS milliseconds
+expression in `bigint`, while rejecting an unsafe `smallint` expression such as
+`extract(epoch from now()) + 0`. Dynamic divisors whose range includes zero are
+rejected.
 
 ## Supported generated and temporal defaults
 
@@ -38,7 +78,7 @@ The generated-function allowlist is intentionally small:
 - `CURRENT_TIME(0..6)` for time-with-time-zone columns;
 - `LOCALTIME(0..6)` for time-without-time-zone columns;
 - `LOCALTIMESTAMP(0..6)` for timestamp-without-time-zone columns;
-- `gen_random_uuid()` for UUID columns; and
+- `gen_random_uuid()` for UUID columns and its exact `::text` result cast for text identifiers; and
 - `timezone('utc'::text, now())` for a UTC timestamp without time zone.
 
 Inspection aliases are normalized before comparison and rendering. In
@@ -92,6 +132,12 @@ declared domain. Validation uses the modeled `base_type`; PostgreSQL still
 enforces the actual domain constraints when the statement runs. Missing,
 mismatched, or ambiguous type dependencies fail closed.
 
+Normalization binds an accepted enum or domain cast to the exact `uses`
+dependency with a schema-qualified type name. This applies even when inspected
+catalog text used an unqualified cast such as `'pending'::job_status`, so fresh
+bootstrap does not depend on the target database's `search_path`. The type
+dependency also orders `CREATE TYPE` before the dependent `ADD COLUMN`.
+
 ## Sequence-backed defaults
 
 `nextval` is supported only for integer-family columns and only in this exact
@@ -111,7 +157,7 @@ sequence references are rejected.
 ## Safety and diagnostics
 
 AutoSQL does not provide an arbitrary-expression escape hatch for defaults.
-It rejects unknown functions, operators, column references, subqueries,
+It rejects unknown functions, unmodeled operators, column references, subqueries,
 multiple statements, comments, dollar quoting, escape-prefixed strings,
 variadic calls, malformed casts, incompatible types, and expressions outside
 the bounded AST grammar. An unchanged legacy default does not block an

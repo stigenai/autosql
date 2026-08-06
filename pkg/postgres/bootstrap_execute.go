@@ -82,6 +82,15 @@ func ExecuteDatabaseBootstrapURL(ctx context.Context, maintenanceURL string, who
 	if hooks.Now == nil {
 		hooks.Now = time.Now
 	}
+	// Extension readiness is a read-only gate and must run before target
+	// creation, bootstrap history initialization, or any schema mutation.
+	extensionReport, err := PreflightBootstrapExtensionsURL(ctx, maintenanceURL, whole)
+	if err != nil {
+		return result, safeError("preflight bootstrap extensions", maintenanceURL, err)
+	}
+	if !extensionReport.Ready {
+		return result, extensionReadinessError(extensionReport)
+	}
 	emit := func(typ string, phase bootstrap.BootstrapPhase, step string) {
 		result.Events = append(result.Events, BootstrapExecutionEvent{Type: typ, PlanDigest: whole.Digest, PhaseID: phase.ID, Checkpoint: phase.Checkpoint, StepID: step, At: hooks.Now().UTC()})
 	}
@@ -121,6 +130,18 @@ func ExecuteDatabaseBootstrapURL(ctx context.Context, maintenanceURL string, who
 	confirmed, intended, err := readBootstrapSteps(ctx, conn, whole)
 	if err != nil {
 		return result, err
+	}
+	if intended != "" {
+		reconciled, reconcileErr := reconcileConcurrentIndexIntent(ctx, conn, whole, intended)
+		if reconcileErr != nil {
+			return result, reconcileErr
+		}
+		if reconciled {
+			confirmed, intended, err = readBootstrapSteps(ctx, conn, whole)
+			if err != nil {
+				return result, err
+			}
+		}
 	}
 	if intended != "" {
 		result.PendingStep = intended
@@ -177,6 +198,85 @@ func ExecuteDatabaseBootstrapURL(ctx context.Context, maintenanceURL string, who
 	result.Completed = true
 	emit("completed", bootstrap.BootstrapPhase{}, result.LastConfirmed)
 	return result, nil
+}
+
+// reconcileConcurrentIndexIntent handles the two catalog states that can be
+// proven safe after an interrupted CREATE INDEX CONCURRENTLY. An absent index
+// proves the statement did not take effect and its intent may be retried. An
+// exact, valid, ready index proves the statement completed and may be
+// confirmed. Invalid or different remnants remain operator-reconciled.
+func reconcileConcurrentIndexIntent(ctx context.Context, conn *pgx.Conn, whole bootstrap.Plan, stepID string) (bool, error) {
+	var bound bootstrap.BootstrapStep
+	for _, candidate := range whole.Steps {
+		if candidate.ID == stepID {
+			bound = candidate
+			break
+		}
+	}
+	if bound.ID == "" || bound.Transaction != plan.TransactionProhibited {
+		return false, nil
+	}
+	var schemaStep plan.Step
+	for _, candidate := range whole.SchemaPlan.Steps {
+		if candidate.ID == bound.SchemaStepID {
+			schemaStep = candidate
+			break
+		}
+	}
+	if schemaStep.ID == "" || schemaStep.Kind != plan.StepExecutable {
+		return false, nil
+	}
+	var desired schema.Resource
+	for _, change := range whole.SchemaPlan.Changes.Changes {
+		if change.ID == schemaStep.ChangeID && change.Operation == schema.OperationCreate && change.After != nil && change.After.Kind == schema.KindIndex {
+			desired = *change.After
+			break
+		}
+	}
+	if desired.ID == "" {
+		return false, nil
+	}
+	expectedSQL, concurrent, err := canonicalConcurrentIndexSQL(schemaStep.SQL)
+	if err != nil || !concurrent {
+		return false, nil
+	}
+	var valid, ready bool
+	var actualDefinition string
+	err = conn.QueryRow(ctx, `select x.indisvalid,x.indisready,pg_get_indexdef(c.oid) from pg_class c join pg_namespace n on n.oid=c.relnamespace join pg_index x on x.indexrelid=c.oid where n.nspname=$1 and c.relname=$2`, desired.Name.Schema, desired.Name.Name).Scan(&valid, &ready, &actualDefinition)
+	if errors.Is(err, pgx.ErrNoRows) {
+		tag, deleteErr := conn.Exec(ctx, `delete from autosql_internal.bootstrap_steps where plan_digest=$1 and step_id=$2 and state='intended' and step_hash=$3`, whole.Digest, stepID, bootstrapStepHash(bound, whole.SchemaPlan))
+		if deleteErr != nil || tag.RowsAffected() != 1 {
+			return false, ErrBootstrapIdentity
+		}
+		return true, nil
+	}
+	if err != nil {
+		return false, errors.New("inspect concurrent index intent")
+	}
+	actualSQL, _, err := canonicalConcurrentIndexSQL(actualDefinition)
+	if err != nil || !valid || !ready || actualSQL != expectedSQL {
+		return false, nil
+	}
+	tag, err := conn.Exec(ctx, `update autosql_internal.bootstrap_steps set state='confirmed',confirmed_at=clock_timestamp() where plan_digest=$1 and step_id=$2 and state='intended' and step_hash=$3`, whole.Digest, stepID, bootstrapStepHash(bound, whole.SchemaPlan))
+	if err != nil || tag.RowsAffected() != 1 {
+		return false, ErrBootstrapIdentity
+	}
+	return true, nil
+}
+
+func canonicalConcurrentIndexSQL(sql string) (string, bool, error) {
+	parsed, err := pg_query.Parse(sql)
+	if err != nil || len(parsed.GetStmts()) != 1 {
+		return "", false, err
+	}
+	statement := parsed.GetStmts()[0].GetStmt().GetIndexStmt()
+	if statement == nil {
+		return "", false, nil
+	}
+	concurrent := statement.GetConcurrent()
+	statement.Concurrent = false
+	canonical, err := pg_query.Deparse(parsed)
+	return canonical, concurrent, err
 }
 
 func openBootstrapTarget(ctx context.Context, maintenanceURL string, whole bootstrap.Plan) (*pgx.Conn, bool, bool, func(context.Context), error) {
@@ -476,15 +576,26 @@ func verifyBootstrapState(ctx context.Context, conn *pgx.Conn, whole bootstrap.P
 	if err != nil {
 		return errors.New("inspect bootstrap precondition")
 	}
+	inspected, err = New().Normalize(ctx, inspected)
+	if err != nil {
+		return errors.New("normalize bootstrap precondition")
+	}
 	actualByID := map[string]schema.Resource{}
 	for _, resource := range inspected.Graph.Resources {
 		actualByID[resource.ID] = resource
+	}
+	desiredByID := make(map[string]schema.Resource, len(actualByID)+len(expected))
+	for id, resource := range actualByID {
+		desiredByID[id] = resource
+	}
+	for id, resource := range expected {
+		desiredByID[id] = resource
 	}
 	var mismatches []string
 	for id, desired := range expected {
 		actual, exists := actualByID[id]
 		if exists {
-			actual = projectInspectedBootstrapResource(actual, desired, managedIDs)
+			actual = projectInspectedBootstrapResource(actual, desired, managedIDs, actualByID, desiredByID)
 		}
 		desiredFingerprint, _ := schema.ResourceFingerprint(desired)
 		actualFingerprint, _ := schema.ResourceFingerprint(actual)
@@ -509,7 +620,7 @@ func verifyBootstrapState(ctx context.Context, conn *pgx.Conn, whole bootstrap.P
 	var filtered []schema.Resource
 	for _, resource := range inspected.Graph.Resources {
 		if desired, keep := expected[resource.ID]; keep {
-			resource = projectInspectedBootstrapResource(resource, desired, managedIDs)
+			resource = projectInspectedBootstrapResource(resource, desired, managedIDs, actualByID, desiredByID)
 			filtered = append(filtered, resource)
 		}
 	}
@@ -583,13 +694,17 @@ func firstStringDifference(a, b string) int {
 	return limit
 }
 
-func projectInspectedBootstrapResource(actual, desired schema.Resource, desiredIDs map[string]bool) schema.Resource {
+func projectInspectedBootstrapResource(actual, desired schema.Resource, desiredIDs map[string]bool, actualResources, desiredResources map[string]schema.Resource) schema.Resource {
 	// Do not reuse the inspected resource's backing array here. Verification
 	// projects the same snapshot both resource-by-resource and as a complete
 	// document; an in-place filter would corrupt the latter projection's input.
 	dependencies := make([]schema.Dependency, 0, len(actual.Dependencies))
+	desiredDependencies := map[string]bool{}
+	for _, dependency := range desired.Dependencies {
+		desiredDependencies[dependency.Target+"\x00"+string(dependency.Type)] = true
+	}
 	for _, dependency := range actual.Dependencies {
-		if desiredIDs[dependency.Target] {
+		if desiredIDs[dependency.Target] && desiredDependencies[dependency.Target+"\x00"+string(dependency.Type)] {
 			dependencies = append(dependencies, dependency)
 		}
 	}
@@ -623,9 +738,22 @@ func projectInspectedBootstrapResource(actual, desired schema.Resource, desiredI
 				}
 			}
 		}
+		if actual.Kind == schema.KindCheckConstraint && desired.Kind == schema.KindCheckConstraint {
+			_, actualOK := actualSpec["definition"].(string)
+			desiredDefinition, desiredOK := desiredSpec["definition"].(string)
+			if actualOK && desiredOK && bootstrapCheckDefinitionsEquivalent(actual, desired, actualResources, desiredResources) {
+				actualSpec["definition"] = desiredDefinition
+			}
+		}
 		actual.Spec, _ = json.Marshal(actualSpec)
 	}
 	return actual
+}
+
+func bootstrapCheckDefinitionsEquivalent(actual, desired schema.Resource, actualResources, desiredResources map[string]schema.Resource) bool {
+	_, actualDefinition, actualErr := renderConstraintCreate(actual, actualResources)
+	_, desiredDefinition, desiredErr := renderConstraintCreate(desired, desiredResources)
+	return actualErr == nil && desiredErr == nil && actualDefinition == desiredDefinition
 }
 
 func verifyBootstrapPhasePreconditions(ctx context.Context, conn *pgx.Conn, whole bootstrap.Plan, phase bootstrap.BootstrapPhase, steps map[string]bootstrap.BootstrapStep, confirmed map[string]bool) error {

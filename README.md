@@ -13,7 +13,9 @@ the world changes during execution.
 
 ## Capabilities
 
-- **Desired state and safety:** deterministic inspection, semantic diffs,
+- **Author-first desired state and safety:** native PostgreSQL HCL blocks,
+  symbolic references, typed expressions and modules, reviewed rename intent,
+  deterministic inspection, semantic diffs,
   dependency-ordered plans, advanced migration lint, policy checks, approvals,
   simulation, and guarded apply. Findings include evidence, confidence,
   impact, remediation, affected objects, and machine-readable properties.
@@ -102,17 +104,15 @@ AUTOSQL_TEST_POSTGRES_URL='postgres://…' go test ./pkg/postgres -run Integrati
 
 ## Container image
 
-The published CLI image is public at
-`ghcr.io/stigenai/autosql:latest`. It is built with the repository's
+The published CLI image is public at `ghcr.io/stigenai/autosql`. It is built with the repository's
 multi-platform BuildKit builder and includes both `linux/amd64` and
 `linux/arm64` variants. The image is nonroot and contains no credentials:
 
 ```sh
-docker run --rm ghcr.io/stigenai/autosql:latest version --json
+docker run --rm ghcr.io/stigenai/autosql@sha256:0e748a1c8fbc51c2bfbdf00be13bf0484d5c6f6be8b45612550ec211d4cd0905 version --json
 ```
 
-Pin a release or commit tag for deployments instead of `latest`:
-`ghcr.io/stigenai/autosql:bced640`.
+Pin the release index digest shown in the release notes for deployments.
 
 ## CLI
 
@@ -139,9 +139,10 @@ output. See [the CLI contract](docs/cli-contract.md) and
 - [Registry, inventory, backup, drift, and audit](docs/schema-registry-observability.md)
 - [Fleet orchestration](docs/fleet-orchestration.md)
 - [Provider and CI contracts](docs/schema-provider-protocol.md) · [CI changesets](docs/ci-changeset-contract.md)
-- [CI/CD packaging and Kubernetes](docs/ci-cd-integrations.md) · [operator](docs/kubernetes-operator.md)
+- [CI/CD packaging and Kubernetes](docs/ci-cd-integrations.md) · [operator](docs/kubernetes-operator.md) · [operator GitOps artifacts](docs/operator-gitops.md)
 - [ORM, deployment, and developer integrations](docs/integrations.md)
 - [Terraform/OpenTofu provider contract](docs/terraform-provider.md)
+- [Platform integration support and upgrades](docs/platform-integrations.md)
 - [Dynamic and composite sources](docs/dynamic-sources.md)
 - [Declarative HCL authoring](docs/hcl-schema.md)
 - [PostgreSQL default-expression support and safety](docs/postgresql-default-expressions.md)

@@ -1,0 +1,33 @@
+{{- if .Values.admissionPolicy.enabled }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "autosql-operator.fullname" . }}.autosql.io
+  labels:
+    {{- include "autosql-operator.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["autosql.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["autosqlschemas"]
+  validations:
+    - expression: "!has(object.spec.bootstrapAuthorization) || object.spec.bootstrapAuthorization.all(k, k in ['manifestSecretRef', 'publicKeySecretRef', 'issuer', 'signer', 'purpose'])"
+      message: bootstrapAuthorization contains an unknown or credential-bearing field
+    - expression: "!has(object.spec.bootstrapAuthorization) || object.spec.bootstrapAuthorization.manifestSecretRef.all(k, k in ['name', 'key'])"
+      message: manifestSecretRef permits only same-namespace name and key fields
+    - expression: "!has(object.spec.bootstrapAuthorization) || object.spec.bootstrapAuthorization.publicKeySecretRef.all(k, k in ['name', 'key'])"
+      message: publicKeySecretRef permits only same-namespace name and key fields
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "autosql-operator.fullname" . }}.autosql.io
+  labels:
+    {{- include "autosql-operator.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "autosql-operator.fullname" . }}.autosql.io
+  validationActions: [Deny]
+{{- end }}

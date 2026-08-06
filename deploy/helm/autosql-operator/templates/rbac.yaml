@@ -1,0 +1,43 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: {{ ternary "ClusterRole" "Role" .Values.rbac.clusterWide }}
+metadata:
+  name: {{ include "autosql-operator.fullname" . }}
+  {{- if not .Values.rbac.clusterWide }}
+  namespace: {{ default .Release.Namespace .Values.watchNamespace }}
+  {{- end }}
+  labels:
+    {{- include "autosql-operator.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["autosql.io"]
+    resources: ["autosqlschemas"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: ["autosql.io"]
+    resources: ["autosqlschemas/status", "autosqlschemas/finalizers"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: {{ ternary "ClusterRoleBinding" "RoleBinding" .Values.rbac.clusterWide }}
+metadata:
+  name: {{ include "autosql-operator.fullname" . }}
+  {{- if not .Values.rbac.clusterWide }}
+  namespace: {{ default .Release.Namespace .Values.watchNamespace }}
+  {{- end }}
+  labels:
+    {{- include "autosql-operator.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "autosql-operator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: {{ ternary "ClusterRole" "Role" .Values.rbac.clusterWide }}
+  name: {{ include "autosql-operator.fullname" . }}

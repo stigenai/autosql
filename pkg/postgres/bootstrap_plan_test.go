@@ -22,12 +22,125 @@ func TestProjectInspectedBootstrapResourceDoesNotMutateSnapshot(t *testing.T) {
 	}
 	desired := actual
 	desired.Dependencies = actual.Dependencies[:1]
-	projected := projectInspectedBootstrapResource(actual, desired, map[string]bool{"managed": true})
+	projected := projectInspectedBootstrapResource(actual, desired, map[string]bool{"managed": true}, nil, nil)
 	if len(projected.Dependencies) != 1 || projected.Dependencies[0].Target != "managed" {
 		t.Fatalf("projected dependencies=%+v", projected.Dependencies)
 	}
 	if len(actual.Dependencies) != 2 || actual.Dependencies[1].Target != "unmanaged" {
 		t.Fatalf("projection mutated inspected snapshot: %+v", actual.Dependencies)
+	}
+}
+
+func TestProjectInspectedBootstrapCheckConstraintUsesSemanticBinding(t *testing.T) {
+	namespace := renderResource(schema.KindSchema, schema.Name{Name: "global"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "global", Name: "cells", Parent: namespace.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
+	cellType := renderResource(schema.KindEnum, schema.Name{Schema: "global", Name: "cell_type", Parent: namespace.ID}, `{"values":["dedicated","isolated","shared"]}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
+	typeColumn := renderResource(schema.KindColumn, schema.Name{Schema: "global", Name: "type", Parent: table.ID}, `{"type":"global.cell_type","not_null":true,"ordinal":1}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: cellType.ID, Type: schema.DependencyUses})
+	dependencies := []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}, {Target: typeColumn.ID, Type: schema.DependencyReferences}, {Target: cellType.ID, Type: schema.DependencyUses}}
+	desired := renderResource(schema.KindCheckConstraint, schema.Name{Schema: "global", Name: "cells_dedicated_capacity_check", Parent: table.ID}, `{"definition":"CHECK (type = ANY (ARRAY['dedicated'::cell_type, 'isolated'::cell_type]))","columns":["type"],"deferrable":false,"initially_deferred":false,"validated":true}`, dependencies...)
+	actual := desired
+	actual.Spec = []byte(`{"definition":"CHECK (type = ANY (ARRAY['dedicated'::global.cell_type, 'isolated'::global.cell_type]))","columns":["type"],"deferrable":false,"initially_deferred":false,"validated":true}`)
+	actualResources := resourceMapForRender(schema.Document{Graph: schema.Graph{Resources: []schema.Resource{namespace, table, cellType, typeColumn, actual}}})
+	desiredResources := resourceMapForRender(schema.Document{Graph: schema.Graph{Resources: []schema.Resource{namespace, table, cellType, typeColumn, desired}}})
+	managed := map[string]bool{namespace.ID: true, table.ID: true, cellType.ID: true, typeColumn.ID: true, desired.ID: true}
+
+	projected := projectInspectedBootstrapResource(actual, desired, managed, actualResources, desiredResources)
+	if stringValue(spec(projected), "definition") != stringValue(spec(desired), "definition") {
+		t.Fatalf("semantically identical CHECK was not projected to desired spelling: %s", projected.Spec)
+	}
+
+	drifted := actual
+	drifted.Spec = []byte(`{"definition":"CHECK (type = ANY (ARRAY['shared'::global.cell_type]))","columns":["type"],"deferrable":false,"initially_deferred":false,"validated":true}`)
+	actualResources[drifted.ID] = drifted
+	projected = projectInspectedBootstrapResource(drifted, desired, managed, actualResources, desiredResources)
+	if stringValue(spec(projected), "definition") == stringValue(spec(desired), "definition") {
+		t.Fatal("semantically different CHECK constraint was hidden")
+	}
+}
+
+func TestManagedBootstrapAdoptsIntrinsicPublicSchema(t *testing.T) {
+	public := renderResource(schema.KindSchema, schema.Name{Name: "public"}, `{}`)
+	app := renderResource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "public", Name: "widgets", Parent: public.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: public.ID, Type: schema.DependencyContains})
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{public, app, table}}}
+	target := bootstrap.DatabaseTarget{Mode: bootstrap.ManagedDatabase, Endpoint: bootstrap.ServerEndpoint{Host: "db.internal", TLSMode: "verify-full"}, MaintenanceDatabase: "postgres", Name: "app", Owner: "postgres", ConnectionLimit: -1, AllowConnections: true}
+
+	whole, err := PlanDatabaseBootstrap(context.Background(), target, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var publicCreate, appCreate, tableCreate bool
+	for _, step := range whole.SchemaPlan.Steps {
+		publicCreate = publicCreate || strings.Contains(step.SQL, `CREATE SCHEMA "public"`)
+		appCreate = appCreate || strings.Contains(step.SQL, `CREATE SCHEMA "app"`)
+		tableCreate = tableCreate || strings.Contains(step.SQL, `CREATE TABLE "public"."widgets"`)
+	}
+	if publicCreate {
+		t.Fatal("managed bootstrap attempted to recreate PostgreSQL's intrinsic public schema")
+	}
+	if !appCreate || !tableCreate {
+		t.Fatalf("ordinary managed resources were not preserved: app_schema=%t public_table=%t", appCreate, tableCreate)
+	}
+
+	external := target
+	external.Mode = bootstrap.ExternalDatabase
+	externalPlan, err := PlanDatabaseBootstrap(context.Background(), external, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicCreate = false
+	for _, step := range externalPlan.SchemaPlan.Steps {
+		publicCreate = publicCreate || strings.Contains(step.SQL, `CREATE SCHEMA "public"`)
+	}
+	if !publicCreate {
+		t.Fatal("external database planning unexpectedly adopted the public schema")
+	}
+}
+
+func TestManagedBootstrapOrdersEnumBeforeDependentAddedColumn(t *testing.T) {
+	namespace := renderResource(schema.KindSchema, schema.Name{Name: "global"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "global", Name: "cells", Parent: namespace.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
+	statusType := renderResource(schema.KindEnum, schema.Name{Schema: "global", Name: "cell_status", Parent: namespace.ID}, `{"values":["provisioning","active","draining","offline"]}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
+	status := renderResource(schema.KindColumn, schema.Name{Schema: "global", Name: "status", Parent: table.ID}, `{"type":"\"global\".\"cell_status\"","default":"'provisioning'::cell_status","not_null":true,"ordinal":1}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: statusType.ID, Type: schema.DependencyUses})
+	// Keep the desired graph deliberately out of dependency order. Planning must
+	// derive execution topology from edges rather than input serialization.
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{status, table, statusType, namespace}}}
+	target := bootstrap.DatabaseTarget{Mode: bootstrap.ManagedDatabase, Endpoint: bootstrap.ServerEndpoint{Host: "db.internal", TLSMode: "verify-full"}, MaintenanceDatabase: "postgres", Name: "app", Owner: "postgres", ConnectionLimit: -1, AllowConnections: true}
+
+	whole, err := PlanDatabaseBootstrap(context.Background(), target, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	typePosition, columnPosition := -1, -1
+	var typeStepID, columnStepID string
+	for position, step := range whole.SchemaPlan.Steps {
+		switch {
+		case strings.Contains(step.SQL, `CREATE TYPE "global"."cell_status"`):
+			typePosition, typeStepID = position, step.ID
+		case strings.Contains(step.SQL, `ADD COLUMN "status"`):
+			columnPosition, columnStepID = position, step.ID
+			if !strings.Contains(step.SQL, `'provisioning'::global.cell_status`) && !strings.Contains(step.SQL, `'provisioning'::"global"."cell_status"`) {
+				t.Fatalf("column default cast is not bound to the declared enum dependency: %s", step.SQL)
+			}
+		}
+	}
+	if typePosition < 0 || columnPosition < 0 || typePosition >= columnPosition {
+		t.Fatalf("enum type position=%d column position=%d steps=%+v", typePosition, columnPosition, whole.SchemaPlan.Steps)
+	}
+	columnStep := schemaStepByID(whole.SchemaPlan, columnStepID)
+	if !containsBootstrapID(columnStep.DependsOn, typeStepID) {
+		t.Fatalf("column step dependencies=%v missing enum step %s", columnStep.DependsOn, typeStepID)
+	}
+	var typeBootstrapID string
+	for _, step := range whole.Steps {
+		if step.SchemaStepID == typeStepID {
+			typeBootstrapID = step.ID
+		}
+	}
+	for _, step := range whole.Steps {
+		if step.SchemaStepID == columnStepID && (!containsBootstrapID(step.DependsOn, typeBootstrapID) || step.Stage != bootstrap.StageStorage) {
+			t.Fatalf("column bootstrap step=%+v missing type bootstrap dependency=%s", step, typeBootstrapID)
+		}
 	}
 }
 
@@ -138,6 +251,42 @@ func schemaStepByID(schemaPlan plan.Plan, id string) plan.Step {
 		}
 	}
 	return plan.Step{}
+}
+
+func TestManagedBootstrapOrdersEnumBeforeDependentCheckConstraint(t *testing.T) {
+	namespace := renderResource(schema.KindSchema, schema.Name{Name: "global"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "global", Name: "cells", Parent: namespace.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
+	cellType := renderResource(schema.KindEnum, schema.Name{Schema: "global", Name: "cell_type", Parent: namespace.ID}, `{"values":["dedicated","isolated","shared"]}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
+	typeColumn := renderResource(schema.KindColumn, schema.Name{Schema: "global", Name: "type", Parent: table.ID}, `{"type":"global.cell_type","not_null":true,"ordinal":1}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: cellType.ID, Type: schema.DependencyUses})
+	// Simulate inspected HCL produced before CHECK-expression type edges were
+	// modeled. Normalization must derive the exact enum dependency.
+	check := renderResource(schema.KindCheckConstraint, schema.Name{Schema: "global", Name: "cells_dedicated_capacity_check", Parent: table.ID}, `{"definition":"CHECK (type = ANY (ARRAY['dedicated'::cell_type, 'isolated'::cell_type, 'shared'::cell_type]))","columns":["type"],"deferrable":false,"initially_deferred":false,"validated":true}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: typeColumn.ID, Type: schema.DependencyReferences})
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{check, typeColumn, table, cellType, namespace}}}
+	target := bootstrap.DatabaseTarget{Mode: bootstrap.ManagedDatabase, Endpoint: bootstrap.ServerEndpoint{Host: "db.internal", TLSMode: "verify-full"}, MaintenanceDatabase: "postgres", Name: "app", Owner: "postgres", ConnectionLimit: -1, AllowConnections: true}
+
+	whole, err := PlanDatabaseBootstrap(context.Background(), target, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	typePosition, checkPosition := -1, -1
+	var typeStepID, checkStepID string
+	for position, step := range whole.SchemaPlan.Steps {
+		switch {
+		case strings.Contains(step.SQL, `CREATE TYPE "global"."cell_type"`):
+			typePosition, typeStepID = position, step.ID
+		case strings.Contains(step.SQL, `ADD CONSTRAINT`) && strings.Contains(step.SQL, `cells_dedicated_capacity_check`):
+			checkPosition, checkStepID = position, step.ID
+			if !strings.Contains(step.SQL, `'dedicated'::global.cell_type`) {
+				t.Fatalf("constraint enum casts are not schema-bound: %s", step.SQL)
+			}
+		}
+	}
+	if typePosition < 0 || checkPosition < 0 || typePosition >= checkPosition {
+		t.Fatalf("enum type position=%d constraint position=%d", typePosition, checkPosition)
+	}
+	if !containsBootstrapID(schemaStepByID(whole.SchemaPlan, checkStepID).DependsOn, typeStepID) {
+		t.Fatalf("constraint step is missing direct enum dependency: %+v", schemaStepByID(whole.SchemaPlan, checkStepID))
+	}
 }
 
 func containsBootstrapID(values []string, want string) bool {

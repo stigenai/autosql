@@ -224,7 +224,7 @@ func TestCreateHelpersRemainDeterministicForInspectedKinds(t *testing.T) {
 		renderResource(schema.KindPrimaryKey, schema.Name{Schema: "app", Name: "users_pkey", Parent: table.ID}, `{"definition":"PRIMARY KEY (id)"}`),
 		renderResource(schema.KindUniqueConstraint, schema.Name{Schema: "app", Name: "users_id_key", Parent: table.ID}, `{"definition":"UNIQUE (id)"}`),
 		renderResource(schema.KindCheckConstraint, schema.Name{Schema: "app", Name: "users_id_check", Parent: table.ID}, `{"definition":"CHECK (id > 0)"}`),
-		renderResource(schema.KindForeignKey, schema.Name{Schema: "app", Name: "users_parent_fkey", Parent: table.ID}, `{"definition":"FOREIGN KEY (id) REFERENCES app.users(id)"}`),
+		renderResource(schema.KindForeignKey, schema.Name{Schema: "app", Name: "users_parent_fkey", Parent: table.ID}, `{"definition":"FOREIGN KEY (id) REFERENCES app.users(id)"}`, schema.Dependency{Target: table.ID, Type: schema.DependencyReferences}),
 		renderResource(schema.KindIndex, schema.Name{Schema: "app", Name: "users_idx", Parent: table.ID}, `{"definition":"(id)"}`),
 		renderResource(schema.KindView, schema.Name{Schema: "app", Name: "user_view", Parent: s.ID}, `{"definition":"SELECT 1 AS value"}`),
 		renderResource(schema.KindMaterializedView, schema.Name{Schema: "app", Name: "user_mv", Parent: s.ID}, `{"definition":"SELECT 1 AS value"}`),
@@ -520,21 +520,72 @@ func TestColumnOrdinalTransitionsRequirePhysicalProof(t *testing.T) {
 	}
 }
 
-func TestNestedViewDependenciesFailClosed(t *testing.T) {
+func TestNestedViewDependenciesRequireExactCapturedGraph(t *testing.T) {
 	ns := renderResource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
 	a := renderResource(schema.KindTable, schema.Name{Schema: "app", Name: "a", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
 	b := renderResource(schema.KindTable, schema.Name{Schema: "app", Name: "b", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
-	for name, deps := range map[string][]schema.Dependency{
-		"missing nested relation":  {{Target: ns.ID, Type: schema.DependencyContains}, {Target: a.ID, Type: schema.DependencyReferences}},
-		"declared nested relation": {{Target: ns.ID, Type: schema.DependencyContains}, {Target: a.ID, Type: schema.DependencyReferences}, {Target: b.ID, Type: schema.DependencyReferences}},
+	for name, test := range map[string]struct {
+		deps    []schema.Dependency
+		allowed bool
+	}{
+		"missing nested relation":  {deps: []schema.Dependency{{Target: ns.ID, Type: schema.DependencyContains}, {Target: a.ID, Type: schema.DependencyReferences}}},
+		"declared nested relation": {deps: []schema.Dependency{{Target: ns.ID, Type: schema.DependencyContains}, {Target: a.ID, Type: schema.DependencyReferences}, {Target: b.ID, Type: schema.DependencyReferences}}, allowed: true},
 	} {
 		t.Run(name, func(t *testing.T) {
-			view := renderResource(schema.KindView, schema.Name{Schema: "app", Name: "v", Parent: ns.ID}, `{"definition":"SELECT id FROM app.a WHERE EXISTS (SELECT 1 FROM app.b)"}`, deps...)
+			view := renderResource(schema.KindView, schema.Name{Schema: "app", Name: "v", Parent: ns.ID}, `{"definition":"SELECT id FROM app.a WHERE EXISTS (SELECT 1 FROM app.b)"}`, test.deps...)
 			projection := projection(view, "id", "integer")
 			desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, a, b, view, projection}}}
 			changes := schema.ChangeSet{Version: schema.ChangeVersion, Changes: []schema.Change{{ID: "c", Operation: schema.OperationCreate, ResourceID: view.ID, After: &view}}}
-			if out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Desired: desired}); err == nil || len(out) != 0 {
+			out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Desired: desired})
+			if test.allowed && (err != nil || len(out) != 1) {
 				t.Fatalf("out=%+v err=%v", out, err)
+			}
+			if !test.allowed && (err == nil || len(out) != 0) {
+				t.Fatalf("out=%+v err=%v", out, err)
+			}
+		})
+	}
+	cte := renderResource(schema.KindMaterializedView, schema.Name{Schema: "app", Name: "cte_v", Parent: ns.ID}, `{"definition":"WITH source AS (SELECT id FROM app.a) SELECT id FROM source"}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains}, schema.Dependency{Target: a.ID, Type: schema.DependencyReferences})
+	cteProjection := projection(cte, "id", "integer")
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, a, cte, cteProjection}}}
+	changes := schema.ChangeSet{Version: schema.ChangeVersion, Changes: []schema.Change{{ID: "cte", Operation: schema.OperationCreate, ResourceID: cte.ID, After: &cte}}}
+	if out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Desired: desired}); err != nil || len(out) != 1 {
+		t.Fatalf("CTE out=%+v err=%v", out, err)
+	}
+}
+
+func TestMaterializedViewProjectionTypeDependenciesAreExact(t *testing.T) {
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "public"}, `{}`)
+	provider := renderResource(schema.KindEnum, schema.Name{Schema: "public", Name: "provider", Parent: ns.ID}, `{"values":["aws","gcp"]}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	source := renderResource(schema.KindTable, schema.Name{Schema: "public", Name: "blocks", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	sourceProvider := renderResource(schema.KindColumn, schema.Name{Schema: "public", Name: "provider", Parent: source.ID}, `{"type":"provider","not_null":false,"ordinal":1}`, schema.Dependency{Target: source.ID, Type: schema.DependencyContains}, schema.Dependency{Target: provider.ID, Type: schema.DependencyUses})
+	view := renderResource(schema.KindMaterializedView, schema.Name{Schema: "public", Name: "block_health_summary", Parent: ns.ID}, `{"definition":"SELECT provider, count(*)::bigint AS total FROM public.blocks GROUP BY provider"}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains}, schema.Dependency{Target: source.ID, Type: schema.DependencyReferences})
+	projectionProvider := projection(view, "provider", "provider")
+	projectionProvider.Dependencies = append(projectionProvider.Dependencies, schema.Dependency{Target: provider.ID, Type: schema.DependencyUses})
+	total := projection(view, "total", "bigint")
+	total.Spec = json.RawMessage(`{"type":"bigint","not_null":false,"ordinal":2}`)
+	resources := []schema.Resource{ns, provider, source, sourceProvider, view, projectionProvider, total}
+	doc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: resources}}
+	if statements, err := RenderDocument(context.Background(), doc, nil); err != nil || len(statements) == 0 {
+		t.Fatalf("projection type-use statements=%+v err=%v", statements, err)
+	}
+	for name, mutate := range map[string]func(*schema.Resource){
+		"missing type use": func(column *schema.Resource) { column.Dependencies = column.Dependencies[:1] },
+		"duplicate type use": func(column *schema.Resource) {
+			column.Dependencies = append(column.Dependencies, schema.Dependency{Target: provider.ID, Type: schema.DependencyUses})
+		},
+		"reference instead of use": func(column *schema.Resource) {
+			column.Dependencies[1].Type = schema.DependencyReferences
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			bad := projectionProvider
+			bad.Dependencies = append([]schema.Dependency(nil), projectionProvider.Dependencies...)
+			mutate(&bad)
+			badResources := append([]schema.Resource(nil), resources...)
+			badResources[5] = bad
+			if statements, err := RenderDocument(context.Background(), schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: badResources}}, nil); err == nil || len(statements) != 0 {
+				t.Fatalf("statements=%+v err=%v", statements, err)
 			}
 		})
 	}

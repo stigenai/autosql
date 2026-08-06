@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"github.com/jackc/pgx/v5"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -131,6 +132,157 @@ func TestPostgresSimulationConcurrentIsolationAndCleanup(t *testing.T) {
 	var remaining int
 	if e = conn.QueryRow(ctx, `select count(*) from pg_database where left(datname,length($1))=$1`, prefix+"_").Scan(&remaining); e != nil || remaining != 0 {
 		t.Fatalf("prefix=%s remaining=%d err=%v", prefix, remaining, e)
+	}
+}
+
+func TestPostgresSimulationPubliclessBootstrapCreatesManagedPublicSchema(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx := context.Background()
+	empty := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{}}}
+	empty, err := postgres.New().Normalize(ctx, empty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := schema.Name{Name: "public"}
+	public := schema.Resource{ID: schema.StableID(schema.KindSchema, name), Kind: schema.KindSchema, Name: name, Spec: json.RawMessage(`{}`)}
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{public}}}
+	desired, err = postgres.New().Normalize(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := plan.Build(ctx, postgres.New(), empty, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var createsPublic bool
+	for _, step := range p.Steps {
+		createsPublic = createsPublic || strings.Contains(step.SQL, `CREATE SCHEMA "public"`)
+	}
+	if !createsPublic {
+		t.Fatal("bootstrap fixture did not create the public schema")
+	}
+	devIdentity, err := ResolvePostgresIdentity(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix := uniqueSimulationPrefix(t)
+	result, err := Run(ctx, PostgresFactory{NamePrefix: prefix, DropPublicSchema: true}, Request{Config: Config{DevelopmentURL: url, DevelopmentIdentity: devIdentity, ProductionIdentity: "production.example:5432/prod", CleanupTimeout: 15 * time.Second}, From: empty, Plan: p})
+	if err != nil || !result.Verified {
+		t.Fatalf("public-less bootstrap simulation result=%+v err=%v", result, err)
+	}
+	if got := countSimulationDatabases(t, url, prefix); got != 0 {
+		t.Fatalf("simulation cleanup left %d databases", got)
+	}
+}
+
+func TestPostgresWorkspaceLeasesMissingOwnerRoleAcrossConcurrentWorkspaces(t *testing.T) {
+	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx := context.Background()
+	devIdentity, err := ResolvePostgresIdentity(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	role := uniqueSimulationPrefix(t) + "_owner"
+	admin, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close(context.Background())
+	defer func() { _, _ = admin.Exec(context.Background(), "DROP ROLE IF EXISTS "+quote(role)) }()
+	_, _ = admin.Exec(ctx, "DROP ROLE IF EXISTS "+quote(role))
+	config := Config{DevelopmentURL: url, DevelopmentIdentity: devIdentity, ProductionIdentity: "production.example:5432/prod", CleanupTimeout: 15 * time.Second}
+	first, err := (PostgresFactory{NamePrefix: uniqueSimulationPrefix(t), RequiredRoles: []string{role}}).CreateWorkspace(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if first != nil {
+			_ = first.Cleanup(context.Background())
+		}
+	}()
+	second, err := (PostgresFactory{NamePrefix: uniqueSimulationPrefix(t), RequiredRoles: []string{role}}).CreateWorkspace(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var exists, login bool
+	if err = admin.QueryRow(ctx, `select true, rolcanlogin from pg_roles where rolname=$1`, role).Scan(&exists, &login); err != nil || !exists || login {
+		t.Fatalf("leased role exists=%v login=%v err=%v", exists, login, err)
+	}
+	if err = second.Cleanup(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err = admin.QueryRow(ctx, `select exists(select 1 from pg_roles where rolname=$1)`, role).Scan(&exists); err != nil || !exists {
+		t.Fatalf("second workspace removed shared role exists=%v err=%v", exists, err)
+	}
+	if err = first.Cleanup(ctx); err != nil {
+		t.Fatal(err)
+	}
+	first = nil
+	if err = admin.QueryRow(ctx, `select exists(select 1 from pg_roles where rolname=$1)`, role).Scan(&exists); err != nil || exists {
+		t.Fatalf("role cleanup exists=%v err=%v", exists, err)
+	}
+}
+
+func TestPostgresWorkspaceMissingOwnerRoleWorksWithCreateRoleAndCreateDBPrivileges(t *testing.T) {
+	adminURL := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if adminURL == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx := context.Background()
+	admin, err := pgx.Connect(ctx, adminURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close(context.Background())
+	limited := uniqueSimulationPrefix(t) + "_dev"
+	owner := uniqueSimulationPrefix(t) + "_owner"
+	password := "autosql-simulation-limited"
+	defer func() {
+		_, _ = admin.Exec(context.Background(), "DROP ROLE IF EXISTS "+quote(owner))
+		_, _ = admin.Exec(context.Background(), "DROP ROLE IF EXISTS "+quote(limited))
+	}()
+	_, _ = admin.Exec(ctx, "DROP ROLE IF EXISTS "+quote(owner))
+	_, _ = admin.Exec(ctx, "DROP ROLE IF EXISTS "+quote(limited))
+	if _, err = admin.Exec(ctx, "CREATE ROLE "+quote(limited)+" LOGIN PASSWORD "+quoteLiteral(password)+" CREATEDB CREATEROLE"); err != nil {
+		t.Fatal(err)
+	}
+	limitedURL, err := url.Parse(adminURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	limitedURL.User = url.UserPassword(limited, password)
+	developmentURL := limitedURL.String()
+	identity, err := ResolvePostgresIdentity(ctx, developmentURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := (PostgresFactory{NamePrefix: uniqueSimulationPrefix(t), RequiredRoles: []string{owner}}).CreateWorkspace(ctx, Config{DevelopmentURL: developmentURL, DevelopmentIdentity: identity, ProductionIdentity: "production.example:5432/prod", CleanupTimeout: 15 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection, err := pgx.Connect(ctx, workspace.URL())
+	if err != nil {
+		_ = workspace.Cleanup(context.Background())
+		t.Fatal(err)
+	}
+	_, err = connection.Exec(ctx, "CREATE SCHEMA owned AUTHORIZATION "+quote(owner))
+	connection.Close(context.Background())
+	if err != nil {
+		_ = workspace.Cleanup(context.Background())
+		t.Fatal(err)
+	}
+	if err = workspace.Cleanup(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var exists bool
+	if err = admin.QueryRow(ctx, `select exists(select 1 from pg_roles where rolname=$1)`, owner).Scan(&exists); err != nil || exists {
+		t.Fatalf("temporary owner role cleanup exists=%v err=%v", exists, err)
 	}
 }
 func TestPostgresFactoryRejectsProductionIdentityAndRemoteByDefault(t *testing.T) {

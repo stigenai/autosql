@@ -295,9 +295,6 @@ func (a Artifact) VerifyTrusted(policy VerifyPolicy) (VerifiedArtifact, error) {
 	if err != nil || want != a.Digest {
 		return VerifiedArtifact{}, fail("digest", ErrInvalid)
 	}
-	if now.Before(a.CreatedAt) || !now.Before(a.ExpiresAt) {
-		return VerifiedArtifact{}, fail("time", ErrExpired)
-	}
 	expected := policy.Expected
 	if expected.PlanDigest == "" || expected.ChecksDigest == "" || expected.GuardrailDigest == "" || expected.SourceRevision == "" || expected.Environment == "" || expected.DatabaseIdentity == "" || expected.ApprovalIdentity == "" || a.Plan.Digest != expected.PlanDigest || a.Checks.Digest != expected.ChecksDigest || a.GuardrailDigest != expected.GuardrailDigest || a.SourceRevision != expected.SourceRevision || a.TargetEnvironment != expected.Environment || a.DatabaseIdentity != expected.DatabaseIdentity || a.Approval.Identity != expected.ApprovalIdentity {
 		return VerifiedArtifact{}, fail("binding", ErrInvalid)
@@ -339,6 +336,15 @@ func (a Artifact) VerifyTrusted(policy VerifyPolicy) (VerifiedArtifact, error) {
 	sig, e := base64.RawStdEncoding.Strict().DecodeString(a.Signature.Value)
 	if e != nil || !ed25519.Verify(record.PublicKey, []byte(signatureDomain+a.Digest), sig) {
 		return VerifiedArtifact{}, fail("signature", ErrInvalid)
+	}
+	// Freshness is validated last, after every authenticity check (bindings,
+	// signing-key record/status/validity, and signature). An ErrExpired result
+	// therefore proves the artifact is otherwise fully authentic against the
+	// current policy — a revoked key or tampered signature returns ErrInvalid
+	// here, never ErrExpired — so callers may treat a lapsed lifetime, and only a
+	// lapsed lifetime, as non-fatal for an already-applied no-op.
+	if now.Before(a.CreatedAt) || !now.Before(a.ExpiresAt) {
+		return VerifiedArtifact{}, fail("time", ErrExpired)
 	}
 	b, marshalErr := a.MarshalCanonical()
 	if marshalErr != nil {
@@ -503,8 +509,15 @@ func (a Artifact) validateStored() error {
 	}
 	return nil
 }
+
+// maxEncodedArtifactSize bounds parser allocation while leaving room for
+// complete database bootstrap plans. Those plans intentionally carry the SQL,
+// checks, resource specifications, comments, and dependency metadata needed to
+// verify the exact generated artifact before mutation.
+const maxEncodedArtifactSize = 8 << 20
+
 func Parse(data []byte) (Artifact, error) {
-	if len(data) > 4<<20 || !utf8.Valid(data) || jsonDepthAndDuplicates(data) != nil {
+	if len(data) > maxEncodedArtifactSize || !utf8.Valid(data) || jsonDepthAndDuplicates(data) != nil {
 		return Artifact{}, fail("encoding", ErrInvalid)
 	}
 	var a Artifact

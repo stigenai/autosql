@@ -151,6 +151,38 @@ func TestTrustedBindingsAndRecomputedInnerDigestsStillRequireSignature(t *testin
 		t.Fatal("recomputed inner and outer digests bypassed signature")
 	}
 }
+
+// TestExpiredArtifactStillFailsAuthenticityChecks proves the lifetime check runs
+// after every authenticity check: an expired artifact whose signing key is
+// revoked or whose signature is tampered must surface ErrInvalid, never masking
+// the authenticity failure behind ErrExpired. This is the invariant the operator
+// relies on to safely tolerate a lapsed lifetime for an already-applied no-op.
+func TestExpiredArtifactStillFailsAuthenticityChecks(t *testing.T) {
+	a, pub, _ := fixture(t)
+	// Sanity: expired but otherwise authentic still classifies as ErrExpired.
+	if _, e := a.VerifyTrusted(trustedPolicy(a, pub, a.ExpiresAt)); !errors.Is(e, ErrExpired) {
+		t.Fatalf("expired-only should be ErrExpired, got %v", e)
+	}
+	t.Run("expired and revoked key", func(t *testing.T) {
+		p := trustedPolicy(a, pub, a.ExpiresAt)
+		r := p.Keys["key-1"]
+		r.Status = "revoked"
+		p.Keys = map[string]KeyRecord{"key-1": r}
+		_, e := a.VerifyTrusted(p)
+		if e == nil || errors.Is(e, ErrExpired) || !errors.Is(e, ErrInvalid) {
+			t.Fatalf("revoked key hidden behind expiry: %v", e)
+		}
+	})
+	t.Run("expired and tampered signature", func(t *testing.T) {
+		x := cloneArtifact(t, a)
+		x.Signature.Value = "AAAA" // digest() blanks Signature.Value, so x.Digest is unchanged
+		_, e := x.VerifyTrusted(trustedPolicy(x, pub, x.ExpiresAt))
+		if e == nil || errors.Is(e, ErrExpired) || !errors.Is(e, ErrInvalid) {
+			t.Fatalf("tampered signature hidden behind expiry: %v", e)
+		}
+	})
+}
+
 func TestTrustedKeyScopeStatusValidityAndClock(t *testing.T) {
 	a, pub, _ := fixture(t)
 	base := trustedPolicy(a, pub, a.CreatedAt)
@@ -183,7 +215,7 @@ func TestTrustedKeyScopeStatusValidityAndClock(t *testing.T) {
 func TestBoundedCanonicalParsing(t *testing.T) {
 	a, _, _ := fixture(t)
 	b, _ := a.MarshalCanonical()
-	cases := map[string][]byte{"whitespace": append([]byte(" "), b...), "duplicate": []byte(`{"version":"a","version":"b"}`), "utf8": []byte{0xff}, "depth": []byte(strings.Repeat("[", 65) + strings.Repeat("]", 65)), "size": make([]byte, (4<<20)+1)}
+	cases := map[string][]byte{"whitespace": append([]byte(" "), b...), "duplicate": []byte(`{"version":"a","version":"b"}`), "utf8": []byte{0xff}, "depth": []byte(strings.Repeat("[", 65) + strings.Repeat("]", 65)), "size": make([]byte, maxEncodedArtifactSize+1)}
 	for name, data := range cases {
 		t.Run(name, func(t *testing.T) {
 			if _, e := Parse(data); e == nil {

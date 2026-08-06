@@ -5,7 +5,9 @@ package operatorcontroller
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -13,21 +15,46 @@ import (
 	"strings"
 	"time"
 
+	"autosql/pkg/artifact"
 	"autosql/pkg/bootstrap"
 	"autosql/pkg/operator"
+	"autosql/pkg/workloadidentity"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
+	controllercache "sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 var GroupVersionKind = schema.GroupVersionKind{Group: "autosql.io", Version: "v1alpha1", Kind: "AutoSQLSchema"}
+
+var resolveWorkloadIdentityURL = func(ctx context.Context, binding workloadidentity.Binding) (string, time.Time, error) {
+	var source *workloadidentity.Source
+	var err error
+	switch binding.Provider {
+	case workloadidentity.AWSRDS:
+		source, err = workloadidentity.NewAWS(ctx, binding)
+	case workloadidentity.GCPCloud:
+		source, err = workloadidentity.NewGCP(ctx, binding)
+	case workloadidentity.AzurePG:
+		source, err = workloadidentity.NewAzure(binding)
+	default:
+		err = errors.New("unsupported workload identity provider")
+	}
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	return source.ConnectionURL(ctx)
+}
 
 // Controller adapts AutoSQL's deterministic reconciler to an unstructured CRD.
 // Apply is injected so production deployments can use the signed-artifact
@@ -38,17 +65,26 @@ type Controller struct {
 	Store  operator.Store
 	Leader operator.Leader
 	Apply  operator.ApplyFunc
-	Now    func() time.Time
+	// VerifyRelease is a test seam. Production leaves it nil and therefore
+	// always uses the mandatory generated-origin verifier.
+	VerifyRelease func(string) (artifact.VerifiedArtifact, error)
+	Now           func() time.Time
+	Recorder      record.EventRecorder
 }
 
 // Run starts the production controller-runtime manager. ArtifactApply keeps
 // the actual mutation behind AutoSQL's signed-artifact production boundary.
 func Run(ctx context.Context, leaderElection bool) error {
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	options := ctrl.Options{
 		Scheme:           NewScheme(),
 		LeaderElection:   leaderElection,
 		LeaderElectionID: "autosql-operator.autosql.io",
-	})
+	}
+	if namespace := strings.TrimSpace(os.Getenv("AUTOSQL_OPERATOR_WATCH_NAMESPACE")); namespace != "" {
+		options.Cache.DefaultNamespaces = map[string]controllercache.Config{namespace: {}}
+		options.LeaderElectionNamespace = namespace
+	}
+	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), options)
 	if err != nil {
 		return err
 	}
@@ -60,7 +96,7 @@ func Run(ctx context.Context, leaderElection bool) error {
 	if err != nil {
 		return err
 	}
-	c := &Controller{Client: mgr.GetClient(), Reader: mgr.GetAPIReader(), Store: store, Apply: ArtifactApply}
+	c := &Controller{Client: mgr.GetClient(), Reader: mgr.GetAPIReader(), Store: store, Apply: ArtifactApply, Recorder: mgr.GetEventRecorderFor("autosql-operator")}
 	if err := c.SetupWithManager(mgr); err != nil {
 		return err
 	}
@@ -82,8 +118,64 @@ func (c *Controller) SetupWithManager(mgr manager.Manager) error {
 	forObject := &unstructured.Unstructured{}
 	forObject.SetGroupVersionKind(GroupVersionKind)
 	return builder.ControllerManagedBy(mgr).
-		For(forObject).
+		For(forObject, builder.WithPredicates(predicate.Or(predicate.GenerationChangedPredicate{}, predicate.AnnotationChangedPredicate{}))).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(c.requestsForSecret)).
+		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(c.requestsForConfigMap)).
 		Complete(c)
+}
+
+func (c *Controller) requestsForSecret(ctx context.Context, object client.Object) []reconcile.Request {
+	secret, ok := object.(*corev1.Secret)
+	if !ok {
+		return nil
+	}
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(GroupVersionKind.GroupVersion().WithKind("AutoSQLSchemaList"))
+	if err := c.List(ctx, list, client.InNamespace(secret.Namespace)); err != nil {
+		return nil
+	}
+	requests := make([]reconcile.Request, 0)
+	for index := range list.Items {
+		resource, _, err := resourceFromObject(&list.Items[index])
+		if err != nil {
+			continue
+		}
+		refs := []*operator.SecretKeyRef{resource.Spec.DatabaseURL, resource.Spec.MaintenanceDatabaseURL, resource.Spec.Source.SecretRef}
+		if resource.Spec.BootstrapAuthorization != nil {
+			refs = append(refs, &resource.Spec.BootstrapAuthorization.ManifestSecretRef, &resource.Spec.BootstrapAuthorization.PublicKeySecretRef)
+		}
+		for _, ref := range refs {
+			if ref != nil && ref.Name == secret.Name {
+				requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: secret.Namespace, Name: list.Items[index].GetName()}})
+				break
+			}
+		}
+	}
+	return requests
+}
+
+func (c *Controller) requestsForConfigMap(ctx context.Context, object client.Object) []reconcile.Request {
+	configMap, ok := object.(*corev1.ConfigMap)
+	if !ok {
+		return nil
+	}
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(GroupVersionKind.GroupVersion().WithKind("AutoSQLSchemaList"))
+	if err := c.List(ctx, list, client.InNamespace(configMap.Namespace)); err != nil {
+		return nil
+	}
+	requests := make([]reconcile.Request, 0)
+	for index := range list.Items {
+		resource, _, err := resourceFromObject(&list.Items[index])
+		if err != nil {
+			continue
+		}
+		ref := resource.Spec.Source.ConfigMapRef
+		if ref != nil && ref.Name == configMap.Name {
+			requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: configMap.Namespace, Name: list.Items[index].GetName()}})
+		}
+	}
+	return requests
 }
 
 func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
@@ -97,14 +189,50 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	if err != nil {
 		return reconcile.Result{}, c.writeFailure(ctx, obj, err)
 	}
+	r := operator.Reconciler{Store: c.Store, Leader: c.Leader, Apply: c.Apply, Now: c.Now}
+	// Suspension must not resolve Secrets, mint workload credentials, or verify
+	// remote artifacts. It is a control-plane pause with a status-only result.
+	if resource.Spec.Suspend {
+		status, reconcileErr := r.Reconcile(ctx, resource, approved)
+		if updateErr := writeStatus(ctx, c.Client, obj, status); updateErr != nil {
+			return reconcile.Result{}, updateErr
+		}
+		return reconcile.Result{}, reconcileErr
+	}
+	// Authenticate the immutable release before resolving any Kubernetes
+	// runtime reference. The opaque verified token is carried into Apply, so
+	// neither a second file read nor an artifact swap can occur after Secrets
+	// become visible to reconciliation.
+	if resource.Spec.Kind == operator.Declarative && (resource.Spec.DatabaseTarget != nil || resource.Spec.AdoptionPolicy == operator.AdoptIfEquivalent) {
+		verifyRelease := verifyOperatorReleaseBeforeReferences
+		if c.VerifyRelease != nil {
+			verifyRelease = c.VerifyRelease
+		}
+		verified, verifyErr := verifyRelease(resource.Spec.ArtifactDigest)
+		if verifyErr != nil {
+			// A converged resource must not regress to Failed solely because its
+			// already-applied immutable artifact's freshness window lapsed. Release
+			// verification authorizes a *mutating* apply; none is pending once the
+			// applied digest matches the desired artifact at the observed
+			// generation, and the artifact stays authentic (its content digest was
+			// confirmed on load and fully verified at first apply). Only an expired
+			// lifetime is tolerated — every other cause (tamper, revoked key,
+			// changed digest, drift needing a fresh plan) still fails closed.
+			if errors.Is(verifyErr, artifact.ErrExpired) && c.holdsConvergedArtifact(resource, obj) {
+				return c.holdConverged(ctx, obj, resource)
+			}
+			return reconcile.Result{}, c.writeFailure(ctx, obj, verifyErr)
+		}
+		resource.VerifiedReleaseArtifact = verified
+	}
 	if err := c.resolveReferences(ctx, obj.GetNamespace(), &resource); err != nil {
 		return reconcile.Result{}, c.writeFailure(ctx, obj, err)
 	}
-	r := operator.Reconciler{Store: c.Store, Leader: c.Leader, Apply: c.Apply, Now: c.Now}
 	status, err := r.Reconcile(ctx, resource, approved)
 	if updateErr := writeStatus(ctx, c.Client, obj, status); updateErr != nil {
 		return reconcile.Result{}, updateErr
 	}
+	c.recordAuthorizationEvent(obj, status)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
@@ -113,6 +241,17 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	}
 	if status.RetryCount > 0 && status.AppliedDigest == "" {
 		return reconcile.Result{RequeueAfter: time.Second}, nil
+	}
+	if !status.AuthorizationExpiresAt.IsZero() {
+		now := time.Now().UTC()
+		if c.Now != nil {
+			now = c.Now().UTC()
+		}
+		remaining := status.AuthorizationExpiresAt.Sub(now) - 30*time.Second
+		if remaining < time.Second {
+			remaining = time.Second
+		}
+		return reconcile.Result{RequeueAfter: remaining}, nil
 	}
 	return reconcile.Result{}, nil
 }
@@ -125,28 +264,6 @@ func (c *Controller) resolveReferences(ctx context.Context, namespace string, re
 	if resource == nil {
 		return fmt.Errorf("resource is required")
 	}
-	if resource.Spec.DatabaseURL != nil {
-		secret := &corev1.Secret{}
-		if err := c.read(ctx, types.NamespacedName{Namespace: namespace, Name: resource.Spec.DatabaseURL.Name}, secret); err != nil {
-			return fmt.Errorf("database Secret reference unavailable")
-		}
-		value := secret.Data[resource.Spec.DatabaseURL.Key]
-		if len(value) == 0 {
-			return fmt.Errorf("database Secret key unavailable")
-		}
-		resource.ResolvedDatabaseURL = string(value)
-	}
-	if resource.Spec.MaintenanceDatabaseURL != nil {
-		secret := &corev1.Secret{}
-		if err := c.read(ctx, types.NamespacedName{Namespace: namespace, Name: resource.Spec.MaintenanceDatabaseURL.Name}, secret); err != nil {
-			return fmt.Errorf("maintenance database Secret reference unavailable")
-		}
-		value := secret.Data[resource.Spec.MaintenanceDatabaseURL.Key]
-		if len(value) == 0 {
-			return fmt.Errorf("maintenance database Secret key unavailable")
-		}
-		resource.ResolvedMaintenanceDatabaseURL = string(value)
-	}
 	if ref := resource.Spec.Source.SecretRef; ref != nil {
 		secret := &corev1.Secret{}
 		if err := c.read(ctx, types.NamespacedName{Namespace: namespace, Name: ref.Name}, secret); err != nil {
@@ -157,6 +274,7 @@ func (c *Controller) resolveReferences(ctx context.Context, namespace string, re
 			return fmt.Errorf("source Secret key unavailable")
 		}
 		resource.ResolvedSource = string(value)
+		resource.SourceBinding = referenceBinding(secret.ResourceVersion, value)
 	}
 	if ref := resource.Spec.Source.ConfigMapRef; ref != nil {
 		config := &corev1.ConfigMap{}
@@ -168,6 +286,7 @@ func (c *Controller) resolveReferences(ctx context.Context, namespace string, re
 			return fmt.Errorf("source ConfigMap key unavailable")
 		}
 		resource.ResolvedSource = value
+		resource.SourceBinding = referenceBinding(config.ResourceVersion, []byte(value))
 	}
 	if resource.ResolvedSource == "" {
 		switch {
@@ -179,7 +298,79 @@ func (c *Controller) resolveReferences(ctx context.Context, namespace string, re
 			resource.ResolvedSource = resource.Spec.Source.RegistryDigest
 		}
 	}
+	if resource.Spec.Kind == operator.Declarative && (resource.Spec.Source.Inline != "" || resource.Spec.Source.SecretRef != nil || resource.Spec.Source.ConfigMapRef != nil) {
+		if _, err := loadOperatorDeclarativeSource(ctx, resource.ResolvedSource, resource.Spec.Source.Format); err != nil {
+			return err
+		}
+	}
+	if resource.Spec.DatabaseURL != nil {
+		secret := &corev1.Secret{}
+		if err := c.read(ctx, types.NamespacedName{Namespace: namespace, Name: resource.Spec.DatabaseURL.Name}, secret); err != nil {
+			return fmt.Errorf("database Secret reference unavailable")
+		}
+		value := secret.Data[resource.Spec.DatabaseURL.Key]
+		if len(value) == 0 {
+			return fmt.Errorf("database Secret key unavailable")
+		}
+		resource.ResolvedDatabaseURL = string(value)
+		resource.DatabaseBinding = referenceBinding(secret.ResourceVersion, nil)
+	}
+	if resource.Spec.DatabaseIdentity != nil {
+		url, _, err := resolveWorkloadIdentityURL(ctx, *resource.Spec.DatabaseIdentity)
+		if err != nil {
+			return fmt.Errorf("database workload identity unavailable")
+		}
+		resource.ResolvedDatabaseURL = url
+		digest, err := resource.Spec.DatabaseIdentity.Digest()
+		if err != nil {
+			return fmt.Errorf("database workload identity invalid")
+		}
+		resource.DatabaseBinding = operator.RuntimeReferenceBinding{ResourceVersion: digest, ContentDigest: digest}
+	}
+	if resource.Spec.MaintenanceDatabaseURL != nil {
+		secret := &corev1.Secret{}
+		if err := c.read(ctx, types.NamespacedName{Namespace: namespace, Name: resource.Spec.MaintenanceDatabaseURL.Name}, secret); err != nil {
+			return fmt.Errorf("maintenance database Secret reference unavailable")
+		}
+		value := secret.Data[resource.Spec.MaintenanceDatabaseURL.Key]
+		if len(value) == 0 {
+			return fmt.Errorf("maintenance database Secret key unavailable")
+		}
+		resource.ResolvedMaintenanceDatabaseURL = string(value)
+		resource.MaintenanceDatabaseBinding = referenceBinding(secret.ResourceVersion, nil)
+	}
+	if ref := resource.Spec.BootstrapAuthorization; ref != nil {
+		manifest := &corev1.Secret{}
+		if err := c.read(ctx, types.NamespacedName{Namespace: namespace, Name: ref.ManifestSecretRef.Name}, manifest); err != nil {
+			return &operator.AuthorizationError{State: operator.AuthorizationMissing}
+		}
+		manifestValue := manifest.Data[ref.ManifestSecretRef.Key]
+		if len(manifestValue) == 0 {
+			return &operator.AuthorizationError{State: operator.AuthorizationMissing}
+		}
+		publicKey := &corev1.Secret{}
+		if err := c.read(ctx, types.NamespacedName{Namespace: namespace, Name: ref.PublicKeySecretRef.Name}, publicKey); err != nil {
+			return &operator.AuthorizationError{State: operator.AuthorizationMissing}
+		}
+		publicKeyValue := publicKey.Data[ref.PublicKeySecretRef.Key]
+		if len(publicKeyValue) == 0 {
+			return &operator.AuthorizationError{State: operator.AuthorizationMissing}
+		}
+		resource.ResolvedAuthorizationManifest = append([]byte(nil), manifestValue...)
+		resource.ResolvedAuthorizationPublicKey = append([]byte(nil), publicKeyValue...)
+		resource.AuthorizationManifestBinding = referenceBinding(manifest.ResourceVersion, manifestValue)
+		resource.AuthorizationPublicKeyBinding = referenceBinding(publicKey.ResourceVersion, publicKeyValue)
+	}
 	return nil
+}
+
+func referenceBinding(resourceVersion string, content []byte) operator.RuntimeReferenceBinding {
+	binding := operator.RuntimeReferenceBinding{ResourceVersion: resourceVersion}
+	if content != nil {
+		digest := sha256.Sum256(content)
+		binding.ContentDigest = fmt.Sprintf("sha256:%x", digest[:])
+	}
+	return binding
 }
 
 func (c *Controller) read(ctx context.Context, key types.NamespacedName, obj client.Object) error {
@@ -198,7 +389,14 @@ func resourceFromObject(obj *unstructured.Unstructured) (operator.Resource, bool
 	generation, _, _ := unstructured.NestedInt64(spec, "generation")
 	artifactDigest, _, _ := unstructured.NestedString(spec, "artifactDigest")
 	requireApproval, _, _ := unstructured.NestedBool(spec, "requireApproval")
+	suspend, _, _ := unstructured.NestedBool(spec, "suspend")
 	createDatabase, _, _ := unstructured.NestedBool(spec, "createDatabase")
+	postgresVersion, _, _ := unstructured.NestedInt64(spec, "postgresVersion")
+	concurrentIndexes, _, _ := unstructured.NestedBool(spec, "concurrentIndexes")
+	adoptionPolicy, _, adoptionPolicyErr := unstructured.NestedString(spec, "adoptionPolicy")
+	if adoptionPolicyErr != nil {
+		return operator.Resource{}, false, fmt.Errorf("adoptionPolicy must be a string")
+	}
 	sourceMap, _, _ := unstructured.NestedMap(spec, "source")
 	source, err := sourceFromMap(sourceMap)
 	if err != nil {
@@ -208,6 +406,24 @@ func resourceFromObject(obj *unstructured.Unstructured) (operator.Resource, bool
 	databaseURL := &operator.SecretKeyRef{}
 	databaseURL.Name, _, _ = unstructured.NestedString(database, "name")
 	databaseURL.Key, _, _ = unstructured.NestedString(database, "key")
+	if databaseURL.Name == "" && databaseURL.Key == "" {
+		databaseURL = nil
+	}
+	var databaseIdentity *workloadidentity.Binding
+	if value, found, nestedErr := unstructured.NestedMap(spec, "databaseIdentity"); nestedErr != nil {
+		return operator.Resource{}, false, fmt.Errorf("databaseIdentity is invalid")
+	} else if found {
+		raw, marshalErr := json.Marshal(value)
+		if marshalErr != nil {
+			return operator.Resource{}, false, fmt.Errorf("databaseIdentity is invalid")
+		}
+		databaseIdentity = &workloadidentity.Binding{}
+		decoder := json.NewDecoder(strings.NewReader(string(raw)))
+		decoder.DisallowUnknownFields()
+		if decodeErr := decoder.Decode(databaseIdentity); decodeErr != nil {
+			return operator.Resource{}, false, fmt.Errorf("databaseIdentity is invalid")
+		}
+	}
 	maintenanceDatabase, _, _ := unstructured.NestedMap(spec, "maintenanceDatabaseURL")
 	maintenanceDatabaseURL := &operator.SecretKeyRef{}
 	maintenanceDatabaseURL.Name, _, _ = unstructured.NestedString(maintenanceDatabase, "name")
@@ -241,39 +457,138 @@ func resourceFromObject(obj *unstructured.Unstructured) (operator.Resource, bool
 			return operator.Resource{}, false, fmt.Errorf("bootstrapAuthority is invalid")
 		}
 	}
+	var authorization *operator.BootstrapAuthorizationRef
+	if value, found, nestedErr := unstructured.NestedMap(spec, "bootstrapAuthorization"); nestedErr != nil {
+		return operator.Resource{}, false, &operator.AuthorizationError{State: operator.AuthorizationInvalid}
+	} else if found {
+		raw, marshalErr := json.Marshal(value)
+		if marshalErr != nil {
+			return operator.Resource{}, false, &operator.AuthorizationError{State: operator.AuthorizationInvalid}
+		}
+		authorization = &operator.BootstrapAuthorizationRef{}
+		decoder := json.NewDecoder(strings.NewReader(string(raw)))
+		decoder.DisallowUnknownFields()
+		if decodeErr := decoder.Decode(authorization); decodeErr != nil {
+			return operator.Resource{}, false, &operator.AuthorizationError{State: operator.AuthorizationInvalid}
+		}
+	}
 	approved := strings.EqualFold(obj.GetAnnotations()["autosql.io/approved"], "true")
-	return operator.Resource{Name: obj.GetNamespace() + "/" + obj.GetName(), Spec: operator.Spec{
-		Kind: operator.ResourceKind(kind), Generation: generation, Source: source,
-		ArtifactDigest: artifactDigest, DatabaseURL: databaseURL, MaintenanceDatabaseURL: maintenanceDatabaseURL, DatabaseTarget: databaseTarget, BootstrapAuthority: authority, CreateDatabase: createDatabase, RequireApproval: requireApproval,
+	return operator.Resource{Name: obj.GetNamespace() + "/" + obj.GetName(), MetadataGeneration: obj.GetGeneration(), Spec: operator.Spec{
+		Kind: operator.ResourceKind(kind), Generation: generation, Suspend: suspend, Source: source,
+		ArtifactDigest: artifactDigest, DatabaseURL: databaseURL, DatabaseIdentity: databaseIdentity, MaintenanceDatabaseURL: maintenanceDatabaseURL, DatabaseTarget: databaseTarget, BootstrapAuthority: authority, BootstrapAuthorization: authorization, CreateDatabase: createDatabase, AdoptionPolicy: operator.AdoptionPolicy(adoptionPolicy), PostgresVersion: int(postgresVersion), ConcurrentIndexes: concurrentIndexes, RequireApproval: requireApproval,
 	}, Status: statusFromObject(obj)}, approved, nil
 }
 
 func sourceFromMap(m map[string]any) (operator.Source, error) {
 	s := operator.Source{}
-	if value, ok := m["inline"].(string); ok {
-		s.Inline = value
+	allowed := map[string]bool{"format": true, "inline": true, "url": true, "registryDigest": true, "secretRef": true, "configMapRef": true}
+	for key := range m {
+		if !allowed[key] {
+			return operator.Source{}, fmt.Errorf("source contains unknown field %q", key)
+		}
 	}
-	if value, ok := m["url"].(string); ok {
-		s.URL = value
+	for field, destination := range map[string]*string{"format": &s.Format, "inline": &s.Inline, "url": &s.URL, "registryDigest": &s.RegistryDigest} {
+		if raw, present := m[field]; present {
+			value, ok := raw.(string)
+			if !ok {
+				return operator.Source{}, fmt.Errorf("source %s must be a string", field)
+			}
+			*destination = value
+		}
 	}
-	if value, ok := m["registryDigest"].(string); ok {
-		s.RegistryDigest = value
+	if raw, present := m["secretRef"]; present {
+		value, ok := raw.(map[string]any)
+		if !ok {
+			return operator.Source{}, fmt.Errorf("source secretRef must be an object")
+		}
+		name, key, err := validateSourceReferenceFields(value, "source secretRef")
+		if err != nil {
+			return operator.Source{}, err
+		}
+		s.SecretRef = &operator.SecretKeyRef{Name: name, Key: key}
 	}
-	if value, ok := m["secretRef"].(map[string]any); ok {
-		s.SecretRef = &operator.SecretKeyRef{}
-		s.SecretRef.Name, _, _ = unstructured.NestedString(value, "name")
-		s.SecretRef.Key, _, _ = unstructured.NestedString(value, "key")
+	if raw, present := m["configMapRef"]; present {
+		value, ok := raw.(map[string]any)
+		if !ok {
+			return operator.Source{}, fmt.Errorf("source configMapRef must be an object")
+		}
+		name, key, err := validateSourceReferenceFields(value, "source configMapRef")
+		if err != nil {
+			return operator.Source{}, err
+		}
+		s.ConfigMapRef = &operator.ConfigMapKeyRef{Name: name, Key: key}
 	}
-	if value, ok := m["configMapRef"].(map[string]any); ok {
-		s.ConfigMapRef = &operator.ConfigMapKeyRef{}
-		s.ConfigMapRef.Name, _, _ = unstructured.NestedString(value, "name")
-		s.ConfigMapRef.Key, _, _ = unstructured.NestedString(value, "key")
+	variants := 0
+	if s.Inline != "" {
+		variants++
+	}
+	if s.URL != "" {
+		variants++
+	}
+	if s.RegistryDigest != "" {
+		variants++
+	}
+	if s.SecretRef != nil {
+		variants++
+	}
+	if s.ConfigMapRef != nil {
+		variants++
+	}
+	if variants != 1 {
+		return operator.Source{}, fmt.Errorf("exactly one source variant must be set")
+	}
+	if s.Format != "" && s.Format != "sql" && s.Format != "hcl" {
+		return operator.Source{}, fmt.Errorf("source format must be sql or hcl")
+	}
+	if s.Format != "" && s.Inline == "" && s.SecretRef == nil && s.ConfigMapRef == nil {
+		return operator.Source{}, fmt.Errorf("source format applies only to inline, Secret, or ConfigMap content")
+	}
+	if s.SecretRef != nil && (s.SecretRef.Name == "" || s.SecretRef.Key == "") {
+		return operator.Source{}, fmt.Errorf("source secretRef requires name and key")
+	}
+	if s.ConfigMapRef != nil && (s.ConfigMapRef.Name == "" || s.ConfigMapRef.Key == "") {
+		return operator.Source{}, fmt.Errorf("source configMapRef requires name and key")
 	}
 	return s, nil
 }
 
+func validateSourceReferenceFields(value map[string]any, label string) (string, string, error) {
+	for key := range value {
+		if key != "name" && key != "key" {
+			return "", "", fmt.Errorf("%s contains unknown field %q", label, key)
+		}
+	}
+	nameRaw, namePresent := value["name"]
+	keyRaw, keyPresent := value["key"]
+	name, nameOK := nameRaw.(string)
+	key, keyOK := keyRaw.(string)
+	if !namePresent || !nameOK {
+		return "", "", fmt.Errorf("%s name must be a string", label)
+	}
+	if !keyPresent || !keyOK {
+		return "", "", fmt.Errorf("%s key must be a string", label)
+	}
+	return name, key, nil
+}
+
 func statusFromObject(obj *unstructured.Unstructured) operator.Status {
 	status, _, _ := unstructured.NestedMap(obj.Object, "status")
+	conditionValues, _, _ := unstructured.NestedSlice(status, "conditions")
+	conditions := make([]operator.Condition, 0, len(conditionValues))
+	for _, value := range conditionValues {
+		conditionMap, ok := value.(map[string]any)
+		if !ok {
+			continue
+		}
+		typ, _, _ := unstructured.NestedString(conditionMap, "type")
+		conditionStatus, _, _ := unstructured.NestedString(conditionMap, "status")
+		reason, _, _ := unstructured.NestedString(conditionMap, "reason")
+		message, _, _ := unstructured.NestedString(conditionMap, "message")
+		generation, _, _ := unstructured.NestedInt64(conditionMap, "observedGeneration")
+		transition, _, _ := unstructured.NestedString(conditionMap, "lastTransitionTime")
+		at, _ := time.Parse(time.RFC3339Nano, transition)
+		conditions = append(conditions, operator.Condition{Type: operator.ConditionType(typ), Status: conditionStatus, Reason: reason, Message: message, ObservedGeneration: generation, LastTransitionTime: at})
+	}
 	observed, _, _ := unstructured.NestedInt64(status, "observedGeneration")
 	retry, _, _ := unstructured.NestedInt64(status, "retryCount")
 	applied, _, _ := unstructured.NestedString(status, "appliedDigest")
@@ -285,7 +600,10 @@ func statusFromObject(obj *unstructured.Unstructured) operator.Status {
 	pending, _, _ := unstructured.NestedString(status, "pendingStep")
 	guidance, _, _ := unstructured.NestedString(status, "recoveryGuidance")
 	steps, _, _ := unstructured.NestedInt64(status, "appliedSteps")
-	return operator.Status{ObservedGeneration: observed, RetryCount: int(retry), AppliedDigest: applied, PlanDigest: planDigest, TargetIdentity: target, OperationID: operation, RecoveryState: recovery, ExecutionID: execution, PendingStep: pending, RecoveryGuidance: guidance, AppliedSteps: int(steps)}
+	appliedFingerprint, _, _ := unstructured.NestedString(status, "appliedFingerprint")
+	expiresRaw, _, _ := unstructured.NestedString(status, "authorizationExpiresAt")
+	expiresAt, _ := time.Parse(time.RFC3339Nano, expiresRaw)
+	return operator.Status{Conditions: conditions, ObservedGeneration: observed, RetryCount: int(retry), AppliedDigest: applied, PlanDigest: planDigest, TargetIdentity: target, OperationID: operation, RecoveryState: recovery, ExecutionID: execution, PendingStep: pending, RecoveryGuidance: guidance, AppliedSteps: int(steps), AppliedFingerprint: appliedFingerprint, AuthorizationExpiresAt: expiresAt}
 }
 
 func writeStatus(ctx context.Context, cl client.Client, obj *unstructured.Unstructured, status operator.Status) error {
@@ -330,17 +648,116 @@ func writeStatus(ctx context.Context, cl client.Client, obj *unstructured.Unstru
 	if status.AppliedSteps > 0 {
 		value["appliedSteps"] = int64(status.AppliedSteps)
 	}
+	if status.AppliedFingerprint != "" {
+		value["appliedFingerprint"] = status.AppliedFingerprint
+	}
+	if !status.AuthorizationExpiresAt.IsZero() {
+		value["authorizationExpiresAt"] = status.AuthorizationExpiresAt.UTC().Format(time.RFC3339Nano)
+	}
 	obj.Object["status"] = value
 	return cl.Status().Update(ctx, obj)
 }
 
+// effectiveGeneration returns the generation the reconciler records as
+// ObservedGeneration: the Kubernetes metadata generation when present, else the
+// spec generation. It mirrors operator.Reconcile so convergence comparisons use
+// the same value the last successful apply persisted.
+func effectiveGeneration(resource operator.Resource) int64 {
+	if resource.MetadataGeneration > 0 {
+		return resource.MetadataGeneration
+	}
+	return resource.Spec.Generation
+}
+
+// holdsConvergedArtifact reports whether persisted status proves the desired
+// immutable artifact was already applied at the current generation, so no
+// mutating apply is pending. It gates the expired-lifetime tolerance in
+// Reconcile: an authentic artifact whose freshness window lapsed only holds a
+// resource that has already converged on it, never one awaiting a first apply.
+func (c *Controller) holdsConvergedArtifact(resource operator.Resource, obj *unstructured.Unstructured) bool {
+	if resource.Spec.Kind != operator.Declarative || resource.Spec.Suspend || resource.Spec.ArtifactDigest == "" {
+		return false
+	}
+	st := statusFromObject(obj)
+	if st.AppliedDigest != resource.Spec.ArtifactDigest || st.ObservedGeneration != effectiveGeneration(resource) {
+		return false
+	}
+	now := time.Now().UTC()
+	if c.Now != nil {
+		now = c.Now().UTC()
+	}
+	// Mirror operator.Reconcile: an elapsed bootstrap authorization window is a
+	// genuine re-authorization, not a converged hold.
+	return st.AuthorizationExpiresAt.IsZero() || now.Before(st.AuthorizationExpiresAt)
+}
+
+// holdConverged reasserts Ready for a resource that has converged on an
+// authentic artifact whose lifetime lapsed, clearing any prior Failed condition
+// without touching the database. condition() flips every other non-authorization
+// condition to False, so asserting Ready alone resolves the stale failure. It
+// preserves the authorization-boundary requeue the normal reconcile path
+// schedules, so a hold with a future authorization window is re-evaluated just
+// before that window lapses rather than waiting for an unrelated watch/resync.
+func (c *Controller) holdConverged(ctx context.Context, obj *unstructured.Unstructured, resource operator.Resource) (reconcile.Result, error) {
+	now := time.Now().UTC()
+	if c.Now != nil {
+		now = c.Now().UTC()
+	}
+	reason, message := "Applied", "resource is converged"
+	if resource.Spec.AdoptionPolicy == operator.AdoptIfEquivalent {
+		reason, message = "Adopted", "existing database matches desired schema; no SQL executed"
+	}
+	status := operator.UpdateCondition(statusFromObject(obj), operator.Ready, reason, message, effectiveGeneration(resource), now)
+	if updateErr := writeStatus(ctx, c.Client, obj, status); updateErr != nil {
+		return reconcile.Result{}, updateErr
+	}
+	if !status.AuthorizationExpiresAt.IsZero() {
+		remaining := status.AuthorizationExpiresAt.Sub(now) - 30*time.Second
+		if remaining < time.Second {
+			remaining = time.Second
+		}
+		return reconcile.Result{RequeueAfter: remaining}, nil
+	}
+	return reconcile.Result{}, nil
+}
+
 func (c *Controller) writeFailure(ctx context.Context, obj *unstructured.Unstructured, err error) error {
-	status := map[string]any{"conditions": []any{map[string]any{"type": string(operator.Failed), "status": "True", "reason": "Invalid", "message": err.Error(), "observedGeneration": int64(0), "lastTransitionTime": time.Now().UTC().Format(time.RFC3339Nano)}}}
-	obj.Object["status"] = status
-	if updateErr := c.Status().Update(ctx, obj); updateErr != nil {
+	typ, reason, message := operator.Failed, "Invalid", err.Error()
+	generation, _, _ := unstructured.NestedInt64(obj.Object, "spec", "generation")
+	var authorizationErr *operator.AuthorizationError
+	if errors.As(err, &authorizationErr) {
+		typ, reason, message = operator.Authorization, string(authorizationErr.State), authorizationErr.Error()
+	}
+	now := time.Now().UTC()
+	if c.Now != nil {
+		now = c.Now().UTC()
+	}
+	status := operator.UpdateCondition(statusFromObject(obj), typ, reason, message, generation, now)
+	if updateErr := writeStatus(ctx, c.Client, obj, status); updateErr != nil {
 		return updateErr
 	}
+	if typ == operator.Authorization && c.Recorder != nil {
+		c.Recorder.Event(obj, corev1.EventTypeWarning, "BootstrapAuthorization"+reason, message)
+	}
 	return err
+}
+
+func (c *Controller) recordAuthorizationEvent(obj *unstructured.Unstructured, status operator.Status) {
+	if c.Recorder == nil {
+		return
+	}
+	for i := len(status.Conditions) - 1; i >= 0; i-- {
+		condition := status.Conditions[i]
+		if condition.Type != operator.Authorization || condition.Status != "True" {
+			continue
+		}
+		eventType := corev1.EventTypeWarning
+		if condition.Reason == string(operator.AuthorizationAccepted) {
+			eventType = corev1.EventTypeNormal
+		}
+		c.Recorder.Event(obj, eventType, "BootstrapAuthorization"+condition.Reason, condition.Message)
+		return
+	}
 }
 
 // ApprovedAnnotation documents the admission-to-controller approval bridge.

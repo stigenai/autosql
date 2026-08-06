@@ -21,6 +21,11 @@ type VerifiedArtifactApplyService struct {
 	PolicyFor             func(artifact.Artifact) (artifact.VerifyPolicy, error)
 	InstallPolicy         func(string, artifact.VerifyPolicy)
 	Guardrail             guardrail.Guardrail
+	// GuardrailFor returns the guardrail configured for one artifact — in
+	// particular carrying the trusted release manifest's safety suppressions
+	// so the recomputed bundle and the safety re-run match the published
+	// artifact. Nil falls back to Guardrail.
+	GuardrailFor          func(artifact.Artifact) guardrail.Guardrail
 	Input                 func(artifact.Artifact) (guardrail.Input, error)
 	Mutation              func(artifact.VerifiedArtifact) (guardrail.AuthorizedMutation, error)
 	MutationLocked        func(artifact.VerifiedArtifact, executor.Session, executor.Tx) (guardrail.AuthorizedMutation, error)
@@ -90,19 +95,38 @@ func (s VerifiedArtifactApplyService) ApplyVersionedAttempt(ctx context.Context,
 	return out, nil
 }
 
-// VerifyArtifact exposes exactly the same trusted release-manifest policy used
-// by the single-artifact path, without granting a mutation capability.
-func (s VerifiedArtifactApplyService) VerifyArtifact(a artifact.Artifact) (artifact.VerifiedArtifact, error) {
+// verificationPolicy is the single policy construction path for both
+// verification-only callers and mutation. mandatoryNoEdits is supplied by
+// security boundaries (such as the Kubernetes operator), not by production
+// configuration, so a permissive configuration cannot weaken the caller.
+func (s VerifiedArtifactApplyService) verificationPolicy(a artifact.Artifact, mandatoryNoEdits bool) (artifact.VerifyPolicy, error) {
 	p := s.Policy
 	var err error
 	if s.PolicyFor != nil {
 		p, err = s.PolicyFor(a)
 		if err != nil {
-			return artifact.VerifiedArtifact{}, err
+			return artifact.VerifyPolicy{}, err
 		}
 	}
-	if s.NoEdits {
+	if s.NoEdits || mandatoryNoEdits {
 		p.NoEdits = true
+	}
+	return p, nil
+
+}
+
+// VerifyArtifact exposes the configured trusted release-manifest policy
+// without granting a mutation capability.
+func (s VerifiedArtifactApplyService) VerifyArtifact(a artifact.Artifact) (artifact.VerifiedArtifact, error) {
+	return s.VerifyArtifactForApply(a, false)
+}
+
+// VerifyArtifactForApply applies the exact verification policy used by Apply.
+// A true mandatoryNoEdits value cannot be disabled by production config.
+func (s VerifiedArtifactApplyService) VerifyArtifactForApply(a artifact.Artifact, mandatoryNoEdits bool) (artifact.VerifiedArtifact, error) {
+	p, err := s.verificationPolicy(a, mandatoryNoEdits)
+	if err != nil {
+		return artifact.VerifiedArtifact{}, err
 	}
 	return a.VerifyTrusted(p)
 }
@@ -119,17 +143,7 @@ func (s VerifiedArtifactApplyService) Apply(ctx context.Context, request ApplyRe
 	if err != nil {
 		return ApplyResult{Status: "refused"}, err
 	}
-	verifyPolicy := s.Policy
-	if s.PolicyFor != nil {
-		verifyPolicy, err = s.PolicyFor(a)
-		if err != nil {
-			return ApplyResult{Status: "refused"}, err
-		}
-	}
-	if s.NoEdits || request.NoEdits {
-		verifyPolicy.NoEdits = true
-	}
-	v, err := a.VerifyTrusted(verifyPolicy)
+	v, err := s.VerifyArtifactForApply(a, request.NoEdits)
 	if err != nil {
 		return ApplyResult{Status: "refused"}, err
 	}
@@ -148,7 +162,11 @@ func (s VerifiedArtifactApplyService) Apply(ctx context.Context, request ApplyRe
 	if err != nil || in.Precheck.Digest != verifiedPayload.Checks.Digest || in.Precheck.ChangeDigest != artifactChangeDigest || !reflect.DeepEqual(in.Precheck.Statements, verifiedPayload.Checks.Statements) {
 		return ApplyResult{Status: "refused"}, errors.New("artifact guardrail input binding mismatch")
 	}
-	bundleDigest, err := s.Guardrail.BundleDigest(in)
+	effectiveGuardrail := s.Guardrail
+	if s.GuardrailFor != nil {
+		effectiveGuardrail = s.GuardrailFor(a)
+	}
+	bundleDigest, err := effectiveGuardrail.BundleDigest(in)
 	if err != nil || bundleDigest != verifiedPayload.GuardrailDigest || in.Approval.Plan.Digest != verifiedPayload.GuardrailDigest {
 		return ApplyResult{Status: "refused"}, errors.New("artifact guardrail bundle binding mismatch")
 	}
@@ -157,7 +175,7 @@ func (s VerifiedArtifactApplyService) Apply(ctx context.Context, request ApplyRe
 		return ApplyResult{Status: "refused"}, err
 	}
 	in.Mutation = mutation
-	_, err = s.Guardrail.Apply(ctx, in)
+	_, err = effectiveGuardrail.Apply(ctx, in)
 	if err != nil {
 		result := ApplyResult{}
 		if errors.Is(err, executor.ErrPartial) {

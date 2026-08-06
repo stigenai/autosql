@@ -67,13 +67,14 @@ index or privileged server operation as transactional. Runtime URLs and
 credentials are not accepted by the planner and cannot enter the artifact.
 
 The dependency graph, rather than resource array order, controls execution.
-Extension and type dependencies precede signatures and columns; generated
-expression routines precede their consumers; referenced primary/unique keys
-precede foreign keys; mutual foreign keys are added only after both tables
-exist; and grants, memberships, and default privileges form the final access
-handoff. Teardown reverses these edges, revoking access and removing dependent
-objects first. `PlanDatabaseTransition` exposes the same contract for upgrades
-and reviewed teardown plans.
+Extension and type dependencies precede signatures, columns, CHECK
+constraints, and partial-index predicates; generated expression routines
+precede their consumers; referenced primary/unique keys precede foreign keys;
+mutual foreign keys are added only after both tables exist; and grants,
+memberships, and default privileges form the final access handoff. Teardown
+reverses these edges, revoking access and removing dependent objects first.
+`PlanDatabaseTransition` exposes the same contract for upgrades and reviewed
+teardown plans.
 
 ## Resumable execution and repair
 
@@ -87,12 +88,15 @@ secret values.
 Transactional phases commit their DDL and confirmed step records together. An
 injected error rolls both back, and the next invocation resumes at that phase.
 For transaction-prohibited work such as `CREATE INDEX CONCURRENTLY`, the
-executor durably records intent first. An interrupted or ambiguous step stops
-with `ErrBootstrapReconcile`; `DiagnoseDatabaseBootstrapURL` returns the bound
-step ID and repair guidance without SQL. After an operator verifies the live
-postcondition, `ConfirmBootstrapStepURL` records that exact digest-bound step
-and the same plan resumes. A different plan, schema digest, target settings, or
-untracked managed-name collision fails before schema SQL.
+executor durably records intent first. On resume, an absent concurrent index is
+safe to retry, while an exact valid and ready catalog match is safe to confirm;
+the executor performs those two bounded reconciliations automatically. An
+invalid, different, or otherwise ambiguous remnant stops with
+`ErrBootstrapReconcile`; `DiagnoseDatabaseBootstrapURL` returns the bound step
+ID and repair guidance without SQL. After an operator verifies an ambiguous
+live postcondition, `ConfirmBootstrapStepURL` records that exact digest-bound
+step and the same plan resumes. A different plan, schema digest, target
+settings, or untracked managed-name collision fails before schema SQL.
 
 `AbortDatabaseBootstrapURL` is explicit cleanup. A managed target requires the
 caller to authorize database deletion; AutoSQL drops the database and then
@@ -123,6 +127,164 @@ autosql database prepare \
 To plan and execute a complete HCL graph through the resumable executor, place
 the database block and desired resources in one file:
 
+Before authorizing execution, compare every requested extension with the live
+server without changing either the maintenance or target database:
+
+```bash
+autosql database bootstrap preflight \
+  --file complete-bootstrap.hcl \
+  --maintenance-url env://AUTOSQL_MAINTENANCE_DATABASE_URL \
+  --extension-allowlist hstore,pgcrypto \
+  --extension-version hstore=1.8 \
+  --extension-version pgcrypto=1.3 \
+  --extension-schema hstore=app \
+  --extension-schema pgcrypto=app \
+  --json
+```
+
+The versioned structured report classifies every extension as `ready`,
+`missing_package_control_file`, `unavailable_requested_version`,
+`schema_conflicted`, `privilege_blocked`, or `unauthorized`, with exact
+remediation. Text output contains the same status and remediation. Preflight
+reads PostgreSQL's available-version, installed-extension, namespace,
+update-path, and privilege catalogs; it never invokes a package manager or
+installs a PostgreSQL control file. A missing package must be installed on the
+server by its operator before retrying.
+
+PostgreSQL's control metadata is interpreted using the connected server's
+major version. A trusted extension may be installed by a non-superuser that
+has the required database and schema privileges; an untrusted extension that
+declares `superuser` remains privilege-blocked unless the executing role is a
+superuser. AutoSQL's allowlist, exact-version, schema, and untrusted-extension
+authorization are independent gates. Execution repeats this read-only check
+before creating the target database, opening the bootstrap ledger, or applying
+any schema mutation, so a readiness failure leaves no partial bootstrap.
+Authorization is rebound to the exact in-memory plan as authenticated,
+non-serializable capabilities; extension metadata in HCL cannot substitute for
+legacy `allow_untrusted_extensions` authority or a verified signed manifest.
+Signed-manifest authority is scoped to each exact extension resource ID, so an
+untrusted approval for one extension cannot authorize another whose signed
+metadata disagrees with the live control file. The legacy flag remains an
+explicit global authorization, but is bound to one exact plan digest.
+
+Privilege diagnosis follows the operation PostgreSQL will execute. A new
+extension checks database and target-schema CREATE plus trusted/superuser
+rules. An update checks the advertised version path and extension ownership,
+without incorrectly requiring database CREATE. A schema move checks
+relocatability, extension ownership, CREATE on the already-existing destination
+schema, and ownership of relocatable member objects. Trusted packages can
+create bootstrap-superuser-owned members (notably hstore on PostgreSQL 18), so
+an extension owner may still need a superuser for relocation. An exact
+installed no-op requires none of these mutation privileges.
+Ownership includes PostgreSQL role membership (`pg_has_role`), not only an
+exact username match. Preflight checks every known owner-bearing extension
+member class through that effective membership and conservatively blocks a
+relocation if it encounters a member class whose ownership semantics are not
+known. A member may assume the owning role for the resulting ALTER operations.
+
+```bash
+autosql database bootstrap prepare \
+  --file complete-bootstrap.hcl \
+  --json
+```
+
+This credential-free preflight reports every routine source digest and every
+extension allowlist, exact-version, target-schema, dependency, and server
+package requirement in one deterministic inventory. It also identifies every
+additional routine gate required by unsafe languages, privileged operations,
+or procedure transaction control, rather than failing on those gates one at a
+time. Extensions whose control metadata is not trusted carry an explicit
+`untrusted_extension_authorization_required` gate, separate from whether the
+PostgreSQL control file requires superuser. Prepare temporarily satisfies this
+gate only to compute the canonical plan; execution remains fail-closed until
+the operator supplies explicit authorization. The public prepare API returns
+only the inventory: its plan and schema-plan digests plus step/phase counts are
+non-executable review summaries. The synthetically authorized plan is discarded
+internally and cannot be passed to `ExecuteDatabaseBootstrapURL`; execution
+must build a new plan from explicit authority. The inventory is bound to the
+canonical bootstrap plan digest. It omits
+routine definitions by default; use `--include-routine-source` only with
+`--json` or `--hcl` for an explicit, machine-verifiable source-review workflow.
+Use `--hcl` instead of `--json` to produce a canonical, reviewable HCL
+inventory suitable for version control. Emitted definitions are byte-bound to
+their `source_digest`; AutoSQL never applies broad text redaction that would
+silently change reviewed SQL.
+
+After review, sign the complete inventory once with an Ed25519 key. The private
+key is read only from a secret reference and is never written to the manifest:
+
+```bash
+autosql database bootstrap authorize \
+  --file complete-bootstrap.hcl \
+  --authorization-signing-key env://AUTOSQL_BOOTSTRAP_AUTH_PRIVATE_KEY \
+  --authorization-key-id production-dba-2026 \
+  --authorization-issuer security \
+  --authorization-signer dba-reviewers \
+  --authorization-purpose bootstrap-authorization \
+  --valid-for 1h \
+  --output bootstrap-authorization.json
+```
+
+The versioned manifest contains no SQL, routine source, executable plan, or
+credential. It binds the canonical plan, schema-plan, and source digests;
+signer identity and purpose; validity window; every exact routine digest and
+additional routine gate; and every exact extension name, version, schema,
+dependency, trust, and authority constraint. Unknown, missing, extra, stale,
+not-yet-valid, expired, or overbroad entries fail verification.
+
+Supply the manifest and its independently trusted public key to execution:
+
+```bash
+autosql database bootstrap \
+  --file complete-bootstrap.hcl \
+  --maintenance-url env://AUTOSQL_MAINTENANCE_DATABASE_URL \
+  --authorization-manifest bootstrap-authorization.json \
+  --authorization-public-key env://AUTOSQL_BOOTSTRAP_AUTH_PUBLIC_KEY \
+  --authorization-issuer security \
+  --authorization-signer dba-reviewers \
+  --authorization-purpose bootstrap-authorization
+```
+
+Manifest verification and exact source/plan rebinding finish before the
+maintenance URL is resolved and before any mutation. Only
+`PlanDatabaseBootstrapAuthorized` can bridge the opaque verified token into an
+executable plan; it materializes the gates internally and rechecks both plan
+digests, so the token cannot authorize a different target or source graph. An
+unverified or zero-value token cannot produce a plan. The repeatable
+`--reviewed-routine-digest` and `--extension-allowlist` flags remain available
+as a separate compatibility path and cannot be combined with a manifest.
+
+The same policy may be declared directly in database HCL without embedding an
+authorization artifact or signing key in the graph:
+
+```hcl
+database "cell" {
+  # target fields omitted
+  bootstrap_authorization = {
+    manifest   = "file:///run/autosql/bootstrap-authorization.json"
+    public_key = "env://AUTOSQL_BOOTSTRAP_AUTH_PUBLIC_KEY"
+    issuer     = "security"
+    signer     = "dba-reviewers"
+    purpose    = "bootstrap-authorization"
+  }
+}
+```
+
+Only `env://` and `file://` runtime references are accepted. Unknown fields,
+including private signing keys or credentials, are rejected. Explicit CLI
+manifest flags and the HCL block are mutually exclusive, keeping the effective
+policy unambiguous. Both routes use the same canonical manifest parser,
+verifier, and opaque plan-bound authorization token.
+
+Manifest mode is also mutually exclusive with every legacy authorization
+input: `--reviewed-routine-digest`, `--extension-allowlist`,
+`--extension-version`, and `--extension-schema`. AutoSQL determines the
+effective direct-or-HCL manifest mode first and rejects a mixed invocation
+before resolving a maintenance URL, public key, manifest, or database
+credential. The rule is identical for preflight and execution.
+
+After reviewing the inventory, execute the complete graph:
+
 ```bash
 autosql database bootstrap \
   --file complete-bootstrap.hcl \
@@ -150,20 +312,35 @@ closed to new sessions while the bootstrap session remains valid.
 `TestManagedAndExternalDatabaseTargetLifecycle` exercises managed create,
 reconnect, collision handling, external verification, immutable drift, rename,
 allow-connections handoff, and drop on PostgreSQL 14–18.
-`TestCanonicalCompleteBootstrapInventoryManifest` builds the complete supplied
-inventory (including 315 indexes and 197 constraints), then proves byte-stable,
-cycle-free phases, a final access handoff, and 315 non-transactional online
-index steps against a real PostgreSQL database. It then provisions that graph
-into a new database, injects one interruption before every execution phase,
-resumes each checkpoint, and verifies exact final catalog parity. Routine
-postconditions compare PostgreSQL parse fingerprints so harmless catalog
-whitespace reformatting does not weaken the reviewed source-body digest.
-The PostgreSQL 14–18 matrix runs this proof plus real native CLI and Kubernetes
-operator reconciliation paths against disposable newly created databases.
+`TestSemanticCellSignedDirectBootstrapInterruptionResume` provisions the
+sanitized, semantically faithful cell fixture into a new database. It combines
+the DBOS epoch arithmetic default, parameterized types, enum/cast, JSON, array,
+UUID and time defaults, a stored generated column and exact function
+dependency, realistic routines and trigger bodies, exactly 248 comments,
+constraints, indexes, triggers, RLS, extensions, roles, memberships, grants,
+default privileges and ownership. It injects one interruption before every
+execution phase, resumes from the digest-bound ledger, reinspects an exact
+fingerprint, and requires both next-plan and adopt-existing convergence at zero
+changes and zero steps.
+
+The PostgreSQL 14–18 matrix runs that semantic fixture through signed direct,
+native CLI prepare/authorize/bootstrap, and production Kubernetes controller
+paths against disposable new databases. The controller independently verifies
+a generated signed release artifact and the signed bootstrap manifest before
+executing the exact whole-database plan; verification is not replaced by a test
+seam. Routine postconditions compare PostgreSQL parse fingerprints so harmless
+catalog whitespace reformatting does not weaken reviewed body digests.
+
+`TestSyntheticScaleBootstrapInventoryManifest` is a separate generated scale
+fixture. Its exact 1,007 resources, 1,026 execution steps, and 370 phases test
+byte stability, cycle-free scheduling, the final access handoff, 315
+non-transactional online indexes and large dependency fanout. The count-shaped
+fixture is not described as a real cell schema and does not replace the
+semantic proof.
 
 ## Complete-cell scale and lock budgets
 
-The canonical count-bearing cell is guarded by deterministic structural
+The synthetic count-bearing fixture is guarded by deterministic structural
 budgets rather than flaky wall-clock assertions. It may contain at most 1,250
 managed resources, produce at most 4 MiB of HCL and SQL respectively, produce
 an 8 MiB canonical whole-database plan, and schedule at most 2,000 steps in
@@ -172,6 +349,9 @@ fanout is deliberate on the final access-handoff barrier, which must follow
 every construction step. The test
 logs the actual resource, byte, step, phase, dependency, lock, transaction, and
 scan totals, and generates the plan twice to require byte-for-byte equality.
+Signed release artifacts are independently bounded at 8 MiB; the semantic
+controller fixture is approximately 5.4 MiB because it carries executable SQL,
+checks, resource specifications, comments and dependency metadata.
 
 Lock exposure is part of the plan artifact. Each of the 315 standalone indexes
 must be represented as a transaction-prohibited, share-lock, scan-impact step

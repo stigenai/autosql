@@ -23,3 +23,25 @@ git push origin vX.Y.Z
 
 Release notes should describe user-visible features, compatibility or upgrade
 requirements, and the validation completed for the tagged commit.
+
+## Optional native publishers
+
+GitHub Release, the multi-architecture AutoSQL container, and the signed Helm
+OCI chart are the default release path. They require `GHCR_TOKEN`; GitHub
+Release uses the workflow's `GITHUB_TOKEN`.
+
+Other public catalogs are opt-in. Set a repository variable to exactly `true`
+only after its destination and protected secrets are ready:
+
+| Repository variable | Optional publication |
+|---|---|
+| `PUBLISH_TERRAFORM_PROVIDER` | Terraform/OpenTofu provider repository and signed checksums |
+| `PUBLISH_CIRCLECI` | CircleCI orb |
+| `PUBLISH_GITLAB` | GitLab CI/CD Catalog component |
+| `PUBLISH_AZURE_DEVOPS` | Azure DevOps Marketplace extension |
+| `PUBLISH_BITBUCKET` | Bitbucket Pipe repository |
+
+Unset variables and variables set to `false` skip that publisher. An enabled
+publisher remains fail-closed: preflight stops before building or publishing
+when any credential for that target is missing. The required secrets for each
+target are listed in [Native CI/CD integrations](ci-cd-integrations.md#native-publication).

@@ -94,6 +94,126 @@ func TestNormalizeSQLSourceMatchesInspectorManagedShapes(t *testing.T) {
 	}
 }
 
+func TestNormalizeCanonicalizesEquivalentCheckTextArrayCasts(t *testing.T) {
+	namespace := schema.Resource{Kind: schema.KindSchema, Name: schema.Name{Name: "global"}, Spec: json.RawMessage(`{}`)}
+	namespace.ID = schema.StableID(namespace.Kind, namespace.Name)
+	table := schema.Resource{Kind: schema.KindTable, Name: schema.Name{Schema: "global", Name: "clouds", Parent: namespace.ID}, Dependencies: []schema.Dependency{{Target: namespace.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{}`)}
+	table.ID = schema.StableID(table.Kind, table.Name)
+	column := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: "global", Name: "provider", Parent: table.ID}, Dependencies: []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{"type":"character varying","ordinal":1}`)}
+	column.ID = schema.StableID(column.Kind, column.Name)
+	check := schema.Resource{Kind: schema.KindCheckConstraint, Name: schema.Name{Schema: "global", Name: "clouds_provider_check", Parent: table.ID}, Dependencies: []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}, {Target: column.ID, Type: schema.DependencyReferences}}, Spec: json.RawMessage(`{"definition":"CHECK (provider::text = ANY (ARRAY['aws'::character varying::text, 'gcp'::character varying::text, 'azure'::character varying::text]))","columns":["provider"],"deferrable":false,"initially_deferred":false,"validated":true}`)}
+	check.ID = schema.StableID(check.Kind, check.Name)
+	oldDocument := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{namespace, table, column, check}}}
+
+	newDocument := oldDocument
+	newDocument.Graph.Resources = append([]schema.Resource(nil), oldDocument.Graph.Resources...)
+	newDocument.Graph.Resources[3].Spec = json.RawMessage(`{"definition":"CHECK (provider::text = ANY (ARRAY['aws'::character varying, 'gcp'::character varying, 'azure'::character varying]::text[]))","columns":["provider"],"deferrable":false,"initially_deferred":false,"validated":true}`)
+
+	oldNormalized, err := New().Normalize(context.Background(), oldDocument)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newNormalized, err := New().Normalize(context.Background(), newDocument)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldFingerprint, err := schema.SemanticFingerprint(oldNormalized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newFingerprint, err := schema.SemanticFingerprint(newNormalized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldFingerprint != newFingerprint {
+		oldJSON, _ := oldNormalized.MarshalCanonical()
+		newJSON, _ := newNormalized.MarshalCanonical()
+		t.Fatalf("equivalent CHECK casts have different fingerprints\nold: %s\nnew: %s", oldJSON, newJSON)
+	}
+	changes, err := schema.Diff(oldNormalized, newNormalized, schema.DiffOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes.Changes) != 0 {
+		t.Fatalf("equivalent CHECK casts produced changes: %#v", changes.Changes)
+	}
+
+	drifted := newDocument
+	drifted.Graph.Resources = append([]schema.Resource(nil), newDocument.Graph.Resources...)
+	drifted.Graph.Resources[3].Spec = json.RawMessage(`{"definition":"CHECK (provider::text = ANY (ARRAY['aws'::character varying, 'gcp'::character varying, 'other'::character varying]::text[]))","columns":["provider"],"deferrable":false,"initially_deferred":false,"validated":true}`)
+	drifted, err = New().Normalize(context.Background(), drifted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changes, err = schema.Diff(oldNormalized, drifted, schema.DiffOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes.Changes) != 1 || changes.Changes[0].Operation != schema.OperationAlter {
+		t.Fatalf("materially different CHECK was hidden: %#v", changes.Changes)
+	}
+}
+
+func TestNormalizeCanonicalizesEquivalentIndexPredicateTextArrayCasts(t *testing.T) {
+	namespace := schema.Resource{Kind: schema.KindSchema, Name: schema.Name{Name: "public"}, Spec: json.RawMessage(`{}`)}
+	namespace.ID = schema.StableID(namespace.Kind, namespace.Name)
+	table := schema.Resource{Kind: schema.KindTable, Name: schema.Name{Schema: "public", Name: "operation_runs", Parent: namespace.ID}, Dependencies: []schema.Dependency{{Target: namespace.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{}`)}
+	table.ID = schema.StableID(table.Kind, table.Name)
+	column := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: "public", Name: "state", Parent: table.ID}, Dependencies: []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}}, Spec: json.RawMessage(`{"type":"character varying","ordinal":1}`)}
+	column.ID = schema.StableID(column.Kind, column.Name)
+	index := schema.Resource{Kind: schema.KindIndex, Name: schema.Name{Schema: "public", Name: "idx_operation_runs_active", Parent: table.ID}, Dependencies: []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}, {Target: column.ID, Type: schema.DependencyReferences}}, Spec: json.RawMessage(`{"definition":"CREATE INDEX idx_operation_runs_active ON public.operation_runs USING btree (state) WHERE ((state)::text = ANY (ARRAY[('queued'::character varying)::text, ('dispatched'::character varying)::text, ('running'::character varying)::text]))","method":"btree","unique":false,"valid":true,"ready":true,"columns":["state"]}`)}
+	index.ID = schema.StableID(index.Kind, index.Name)
+	oldDocument := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{namespace, table, column, index}}}
+
+	newDocument := oldDocument
+	newDocument.Graph.Resources = append([]schema.Resource(nil), oldDocument.Graph.Resources...)
+	newDocument.Graph.Resources[3].Spec = json.RawMessage(`{"definition":"CREATE INDEX idx_operation_runs_active ON public.operation_runs USING btree (state) WHERE ((state)::text = ANY ((ARRAY['queued'::character varying, 'dispatched'::character varying, 'running'::character varying])::text[]))","method":"btree","unique":false,"valid":true,"ready":true,"columns":["state"]}`)
+
+	oldNormalized, err := New().Normalize(context.Background(), oldDocument)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newNormalized, err := New().Normalize(context.Background(), newDocument)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldFingerprint, err := schema.SemanticFingerprint(oldNormalized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newFingerprint, err := schema.SemanticFingerprint(newNormalized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldFingerprint != newFingerprint {
+		oldJSON, _ := oldNormalized.MarshalCanonical()
+		newJSON, _ := newNormalized.MarshalCanonical()
+		t.Fatalf("equivalent index predicate casts have different fingerprints\nold: %s\nnew: %s", oldJSON, newJSON)
+	}
+	changes, err := schema.Diff(oldNormalized, newNormalized, schema.DiffOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes.Changes) != 0 {
+		t.Fatalf("equivalent index predicate casts produced changes: %#v", changes.Changes)
+	}
+
+	drifted := newDocument
+	drifted.Graph.Resources = append([]schema.Resource(nil), newDocument.Graph.Resources...)
+	drifted.Graph.Resources[3].Spec = json.RawMessage(`{"definition":"CREATE INDEX idx_operation_runs_active ON public.operation_runs USING btree (state) WHERE ((state)::text = ANY ((ARRAY['queued'::character varying, 'dispatched'::character varying, 'failed'::character varying])::text[]))","method":"btree","unique":false,"valid":true,"ready":true,"columns":["state"]}`)
+	drifted, err = New().Normalize(context.Background(), drifted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changes, err = schema.Diff(oldNormalized, drifted, schema.DiffOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes.Changes) != 1 || changes.Changes[0].Operation != schema.OperationAlter {
+		t.Fatalf("materially different index predicate was hidden: %#v", changes.Changes)
+	}
+}
+
 func TestNormalizeAcceptsLegacyColumnPosition(t *testing.T) {
 	schemaResource := schema.Resource{Kind: schema.KindSchema, Name: schema.Name{Name: "app"}, Spec: json.RawMessage(`{}`)}
 	schemaResource.ID = schema.StableID(schemaResource.Kind, schemaResource.Name)
@@ -292,6 +412,9 @@ func TestNormalizeTypesConservatively(t *testing.T) {
 		"bpchar(4)":                      "character(4)",
 		"varbit(8)":                      "bit varying(8)",
 		"pg_catalog.int4[][]":            "integer[]",
+		"pg_catalog.cidr":                "cidr",
+		"PG_CATALOG.INET[]":              "inet[]",
+		"MACADDR":                        "macaddr",
 		`"CaseSensitiveType"`:            `"CaseSensitiveType"`,
 		"App.CustomType":                 "App.CustomType",
 	}
@@ -308,6 +431,8 @@ func TestNormalizeTypesConservatively(t *testing.T) {
 		"gen_random_uuid()":                       "pg_catalog.gen_random_uuid()",
 		"timezone('utc'::text, now())":            "pg_catalog.timezone('utc'::text, CURRENT_TIMESTAMP)",
 		"pg_catalog.timezone('utc'::text, now())": "pg_catalog.timezone('utc'::text, CURRENT_TIMESTAMP)",
+		"(gen_random_uuid())::text":               "pg_catalog.gen_random_uuid()::text",
+		"pg_catalog.gen_random_uuid()::text":      "pg_catalog.gen_random_uuid()::text",
 	}
 	for input, want := range defaults {
 		if got := postgresDefault(input); got != want {

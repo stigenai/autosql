@@ -33,6 +33,11 @@
           "level": "contract",
           "path": "examples/hcl-postgres/example_test.go",
           "command": "go test ./examples/hcl-postgres"
+        },
+        {
+          "level": "example",
+          "path": "examples/hcl-postgres/author-modules/main.hcl",
+          "command": "go test ./examples/hcl-postgres -run AuthorLanguageModule"
         }
       ]
     },
@@ -115,7 +120,11 @@
         "domain.literal_check",
         "sequence.lifecycle",
         "sequence.options",
-        "table.permanent_nonpartitioned",
+        "table.permanent",
+        "table.partitioned.range",
+        "table.partitioned.list",
+        "table.partitioned.hash",
+        "table.partition",
         "table.rls",
         "table.child_columns",
         "column.type_safe_casts",
@@ -135,16 +144,23 @@
         "index.partial",
         "index.include",
         "index.operator_class",
+        "index.network_inet_ops",
         "index.storage_parameters",
         "index.tablespace",
         "function.lifecycle",
         "procedure.lifecycle",
         "procedure.transaction_control_guard",
+        "routine.schema_bound_signature",
+        "routine.fixed_runtime_search_path",
         "trigger.lifecycle",
         "trigger.enablement",
         "trigger.constraint",
         "trigger.transition_tables",
         "trigger.when",
+        "trigger.schema_bound_target",
+        "trigger.schema_bound_function",
+        "view.schema_bound_query",
+        "materialized_view.schema_bound_query",
         "policy.lifecycle",
         "policy.permissive_restrictive",
         "policy.exact_dependencies",
@@ -171,7 +187,13 @@
         "routine.plpgsql",
         "metadata.comment",
         "view.provable_projection",
+        "view.ast_dependency_graph",
+        "view.captured_projection",
+        "view.projection_type_dependencies",
         "materialized_view.provable_projection",
+        "materialized_view.ast_dependency_graph",
+        "materialized_view.captured_projection",
+        "materialized_view.projection_type_dependencies",
         "alter.explicit_rebuild"
       ]
     },
@@ -299,6 +321,8 @@
       "id": "delivery-and-developer-integrations",
       "title": "CI, GitOps, ORM, IDE, deployment, and Terraform integrations",
       "packages": [
+        "cmd/terraform-provider-autosql",
+        "internal/terraformprovider",
         "pkg/ci",
         "pkg/integration",
         "pkg/integrations/deploy",
@@ -306,20 +330,32 @@
         "pkg/integrations/gitops",
         "pkg/integrations/ide",
         "pkg/integrations/orm",
-        "pkg/integrations/terraform"
+        "pkg/integrations/terraform",
+        "pkg/workloadidentity"
       ],
       "docs": [
         "docs/ci-changeset-contract.md",
         "docs/ci-cd-integrations.md",
         "docs/ci-gitops-ecosystem.md",
         "docs/integrations.md",
-        "docs/terraform-provider.md"
+        "docs/terraform-provider.md",
+        "docs/platform-integrations.md"
       ],
       "evidence": [
         {
           "level": "integration",
           "path": "pkg/integration/conformance_integration_test.go",
           "command": "go test ./pkg/ci ./pkg/integration ./pkg/integrations/..."
+        },
+        {
+          "level": "live",
+          "path": "internal/terraformprovider/acceptance_integration_test.go",
+          "command": "AUTOSQL_TF_ACC_PG_URL=env://TEST_DATABASE_URL go test ./internal/terraformprovider -run TestTerraformLifecycleAgainstPostgres"
+        },
+        {
+          "level": "live",
+          "path": "deploy/gitops/tests/live.sh",
+          "command": "deploy/gitops/tests/live.sh autosql-conformance"
         }
       ]
     },

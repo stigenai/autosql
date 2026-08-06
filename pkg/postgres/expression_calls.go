@@ -76,6 +76,111 @@ func immutableBuiltinExpressionFunction(name string) bool {
 	}[name]
 }
 
+func expressionTypeDependencies(root protoreflect.Message, defaultSchema string, resource schema.Resource, resources map[string]schema.Resource) ([]string, error) {
+	seen := map[string]bool{}
+	var dependencyErr error
+	walkPostgresMessages(root, func(message protoreflect.Message) {
+		if dependencyErr != nil {
+			return
+		}
+		cast, ok := message.Interface().(*pg_query.TypeCast)
+		if !ok || cast.GetTypeName() == nil {
+			return
+		}
+		target, matched, err := expressionTypeTarget(cast.GetTypeName(), defaultSchema, resource, resources)
+		if err != nil {
+			dependencyErr = err
+			return
+		}
+		if matched {
+			seen[target.ID] = true
+		}
+	})
+	if dependencyErr != nil {
+		return nil, dependencyErr
+	}
+	expected := make([]string, 0, len(seen))
+	for id := range seen {
+		expected = append(expected, id)
+	}
+	sort.Strings(expected)
+	return expected, nil
+}
+
+func qualifyExpressionTypeCasts(root protoreflect.Message, defaultSchema string, resource schema.Resource, resources map[string]schema.Resource) error {
+	declared := map[string]bool{}
+	for _, dependency := range resource.Dependencies {
+		if dependency.Type == schema.DependencyUses {
+			declared[dependency.Target] = true
+		}
+	}
+	var qualificationErr error
+	walkPostgresMessages(root, func(message protoreflect.Message) {
+		if qualificationErr != nil {
+			return
+		}
+		cast, ok := message.Interface().(*pg_query.TypeCast)
+		if !ok || cast.GetTypeName() == nil {
+			return
+		}
+		target, matched, err := expressionTypeTarget(cast.GetTypeName(), defaultSchema, resource, resources)
+		if err != nil {
+			qualificationErr = err
+			return
+		}
+		if !matched {
+			return
+		}
+		if !declared[target.ID] {
+			qualificationErr = unsupported(resource, "expression type cast is missing its exact uses dependency")
+			return
+		}
+		cast.TypeName.Names = []*pg_query.Node{
+			{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: target.Name.Schema}}},
+			{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: target.Name.Name}}},
+		}
+	})
+	return qualificationErr
+}
+
+func expressionTypeTarget(typeName *pg_query.TypeName, defaultSchema string, resource schema.Resource, resources map[string]schema.Resource) (schema.Resource, bool, error) {
+	parts := make([]string, 0, len(typeName.GetNames()))
+	for _, node := range typeName.GetNames() {
+		value := node.GetString_()
+		if value == nil {
+			return schema.Resource{}, false, unsupported(resource, "expression type cast has a non-identifier target")
+		}
+		parts = append(parts, value.GetSval())
+	}
+	if len(parts) == 0 || len(parts) > 2 {
+		return schema.Resource{}, false, unsupported(resource, "expression type cast target is not canonical")
+	}
+	quoted := make([]string, len(parts))
+	for index, part := range parts {
+		quoted[index] = quote(part)
+	}
+	reference := strings.Join(quoted, ".")
+	for range typeName.GetArrayBounds() {
+		reference += "[]"
+	}
+	var matches []schema.Resource
+	for _, candidate := range resources {
+		if candidate.Kind != schema.KindEnum && candidate.Kind != schema.KindDomain && candidate.Kind != schema.KindComposite {
+			continue
+		}
+		if typeReferenceMatches(reference, defaultSchema, candidate.Name) {
+			matches = append(matches, candidate)
+		}
+	}
+	if len(matches) > 1 {
+		return schema.Resource{}, false, unsupported(resource, "expression type cast dependency is ambiguous")
+	}
+	if len(matches) == 1 {
+		return matches[0], true, nil
+	}
+	return schema.Resource{}, false, nil
+}
+
 func rejectUnsafeExpressionNodes(root protoreflect.Message, resource schema.Resource) error {
 	unsafe := ""
 	var walk func(protoreflect.Message)

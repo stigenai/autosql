@@ -57,6 +57,15 @@ func PreflightBootstrapProvisioning(ctx context.Context, doc schema.Document, op
 	return report, nil
 }
 
+// ValidateBootstrapAuthority validates only the non-secret phase-to-identity
+// contract. Callers using a signed bootstrap authorization manifest validate
+// routine and extension renderability when they materialize the exact
+// manifest-bound plan, rather than weakening those gates with synthetic
+// legacy render options during the earlier authority check.
+func ValidateBootstrapAuthority(doc schema.Document, contract bootstrap.Contract, createDatabase bool) ([]bootstrap.Binding, error) {
+	return contract.Validate(bootstrapRequirements(doc, createDatabase))
+}
+
 func bootstrapRequirements(doc schema.Document, createDatabase bool) []bootstrap.Requirement {
 	required := map[bootstrap.Responsibility]bootstrap.Requirement{}
 	add := func(responsibility bootstrap.Responsibility, capability bootstrap.Capability, reason string) {
@@ -135,7 +144,7 @@ func PreflightProvisioning(ctx context.Context, doc schema.Document, options map
 						add(resource, "unsupported_spec_key", key, "routine field is outside the canonical inspected model", true)
 					}
 				}
-				if _, sourceErr := validateRoutineSource(resource, options); sourceErr != nil {
+				if _, sourceErr := validateRoutineSource(resource, resources, options); sourceErr != nil {
 					add(resource, "routine_source_trust", "definition", "routine source is not parser-proven and bound to explicit review authority", true)
 				}
 			}
@@ -172,6 +181,13 @@ func PreflightProvisioning(ctx context.Context, doc schema.Document, options map
 		}
 		if err := validateSemanticDependencies(resource, resources); err != nil {
 			add(resource, "dependency", "semantics", "declared dependencies do not exactly describe rendered semantics", false)
+		}
+		if resource.Kind == schema.KindColumn && stringValue(values, "generated") == "" {
+			if value := stringValue(values, "default"); value != "" {
+				if err := validateColumnDefault(resource, value, resources); err != nil {
+					add(resource, "unsupported_semantic", "default", "column default is outside the bounded provisioning policy", false)
+				}
+			}
 		}
 		if resource.Kind == schema.KindColumn && stringValue(values, "generated") != "" {
 			if err := validateGeneratedColumnCreate(resource, resources); err != nil {
@@ -211,7 +227,7 @@ func provisioningSpecKeys(kind schema.Kind) map[string]bool {
 		schema.KindDomain:           {"base_type", "default", "not_null", "constraints", "owner"},
 		schema.KindComposite:        {"attributes", "owner"},
 		schema.KindSequence:         {"start", "increment", "min", "max", "cache", "cycle", "owner"},
-		schema.KindTable:            {"partitioned", "persistence", "row_security", "force_row_security", "owner"},
+		schema.KindTable:            {"partitioned", "partition_strategy", "partition_columns", "partition_of", "partition_bound", "persistence", "row_security", "force_row_security", "owner"},
 		schema.KindColumn:           {"type", "default", "not_null", "ordinal", "identity", "generated"},
 		schema.KindPrimaryKey:       {"definition", "deferrable", "initially_deferred", "validated", "columns"},
 		schema.KindUniqueConstraint: {"definition", "deferrable", "initially_deferred", "validated", "columns"},

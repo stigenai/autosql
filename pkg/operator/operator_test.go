@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"autosql/pkg/bootstrap"
 )
@@ -49,6 +51,41 @@ func TestReconcileIsIdempotentAndApprovalGated(t *testing.T) {
 		t.Fatalf("duplicate apply calls=%d err=%v", calls, e)
 	}
 }
+
+func TestSuspendedResourceDoesNotApplyAndResumes(t *testing.T) {
+	s := NewMemoryStore()
+	calls := 0
+	r := Reconciler{Store: s, Apply: func(context.Context, Resource, string) (ApplyResult, error) {
+		calls++
+		return ApplyResult{}, nil
+	}}
+	obj := resource()
+	obj.Spec.RequireApproval = false
+	obj.Spec.Suspend = true
+	st, err := r.Reconcile(context.Background(), obj, true)
+	if err != nil || calls != 0 || len(st.Conditions) == 0 || st.Conditions[len(st.Conditions)-1].Reason != "Suspended" {
+		t.Fatalf("suspended status=%#v calls=%d err=%v", st, calls, err)
+	}
+	obj.Spec.Suspend = false
+	st, err = r.Reconcile(context.Background(), obj, true)
+	if err != nil || calls != 1 || st.Conditions[len(st.Conditions)-1].Reason != "Applied" {
+		t.Fatalf("resumed status=%#v calls=%d err=%v", st, calls, err)
+	}
+}
+
+func TestConditionsRemainUniqueAcrossRetries(t *testing.T) {
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	st := Status{}
+	for i := 0; i < 100; i++ {
+		st = condition(st, Failed, "ApplyFailed", "temporary", 1, now.Add(time.Duration(i)*time.Second))
+	}
+	if len(st.Conditions) != 1 {
+		t.Fatalf("conditions grew across identical retries: %#v", st.Conditions)
+	}
+	if !st.Conditions[0].LastTransitionTime.Equal(now) {
+		t.Fatalf("identical condition changed transition time: %s", st.Conditions[0].LastTransitionTime)
+	}
+}
 func TestRestartUsesPersistentRecord(t *testing.T) {
 	s := NewMemoryStore()
 	calls := 0
@@ -62,17 +99,17 @@ func TestRestartUsesPersistentRecord(t *testing.T) {
 	}
 }
 
-func TestPodReplacementRehydratesFromKubernetesStatus(t *testing.T) {
+func TestPodReplacementReverifiesInsteadOfTrustingKubernetesStatus(t *testing.T) {
 	obj := resource()
-	obj.Status = Status{ObservedGeneration: obj.Spec.Generation, AppliedDigest: obj.Spec.ArtifactDigest, PlanDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", RecoveryState: "none", ExecutionID: "exec-1"}
+	obj.Status = Status{ObservedGeneration: obj.Spec.Generation, AppliedDigest: obj.Spec.ArtifactDigest, PlanDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", RecoveryState: "none", ExecutionID: "exec-1", AppliedFingerprint: "sha256:" + strings.Repeat("f", 64), AuthorizationExpiresAt: time.Now().Add(time.Hour)}
 	calls := 0
 	r := Reconciler{Store: NewMemoryStore(), Apply: func(context.Context, Resource, string) (ApplyResult, error) {
 		calls++
 		return ApplyResult{}, nil
 	}}
 	status, err := r.Reconcile(context.Background(), obj, true)
-	if err != nil || calls != 0 || status.ExecutionID != "exec-1" {
-		t.Fatalf("rehydrated status=%#v calls=%d err=%v", status, calls, err)
+	if err != nil || calls != 1 || status.AppliedFingerprint == "" {
+		t.Fatalf("reverified status=%#v calls=%d err=%v", status, calls, err)
 	}
 }
 
@@ -91,6 +128,122 @@ func TestSourceChangeInvalidatesApplyKey(t *testing.T) {
 	}
 	if calls != 2 {
 		t.Fatalf("source change was treated as idempotent: calls=%d", calls)
+	}
+}
+
+func TestMetadataAndRuntimeReferenceBindingsInvalidateApplyKey(t *testing.T) {
+	store := NewMemoryStore()
+	calls := 0
+	r := Reconciler{Store: store, Apply: func(context.Context, Resource, string) (ApplyResult, error) {
+		calls++
+		return ApplyResult{SourceDigest: "sha256:" + strings.Repeat("a", 64)}, nil
+	}}
+	obj := resource()
+	obj.Spec.RequireApproval = false
+	obj.MetadataGeneration = 1
+	obj.AuthorizationManifestBinding = RuntimeReferenceBinding{ResourceVersion: "1", ContentDigest: "sha256:" + strings.Repeat("b", 64)}
+	if _, err := r.Reconcile(context.Background(), obj, true); err != nil {
+		t.Fatal(err)
+	}
+	obj.AuthorizationManifestBinding.ResourceVersion = "2"
+	obj.AuthorizationManifestBinding.ContentDigest = "sha256:" + strings.Repeat("c", 64)
+	if _, err := r.Reconcile(context.Background(), obj, true); err != nil {
+		t.Fatal(err)
+	}
+	obj.MetadataGeneration = 2
+	if _, err := r.Reconcile(context.Background(), obj, true); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 3 {
+		t.Fatalf("binding changes did not force verification: calls=%d", calls)
+	}
+}
+
+func TestPostgresRenderContractInvalidatesApplyKey(t *testing.T) {
+	obj := resource()
+	base := applyKey(obj)
+	obj.Spec.PostgresVersion = 16
+	if got := applyKey(obj); got == base {
+		t.Fatal("postgresVersion did not invalidate apply key")
+	}
+	versioned := applyKey(obj)
+	obj.Spec.ConcurrentIndexes = true
+	if got := applyKey(obj); got == versioned {
+		t.Fatal("concurrentIndexes did not invalidate apply key")
+	}
+}
+
+func TestAdoptionPolicyIsExplicitFailClosedAndDigestBound(t *testing.T) {
+	obj := resource()
+	obj.Spec.RequireApproval = false
+	obj.Spec.Source = Source{Format: "hcl", Inline: `schema "app" {}`}
+	obj.Spec.AdoptionPolicy = AdoptIfEquivalent
+	base := applyKey(obj)
+	calls := 0
+	reconciler := Reconciler{Store: NewMemoryStore(), Apply: func(_ context.Context, got Resource, _ string) (ApplyResult, error) {
+		calls++
+		if got.Spec.AdoptionPolicy != AdoptIfEquivalent {
+			t.Fatalf("adoption policy lost: %+v", got.Spec)
+		}
+		return ApplyResult{Status: "adopted", PlanDigest: "sha256:" + strings.Repeat("a", 64), SourceDigest: "sha256:" + strings.Repeat("b", 64)}, nil
+	}}
+	status, err := reconciler.Reconcile(context.Background(), obj, true)
+	if err != nil || calls != 1 || status.AppliedSteps != 0 || status.Conditions[len(status.Conditions)-1].Reason != "Adopted" || !strings.Contains(status.Conditions[len(status.Conditions)-1].Message, "no SQL") {
+		t.Fatalf("adoption status=%+v calls=%d err=%v", status, calls, err)
+	}
+	obj.Spec.AdoptionPolicy = ""
+	if applyKey(obj) == base {
+		t.Fatal("adoption policy was omitted from the apply key")
+	}
+}
+
+func TestAdoptionPolicyRejectsUnsafeCombinations(t *testing.T) {
+	valid := resource().Spec
+	valid.RequireApproval = false
+	valid.Source = Source{Format: "hcl", Inline: `schema "app" {}`}
+	valid.AdoptionPolicy = AdoptIfEquivalent
+	for name, mutate := range map[string]func(*Spec){
+		"unknown policy":      func(s *Spec) { s.AdoptionPolicy = "Always" },
+		"versioned migration": func(s *Spec) { s.Kind = Versioned },
+		"unresolved source":   func(s *Spec) { s.Source = Source{URL: "https://schemas.example.test/app.hcl"} },
+		"database creation":   func(s *Spec) { s.CreateDatabase = true },
+		"database target":     func(s *Spec) { s.DatabaseTarget = &bootstrap.DatabaseTarget{} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := valid
+			mutate(&candidate)
+			if err := validate(candidate); err == nil {
+				t.Fatalf("unsafe adoption combination accepted: %+v", candidate)
+			}
+		})
+	}
+	if err := validate(valid); err != nil {
+		t.Fatalf("valid adoption rejected: %v", err)
+	}
+}
+
+func TestAuthorizationExpiryForcesReverification(t *testing.T) {
+	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+	calls := 0
+	r := Reconciler{Store: NewMemoryStore(), Now: func() time.Time { return now }, Apply: func(context.Context, Resource, string) (ApplyResult, error) {
+		calls++
+		return ApplyResult{AuthorizationState: AuthorizationAccepted, AuthorizationExpiresAt: now.Add(time.Minute)}, nil
+	}}
+	obj := resource()
+	obj.Spec.RequireApproval = false
+	if _, err := r.Reconcile(context.Background(), obj, true); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(30 * time.Second)
+	if _, err := r.Reconcile(context.Background(), obj, true); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(31 * time.Second)
+	if _, err := r.Reconcile(context.Background(), obj, true); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("expired authorization was not reverified: calls=%d", calls)
 	}
 }
 
@@ -116,6 +269,26 @@ func TestApplyFailureIsRetryable(t *testing.T) {
 	status, err := r.Reconcile(context.Background(), obj, true)
 	if err != nil || status.Conditions[len(status.Conditions)-1].Type != Ready || calls != 2 {
 		t.Fatalf("retry status=%#v calls=%d err=%v", status, calls, err)
+	}
+}
+
+func TestAcceptedBootstrapAuthorizationRemainsVisibleWhenApplyFails(t *testing.T) {
+	obj := resource()
+	obj.Spec.RequireApproval = false
+	r := Reconciler{Store: NewMemoryStore(), Apply: func(context.Context, Resource, string) (ApplyResult, error) {
+		return ApplyResult{AuthorizationState: AuthorizationAccepted}, errors.New("database unavailable")
+	}}
+	status, err := r.Reconcile(context.Background(), obj, true)
+	if err == nil {
+		t.Fatal("apply failure was ignored")
+	}
+	accepted, applyFailed := false, false
+	for _, condition := range status.Conditions {
+		accepted = accepted || (condition.Type == Authorization && condition.Status == "True" && condition.Reason == string(AuthorizationAccepted))
+		applyFailed = applyFailed || (condition.Type == Failed && condition.Status == "True")
+	}
+	if !accepted || !applyFailed {
+		t.Fatalf("accepted authorization and apply failure were not independently reported: %#v", status.Conditions)
 	}
 }
 

@@ -1,14 +1,15 @@
 version: 2.1
-jobs:
-  autosql-review:
-    docker:
-      - image: ghcr.io/example/autosql-ci@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-    steps:
-      - checkout
-      - run: autosql verify --contract-ref env://AUTOSQL_CONTRACT --mode review
-  autosql-deploy:
-    docker:
-      - image: ghcr.io/example/autosql-ci@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-    steps:
-      - checkout
-      - run: autosql verify --contract-ref env://AUTOSQL_CONTRACT --mode deploy --oidc
+orbs:
+  autosql: stigenai/autosql@0.1.0
+workflows:
+  database:
+    jobs:
+      - autosql/review:
+          contract: .autosql/review-contract.json
+          contract-digest: ${AUTOSQL_REVIEW_CONTRACT_DIGEST}
+      - autosql/deploy:
+          context: autosql-production
+          contract: .autosql/deploy-contract.json
+          contract-digest: ${AUTOSQL_DEPLOY_CONTRACT_DIGEST}
+          requires: [autosql/review]
+          filters: {branches: {only: main}}

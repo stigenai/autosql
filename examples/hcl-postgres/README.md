@@ -8,7 +8,7 @@ checks the result against a real PostgreSQL database:
 2. Compute the semantic diff from v1 to v2.
 3. Build a dependency-aware PostgreSQL plan for two additive columns.
 4. Create v1 in a disposable PostgreSQL database.
-5. Inspect the live database and render its canonical schema back to HCL.
+5. Inspect the live database and render its author or canonical schema back to HCL.
 6. Load the generated HCL again to prove deterministic round-tripping.
 7. Apply the v2 SQL expansion and verify that desired and live identities
    converge.
@@ -50,7 +50,8 @@ Example completed successfully.
 
 The count-bearing bootstrap demo generates one monolithic
 `complete-bootstrap.hcl` containing a non-secret managed-database target and
-more than 1,004 canonical resources. It includes 315 indexes, 197 constraints, 47
+1,007 resources in author HCL with per-resource canonical fallback only when
+needed. It includes 315 indexes, 197 constraints, 47
 routines, six triggers, 14 policies on seven RLS tables, two extensions, a
 composite type, roles,
 memberships, grants, default privileges, and comments. The runner loads the HCL
@@ -68,6 +69,20 @@ creates and removes a uniquely named target and its disposable roles. With
 `AUTOSQL_KEEP_WORKDIR=1`, it retains the exact generated HCL for inspection;
 otherwise the artifact is removed after successful verification. CI runs this
 same proof on PostgreSQL 14–18.
+
+Before running a retained `complete-bootstrap.hcl` outside the disposable demo,
+use `autosql database bootstrap prepare --json` to review its complete
+authorization inventory, then `autosql database bootstrap authorize` to create
+one signed, expiring manifest. Execution accepts that manifest with an
+independently supplied Ed25519 public key; the artifact binds the exact source
+and plan while containing no SQL, routine source, executable steps, or
+credentials. See [PostgreSQL database bootstrap](../../docs/postgresql-database-bootstrap.md)
+for the full commands and key policy.
+
+`database-bootstrap.hcl` also demonstrates the execution-side
+`bootstrap_authorization` block. It contains only `env://`/`file://` runtime
+references plus issuer, signer, and purpose; it cannot carry a private key or
+resolved credential. Remove or replace the example paths before execution.
 
 ## HCL model
 
@@ -87,11 +102,19 @@ table "accounts" {
 }
 ```
 
-Nested resources gain containment dependencies automatically. AutoSQL also
-supports a lossless `resource "kind" "name"` form; `schema inspect --format
-hcl` emits that deterministic form so every supported canonical resource,
-including PostgreSQL-specific constraints, can round-trip without information
-loss.
+Nested resources gain containment dependencies automatically. Symbolic
+references such as `schema.hcl_demo`, `table["hcl_demo"]["accounts"]`, and
+`column.email` replace copied stable IDs. `schema inspect --format hcl
+--hcl-style author` emits native blocks, comments, and heredocs;
+`--hcl-style canonical` emits the lossless `resource "kind" "name"` form.
+Author output falls back per resource when extension fields have no native
+representation, so mixed output remains lossless.
+
+[`author-modules/main.hcl`](author-modules/main.hcl) is the executable language
+example for typed variables, validation, locals, deterministic `for_each`,
+isolated module inputs, typed outputs, and cross-file symbolic references.
+[`rename-intent.hcl`](rename-intent.hcl) demonstrates `renamed_from` and
+`moved` blocks; plans bind the normalized rename-hint digest.
 
 ## Comprehensive PostgreSQL catalog
 
@@ -101,21 +124,18 @@ checks its resource kinds against `postgres.New().Info().Capabilities`, so a
 new PostgreSQL capability added to AutoSQL makes the example test fail until
 the catalog is expanded.
 
-[`friendly-advanced.hcl`](friendly-advanced.hcl) expresses the commonly
-hand-authored subset without escaped JSON or copied stable IDs. For example:
+[`friendly-advanced.hcl`](friendly-advanced.hcl) demonstrates the compatibility
+helpers used by older or generated HCL. New hand-authored schemas should prefer
+native blocks such as:
 
 ```hcl
-resource "foreign_key" "accounts_organization_fkey" {
-  schema    = "friendly"
-  parent    = table_id("friendly", "accounts")
-  spec_json = jsonencode({
-    definition = "FOREIGN KEY (organization_id) REFERENCES friendly.organizations(id)"
-  })
-  deps_json = jsonencode([
-    contains(table_id("friendly", "accounts")),
-    references(column_id("friendly", "accounts", "organization_id")),
-    references(column_id("friendly", "organizations", "id")),
-  ])
+table "accounts" {
+  schema = schema.friendly
+  column "organization_id" { type = "bigint" }
+  foreign_key "accounts_organization_fkey" {
+    columns     = [column.organization_id]
+    ref_columns = [table.organizations.column.id]
+  }
 }
 ```
 
@@ -133,14 +153,24 @@ separate render policy (`extension_allowlist`, exact `extension_version.<name>`,
 and optional `extension_schemas.<name>`), so an HCL declaration cannot approve
 its own privileged supply-chain input.
 
+[`extension-readiness.hcl`](extension-readiness.hcl) is a non-secret, complete
+preflight example. Run `autosql database bootstrap preflight` with an extension
+allowlist plus repeatable `--extension-version` and `--extension-schema` flags
+to get deterministic text or JSON readiness for each requested package. The
+report separates authorization failures from missing server control files,
+unavailable versions, fixed-schema conflicts, and insufficient database or
+schema privilege; the command performs no bootstrap mutation.
+
 [`database-bootstrap.hcl`](database-bootstrap.hcl) declares the separate
 server/maintenance-database/target-database contract used by
 `autosql database prepare`. It contains no connection URL or credential.
 
 [`defaults.hcl`](defaults.hcl) is the executable default-expression reference.
-It provisions scalar and cast literals, JSONB, UUIDs, the generated-function
-allowlist, enum and domain defaults, one-dimensional arrays, temporal and
-interval forms, and an exactly qualified sequence-backed `nextval`. The
+It provisions scalar and cast literals, JSONB, UUIDs, CIDR/INET/MACADDR network
+values, bounded arithmetic
+(including the DBOS `extract(epoch from ...) * 1000` default), the
+generated-function allowlist, enum and domain defaults, one-dimensional arrays,
+temporal and interval forms, and an exactly qualified sequence-backed `nextval`. The
 automated example test builds a clean-database plan and checks that sequence
 creation precedes the dependent column. The complete grammar and its explicit
 rejection boundaries are documented in
@@ -190,5 +220,5 @@ autosql plan \
   --from hcl:examples/hcl-postgres/schema-v1.hcl \
   --to hcl:examples/hcl-postgres/schema-v2.hcl --json
 autosql schema inspect --url env://AUTOSQL_DATABASE_URL \
-  --schema hcl_demo --format hcl
+  --schema hcl_demo --format hcl --hcl-style author
 ```

@@ -2,6 +2,7 @@ package hclpostgres_test
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
@@ -67,6 +68,31 @@ func TestAdvancedHCLCoversEveryPostgresCapability(t *testing.T) {
 	}
 }
 
+func TestAdvancedCatalogAuthorFormatIsStableAndLossless(t *testing.T) {
+	doc := loadHCL(t, context.Background(), "advanced.hcl")
+	formatted, err := source.FormatAuthorHCL(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(formatted), `table "accounts"`) || !strings.Contains(string(formatted), `resource "`) {
+		t.Fatalf("advanced author output did not retain native blocks plus canonical fallback")
+	}
+	back, err := source.ParseHCL("advanced-author.hcl", formatted, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changes, diffErr := schema.Diff(doc, back, schema.DiffOptions{}); diffErr != nil || len(changes.Changes) != 0 {
+		t.Fatalf("advanced author round trip changes=%+v err=%v", changes.Changes, diffErr)
+	}
+	again, err := source.FormatAuthorHCL(back)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(formatted) != string(again) {
+		t.Fatal("advanced author formatting is not stable")
+	}
+}
+
 func TestFriendlyAdvancedHCLUsesHelpersWithoutEscapedJSONOrLiteralIDs(t *testing.T) {
 	doc := loadHCL(t, context.Background(), "friendly-advanced.hcl")
 	want := map[schema.Kind]bool{
@@ -80,6 +106,41 @@ func TestFriendlyAdvancedHCLUsesHelpersWithoutEscapedJSONOrLiteralIDs(t *testing
 	}
 	if len(want) != 0 {
 		t.Fatalf("friendly helper example is missing kinds: %+v", want)
+	}
+}
+
+func TestAuthorLanguageModuleAndRenameExamples(t *testing.T) {
+	ctx := context.Background()
+	loader := source.HCLLoader{}
+	doc, err := loader.Load(ctx, "author-modules/main.hcl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantTables := map[string]bool{"accounts": true, "audit_log": true, "queue_east": true, "queue_west": true}
+	for _, resource := range doc.Graph.Resources {
+		if resource.Kind == schema.KindTable {
+			delete(wantTables, resource.Name.Name)
+		}
+	}
+	if len(wantTables) != 0 {
+		t.Fatalf("author module example is missing tables: %v", wantTables)
+	}
+	formatted, err := source.FormatAuthorHCL(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	back, err := source.ParseHCL("author-modules-formatted.hcl", formatted, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changes, err := schema.Diff(doc, back, schema.DiffOptions{}); err != nil || len(changes.Changes) != 0 {
+		t.Fatalf("author module format round trip changes=%+v err=%v", changes.Changes, err)
+	}
+
+	rename := loadHCL(t, ctx, "rename-intent.hcl")
+	hints, err := schema.DocumentRenameHints(rename)
+	if err != nil || len(hints) != 2 {
+		t.Fatalf("rename example hints=%+v err=%v", hints, err)
 	}
 }
 
@@ -103,6 +164,30 @@ func TestDatabaseBootstrapHCLUsesSeparateNonSecretTargetContract(t *testing.T) {
 	}
 	if strings.Contains(string(databases[0].Spec), "password") || strings.Contains(string(databases[0].Spec), "postgres://") {
 		t.Fatal("database HCL contains a credential or resolved URL")
+	}
+}
+
+func TestExtensionReadinessHCLHasOneTargetAndExactExtensionRequests(t *testing.T) {
+	doc := loadHCL(t, context.Background(), "extension-readiness.hcl")
+	var databases int
+	versions := map[string]string{}
+	for _, resource := range doc.Graph.Resources {
+		switch resource.Kind {
+		case schema.KindDatabase:
+			databases++
+		case schema.KindExtension:
+			var spec struct {
+				Version string `json:"version"`
+			}
+			err := json.Unmarshal(resource.Spec, &spec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			versions[resource.Name.Name] = spec.Version
+		}
+	}
+	if databases != 1 || versions["hstore"] != "1.8" || versions["pgcrypto"] != "1.3" {
+		t.Fatalf("databases=%d extensions=%v", databases, versions)
 	}
 }
 
@@ -145,12 +230,17 @@ func TestDocumentedDefaultExpressionHCLBuildsFreshPlan(t *testing.T) {
 		`DEFAULT 0.00`,
 		`DEFAULT '{}'::jsonb`,
 		`DEFAULT '550e8400-e29b-41d4-a716-446655440000'::uuid`,
+		`DEFAULT '10.0.0.0/8'::cidr`,
+		`DEFAULT '192.0.2.1/24'::inet`,
+		`DEFAULT '08:00:2b:01:02:03'::macaddr`,
 		`DEFAULT pg_catalog.gen_random_uuid()`,
+		`DEFAULT pg_catalog.gen_random_uuid()::text`,
 		`DEFAULT 'pending'::defaults_demo.job_status`,
 		`DEFAULT '{}'::text[]`,
 		`DEFAULT CURRENT_DATE`,
 		`DEFAULT CURRENT_TIMESTAMP`,
 		`DEFAULT pg_catalog.timezone('utc'::text, CURRENT_TIMESTAMP)`,
+		`DEFAULT (extract(epoch from CURRENT_TIMESTAMP) OPERATOR(pg_catalog.*) 1000)::bigint`,
 	} {
 		if !strings.Contains(sql.String(), want) {
 			t.Errorf("documented plan is missing %q", want)

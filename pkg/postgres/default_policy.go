@@ -2,7 +2,11 @@ package postgres
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"math"
+	"net"
+	"net/netip"
 	"regexp"
 	"strconv"
 	"strings"
@@ -22,6 +26,9 @@ func coreDefaultAllowed(typ coreColumnType, expr defaultExpression, source strin
 	if typ.array {
 		return coreArrayDefaultAllowed(typ, expr)
 	}
+	if expr.Kind == defaultExpressionOperator {
+		return coreOperatorDefaultAllowed(typ, expr, source)
+	}
 	if expr.Kind == defaultExpressionFunction {
 		return coreFunctionDefaultAllowed(typ, expr.Function, source)
 	}
@@ -30,10 +37,68 @@ func coreDefaultAllowed(typ coreColumnType, expr defaultExpression, source strin
 		if !ok || castType.array || !coreTypesCompatible(typ, castType) {
 			return false
 		}
+		if expr.Cast.Expression.Kind == defaultExpressionFunction {
+			return genRandomUUIDTextCastAllowed(typ, castType, expr.Cast.Expression.Function, source)
+		}
+		if containsDefaultOperator(expr.Cast.Expression) {
+			return coreOperatorDefaultAllowed(typ, expr, source)
+		}
 		literal, ok := coreCastLiteralExpression(castType, expr.Cast.Expression)
 		return ok && coreScalarLiteralAllowed(castType, literal) && coreScalarLiteralAllowed(typ, literal)
 	}
 	return coreScalarLiteralAllowed(typ, expr) && coreLiteralSourceCanonical(typ, expr, source)
+}
+
+func genRandomUUIDTextCastAllowed(column, cast coreColumnType, function *defaultFunction, source string) bool {
+	return column.base == "text" && !column.array && cast.base == "text" && !cast.array &&
+		isGenRandomUUIDFunction(function, true) && source == "pg_catalog.gen_random_uuid()::text"
+}
+
+func isGenRandomUUIDFunction(function *defaultFunction, requireCatalog bool) bool {
+	if function == nil || len(function.Arguments) != 0 || function.Precision != nil || function.SQLSyntax {
+		return false
+	}
+	name := strings.Join(function.Name.Parts, ".")
+	return name == "pg_catalog.gen_random_uuid" || !requireCatalog && name == "gen_random_uuid"
+}
+
+func coreOperatorDefaultAllowed(typ coreColumnType, expr defaultExpression, source string) bool {
+	return validateCoreOperatorDefault(typ, expr, source) == nil
+}
+
+func validateCoreOperatorDefault(typ coreColumnType, expr defaultExpression, source string) error {
+	if !isNumericCoreType(typ) {
+		return errors.New("operator destination is not a numeric core type")
+	}
+	analysis, err := analyzeNumericDefaultExpression(expr)
+	if err != nil {
+		return err
+	}
+	destination := numericTypeFromCore(typ)
+	if _, err := convertDefaultNumericConstantToCore(analysis.Constant, typ); err != nil {
+		return fmt.Errorf("operator destination conversion: %w", err)
+	}
+	if analysis.Minimum == nil || analysis.Maximum == nil {
+		return errors.New("operator destination range is not proven safe")
+	}
+	if _, err := convertDefaultNumericConstantToCore(analysis.Minimum, typ); err != nil {
+		return fmt.Errorf("operator destination minimum: %w", err)
+	}
+	if _, err := convertDefaultNumericConstantToCore(analysis.Maximum, typ); err != nil {
+		return fmt.Errorf("operator destination maximum: %w", err)
+	}
+	if destination == defaultNumericInvalid {
+		return errors.New("operator destination numeric type is invalid")
+	}
+	if !canonicalDefaultSource(expr, source) {
+		return errors.New("operator expression is not in canonical pg_catalog-bound form")
+	}
+	return nil
+}
+
+func canonicalDefaultSource(expr defaultExpression, source string) bool {
+	canonical, err := canonicalOperatorDefault(expr)
+	return err == nil && source == canonical
 }
 
 func coreDefaultCastType(ref defaultTypeReference) (coreColumnType, bool) {
@@ -128,6 +193,8 @@ func coreScalarLiteralAllowed(typ coreColumnType, expr defaultExpression) bool {
 		return literal.Kind == defaultLiteralString && uuidDefault.MatchString(literal.Text)
 	case "json", "jsonb":
 		return literal.Kind == defaultLiteralString && json.Valid([]byte(literal.Text))
+	case "cidr", "inet", "macaddr":
+		return literal.Kind == defaultLiteralString && networkLiteralAllowed(typ.base, literal.Text)
 	case "date":
 		return literal.Kind == defaultLiteralString && parsesTime("2006-01-02", literal.Text)
 	case "time":
@@ -140,6 +207,25 @@ func coreScalarLiteralAllowed(typ coreColumnType, expr defaultExpression) bool {
 		return literal.Kind == defaultLiteralString && parsesAnyTime(literal.Text, "2006-01-02 15:04:05Z07:00", "2006-01-02 15:04:05.999999Z07:00")
 	default:
 		return strings.HasPrefix(typ.base, "interval") && literal.Kind == defaultLiteralString && validIntervalDefault(literal.Text)
+	}
+}
+
+func networkLiteralAllowed(typ, value string) bool {
+	switch typ {
+	case "cidr":
+		prefix, err := netip.ParsePrefix(value)
+		return err == nil && prefix.Addr().Zone() == "" && prefix == prefix.Masked()
+	case "inet":
+		if address, err := netip.ParseAddr(value); err == nil {
+			return address.Zone() == ""
+		}
+		prefix, err := netip.ParsePrefix(value)
+		return err == nil && prefix.Addr().Zone() == ""
+	case "macaddr":
+		address, err := net.ParseMAC(value)
+		return err == nil && len(address) == 6
+	default:
+		return false
 	}
 }
 
@@ -396,7 +482,7 @@ func coreFunctionDefaultAllowed(typ coreColumnType, function *defaultFunction, s
 	case "localtimestamp", "localtimestamp_n":
 		return precisionOK && len(function.Arguments) == 0 && typ.base == "timestamp" && (source == "LOCALTIMESTAMP" || canonicalTemporalPrecision(source, "LOCALTIMESTAMP"))
 	case "pg_catalog.gen_random_uuid":
-		return len(function.Arguments) == 0 && typ.base == "uuid" && source == "pg_catalog.gen_random_uuid()"
+		return isGenRandomUUIDFunction(function, true) && typ.base == "uuid" && source == "pg_catalog.gen_random_uuid()"
 	case "pg_catalog.timezone":
 		return typ.base == "timestamp" && source == "pg_catalog.timezone('utc'::text, CURRENT_TIMESTAMP)" && utcTimezoneArguments(function.Arguments)
 	default:

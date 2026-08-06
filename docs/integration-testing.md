@@ -41,22 +41,39 @@ reinspects it, proves a second-plan no-op, and applies an unrelated incremental
 change. See [PostgreSQL fresh-provisioning compatibility](postgresql-provisioning-compatibility.md)
 for the exact managed and external/read-only boundary.
 
-`TestCanonicalCompleteBootstrapInventoryManifest` adds the empty-database
-control-plane proof. It creates roles, extensions, 47 routines, 69 tables,
-197 constraints, 315 concurrent indexes, triggers, RLS policies, and access
-grants in a brand-new database. Every execution phase is interrupted once and
-resumed from its digest-bound checkpoint before final catalog parity is
-verified. Separate cases cover transaction rollback, untracked collision
-refusal, ambiguous online-step diagnosis and confirmation, no-op reruns,
-explicit abort authorization, and exclusion of the reserved execution ledger
-from the managed graph.
+`TestSemanticCellSignedDirectBootstrapInterruptionResume` is the
+empty-database fidelity proof. Its sanitized fixture contains 16 named
+application tables and the combined semantics that previously surfaced one at
+a time: the DBOS epoch arithmetic default, parameterized types, enum/cast,
+JSON, array, UUID and time defaults, a stored generated column with its exact
+function dependency, realistic function/procedure/trigger bodies and digests,
+exactly 248 object comments, constraints, indexes, triggers, RLS, `hstore` and
+`pgcrypto`, roles, memberships, grants, default privileges and ownership.
+Every execution phase is interrupted once and resumed from its digest-bound
+checkpoint before exact catalog fingerprint parity is verified.
 
-The same proof enforces documented resource, HCL, SQL, plan-byte, step, phase,
-and dependency-fanout budgets and logs aggregate lock/transaction/scan
-exposure. PostgreSQL 16 also runs `BenchmarkCompleteBootstrapPipeline` with
-allocation reporting for inspect, normalize, HCL round-trip, preflight and
-planning, and plan serialization. Wall-clock results are retained as CI
-artifacts for trend review; pass/fail uses deterministic structural limits.
+The semantic execution plan is produced only from a canonical Ed25519
+authorization manifest. Every PostgreSQL 14–18 job exercises the signed direct
+path, the native CLI prepare/authorize/bootstrap path, and the production
+controller's real signed release artifact plus separately signed bootstrap
+manifest. Each path reinspects the target and requires both the next desired
+plan and adopt-existing plan to contain zero changes and zero steps; neither
+verification boundary is stubbed.
+
+`TestSyntheticScaleBootstrapInventoryManifest` is separate structural-scale
+evidence. Its generated count-shaped graph has exactly 1,007 resources (1
+schema, 69 tables, 345 columns, 69 primary keys, 56 foreign keys, 45 checks, 27
+unique constraints, 315 indexes, 39 functions, 8 procedures, 6 triggers, 14
+policies, 2 extensions, 3 roles, 1 membership, 5 grants, 1 default privilege,
+and 1 composite type) and produces exactly 1,026 steps in 370 phases. Those
+counts test scale, lock exposure, scheduling and dependency fanout; they are
+not evidence that the generated fixture is a real cell schema.
+
+The synthetic proof enforces documented resource, HCL, SQL, plan-byte, step,
+phase, and dependency-fanout budgets and logs aggregate
+lock/transaction/scan exposure. PostgreSQL 16 also runs
+`BenchmarkCompleteBootstrapPipeline` with allocation reporting for inspect,
+normalize, HCL round-trip, preflight and planning, and plan serialization.
 
 ## Current audit baseline
 

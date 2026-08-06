@@ -1,0 +1,11 @@
+{
+  "name": "autosql-azure-task",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "azure-pipelines-task-lib": "5.277.0"
+  },
+  "overrides": {
+    "adm-zip": "0.6.0"
+  }
+}

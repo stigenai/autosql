@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"regexp"
 	"strings"
 	"time"
 
@@ -187,6 +188,7 @@ func inspectSnapshot(ctx context.Context, conn catalogQueryer, req plugin.Inspec
 		{"type dependencies", "USAGE on composite attribute types", i.inspectTypeDependencies},
 		{"sequences", "USAGE on the selected schemas", i.inspectSequences},
 		{"relations", "USAGE on schemas and SELECT on catalog metadata", i.inspectRelations},
+		{"partitions", "USAGE on schemas and SELECT on partition metadata", i.inspectPartitions},
 		{"relation dependencies", "USAGE on schemas and SELECT on catalog dependency metadata", i.inspectRelationDependencies},
 		{"columns", "USAGE on schemas and SELECT on catalog metadata", i.inspectColumns},
 		{"column default dependencies", "USAGE on schemas and SELECT on catalog dependency metadata", i.inspectColumnDefaultDependencies},
@@ -195,7 +197,7 @@ func inspectSnapshot(ctx context.Context, conn catalogQueryer, req plugin.Inspec
 		{"routines", "USAGE on schemas and routines", i.inspectRoutines},
 		{"routine dependencies", "USAGE on schemas, routines, types, and relations", i.inspectRoutineDependencies},
 		{"column routine dependencies", "USAGE on column defaults and routines", i.inspectColumnRoutineDependencies},
-		{"expression routine dependencies", "USAGE on constraints, indexes, and routines", i.inspectExpressionRoutineDependencies},
+		{"expression dependencies", "USAGE on constraints, indexes, routines, and types", i.inspectExpressionDependencies},
 		{"generated column dependencies", "USAGE on schemas, columns, and routines", i.inspectGeneratedColumnDependencies},
 		{"triggers", "USAGE on schemas and tables", i.inspectTriggers},
 	}
@@ -247,19 +249,24 @@ func inspectSnapshot(ctx context.Context, conn catalogQueryer, req plugin.Inspec
 }
 
 func (i *inspector) inspectRelationDependencies(ctx context.Context) error {
-	rows, err := i.conn.Query(ctx, `select distinct rw.ev_class::oid,d.refobjid::oid from pg_rewrite rw join pg_depend d on d.classid='pg_rewrite'::regclass and d.objid=rw.oid join pg_class v on v.oid=rw.ev_class where v.relkind in ('v','m') and d.refclassid='pg_class'::regclass and d.deptype='n' and d.refobjid<>rw.ev_class order by 1,2`)
+	rows, err := i.conn.Query(ctx, `select distinct rw.ev_class::oid,d.refclassid::regclass::text,d.refobjid::oid from pg_rewrite rw join pg_depend d on d.classid='pg_rewrite'::regclass and d.objid=rw.oid join pg_class v on v.oid=rw.ev_class where v.relkind in ('v','m') and d.refclassid in ('pg_class'::regclass,'pg_type'::regclass) and d.deptype='n' and not (d.refclassid='pg_class'::regclass and d.refobjid=rw.ev_class) order by 1,2,3`)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var from, to uint32
-		if err := rows.Scan(&from, &to); err != nil {
+		var catalog string
+		if err := rows.Scan(&from, &catalog, &to); err != nil {
 			return err
 		}
 		fromID, toID := i.byOID[from], i.byOID[to]
 		if fromID == "" || toID == "" {
 			continue
+		}
+		dependencyType := schema.DependencyReferences
+		if catalog == "pg_type" {
+			dependencyType = schema.DependencyUses
 		}
 		for idx := range i.resources {
 			if i.resources[idx].ID != fromID {
@@ -267,10 +274,10 @@ func (i *inspector) inspectRelationDependencies(ctx context.Context) error {
 			}
 			exists := false
 			for _, dep := range i.resources[idx].Dependencies {
-				exists = exists || dep.Target == toID && dep.Type == schema.DependencyReferences
+				exists = exists || dep.Target == toID && dep.Type == dependencyType
 			}
 			if !exists {
-				i.resources[idx].Dependencies = append(i.resources[idx].Dependencies, schema.Dependency{Target: toID, Type: schema.DependencyReferences})
+				i.resources[idx].Dependencies = append(i.resources[idx].Dependencies, schema.Dependency{Target: toID, Type: dependencyType})
 			}
 		}
 	}
@@ -769,6 +776,61 @@ func (i *inspector) inspectRelations(ctx context.Context) error {
 	return rows.Err()
 }
 
+func (i *inspector) inspectPartitions(ctx context.Context) error {
+	rows, err := i.conn.Query(ctx, `select child.oid,parent.oid,pg_get_expr(child.relpartbound,child.oid,true),pg_get_partkeydef(parent.oid) from pg_inherits inh join pg_class child on child.oid=inh.inhrelid join pg_class parent on parent.oid=inh.inhparent join pg_namespace n on n.oid=child.relnamespace where child.relispartition and n.nspname <> 'information_schema' and n.nspname !~ '^pg_' order by child.oid`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var childOID, parentOID uint32
+		var bound, key string
+		if err := rows.Scan(&childOID, &parentOID, &bound, &key); err != nil {
+			return err
+		}
+		childID, parentID := i.byOID[childOID], i.byOID[parentOID]
+		if childID == "" || parentID == "" {
+			continue
+		}
+		strategy, columns, parseErr := parseInspectedPartitionKey(key)
+		if parseErr != nil {
+			return parseErr
+		}
+		for index := range i.resources {
+			resource := &i.resources[index]
+			if resource.ID == parentID {
+				values := specMap(resource.Spec)
+				values["partitioned"], values["partition_strategy"], values["partition_columns"] = true, strategy, columns
+				resource.Spec, _ = json.Marshal(values)
+			}
+			if resource.ID == childID {
+				values := specMap(resource.Spec)
+				values["partition_of"], values["partition_bound"] = parentID, bound
+				resource.Spec, _ = json.Marshal(values)
+				appendUniqueDependency(&resource.Dependencies, schema.Dependency{Target: parentID, Type: schema.DependencyReferences})
+			}
+		}
+	}
+	return rows.Err()
+}
+
+func parseInspectedPartitionKey(value string) (string, []string, error) {
+	match := regexp.MustCompile(`(?i)^\s*(RANGE|LIST|HASH)\s*\((.*)\)\s*$`).FindStringSubmatch(value)
+	if match == nil {
+		return "", nil, fmt.Errorf("unsupported inspected partition key %q", value)
+	}
+	parts := strings.Split(match[2], ",")
+	columns := make([]string, 0, len(parts))
+	for _, part := range parts {
+		column := strings.Trim(strings.TrimSpace(part), `"`)
+		if column == "" || strings.ContainsAny(column, " ()") {
+			return "", nil, fmt.Errorf("partition expression %q is outside the managed column-key grammar", part)
+		}
+		columns = append(columns, column)
+	}
+	return strings.ToLower(match[1]), columns, nil
+}
+
 func (i *inspector) inspectColumns(ctx context.Context) error {
 	rows, err := i.conn.Query(ctx, `select a.attrelid,a.attnum,n.nspname,c.relname,a.attname,format_type(a.atttypid,a.atttypmod),a.attnotnull,pg_get_expr(ad.adbin,ad.adrelid),a.attidentity::text,a.attgenerated::text,col_description(a.attrelid,a.attnum),case when t.typelem<>0 then t.typelem else a.atttypid end from pg_attribute a join pg_class c on c.oid=a.attrelid join pg_namespace n on n.oid=c.relnamespace join pg_type t on t.oid=a.atttypid left join pg_attrdef ad on ad.adrelid=a.attrelid and ad.adnum=a.attnum where a.attnum>0 and not a.attisdropped and c.relkind in ('r','p','v','m') and n.nspname <> 'information_schema' and n.nspname !~ '^pg_' order by n.nspname,c.relname,a.attnum`)
 	if err != nil {
@@ -1121,19 +1183,20 @@ func (i *inspector) inspectRoutineDependencies(ctx context.Context) error {
 	return rows.Err()
 }
 
-func (i *inspector) inspectExpressionRoutineDependencies(ctx context.Context) error {
-	rows, err := i.conn.Query(ctx, `select distinct d.classid::regclass::text,d.objid::oid,d.refobjid::oid from pg_depend d join pg_proc p on p.oid=d.refobjid join pg_namespace n on n.oid=p.pronamespace where d.classid in ('pg_constraint'::regclass,'pg_class'::regclass) and d.refclassid='pg_proc'::regclass and d.deptype in ('n','a') and n.nspname <> 'information_schema' and n.nspname !~ '^pg_' order by 1,2,3`)
+func (i *inspector) inspectExpressionDependencies(ctx context.Context) error {
+	rows, err := i.conn.Query(ctx, `select distinct d.classid::regclass::text,d.objid::oid,d.refclassid::regclass::text,d.refobjid::oid from pg_depend d where d.classid in ('pg_constraint'::regclass,'pg_class'::regclass) and (d.refclassid='pg_proc'::regclass or d.classid='pg_constraint'::regclass and d.refclassid='pg_type'::regclass) and d.deptype in ('n','a') order by 1,2,3,4`)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var catalog string
+		var catalog, targetCatalog string
 		var fromOID, toOID uint32
-		if err := rows.Scan(&catalog, &fromOID, &toOID); err != nil {
+		if err := rows.Scan(&catalog, &fromOID, &targetCatalog, &toOID); err != nil {
 			return err
 		}
-		from, to := i.byOID[fromOID], i.byOID[toOID]
+		from := i.byCatalog[catalogOID{catalog: catalog, oid: fromOID}]
+		to := i.byCatalog[catalogOID{catalog: targetCatalog, oid: toOID}]
 		if from == "" || to == "" {
 			continue
 		}
@@ -1142,12 +1205,16 @@ func (i *inspector) inspectExpressionRoutineDependencies(ctx context.Context) er
 			if resource.ID != from || catalog == "pg_class" && resource.Kind != schema.KindIndex {
 				continue
 			}
+			dependencyType := schema.DependencyReferences
+			if targetCatalog == "pg_type" {
+				dependencyType = schema.DependencyUses
+			}
 			exists := false
 			for _, dependency := range resource.Dependencies {
-				exists = exists || dependency.Target == to && dependency.Type == schema.DependencyReferences
+				exists = exists || dependency.Target == to && dependency.Type == dependencyType
 			}
 			if !exists {
-				resource.Dependencies = append(resource.Dependencies, schema.Dependency{Target: to, Type: schema.DependencyReferences})
+				resource.Dependencies = append(resource.Dependencies, schema.Dependency{Target: to, Type: dependencyType})
 			}
 		}
 	}

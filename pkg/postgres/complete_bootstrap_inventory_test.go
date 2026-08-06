@@ -2,14 +2,18 @@ package postgres_test
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"autosql/pkg/artifact"
 	"autosql/pkg/bootstrap"
 	"autosql/pkg/plan"
 	"autosql/pkg/postgres"
@@ -31,7 +35,24 @@ type completeBootstrapManifest struct {
 	Fingerprint        string              `json:"fingerprint"`
 }
 
-func TestCanonicalCompleteBootstrapInventoryManifest(t *testing.T) {
+// This is a generated structural scale contract, not a claim that the fixture
+// is a real application schema. Any intentional expansion must update this
+// map, the 1,007 total, and the signed inventory/plan counts in the same change.
+var expectedCompleteBootstrapKindCounts = map[schema.Kind]int{
+	schema.KindSchema: 1, schema.KindTable: 69, schema.KindColumn: 345,
+	schema.KindPrimaryKey: 69, schema.KindForeignKey: 56, schema.KindCheckConstraint: 45, schema.KindUniqueConstraint: 27,
+	schema.KindIndex: 315, schema.KindFunction: 39, schema.KindProcedure: 8, schema.KindTrigger: 6,
+	schema.KindPolicy: 14, schema.KindExtension: 2, schema.KindRole: 3, schema.KindMembership: 1,
+	schema.KindGrant: 5, schema.KindDefaultPrivilege: 1, schema.KindComposite: 1,
+}
+
+const (
+	expectedCompleteBootstrapResources = 1007
+	expectedCompleteBootstrapSteps     = 1026
+	expectedCompleteBootstrapPhases    = 370
+)
+
+func TestSyntheticScaleBootstrapInventoryManifest(t *testing.T) {
 	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
 	if url == "" {
 		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
@@ -47,10 +68,10 @@ func TestCanonicalCompleteBootstrapInventoryManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close(context.Background())
-	const namespace = "autosql_canonical_cell"
+	const namespace = "autosql_synthetic_scale_cell"
 	cleanupCompleteBootstrapInventory(t, ctx, conn, namespace)
 	defer cleanupCompleteBootstrapInventory(t, context.Background(), conn, namespace)
-	if _, err := conn.Exec(ctx, completeBootstrapInventorySQL(namespace)); err != nil {
+	if _, err := conn.Exec(ctx, syntheticScaleBootstrapInventorySQL(namespace)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -74,7 +95,7 @@ func TestCanonicalCompleteBootstrapInventoryManifest(t *testing.T) {
 		Name: schema.Name{Name: target.Name}, Spec: targetSpec,
 	})
 	completeHCL.Normalize()
-	hcl, err := source.FormatHCL(completeHCL)
+	hcl, err := source.FormatAuthorHCL(completeHCL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,16 +158,37 @@ func TestCanonicalCompleteBootstrapInventoryManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 	options["postgres_version"] = fmt.Sprintf("%d", serverVersion/10000)
+	authorizationInventory, err := postgres.PrepareBootstrapAuthorizationInventory(ctx, target, reloaded, postgres.BootstrapAuthorizationInventoryOptions{Render: map[string]string{
+		"postgres_version":   options["postgres_version"],
+		"concurrent_indexes": "true",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(authorizationInventory.Routines) != manifest.CellRoutines+manifest.RepositoryRoutines || len(authorizationInventory.Extensions) != manifest.Counts[schema.KindExtension] {
+		t.Fatalf("complete-cell authorization inventory routines=%d extensions=%d plan=%s", len(authorizationInventory.Routines), len(authorizationInventory.Extensions), authorizationInventory.PlanDigest)
+	}
+	assertCompleteAuthorizationInventory(t, authorizationInventory)
+	authorizationJSON, err := authorizationInventory.MarshalCanonical()
+	if err != nil || strings.Contains(string(authorizationJSON), `"definition"`) || strings.Contains(string(authorizationJSON), "CREATE FUNCTION") {
+		t.Fatalf("complete-cell authorization inventory disclosed source: err=%v", err)
+	}
 	report, err := postgres.PreflightProvisioning(ctx, desired, options)
 	if err != nil || !report.Supported {
 		t.Fatalf("complete inventory preflight=%+v err=%v", report.Diagnostics, err)
 	}
 	options["concurrent_indexes"] = "true"
-	firstPlan, err := postgres.PlanDatabaseBootstrap(ctx, target, reloaded, plan.Options{Render: options})
+	authorizedRender := map[string]string{"postgres_version": options["postgres_version"], "concurrent_indexes": "true"}
+	verifiedAuthorization := signCompleteBootstrapAuthorization(t, authorizationInventory).Verified
+	t.Logf("complete_bootstrap_authorization routines=%d extensions=%d plan=%s source=%s", len(authorizationInventory.Routines), len(authorizationInventory.Extensions), authorizationInventory.PlanDigest, authorizationInventory.SourceDigest)
+	firstPlan, err := postgres.PlanDatabaseBootstrapAuthorized(ctx, target, reloaded, plan.Options{Render: authorizedRender}, verifiedAuthorization)
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondPlan, err := postgres.PlanDatabaseBootstrap(ctx, target, reloaded, plan.Options{Render: options})
+	if firstPlan.Digest != authorizationInventory.PlanDigest || len(firstPlan.Steps) != authorizationInventory.PlanSummary.StepCount || len(firstPlan.Phases) != authorizationInventory.PlanSummary.PhaseCount || firstPlan.SchemaPlan.Digest != authorizationInventory.PlanSummary.SchemaPlanDigest {
+		t.Fatalf("prepared inventory summary=%+v execution plan=%s", authorizationInventory.PlanSummary, firstPlan.Digest)
+	}
+	secondPlan, err := postgres.PlanDatabaseBootstrapAuthorized(ctx, target, reloaded, plan.Options{Render: authorizedRender}, verifiedAuthorization)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,10 +221,16 @@ func TestCanonicalCompleteBootstrapInventoryManifest(t *testing.T) {
 		Encoding: "UTF8", Template: "template0", Tablespace: "pg_default", ConnectionLimit: -1, AllowConnections: true,
 	}
 	defer postgres.DropDatabaseURL(context.Background(), url, executionTarget.Name, true)
-	executionPlan, err := postgres.PlanDatabaseBootstrap(ctx, executionTarget, desired, plan.Options{Render: options})
+	executionInventory, err := postgres.PrepareBootstrapAuthorizationInventory(ctx, executionTarget, desired, postgres.BootstrapAuthorizationInventoryOptions{Render: authorizedRender})
 	if err != nil {
 		t.Fatal(err)
 	}
+	executionAuthorization := signCompleteBootstrapAuthorization(t, executionInventory).Verified
+	executionPlan, err := postgres.PlanDatabaseBootstrapAuthorized(ctx, executionTarget, desired, plan.Options{Render: authorizedRender}, executionAuthorization)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertCompleteBootstrapPlan(t, executionPlan)
 	interrupted := map[string]bool{}
 	var execution postgres.BootstrapExecutionResult
 	for attempt := 0; attempt <= len(executionPlan.Phases); attempt++ {
@@ -233,16 +281,63 @@ func TestCanonicalCompleteBootstrapInventoryManifest(t *testing.T) {
 	if err != nil || len(noopPlan.Changes.Changes) != 0 || len(noopPlan.Steps) != 0 {
 		t.Fatalf("complete bootstrap second plan changes=%d steps=%d err=%v", len(noopPlan.Changes.Changes), len(noopPlan.Steps), err)
 	}
+	adoptPlan, err := plan.Build(ctx, postgres.New(), actual, actual, plan.Options{Render: options})
+	if err != nil || len(adoptPlan.Changes.Changes) != 0 || len(adoptPlan.Steps) != 0 {
+		t.Fatalf("complete bootstrap adopt-existing changes=%d steps=%d err=%v", len(adoptPlan.Changes.Changes), len(adoptPlan.Steps), err)
+	}
+	t.Logf("complete_bootstrap_zero_change next_plan_changes=%d next_plan_steps=%d adopt_changes=%d adopt_steps=%d", len(noopPlan.Changes.Changes), len(noopPlan.Steps), len(adoptPlan.Changes.Changes), len(adoptPlan.Steps))
 	if err := postgres.AbortDatabaseBootstrapURL(ctx, url, executionPlan, true); err != nil {
 		t.Fatal(err)
 	}
 	cleanupCompleteBootstrapInventory(t, ctx, conn, namespace)
 }
 
+type completeBootstrapAuthorizationProof struct {
+	Verified postgres.VerifiedBootstrapAuthorization
+	Manifest []byte
+	Public   ed25519.PublicKey
+}
+
+func signCompleteBootstrapAuthorization(t testing.TB, inventory postgres.BootstrapAuthorizationInventory) completeBootstrapAuthorizationProof {
+	t.Helper()
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	manifest, err := postgres.NewBootstrapAuthorizationManifest(inventory, now, now.Add(-time.Minute), now.Add(time.Hour), "complete-cell-security", "complete-cell-reviewers", "bootstrap-authorization")
+	if err == nil {
+		err = manifest.Sign("complete-cell-key", private)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := manifest.MarshalCanonical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := postgres.ParseBootstrapAuthorizationManifest(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verified, err := postgres.VerifyBootstrapAuthorizationManifest(parsed, inventory, postgres.BootstrapAuthorizationVerifyPolicy{
+		Now:    func() time.Time { return now },
+		Keys:   map[string]artifact.KeyRecord{"complete-cell-key": {PublicKey: public, Issuer: "complete-cell-security", Identity: "complete-cell-reviewers", Purpose: "bootstrap-authorization", Status: "active", NotBefore: manifest.NotBefore, NotAfter: manifest.ExpiresAt}},
+		Issuer: "complete-cell-security", Signer: "complete-cell-reviewers", Purpose: "bootstrap-authorization",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return completeBootstrapAuthorizationProof{Verified: verified, Manifest: encoded, Public: public}
+}
+
 func assertCompleteBootstrapPlan(t *testing.T, whole bootstrap.Plan) {
 	t.Helper()
 	if err := whole.Validate(); err != nil {
 		t.Fatal(err)
+	}
+	if len(whole.Steps) != expectedCompleteBootstrapSteps || len(whole.Phases) != expectedCompleteBootstrapPhases {
+		t.Fatalf("complete bootstrap plan shape steps=%d phases=%d want=%d/%d; intentional fixture changes must update the canonical contract", len(whole.Steps), len(whole.Phases), expectedCompleteBootstrapSteps, expectedCompleteBootstrapPhases)
 	}
 	if len(whole.Steps) == 0 || whole.Steps[0].Action != bootstrap.ActionPrepareDatabase || whole.Steps[0].Transaction != plan.TransactionProhibited {
 		t.Fatalf("missing out-of-transaction database preparation: %+v", whole.Steps)
@@ -284,7 +379,7 @@ func assertCompleteBootstrapPlan(t *testing.T, whole bootstrap.Plan) {
 	}
 }
 
-func completeBootstrapInventorySQL(namespace string) string {
+func syntheticScaleBootstrapInventorySQL(namespace string) string {
 	var fixture strings.Builder
 	fmt.Fprintf(&fixture, `create role autosql_cell_reader; create role autosql_cell_app; create role autosql_cell_owner; create schema %s authorization autosql_cell_owner; create extension hstore with schema %s; create extension pgcrypto with schema %s; create type %s.cell_composite as (label text, rank integer);`, namespace, namespace, namespace, namespace)
 	for index := 0; index < 69; index++ {
@@ -421,19 +516,71 @@ func manifestForCompleteBootstrap(t *testing.T, document schema.Document, namesp
 
 func assertCompleteBootstrapManifest(t *testing.T, manifest completeBootstrapManifest) {
 	t.Helper()
-	want := map[schema.Kind]int{
-		schema.KindIndex: 315, schema.KindPrimaryKey: 69, schema.KindForeignKey: 56,
-		schema.KindCheckConstraint: 45, schema.KindUniqueConstraint: 27,
-		schema.KindTrigger: 6, schema.KindPolicy: 14, schema.KindExtension: 2,
-		schema.KindGrant: 5, schema.KindComposite: 1,
+	if err := validateCompleteBootstrapManifest(manifest); err != nil {
+		t.Fatal(err)
 	}
-	for kind, count := range want {
-		if manifest.Counts[kind] != count {
-			t.Errorf("%s count=%d want=%d", kind, manifest.Counts[kind], count)
-		}
+}
+
+func validateCompleteBootstrapManifest(manifest completeBootstrapManifest) error {
+	total := 0
+	for _, count := range manifest.Counts {
+		total += count
+	}
+	if total != expectedCompleteBootstrapResources || !maps.Equal(manifest.Counts, expectedCompleteBootstrapKindCounts) {
+		return fmt.Errorf("complete-cell fixture drift: total=%d want=%d counts=%v want=%v; update the explicit fixture contract for intentional changes", total, expectedCompleteBootstrapResources, manifest.Counts, expectedCompleteBootstrapKindCounts)
 	}
 	if manifest.CellRoutines != 15 || manifest.RepositoryRoutines != 32 || manifest.RLSTables != 7 || manifest.ExplicitGrants != 3 || manifest.NamespaceOwner != "autosql_cell_owner" || manifest.Fingerprint == "" {
-		t.Fatalf("manifest=%+v", manifest)
+		return fmt.Errorf("complete-cell manifest drift: %+v", manifest)
+	}
+	return nil
+}
+
+func assertCompleteAuthorizationInventory(t testing.TB, inventory postgres.BootstrapAuthorizationInventory) {
+	t.Helper()
+	if len(inventory.Routines) != 47 || len(inventory.Extensions) != 2 {
+		t.Fatalf("authorization inventory routines=%d extensions=%d want=47/2", len(inventory.Routines), len(inventory.Extensions))
+	}
+	functions, procedures := 0, 0
+	for _, routine := range inventory.Routines {
+		if !routine.DigestReviewRequired || routine.SourceDigest == "" || routine.ResourceID == "" || routine.Signature == "" {
+			t.Fatalf("routine authorization gate incomplete: %+v", routine)
+		}
+		switch routine.Kind {
+		case string(schema.KindFunction):
+			functions++
+		case string(schema.KindProcedure):
+			procedures++
+		default:
+			t.Fatalf("unexpected routine kind: %+v", routine)
+		}
+	}
+	if functions != 39 || procedures != 8 {
+		t.Fatalf("authorization routine kinds functions=%d procedures=%d want=39/8", functions, procedures)
+	}
+	extensions := map[string]postgres.BootstrapExtensionAuthorization{}
+	for _, extension := range inventory.Extensions {
+		extensions[extension.Name] = extension
+		if !extension.AllowlistRequired || !extension.ExactVersionRequired || !extension.SchemaPolicyRequired || !extension.ServerPackageRequired || extension.ResourceID == "" || extension.Version == "" || extension.Schema == "" {
+			t.Fatalf("extension authorization gate incomplete: %+v", extension)
+		}
+	}
+	if _, ok := extensions["hstore"]; !ok {
+		t.Fatalf("hstore authorization missing: %+v", extensions)
+	}
+	if _, ok := extensions["pgcrypto"]; !ok {
+		t.Fatalf("pgcrypto authorization missing: %+v", extensions)
+	}
+}
+
+func TestCompleteBootstrapFixtureContractRejectsDrift(t *testing.T) {
+	counts := maps.Clone(expectedCompleteBootstrapKindCounts)
+	manifest := completeBootstrapManifest{Version: 1, Counts: counts, CellRoutines: 15, RepositoryRoutines: 32, RLSTables: 7, ExplicitGrants: 3, NamespaceOwner: "autosql_cell_owner", Fingerprint: "sha256:test"}
+	if err := validateCompleteBootstrapManifest(manifest); err != nil {
+		t.Fatal(err)
+	}
+	manifest.Counts[schema.KindColumn]++
+	if err := validateCompleteBootstrapManifest(manifest); err == nil || !strings.Contains(err.Error(), "fixture drift") {
+		t.Fatalf("fixture drift was accepted: %v", err)
 	}
 }
 
@@ -491,7 +638,7 @@ func BenchmarkCompleteBootstrapPipeline(b *testing.B) {
 	const namespace = "autosql_benchmark_cell"
 	cleanupCompleteBootstrapInventory(b, ctx, conn, namespace)
 	defer cleanupCompleteBootstrapInventory(b, ctx, conn, namespace)
-	if _, err := conn.Exec(ctx, completeBootstrapInventorySQL(namespace)); err != nil {
+	if _, err := conn.Exec(ctx, syntheticScaleBootstrapInventorySQL(namespace)); err != nil {
 		b.Fatal(err)
 	}
 	inspected, err := postgres.InspectURL(ctx, url, postgres.Options{Schemas: []string{namespace}, Advanced: true})

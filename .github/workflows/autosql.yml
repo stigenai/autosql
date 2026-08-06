@@ -9,7 +9,7 @@ jobs:
   operator-kubernetes:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
@@ -22,15 +22,46 @@ jobs:
           export KUBEBUILDER_ASSETS
           AUTOSQL_OPERATOR_ENVTEST=1 go test -count=1 ./internal/operatorcontroller \
             -run TestEnvtestReconcilesCRAndWritesStatus
+  release-conformance:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.2.3
+      - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        with:
+          version: v0.32.0
+          cluster_name: autosql-conformance
+          node_image: kindest/node:v1.35.5@sha256:ce977ae6d65918d0b58a5f8b5e940429c2ce42fa3a5619ec2bbc60b949c0ac95
+      - name: Build current operator image
+        run: |
+          set -eu
+          docker build -f Dockerfile.autosql -t autosql:conformance .
+          kind load docker-image autosql:conformance --name autosql-conformance
+      - name: Test release conformance
+        run: |
+          set -eu
+          go test ./pkg/integration ./pkg/integrations/... ./pkg/workloadidentity ./internal/terraformprovider ./internal/operatorcontroller
+          deploy/helm/autosql-operator/tests/render.sh
+          helm install autosql deploy/helm/autosql-operator --namespace autosql-system --create-namespace --set image.repository=autosql --set image.digest= --set image.tag=conformance --set image.pullPolicy=Never --wait --timeout 3m
+          helm upgrade autosql deploy/helm/autosql-operator --namespace autosql-system --set image.repository=autosql --set image.digest= --set image.tag=conformance --set image.pullPolicy=Never --set-string 'podAnnotations.autosql\.io/conformance=upgrade' --wait --timeout 3m
+          kubectl -n autosql-system rollout status deployment/autosql-autosql-operator --timeout=2m
+          deploy/gitops/tests/live.sh autosql-conformance
   changeset:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
       - run: go test ./...
+      - run: scripts/test-release-preflight.sh
       - run: go test -coverprofile=coverage.out ./...
       - run: go tool cover -func=coverage.out > coverage.txt
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -50,7 +81,7 @@ jobs:
       id-token: write
     environment: production
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod

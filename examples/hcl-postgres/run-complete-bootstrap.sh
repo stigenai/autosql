@@ -11,12 +11,12 @@ cleanup() {
   if [[ "$KEEP_WORKDIR" != 1 ]]; then
     rm -rf "$WORKDIR"
   else
-    printf 'Complete HCL artifact kept in %s\n' "$WORKDIR"
+    printf 'Synthetic scale HCL artifact kept in %s\n' "$WORKDIR"
   fi
 }
 trap cleanup EXIT
 
 export AUTOSQL_COMPLETE_HCL_OUTPUT="$WORKDIR/complete-bootstrap.hcl"
 cd "$ROOT"
-go test ./pkg/postgres -run '^TestCanonicalCompleteBootstrapInventoryManifest$' -count=1 -v
-printf 'Verified complete HCL bootstrap: %s\n' "$AUTOSQL_COMPLETE_HCL_OUTPUT"
+go test ./pkg/postgres -run '^TestSyntheticScaleBootstrapInventoryManifest$' -count=1 -v
+printf 'Verified synthetic scale HCL bootstrap: %s\n' "$AUTOSQL_COMPLETE_HCL_OUTPUT"

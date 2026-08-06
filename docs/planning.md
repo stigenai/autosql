@@ -69,25 +69,30 @@ View and materialized-view output columns remain canonical resources. The SQL
 source normalizer derives them only for a conservative round-trip subset:
 simple projections, expanded wildcards over known tables, and aliased integer
 or text literals. Output name, type, nullability, dependency, and ordinal are
-validated. Shape-changing view alters require an explicit proven rebuild;
-independent projection-child changes fail closed. Other definitions fail closed
-instead of planning drift.
+validated. Inspected complex queries may instead use their captured projection
+graph when the definition parses as exactly one query and every projection is
+contiguous, uniquely named, typed, and canonical. Shape-changing view alters
+require an explicit proven rebuild; independent projection-child changes fail
+closed. Projection columns whose output type is a managed enum, domain, or
+composite must carry exactly the matching type-use dependency; builtin outputs
+must not carry one.
 
 Reference and type-use dependencies are part of rendered semantics, not advisory
-metadata. For managed views and columns, the declared `references`/`uses` sets
-must exactly match the dependencies derivable from the conservative definition
-and type subset. Missing, extra, or unprovable dependencies fail planning so a
-post-apply inspection cannot silently change the target graph.
-The conservative view grammar accepts only one top-level relation; joins,
-subqueries, nested `SELECT`/`EXISTS`, and other multi-relation forms fail closed.
-`TABLE` query expressions, CTEs, and set operations are also rejected by lexical
-token checks performed outside quoted strings.
-Managed relation-backed views are limited to direct column projections with no
-`WHERE`, functions, casts, or trailing clauses; proven integer/text literal views
-remain dependency-free, while object-bearing casts such as `regclass` fail closed.
-Qualified projection columns must use the sole relation's name, and `*` is valid
-only as the entire projection list; foreign qualifiers and mixed `*, column`
-lists fail before output-shape inference.
+metadata. For managed views, the renderer walks PostgreSQL's parsed query tree,
+including joins, CTE bodies and nested `SELECT`/`EXISTS`, resolves each relation
+against the desired graph, and requires exact equality with the declared
+`references` set. Missing, extra, ambiguous, duplicate, self, or unsupported
+catalog-qualified relations fail planning so post-apply inspection cannot
+silently change the target graph. Column `uses` edges remain bound to the
+conservative type grammar.
+Automatic projection inference from authored SQL remains limited to direct
+column projections with no `WHERE`, functions, casts, or trailing clauses;
+proven integer/text literal views remain dependency-free, while object-bearing
+casts such as `regclass` fail closed. Inspected complex definitions do not use
+that inference path: their canonical projection resources and exact parsed
+relation graph are validated directly. In the simple inference path, qualified
+columns must use the sole relation's name, and `*` is valid only as the entire
+projection list; foreign qualifiers and mixed `*, column` lists fail.
 For user-defined column types, inspection follows array element OIDs and emits a
 `uses` edge to the true enum/domain/composite resource. Validation resolves
 canonical qualified, same-schema/public unqualified, quoted, and array spellings

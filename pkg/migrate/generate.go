@@ -13,13 +13,11 @@ import (
 	"autosql/pkg/simulate"
 	"context"
 	"crypto/ed25519"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -38,12 +36,26 @@ var (
 type GenerateError struct {
 	Stage string
 	Kind  error
+	Cause error
 }
 
-func (e *GenerateError) Error() string { return fmt.Sprintf("%v: %s", e.Kind, e.Stage) }
-func (e *GenerateError) Unwrap() error { return e.Kind }
+func (e *GenerateError) Error() string {
+	if e.Cause != nil {
+		return fmt.Sprintf("%v: %s: %v", e.Kind, e.Stage, e.Cause)
+	}
+	return fmt.Sprintf("%v: %s", e.Kind, e.Stage)
+}
+func (e *GenerateError) Unwrap() []error {
+	if e.Cause == nil {
+		return []error{e.Kind}
+	}
+	return []error{e.Kind, e.Cause}
+}
 func generationFailure(stage string, kind error) error {
 	return &GenerateError{Stage: stage, Kind: kind}
+}
+func generationFailureCause(stage string, kind, cause error) error {
+	return &GenerateError{Stage: stage, Kind: kind, Cause: cause}
 }
 
 type GenerateRequest struct {
@@ -56,14 +68,28 @@ type GenerateRequest struct {
 	PolicyIdentity                                                   string
 	ApprovalPolicy                                                   approval.Policy
 	Authority                                                        approval.IdentityAuthority
+	ApprovalProvider                                                 ApprovalProvider
 	ApprovalAudit                                                    approval.AuditTrail
 	Approvals                                                        []approval.Approval
 	PrecheckAssertions                                               []precheck.Assertion
+	// SafetySuppressions carries pre-approved safety findings (for example a
+	// human-approved destructive change) into the analyzer. Each suppression
+	// is a narrow audit record: exactly one rule and one stable object ID,
+	// with a mandatory reason. Suppressed findings remain in the artifact's
+	// diagnostics and are bound into the guardrail bundle digest.
+	SafetySuppressions                                               []safety.Suppression
 	CreatedAt, ExpiresAt                                             time.Time
 	GeneratorKeyID, GeneratorPurpose, SigningKeyID                   string
 	GeneratorPrivateKey, SigningPrivateKey                           ed25519.PrivateKey
 	Metadata                                                         map[string]string
 	Stage                                                            func(string) error
+}
+
+// ApprovalProvider issues approval only after the exact guardrail bundle is
+// known. It is the non-interactive boundary used by CI release automation and
+// avoids requiring callers to predict a digest before planning has run.
+type ApprovalProvider interface {
+	Issue(context.Context, string, string, time.Time, time.Time) ([]approval.Approval, approval.IdentityAuthority, error)
 }
 
 type GenerateResult struct {
@@ -130,21 +156,74 @@ func (s GenerateService) Generate(ctx context.Context, r GenerateRequest) (Gener
 	if fromFP == toFP {
 		return GenerateResult{Status: "no_op", ManifestDigest: snap.Manifest.Digest}, nil
 	}
+	metadata := cloneStrings(r.Metadata)
+	metadata["autosql.migration.manifest"] = snap.Manifest.Digest
+	metadata["autosql.migration.from"] = fromFP
+	metadata["autosql.migration.to"] = toFP
+	metadata["autosql.migration.rename_hints"] = canonicalHints
+	built, err := s.buildGeneratedArtifact(ctx, r, current, desired, workspace.URL, hints, plan.Options{}, nil, metadata, simulate.PostgresFactory{NamePrefix: "autosql_sim_generate"})
+	if err != nil {
+		return out, err
+	}
+	p, checks, bundle, artifactBytes := built.Plan, built.Checks, built.BundleDigest, built.Bytes
+	sql := renderGeneratedSQL(p, checks.Digest, bundle, canonicalHints)
+	name := fmt.Sprintf("V%s__%s.sql", r.Version, r.Label)
+	files := snapshotFiles(snap)
+	artifactName := name + ".artifact.json"
+	files = append(files, File{Name: name, SQL: sql, ArtifactName: artifactName, Artifact: artifactBytes})
+	if err = s.checkpoint(r, "publish"); err != nil {
+		return out, err
+	}
+	man, err := UpdateWithOps(r.Directory, UpdateRequest{Files: files, ManifestVersion: ManifestVersion, ExpectedManifestDigest: snap.Manifest.Digest}, s.Ops)
+	if err != nil {
+		return out, generationFailure("publish", ErrGenerateConflict)
+	}
+	return GenerateResult{Status: "generated", File: name, ArtifactFile: artifactName, ManifestDigest: man.Digest, PlanDigest: p.Digest, ChecksDigest: checks.Digest, BundleDigest: bundle, Changes: len(p.Changes.Changes)}, nil
+}
+
+type generatedArtifact struct {
+	Artifact                                        artifact.Artifact
+	Plan                                            plan.Plan
+	Checks                                          precheck.Plan
+	BundleDigest                                    string
+	Bytes                                           []byte
+	SchemaPolicyResources, MigrationPolicyResources []policy.Resource
+}
+
+func (s GenerateService) buildGeneratedArtifact(ctx context.Context, r GenerateRequest, current, desired schema.Document, workspaceURL string, hints []schema.RenameHint, options plan.Options, prebuilt *plan.Plan, metadata map[string]string, simulationFactory simulate.Factory) (generatedArtifact, error) {
+	var out generatedArtifact
+	fromFP, err := schema.SemanticFingerprint(current)
+	if err != nil {
+		return out, generationFailure("source_fingerprint", ErrGenerateStage)
+	}
+	toFP, err := schema.SemanticFingerprint(desired)
+	if err != nil {
+		return out, generationFailure("desired_fingerprint", ErrGenerateConfig)
+	}
 	if err = s.checkpoint(r, "plan"); err != nil {
 		return out, err
 	}
-	p, err := plan.Build(ctx, postgres.New(), current, desired, plan.Options{Diff: schema.DiffOptions{RenameHints: hints}})
-	if err != nil {
-		return out, generationFailure("plan", ErrGenerateStage)
+	var p plan.Plan
+	if prebuilt == nil {
+		options.Diff = schema.DiffOptions{RenameHints: hints}
+		p, err = plan.Build(ctx, postgres.New(), current, desired, options)
+		if err != nil {
+			return out, generationFailure("plan", ErrGenerateStage)
+		}
+	} else {
+		p = *prebuilt
 	}
-	if p.FromFingerprint != fromFP || p.ToFingerprint != toFP || len(p.Changes.Changes) == 0 {
+	if p.FromFingerprint != fromFP || p.ToFingerprint != toFP {
 		return out, generationFailure("plan_binding", ErrGenerateStage)
 	}
 	if err = s.checkpoint(r, "simulate"); err != nil {
 		return out, err
 	}
-	sim, err := simulate.Run(ctx, simulate.PostgresFactory{NamePrefix: "autosql_sim_generate"}, simulate.Request{Config: simulate.Config{DevelopmentURL: r.DevelopmentURL, DevelopmentIdentity: r.DevelopmentIdentity, ProductionIdentity: r.ProductionIdentity, CleanupTimeout: 20 * time.Second}, From: current, Plan: p})
-	if err != nil || !sim.Verified || sim.ToFingerprint != toFP {
+	sim, err := simulate.Run(ctx, simulationFactory, simulate.Request{Config: simulate.Config{DevelopmentURL: r.DevelopmentURL, DevelopmentIdentity: r.DevelopmentIdentity, ProductionIdentity: r.ProductionIdentity, CleanupTimeout: 20 * time.Second}, From: current, Plan: p})
+	if err != nil {
+		return out, generationFailureCause("simulate", ErrGenerateStage, simulate.Redacted(err))
+	}
+	if !sim.Verified || sim.ToFingerprint != toFP {
 		return out, generationFailure("simulate", ErrGenerateStage)
 	}
 	statements := executableStatements(p)
@@ -161,15 +240,16 @@ func (s GenerateService) Generate(ctx context.Context, r GenerateRequest) (Gener
 	if err != nil {
 		return out, generationFailure("safety", ErrGenerateStage)
 	}
-	for _, d := range diagnostics {
-		if d.Suppressed == nil && d.Severity == safety.SeverityError {
+	for _, diagnostic := range diagnostics {
+		if diagnostic.Suppressed == nil && diagnostic.Severity == safety.SeverityError {
 			return out, generationFailure("safety", ErrGenerateStage)
 		}
 	}
 	if err = s.checkpoint(r, "policy"); err != nil {
 		return out, err
 	}
-	violations, err := g.Policy.Evaluate(ctx, r.Policy, schemaPolicyResources(desired), migrationPolicyResources(p))
+	schemaResources, migrationResources := schemaPolicyResources(desired), migrationPolicyResources(p)
+	violations, err := g.Policy.Evaluate(ctx, r.Policy, schemaResources, migrationResources)
 	if err != nil || len(violations) != 0 {
 		return out, generationFailure("policy", ErrGenerateStage)
 	}
@@ -177,7 +257,8 @@ func (s GenerateService) Generate(ctx context.Context, r GenerateRequest) (Gener
 	if err != nil {
 		return out, generationFailure("guardrail_bindings", ErrGenerateStage)
 	}
-	in := guardrail.Input{Changes: p.Changes, Safety: si, Policy: r.Policy, PolicyIdentity: r.PolicyIdentity, SchemaResources: schemaPolicyResources(desired), MigrationResources: migrationPolicyResources(p), Precheck: checks, Approval: approval.Request{Plan: approval.Plan{Environment: r.Environment, Author: r.Author, ExpiresAt: r.ExpiresAt}, Approvals: append([]approval.Approval(nil), r.Approvals...), RequestedBy: r.Requester}, StatementBindings: bindings, Database: replayDB{url: workspace.URL}}
+	mutation := &generationPlanMutation{url: workspaceURL, plan: p}
+	in := guardrail.Input{Changes: p.Changes, Safety: si, Policy: r.Policy, PolicyIdentity: r.PolicyIdentity, SchemaResources: schemaResources, MigrationResources: migrationResources, Precheck: checks, Approval: approval.Request{Plan: approval.Plan{Environment: r.Environment, Author: r.Author, ExpiresAt: r.ExpiresAt}, Approvals: append([]approval.Approval(nil), r.Approvals...), RequestedBy: r.Requester}, StatementBindings: bindings, Mutation: mutation}
 	if err = s.checkpoint(r, "guardrail"); err != nil {
 		return out, err
 	}
@@ -185,27 +266,28 @@ func (s GenerateService) Generate(ctx context.Context, r GenerateRequest) (Gener
 	if err != nil {
 		return out, generationFailure("guardrail", ErrGenerateStage)
 	}
+	authority := r.Authority
+	if r.ApprovalProvider != nil {
+		in.Approval.Approvals, authority, err = r.ApprovalProvider.Issue(ctx, bundle, r.Environment, r.CreatedAt.UTC(), r.ExpiresAt.UTC())
+		if err != nil {
+			return out, generationFailure("approval_issue", ErrGenerateStage)
+		}
+	}
 	for i := range in.Approval.Approvals {
 		in.Approval.Approvals[i].PlanDigest = bundle
 		in.Approval.Approvals[i].Environment = r.Environment
 	}
 	in.Approval.Plan.Digest = bundle
-	g.Approval.Authority = r.Authority
+	g.Approval.Authority = authority
 	g.Approval.Audit = r.ApprovalAudit
 	if _, err = g.Apply(ctx, in); err != nil {
-		return out, generationFailure("guardrail_approval_precheck", ErrGenerateStage)
+		return out, generationFailureCause("guardrail_approval_precheck", ErrGenerateStage, mutation.cause)
 	}
-	approved, err := trustedArtifactApproval(ctx, r.Authority, in.Approval.Approvals, bundle, r.Environment)
+	approved, err := trustedArtifactApproval(ctx, authority, in.Approval.Approvals, bundle, r.Environment)
 	if err != nil {
 		return out, generationFailure("approval_evidence", ErrGenerateStage)
 	}
-	in.Approval.Plan.Digest = bundle
 	created := r.CreatedAt.UTC()
-	metadata := cloneStrings(r.Metadata)
-	metadata["autosql.migration.manifest"] = snap.Manifest.Digest
-	metadata["autosql.migration.from"] = fromFP
-	metadata["autosql.migration.to"] = toFP
-	metadata["autosql.migration.rename_hints"] = canonicalHints
 	if err = s.checkpoint(r, "artifact"); err != nil {
 		return out, err
 	}
@@ -221,34 +303,22 @@ func (s GenerateService) Generate(ctx context.Context, r GenerateRequest) (Gener
 		Identity       string
 		Checks, Bundle string
 	}{r.Policy, r.PolicyIdentity, checks.Digest, bundle})
-	atts := []artifact.ValidationAttestation{{Stage: "replay_simulation", Implementation: "autosql/pkg/migrate.GenerateService", Version: "1", ConfigDigest: simConfig, ResultDigest: toFP, At: created, ExpiresAt: attExpiry, Simulation: &artifact.SimulationAttestation{TargetIdentity: r.ProductionIdentity, DevelopmentIdentity: r.DevelopmentIdentity, FromFingerprint: fromFP, ToFingerprint: toFP, DatabaseVersion: fmt.Sprint(r.PostgresVersion), ConfigDigest: simConfig}}, {Stage: "safety", Implementation: "autosql/pkg/safety.Runner", Version: "1", ConfigDigest: safetyConfig, ResultDigest: shaJSON(diagnostics), At: created, ExpiresAt: attExpiry, Safety: &artifact.SafetyAttestation{Analyzers: []string{"compatibility", "postgresql-operational"}, Threshold: string(safety.SeverityError), SuppressionsDigest: shaJSON([]safety.Diagnostic{}), DiagnosticsDigest: shaJSON(diagnostics), ConfigDigest: safetyConfig}}, {Stage: "policy_precheck_guardrail", Implementation: "autosql/pkg/guardrail.Guardrail", Version: "1", ConfigDigest: policyConfig, ResultDigest: bundle, At: created, ExpiresAt: attExpiry, Policy: &artifact.PolicyAttestation{DocumentDigest: shaJSON(r.Policy), LimitsDigest: shaJSON(g.Policy.Limits), ResourcesDigest: shaJSON([]any{in.SchemaResources, in.MigrationResources}), ConfigDigest: policyConfig}, Precheck: &artifact.PrecheckGuardrailAttestation{ChecksDigest: checks.Digest, GuardrailDigest: bundle, ConfigDigest: policyConfig}}}
+	atts := []artifact.ValidationAttestation{{Stage: "replay_simulation", Implementation: "autosql/pkg/migrate.GenerateService", Version: "1", ConfigDigest: simConfig, ResultDigest: toFP, At: created, ExpiresAt: attExpiry, Simulation: &artifact.SimulationAttestation{TargetIdentity: r.ProductionIdentity, DevelopmentIdentity: r.DevelopmentIdentity, FromFingerprint: fromFP, ToFingerprint: toFP, DatabaseVersion: fmt.Sprint(r.PostgresVersion), ConfigDigest: simConfig}}, {Stage: "safety", Implementation: "autosql/pkg/safety.Runner", Version: "1", ConfigDigest: safetyConfig, ResultDigest: shaJSON(diagnostics), At: created, ExpiresAt: attExpiry, Safety: &artifact.SafetyAttestation{Analyzers: []string{"compatibility", "postgresql-operational"}, Threshold: string(safety.SeverityError), SuppressionsDigest: shaJSON(append([]safety.Suppression{}, r.SafetySuppressions...)), DiagnosticsDigest: shaJSON(diagnostics), ConfigDigest: safetyConfig}}, {Stage: "policy_precheck_guardrail", Implementation: "autosql/pkg/guardrail.Guardrail", Version: "1", ConfigDigest: policyConfig, ResultDigest: bundle, At: created, ExpiresAt: attExpiry, Policy: &artifact.PolicyAttestation{DocumentDigest: shaJSON(r.Policy), LimitsDigest: shaJSON(g.Policy.Limits), ResourcesDigest: shaJSON([]any{in.SchemaResources, in.MigrationResources}), ConfigDigest: policyConfig}, Precheck: &artifact.PrecheckGuardrailAttestation{ChecksDigest: checks.Digest, GuardrailDigest: bundle, ConfigDigest: policyConfig}}}
 	if err = a.SetValidationAttestations(atts); err != nil {
 		return out, generationFailure("attest", ErrGenerateStage)
 	}
 	if err = a.Sign(r.SigningKeyID, r.SigningPrivateKey); err != nil {
 		return out, generationFailure("sign", ErrGenerateStage)
 	}
-	artifactBytes, err := a.MarshalCanonical()
+	encoded, err := a.MarshalCanonical()
 	if err != nil {
 		return out, generationFailure("artifact_encode", ErrGenerateStage)
 	}
-	sql := renderGeneratedSQL(p, checks.Digest, bundle, canonicalHints)
-	name := fmt.Sprintf("V%s__%s.sql", r.Version, r.Label)
-	files := snapshotFiles(snap)
-	artifactName := name + ".artifact.json"
-	files = append(files, File{Name: name, SQL: sql, ArtifactName: artifactName, Artifact: artifactBytes})
-	if err = s.checkpoint(r, "publish"); err != nil {
-		return out, err
-	}
-	man, err := UpdateWithOps(r.Directory, UpdateRequest{Files: files, ManifestVersion: ManifestVersion, ExpectedManifestDigest: snap.Manifest.Digest}, s.Ops)
-	if err != nil {
-		return out, generationFailure("publish", ErrGenerateConflict)
-	}
-	return GenerateResult{Status: "generated", File: name, ArtifactFile: artifactName, ManifestDigest: man.Digest, PlanDigest: p.Digest, ChecksDigest: checks.Digest, BundleDigest: bundle, Changes: len(p.Changes.Changes)}, nil
+	return generatedArtifact{Artifact: a, Plan: p, Checks: checks, BundleDigest: bundle, Bytes: encoded, SchemaPolicyResources: schemaResources, MigrationPolicyResources: migrationResources}, nil
 }
 
 func validateGenerateRequest(r GenerateRequest) error {
-	if r.Directory == "" || r.Version == "" || r.Label == "" || r.Format != "sql" || r.DevelopmentURL == "" || r.DevelopmentIdentity == "" || r.ProductionIdentity == "" || r.DevelopmentIdentity == r.ProductionIdentity || r.Environment == "" || r.DatabaseIdentity == "" || r.SourceRevision == "" || r.Author == "" || r.Requester == "" || r.Author == r.Requester || r.PolicyIdentity == "" || r.PostgresVersion <= 0 || r.CreatedAt.IsZero() || !r.ExpiresAt.After(r.CreatedAt) || len(r.GeneratorPrivateKey) != ed25519.PrivateKeySize || len(r.SigningPrivateKey) != ed25519.PrivateKeySize || r.GeneratorKeyID == "" || r.GeneratorPurpose == "" || r.SigningKeyID == "" || r.Authority == nil || r.ApprovalAudit == nil || len(r.Approvals) == 0 {
+	if r.Directory == "" || r.Version == "" || r.Label == "" || r.Format != "sql" || r.DevelopmentURL == "" || r.DevelopmentIdentity == "" || r.ProductionIdentity == "" || r.DevelopmentIdentity == r.ProductionIdentity || r.Environment == "" || r.DatabaseIdentity == "" || r.SourceRevision == "" || r.Author == "" || r.Requester == "" || r.Author == r.Requester || r.PolicyIdentity == "" || r.PostgresVersion <= 0 || r.CreatedAt.IsZero() || !r.ExpiresAt.After(r.CreatedAt) || len(r.GeneratorPrivateKey) != ed25519.PrivateKeySize || len(r.SigningPrivateKey) != ed25519.PrivateKeySize || r.GeneratorKeyID == "" || r.GeneratorPurpose == "" || r.SigningKeyID == "" || r.ApprovalAudit == nil || (r.ApprovalProvider == nil && (r.Authority == nil || len(r.Approvals) == 0)) {
 		return generationFailure("config", ErrGenerateConfig)
 	}
 	if strings.ToLower(r.Label) != r.Label || strings.IndexFunc(r.Label, func(x rune) bool { return !(x >= 'a' && x <= 'z' || x >= '0' && x <= '9' || x == '-' || x == '_') }) >= 0 {
@@ -259,6 +329,11 @@ func validateGenerateRequest(r GenerateRequest) error {
 	}
 	if err := r.Desired.Validate(); err != nil || len(r.Policy.Rules) == 0 {
 		return generationFailure("desired_or_policy", ErrGenerateConfig)
+	}
+	for _, suppression := range r.SafetySuppressions {
+		if err := suppression.Validate(); err != nil {
+			return generationFailure("safety_suppression", ErrGenerateConfig)
+		}
 	}
 	return nil
 }
@@ -298,7 +373,7 @@ func generationChecks(p plan.Plan, statements []string, assertions []precheck.As
 	return c, e
 }
 func generationGuardrail(r GenerateRequest) guardrail.Guardrail {
-	return guardrail.Guardrail{Config: guardrail.Config{Environment: r.Environment, FailOn: safety.SeverityError, Risk: guardrail.RiskConfig{Baseline: approval.RiskLow}}, Safety: safety.Runner{Analyzers: safety.Builtins()}, Policy: policy.Evaluator{}, Approval: approval.Gate{Policy: r.ApprovalPolicy}}
+	return guardrail.Guardrail{Config: guardrail.Config{Environment: r.Environment, FailOn: safety.SeverityError, Risk: guardrail.RiskConfig{Baseline: approval.RiskLow}}, Safety: safety.Runner{Analyzers: safety.Builtins(), Suppressions: append([]safety.Suppression(nil), r.SafetySuppressions...)}, Policy: policy.Evaluator{}, Approval: approval.Gate{Policy: r.ApprovalPolicy}}
 }
 func schemaPolicyResources(d schema.Document) []policy.Resource {
 	out := make([]policy.Resource, 0, len(d.Graph.Resources))
@@ -421,50 +496,35 @@ func shaJSON(v any) string { b, _ := json.Marshal(v); return sha(string(b)) }
 type replayWorkspace struct {
 	Document            schema.Document
 	URL, adminURL, name string
+	workspace           *simulate.PostgresWorkspace
 }
 
 func (w replayWorkspace) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	c, e := pgx.Connect(ctx, w.adminURL)
-	if e != nil {
-		return e
+	if w.workspace == nil {
+		c, err := pgx.Connect(ctx, w.adminURL)
+		if err != nil {
+			return err
+		}
+		defer c.Close(context.Background())
+		_, err = c.Exec(ctx, "DROP DATABASE IF EXISTS "+pgx.Identifier{w.name}.Sanitize()+" WITH (FORCE)")
+		return err
 	}
-	defer c.Close(context.Background())
-	_, e = c.Exec(ctx, "DROP DATABASE IF EXISTS "+pgx.Identifier{w.name}.Sanitize()+" WITH (FORCE)")
-	return e
+	return w.workspace.Cleanup(ctx)
 }
 func replaySnapshot(ctx context.Context, snap Snapshot, r GenerateRequest) (out replayWorkspace, err error) {
-	u, e := url.Parse(r.DevelopmentURL)
-	if e != nil || u.Scheme == "" {
-		return out, e
-	}
-	admin, e := pgx.Connect(ctx, r.DevelopmentURL)
-	if e != nil {
-		return out, e
-	}
-	defer admin.Close(context.Background())
-	actual, e := simulate.ResolvePostgresIdentity(ctx, r.DevelopmentURL)
-	if e != nil || actual != r.DevelopmentIdentity || actual == r.ProductionIdentity {
-		return out, errors.New("development identity mismatch")
-	}
-	random := make([]byte, 12)
-	if _, e = rand.Read(random); e != nil {
-		return out, e
-	}
-	name := "autosql_gen_replay_" + hex.EncodeToString(random)
-	if _, e = admin.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()); e != nil {
-		return out, e
+	out, err = createReplayWorkspace(ctx, r, simulate.PostgresFactory{NamePrefix: "autosql_sim_gen_replay"})
+	if err != nil {
+		return out, err
 	}
 	created := true
 	defer func() {
 		if err != nil && created {
-			_ = (replayWorkspace{adminURL: r.DevelopmentURL, name: name}).Close()
+			_ = out.Close()
 		}
 	}()
-	du := *u
-	du.Path = "/" + name
-	conn, e := pgx.Connect(ctx, du.String())
+	conn, e := pgx.Connect(ctx, out.URL)
 	if e != nil {
 		return out, e
 	}
@@ -486,11 +546,21 @@ func replaySnapshot(ctx context.Context, snap Snapshot, r GenerateRequest) (out 
 			schemas = append(schemas, resource.Name.Name)
 		}
 	}
-	doc, e := postgres.InspectURL(ctx, du.String(), postgres.Options{Schemas: schemas})
+	doc, e := postgres.InspectURL(ctx, out.URL, postgres.Options{Schemas: schemas})
 	if e != nil {
 		return out, e
 	}
-	return replayWorkspace{Document: doc, URL: du.String(), adminURL: r.DevelopmentURL, name: name}, nil
+	out.Document = doc
+	created = false
+	return out, nil
+}
+
+func createReplayWorkspace(ctx context.Context, r GenerateRequest, factory simulate.PostgresFactory) (replayWorkspace, error) {
+	workspace, err := factory.CreateWorkspace(ctx, simulate.Config{DevelopmentURL: r.DevelopmentURL, DevelopmentIdentity: r.DevelopmentIdentity, ProductionIdentity: r.ProductionIdentity, CleanupTimeout: 20 * time.Second})
+	if err != nil {
+		return replayWorkspace{}, err
+	}
+	return replayWorkspace{URL: workspace.URL(), workspace: workspace}, nil
 }
 
 type replayDB struct{ url string }

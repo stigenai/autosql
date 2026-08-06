@@ -27,10 +27,10 @@ func TestProviderDeliveryConformance(t *testing.T) {
 	d := "sha256:" + strings.Repeat("a", 64)
 	p := "sha256:" + strings.Repeat("b", 64)
 	target := "sha256:" + strings.Repeat("c", 64)
-	platforms := []gitops.Platform{gitops.CircleCI, gitops.Bitbucket, gitops.AzureDevOps, gitops.ArgoCD, gitops.GitHub, gitops.GitLab}
+	platforms := []gitops.Platform{gitops.CircleCI, gitops.Bitbucket, gitops.AzureDevOps, gitops.ArgoCD, gitops.GitHub, gitops.GitLab, gitops.Flux, gitops.Crossplane}
 	for _, platform := range platforms {
 		t.Run(string(platform), func(t *testing.T) {
-			c := gitops.Contract{Platform: platform, Version: "v1", Mode: gitops.Deploy, ArtifactRef: "env://AUTOSQL_ARTIFACT", ArtifactDigest: d, PolicyDigest: p, TargetSnapshot: target, ApprovalRef: "env://AUTOSQL_APPROVAL", OIDC: true, Image: conformanceImage(), Retry: gitops.RetryPolicy{MaxAttempts: 2, Backoff: time.Second}}
+			c := gitops.Contract{Platform: platform, Version: "v1", Mode: gitops.Deploy, ArtifactRef: "env://AUTOSQL_ARTIFACT", ArtifactDigest: d, PolicyDigest: p, TargetSnapshot: target, ApprovalRef: "env://AUTOSQL_APPROVAL", ApprovalDigest: d, OIDC: true, Image: conformanceImage(), Retry: gitops.RetryPolicy{MaxAttempts: 2, Backoff: time.Second}}
 			if _, err := gitops.Render(c); err != nil {
 				t.Fatal(err)
 			}

@@ -15,7 +15,7 @@ import (
 	"autosql/pkg/plugin"
 	"autosql/pkg/schema"
 	"github.com/jackc/pgx/v5"
-	pg_query "github.com/pganalyze/pg_query_go/v6"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 const version = "0.1.0"
@@ -98,23 +98,23 @@ func (*Driver) Info() plugin.Info {
 		schema.KindEnum:             {Kind: schema.KindEnum, Mode: plugin.Managed, Operations: all, Features: []string{"enum.lifecycle", "enum.append_values"}},
 		schema.KindDomain:           {Kind: schema.KindDomain, Mode: plugin.Managed, Operations: all, Features: []string{"domain.lifecycle", "domain.core_base_type", "domain.literal_check", "owner.lifecycle"}},
 		schema.KindSequence:         {Kind: schema.KindSequence, Mode: plugin.Managed, Operations: all, Features: []string{"sequence.lifecycle", "sequence.options"}},
-		schema.KindTable:            {Kind: schema.KindTable, Mode: plugin.Managed, Operations: all, Features: []string{"table.permanent_nonpartitioned", "table.rls", "table.child_columns"}},
+		schema.KindTable:            {Kind: schema.KindTable, Mode: plugin.Managed, Operations: all, Features: []string{"table.permanent", "table.partitioned.range", "table.partitioned.list", "table.partitioned.hash", "table.partition", "table.rls", "table.child_columns"}},
 		schema.KindColumn:           {Kind: schema.KindColumn, Mode: plugin.Managed, Operations: all, Features: []string{"column.type_safe_casts", "column.default", "column.not_null", "column.ordinal_metadata", "column.identity_create", "column.generated_external_routines", "column.generated_stored_create"}},
 		schema.KindPrimaryKey:       {Kind: schema.KindPrimaryKey, Mode: plugin.Managed, Operations: all, Features: []string{"constraint.primary_key", "constraint.lifecycle", "alter.explicit_rebuild"}},
 		schema.KindUniqueConstraint: {Kind: schema.KindUniqueConstraint, Mode: plugin.Managed, Operations: all, Features: []string{"constraint.unique", "constraint.lifecycle", "alter.explicit_rebuild"}},
 		schema.KindCheckConstraint:  {Kind: schema.KindCheckConstraint, Mode: plugin.Managed, Operations: all, Features: []string{"constraint.check", "constraint.lifecycle", "alter.explicit_rebuild"}},
 		schema.KindForeignKey:       {Kind: schema.KindForeignKey, Mode: plugin.Managed, Operations: all, Features: []string{"constraint.foreign_key", "constraint.lifecycle", "alter.explicit_rebuild"}},
-		schema.KindIndex:            {Kind: schema.KindIndex, Mode: plugin.Managed, Operations: all, Features: []string{"index.lifecycle", "index.expression", "index.partial", "index.include", "index.operator_class", "index.storage_parameters", "index.tablespace", "alter.explicit_rebuild"}},
-		schema.KindFunction:         {Kind: schema.KindFunction, Mode: plugin.Managed, Operations: all, Features: []string{"function.lifecycle", "routine.reviewed_source", "routine.overloads", "routine.sql", "routine.plpgsql"}},
-		schema.KindProcedure:        {Kind: schema.KindProcedure, Mode: plugin.Managed, Operations: all, Features: []string{"procedure.lifecycle", "procedure.transaction_control_guard", "routine.reviewed_source", "routine.overloads", "routine.sql", "routine.plpgsql"}},
-		schema.KindTrigger:          {Kind: schema.KindTrigger, Mode: plugin.Managed, Operations: all, Features: []string{"trigger.lifecycle", "trigger.enablement", "trigger.constraint", "trigger.transition_tables", "trigger.when"}},
+		schema.KindIndex:            {Kind: schema.KindIndex, Mode: plugin.Managed, Operations: all, Features: []string{"index.lifecycle", "index.expression", "index.partial", "index.include", "index.operator_class", "index.network_inet_ops", "index.storage_parameters", "index.tablespace", "alter.explicit_rebuild"}},
+		schema.KindFunction:         {Kind: schema.KindFunction, Mode: plugin.Managed, Operations: all, Features: []string{"function.lifecycle", "routine.reviewed_source", "routine.overloads", "routine.sql", "routine.plpgsql", "routine.schema_bound_signature", "routine.fixed_runtime_search_path"}},
+		schema.KindProcedure:        {Kind: schema.KindProcedure, Mode: plugin.Managed, Operations: all, Features: []string{"procedure.lifecycle", "procedure.transaction_control_guard", "routine.reviewed_source", "routine.overloads", "routine.sql", "routine.plpgsql", "routine.schema_bound_signature", "routine.fixed_runtime_search_path"}},
+		schema.KindTrigger:          {Kind: schema.KindTrigger, Mode: plugin.Managed, Operations: all, Features: []string{"trigger.lifecycle", "trigger.enablement", "trigger.constraint", "trigger.transition_tables", "trigger.when", "trigger.schema_bound_target", "trigger.schema_bound_function"}},
 		schema.KindPolicy:           {Kind: schema.KindPolicy, Mode: plugin.Managed, Operations: all, Features: []string{"policy.lifecycle", "policy.permissive_restrictive", "policy.exact_dependencies", "policy.deny_first_rls"}},
 		schema.KindRole:             {Kind: schema.KindRole, Mode: plugin.Managed, Operations: all, Features: []string{"role.lifecycle", "role.external_password", "role.protected", "role.reassign_owned"}},
 		schema.KindMembership:       {Kind: schema.KindMembership, Mode: plugin.Managed, Operations: all, Features: []string{"membership.lifecycle", "membership.admin_guard", "membership.pg16_options", "membership.cycle_guard"}},
 		schema.KindGrant:            {Kind: schema.KindGrant, Mode: plugin.Managed, Operations: []schema.Operation{schema.OperationCreate, schema.OperationAlter, schema.OperationDrop}, Features: []string{"grant.lifecycle", "grant.option", "grant.partial_revoke", "grant.exact_dependencies"}},
 		schema.KindDefaultPrivilege: {Kind: schema.KindDefaultPrivilege, Mode: plugin.Managed, Operations: []schema.Operation{schema.OperationCreate, schema.OperationAlter, schema.OperationDrop}, Features: []string{"default_privilege.lifecycle", "default_privilege.future_objects", "default_privilege.exact_dependencies"}},
-		schema.KindView:             {Kind: schema.KindView, Mode: plugin.Managed, Operations: all, Features: []string{"view.provable_projection"}},
-		schema.KindMaterializedView: {Kind: schema.KindMaterializedView, Mode: plugin.Managed, Operations: all, Features: []string{"materialized_view.provable_projection", "alter.explicit_rebuild"}},
+		schema.KindView:             {Kind: schema.KindView, Mode: plugin.Managed, Operations: all, Features: []string{"view.provable_projection", "view.ast_dependency_graph", "view.captured_projection", "view.projection_type_dependencies", "view.schema_bound_query"}},
+		schema.KindMaterializedView: {Kind: schema.KindMaterializedView, Mode: plugin.Managed, Operations: all, Features: []string{"materialized_view.provable_projection", "materialized_view.ast_dependency_graph", "materialized_view.captured_projection", "materialized_view.projection_type_dependencies", "materialized_view.schema_bound_query", "alter.explicit_rebuild"}},
 	}
 	for _, kind := range kinds {
 		if capability, ok := profiles[kind]; ok {
@@ -164,15 +164,124 @@ func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Documen
 	if err := canonicalizeUsedTypes(&doc); err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
+	if err := canonicalizeConstraintIndexTypeDependencies(&doc); err != nil {
+		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
+	}
+	if err := canonicalizeConstraintIndexBindings(&doc); err != nil {
+		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
+	}
+	if err := canonicalizeExpressionCasts(&doc); err != nil {
+		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
+	}
+	if err := canonicalizeViewBindings(&doc); err != nil {
+		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
+	}
+	if err := canonicalizeRoutineBindings(&doc); err != nil {
+		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
+	}
+	if err := canonicalizePartitionTables(&doc); err != nil {
+		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
+	}
 	if err := canonicalizeColumnOrdinals(&doc); err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
 	augmentProjectionColumns(&doc)
+	canonicalizeTriggerDefinitions(&doc)
 	doc.Normalize()
 	if err := doc.Validate(); err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
 	return doc, nil
+}
+
+func canonicalizeTriggerDefinitions(doc *schema.Document) {
+	resources := make(map[string]schema.Resource, len(doc.Graph.Resources))
+	for _, resource := range doc.Graph.Resources {
+		resources[resource.ID] = resource
+	}
+	for index := range doc.Graph.Resources {
+		resource := &doc.Graph.Resources[index]
+		if resource.Kind != schema.KindTrigger {
+			continue
+		}
+		parsed, err := parseTriggerDefinition(*resource, resources)
+		if err != nil {
+			continue
+		}
+		values := specMap(resource.Spec)
+		values["definition"] = parsed.SQL
+		normalized, err := json.Marshal(values)
+		if err != nil {
+			continue
+		}
+		resource.Spec = normalized
+		resources[resource.ID] = *resource
+	}
+}
+
+func canonicalizePartitionTables(doc *schema.Document) error {
+	resources := make(map[string]schema.Resource, len(doc.Graph.Resources))
+	columns := map[string][]schema.Resource{}
+	for _, resource := range doc.Graph.Resources {
+		resources[resource.ID] = resource
+		if resource.Kind == schema.KindColumn {
+			columns[resource.Name.Parent] = append(columns[resource.Name.Parent], resource)
+		}
+	}
+	for index := range doc.Graph.Resources {
+		table := &doc.Graph.Resources[index]
+		if table.Kind != schema.KindTable {
+			continue
+		}
+		values := specMap(table.Spec)
+		parentID := stringValue(values, "partition_of")
+		if parentID == "" {
+			if boolValue(values, "partitioned") {
+				for _, column := range columns[table.ID] {
+					for _, dependency := range column.Dependencies {
+						if dependency.Type != schema.DependencyContains {
+							appendUniqueDependency(&table.Dependencies, dependency)
+						}
+					}
+				}
+			}
+			continue
+		}
+		parent, ok := resources[parentID]
+		if !ok || parent.Kind != schema.KindTable || !boolValue(spec(parent), "partitioned") {
+			return fmt.Errorf("partition %s references a missing or nonpartitioned parent", table.Name.String())
+		}
+		appendUniqueDependency(&table.Dependencies, schema.Dependency{Target: parentID, Type: schema.DependencyReferences})
+		if len(columns[table.ID]) != 0 {
+			continue
+		}
+		parentColumns := append([]schema.Resource(nil), columns[parentID]...)
+		sort.Slice(parentColumns, func(i, j int) bool {
+			return numberAsInt(spec(parentColumns[i]), "ordinal") < numberAsInt(spec(parentColumns[j]), "ordinal")
+		})
+		for _, sourceColumn := range parentColumns {
+			clone := sourceColumn
+			clone.Name = schema.Name{Schema: table.Name.Schema, Parent: table.ID, Name: sourceColumn.Name.Name}
+			clone.ID = schema.StableID(schema.KindColumn, clone.Name)
+			clone.Dependencies = []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}}
+			for _, dependency := range sourceColumn.Dependencies {
+				if dependency.Type != schema.DependencyContains {
+					appendUniqueDependency(&clone.Dependencies, dependency)
+				}
+			}
+			doc.Graph.Resources = append(doc.Graph.Resources, clone)
+		}
+	}
+	return nil
+}
+
+func appendUniqueDependency(dependencies *[]schema.Dependency, candidate schema.Dependency) {
+	for _, dependency := range *dependencies {
+		if dependency.Target == candidate.Target && dependency.Type == candidate.Type {
+			return
+		}
+	}
+	*dependencies = append(*dependencies, candidate)
 }
 
 func canonicalizeUsedTypes(doc *schema.Document) error {
@@ -216,11 +325,120 @@ func canonicalizeUsedTypes(doc *schema.Document) error {
 				name = identifier(target.Name.Schema) + "." + name
 			}
 			s["type"] = name + array
+			if value, ok := s["default"].(string); ok && stringValue(s, "generated") == "" && (target.Kind == schema.KindEnum || target.Kind == schema.KindDomain || target.Kind == schema.KindComposite) {
+				expression, expressionErr := classifyDefaultExpression(value)
+				if expressionErr == nil && userDefinedCastMatches(expression, target, r.Name.Schema, array != "") {
+					canonical, canonicalErr := qualifyUserDefinedDefaultCast(value, target)
+					if canonicalErr != nil {
+						return fmt.Errorf("column %s default cast: %w", r.Name.String(), canonicalErr)
+					}
+					s["default"] = canonical
+				}
+			}
 			r.Spec, _ = json.Marshal(s)
 		}
 		if uses > 1 {
 			return fmt.Errorf("column %s has ambiguous uses targets", r.Name.String())
 		}
+	}
+	return nil
+}
+
+func canonicalizeConstraintIndexTypeDependencies(doc *schema.Document) error {
+	resources := make(map[string]schema.Resource, len(doc.Graph.Resources))
+	for _, resource := range doc.Graph.Resources {
+		resources[resource.ID] = resource
+	}
+	for index := range doc.Graph.Resources {
+		resource := &doc.Graph.Resources[index]
+		if resource.Kind != schema.KindCheckConstraint && resource.Kind != schema.KindIndex {
+			continue
+		}
+		var expressionRoot protoreflect.Message
+		var err error
+		if resource.Kind == schema.KindIndex {
+			var parsed parsedIndex
+			parsed, err = parseIndexDefinition(*resource, resources)
+			if err == nil {
+				expressionRoot = parsed.statement.ProtoReflect()
+			}
+		} else {
+			var parsed parsedConstraint
+			parsed, err = parseConstraintDefinition(*resource, resources)
+			if err == nil {
+				expressionRoot = parsed.statement.ProtoReflect()
+			}
+		}
+		if err != nil {
+			// Normalization historically leaves unsupported constraint/index grammar to
+			// the scoped renderer. Preserve that contract when no dependency can
+			// be proven from a parser-bound expression.
+			continue
+		}
+		targets, err := expressionTypeDependencies(expressionRoot, resource.Name.Schema, *resource, resources)
+		if err != nil {
+			return err
+		}
+		for _, target := range targets {
+			exists := false
+			for _, dependency := range resource.Dependencies {
+				exists = exists || dependency.Target == target && dependency.Type == schema.DependencyUses
+			}
+			if !exists {
+				resource.Dependencies = append(resource.Dependencies, schema.Dependency{Target: target, Type: schema.DependencyUses})
+			}
+		}
+		resources[resource.ID] = *resource
+	}
+	return nil
+}
+
+func canonicalizeConstraintIndexBindings(doc *schema.Document) error {
+	resources := make(map[string]schema.Resource, len(doc.Graph.Resources))
+	for _, resource := range doc.Graph.Resources {
+		resources[resource.ID] = resource
+	}
+	for index := range doc.Graph.Resources {
+		resource := &doc.Graph.Resources[index]
+		if resource.Kind != schema.KindCheckConstraint && resource.Kind != schema.KindForeignKey && resource.Kind != schema.KindIndex {
+			continue
+		}
+		if resource.Kind == schema.KindForeignKey && stringValue(spec(*resource), "definition") == "" {
+			continue
+		}
+		hasManagedType := false
+		for _, dependency := range resource.Dependencies {
+			target := resources[dependency.Target]
+			hasManagedType = hasManagedType || dependency.Type == schema.DependencyUses && (target.Kind == schema.KindEnum || target.Kind == schema.KindDomain || target.Kind == schema.KindComposite)
+		}
+		if !hasManagedType && resource.Kind != schema.KindForeignKey {
+			continue
+		}
+		definition := ""
+		if resource.Kind == schema.KindIndex {
+			parsed, err := parseIndexDefinition(*resource, resources)
+			if err != nil {
+				return err
+			}
+			if err := schemaBindIndexTypeCasts(&parsed, *resource, resources); err != nil {
+				return err
+			}
+			definition = parsed.SQL
+		} else {
+			_, renderedDefinition, err := renderConstraintCreate(*resource, resources)
+			if err != nil {
+				return err
+			}
+			definition = renderedDefinition
+		}
+		values := specMap(resource.Spec)
+		values["definition"] = definition
+		normalized, err := json.Marshal(values)
+		if err != nil {
+			return err
+		}
+		resource.Spec = normalized
+		resources[resource.ID] = *resource
 	}
 	return nil
 }
@@ -463,6 +681,14 @@ func numberAsInt(values map[string]any, key string) int {
 }
 
 func normalizePostgresSpecForKind(kind schema.Kind, spec map[string]any) {
+	// Routine definitions are reviewed and authorized as exact source. Preserve
+	// their line structure before the generic definition normalizer collapses
+	// SQL whitespace: a PL/pgSQL -- comment is semantic through end-of-line.
+	var routineDefinition string
+	var hasRoutineDefinition bool
+	if kind == schema.KindFunction || kind == schema.KindProcedure {
+		routineDefinition, hasRoutineDefinition = spec["definition"].(string)
+	}
 	normalizePostgresSpec(spec)
 	if kind == schema.KindColumn {
 		if nullable, ok := spec["nullable"].(bool); ok {
@@ -539,16 +765,18 @@ func normalizePostgresSpecForKind(kind schema.Kind, spec map[string]any) {
 		}
 	}
 	if kind == schema.KindFunction || kind == schema.KindProcedure {
-		if definition, ok := spec["definition"].(string); ok {
-			if parsed, err := pg_query.Parse(definition); err == nil && len(parsed.Stmts) == 1 && parsed.Stmts[0].Stmt.GetCreateFunctionStmt() != nil {
-				if canonical, err := pg_query.Deparse(parsed); err == nil && strings.TrimSpace(canonical) != "" {
-					definition = strings.TrimSpace(canonical)
-					spec["definition"] = definition
-				}
-			}
+		if hasRoutineDefinition {
+			definition := normalizeRoutineSource(routineDefinition)
+			spec["definition"] = definition
 			spec["body_digest"] = routineDefinitionDigest(definition)
 		}
 	}
+}
+
+func normalizeRoutineSource(definition string) string {
+	definition = strings.ReplaceAll(definition, "\r\n", "\n")
+	definition = strings.ReplaceAll(definition, "\r", "\n")
+	return strings.TrimSpace(definition)
 }
 
 func routineDefinitionDigest(definition string) string {
@@ -631,6 +859,7 @@ func postgresTypeAlias(value string) string {
 		"time without time zone": "time", "time": "time", "time with time zone": "timetz", "timetz": "timetz",
 		"numeric": "numeric", "decimal": "numeric", "date": "date", "interval": "interval", "text": "text",
 		"uuid": "uuid", "json": "json", "jsonb": "jsonb", "bytea": "bytea",
+		"cidr": "cidr", "inet": "inet", "macaddr": "macaddr",
 	}
 	if normalized, ok := aliases[s]; ok {
 		return normalized + suffix + array
@@ -662,6 +891,12 @@ func postgresDefault(value string) string {
 	if lower == "gen_random_uuid()" || lower == "pg_catalog.gen_random_uuid()" {
 		return "pg_catalog.gen_random_uuid()"
 	}
+	if expression, err := classifyDefaultExpression(s); err == nil && expression.Kind == defaultExpressionCast && expression.Cast != nil {
+		castType, castOK := coreDefaultCastType(expression.Cast.Type)
+		if castOK && castType.base == "text" && !castType.array && expression.Cast.Expression.Kind == defaultExpressionFunction && isGenRandomUUIDFunction(expression.Cast.Expression.Function, false) {
+			return "pg_catalog.gen_random_uuid()::text"
+		}
+	}
 	for _, clock := range []string{"now()", "transaction_timestamp()", "current_timestamp", "current_timestamp()"} {
 		if lower == "timezone('utc'::text, "+clock+")" || lower == "pg_catalog.timezone('utc'::text, "+clock+")" {
 			return "pg_catalog.timezone('utc'::text, CURRENT_TIMESTAMP)"
@@ -685,6 +920,11 @@ func postgresDefault(value string) string {
 			if strings.HasPrefix(base, "'") || base == "true" || base == "false" || base == "NULL" || base == "null" {
 				return base
 			}
+		}
+	}
+	if expression, err := classifyDefaultExpression(s); err == nil && containsDefaultOperator(expression) {
+		if canonical, err := canonicalOperatorDefault(expression); err == nil {
+			return canonical
 		}
 	}
 	return s

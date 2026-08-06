@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -17,6 +18,7 @@ import (
 type parsedConstraint struct {
 	statement  *pg_query.AlterTableStmt
 	constraint *pg_query.Constraint
+	tree       *pg_query.ParseResult
 }
 
 func parseConstraintDefinition(resource schema.Resource, resources map[string]schema.Resource) (parsedConstraint, error) {
@@ -24,7 +26,7 @@ func parseConstraintDefinition(resource schema.Resource, resources map[string]sc
 	if definition == "" {
 		return parsedConstraint{}, unsupported(resource, "constraint definition is required")
 	}
-	parent, err := parentResource(resource, resources)
+	parent, err := constraintParentResource(resource, resources)
 	if err != nil {
 		return parsedConstraint{}, err
 	}
@@ -77,7 +79,303 @@ func parseConstraintDefinition(resource schema.Resource, resources map[string]sc
 			return parsedConstraint{}, unsupported(resource, "constraint validated metadata does not match its definition")
 		}
 	}
-	return parsedConstraint{statement: statement, constraint: constraint}, nil
+	return parsedConstraint{statement: statement, constraint: constraint, tree: parsed}, nil
+}
+
+func renderConstraintCreateSQL(resource schema.Resource, resources map[string]schema.Resource) (string, error) {
+	sql, _, err := renderConstraintCreate(resource, resources)
+	return sql, err
+}
+
+func renderConstraintCreate(resource schema.Resource, resources map[string]schema.Resource) (string, string, error) {
+	parsed, err := parseConstraintDefinition(resource, resources)
+	if err != nil {
+		return "", "", err
+	}
+	schemaBound, err := schemaBindForeignKeyReference(&parsed, resource, resources)
+	if err != nil {
+		return "", "", err
+	}
+	managedType := false
+	for _, dependency := range resource.Dependencies {
+		target := resources[dependency.Target]
+		managedType = managedType || dependency.Type == schema.DependencyUses && (target.Kind == schema.KindEnum || target.Kind == schema.KindDomain || target.Kind == schema.KindComposite)
+	}
+	if !managedType && !schemaBound {
+		parent, parentErr := constraintParentResource(resource, resources)
+		if parentErr != nil {
+			return "", "", parentErr
+		}
+		definition := stringValue(spec(resource), "definition")
+		return "ALTER TABLE " + qualified(parent.Name) + " ADD CONSTRAINT " + quote(resource.Name.Name) + " " + definition, definition, nil
+	}
+	if err := qualifyExpressionTypeCasts(parsed.statement.ProtoReflect(), resource.Name.Schema, resource, resources); err != nil {
+		return "", "", err
+	}
+	sql, err := pg_query.Deparse(parsed.tree)
+	if err != nil {
+		return "", "", unsupported(resource, "constraint definition could not be schema-bound")
+	}
+	marker := " ADD CONSTRAINT "
+	position := strings.Index(sql, marker)
+	if position < 0 {
+		return "", "", unsupported(resource, "schema-bound constraint changed statement shape")
+	}
+	remainder := strings.TrimSpace(sql[position+len(marker):])
+	if remainder == "" {
+		return "", "", unsupported(resource, "schema-bound constraint lost its identity")
+	}
+	if remainder[0] == '"' {
+		index := 1
+		for index < len(remainder) {
+			if remainder[index] != '"' {
+				index++
+				continue
+			}
+			if index+1 < len(remainder) && remainder[index+1] == '"' {
+				index += 2
+				continue
+			}
+			index++
+			remainder = strings.TrimSpace(remainder[index:])
+			break
+		}
+	} else if index := strings.IndexByte(remainder, ' '); index >= 0 {
+		remainder = strings.TrimSpace(remainder[index+1:])
+	} else {
+		remainder = ""
+	}
+	if remainder == "" {
+		return "", "", unsupported(resource, "schema-bound constraint lost its definition")
+	}
+	parent, err := constraintParentResource(resource, resources)
+	if err != nil {
+		return "", "", err
+	}
+	sql = "ALTER TABLE " + qualified(parent.Name) + " ADD CONSTRAINT " + quote(resource.Name.Name) + " " + remainder
+	return sql, remainder, nil
+}
+
+// canonicalizeExpressionCasts folds PostgreSQL's equivalent renderings
+// of an array of scalar text casts into one array-level text[] cast. Older
+// server/client combinations commonly deparsed
+//
+//	ARRAY[value::varchar::text, ...]
+//
+// while newer combinations deparse the same expression as
+//
+//	ARRAY[value::varchar, ...]::text[].
+//
+// Keeping one parser-proven spelling prevents cosmetic CHECK, index-key and
+// partial-index-predicate changes from producing a different resource
+// fingerprint or blocking adoption. The rewrite is deliberately limited to
+// non-empty arrays whose every element has the same plain scalar text cast.
+func canonicalizeExpressionCasts(doc *schema.Document) error {
+	resources := make(map[string]schema.Resource, len(doc.Graph.Resources))
+	for _, resource := range doc.Graph.Resources {
+		resources[resource.ID] = resource
+	}
+	for index := range doc.Graph.Resources {
+		resource := &doc.Graph.Resources[index]
+		if resource.Kind != schema.KindCheckConstraint && resource.Kind != schema.KindIndex {
+			continue
+		}
+		var root protoreflect.Message
+		var canonicalDefinition func() (string, error)
+		switch resource.Kind {
+		case schema.KindCheckConstraint:
+			parsed, err := parseConstraintDefinition(*resource, resources)
+			if err == nil && parsed.constraint.GetRawExpr() != nil {
+				root = parsed.constraint.GetRawExpr().ProtoReflect()
+				canonicalDefinition = func() (string, error) { return deparseConstraintDefinition(parsed) }
+			}
+		case schema.KindIndex:
+			parsed, err := parseIndexDefinition(*resource, resources)
+			if err == nil {
+				root = parsed.statement.ProtoReflect()
+				canonicalDefinition = func() (string, error) {
+					definition, deparseErr := pg_query.Deparse(parsed.tree)
+					if deparseErr != nil {
+						return "", unsupported(*resource, "index expression could not be canonicalized")
+					}
+					return definition, nil
+				}
+			}
+		}
+		if canonicalDefinition == nil {
+			// Preserve the existing normalization contract for CHECK and index expression grammar
+			// that is accepted only by a more narrowly scoped renderer.
+			continue
+		}
+		if !canonicalizeTextArrayCasts(root) {
+			continue
+		}
+		definition, err := canonicalDefinition()
+		if err != nil {
+			return err
+		}
+		values := specMap(resource.Spec)
+		values["definition"] = definition
+		resource.Spec, err = json.Marshal(values)
+		if err != nil {
+			return err
+		}
+		resources[resource.ID] = *resource
+	}
+	return nil
+}
+
+func canonicalizeTextArrayCasts(root protoreflect.Message) bool {
+	var nodes []*pg_query.Node
+	walkPostgresMessages(root, func(message protoreflect.Message) {
+		if node, ok := message.Interface().(*pg_query.Node); ok {
+			nodes = append(nodes, node)
+		}
+	})
+	changed := false
+	for _, node := range nodes {
+		changed = foldScalarTextArrayCasts(node) || changed
+	}
+	if !changed {
+		for _, node := range nodes {
+			cast := node.GetTypeCast()
+			if cast != nil && cast.GetArg().GetAArrayExpr() != nil && plainTextArrayType(cast.GetTypeName()) {
+				changed = true
+				break
+			}
+		}
+	}
+	return changed
+}
+
+func foldScalarTextArrayCasts(node *pg_query.Node) bool {
+	array := node.GetAArrayExpr()
+	if array == nil || len(array.GetElements()) == 0 {
+		return false
+	}
+	var scalarType *pg_query.TypeName
+	elements := make([]*pg_query.Node, len(array.GetElements()))
+	for index, element := range array.GetElements() {
+		cast := element.GetTypeCast()
+		if cast == nil || cast.GetArg() == nil || !plainScalarTextType(cast.GetTypeName()) {
+			return false
+		}
+		if scalarType == nil {
+			scalarType = cast.GetTypeName()
+		}
+		elements[index] = cast.GetArg()
+	}
+	array.Elements = elements
+	names := make([]*pg_query.Node, 0, len(scalarType.GetNames()))
+	for _, name := range scalarType.GetNames() {
+		names = append(names, &pg_query.Node{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: name.GetString_().GetSval()}}})
+	}
+	arrayType := &pg_query.TypeName{Names: names, ArrayBounds: []*pg_query.Node{pg_query.MakeIntNode(-1)}}
+	node.Reset()
+	node.Node = &pg_query.Node_TypeCast{TypeCast: &pg_query.TypeCast{
+		Arg:      &pg_query.Node{Node: &pg_query.Node_AArrayExpr{AArrayExpr: array}},
+		TypeName: arrayType,
+	}}
+	return true
+}
+
+func plainScalarTextType(name *pg_query.TypeName) bool {
+	return plainTextType(name, 0)
+}
+
+func plainTextArrayType(name *pg_query.TypeName) bool {
+	return plainTextType(name, 1)
+}
+
+func plainTextType(name *pg_query.TypeName, dimensions int) bool {
+	if name == nil || name.GetSetof() || name.GetPctType() || len(name.GetTypmods()) != 0 || len(name.GetArrayBounds()) != dimensions {
+		return false
+	}
+	parts := make([]string, 0, len(name.GetNames()))
+	for _, part := range name.GetNames() {
+		value := part.GetString_()
+		if value == nil {
+			return false
+		}
+		parts = append(parts, value.GetSval())
+	}
+	return len(parts) == 1 && parts[0] == "text" || len(parts) == 2 && parts[0] == "pg_catalog" && parts[1] == "text"
+}
+
+func deparseConstraintDefinition(parsed parsedConstraint) (string, error) {
+	sql, err := pg_query.Deparse(parsed.tree)
+	if err != nil {
+		return "", unsupported(schema.Resource{Kind: schema.KindCheckConstraint}, "constraint definition could not be canonicalized")
+	}
+	marker := " ADD CONSTRAINT "
+	position := strings.Index(sql, marker)
+	if position < 0 {
+		return "", unsupported(schema.Resource{Kind: schema.KindCheckConstraint}, "canonicalized constraint changed statement shape")
+	}
+	remainder := strings.TrimSpace(sql[position+len(marker):])
+	if remainder == "" {
+		return "", unsupported(schema.Resource{Kind: schema.KindCheckConstraint}, "canonicalized constraint lost its identity")
+	}
+	if remainder[0] == '"' {
+		cursor := 1
+		for cursor < len(remainder) {
+			if remainder[cursor] != '"' {
+				cursor++
+				continue
+			}
+			if cursor+1 < len(remainder) && remainder[cursor+1] == '"' {
+				cursor += 2
+				continue
+			}
+			cursor++
+			remainder = strings.TrimSpace(remainder[cursor:])
+			break
+		}
+	} else if cursor := strings.IndexByte(remainder, ' '); cursor >= 0 {
+		remainder = strings.TrimSpace(remainder[cursor+1:])
+	} else {
+		remainder = ""
+	}
+	if remainder == "" {
+		return "", unsupported(schema.Resource{Kind: schema.KindCheckConstraint}, "canonicalized constraint lost its definition")
+	}
+	return remainder, nil
+}
+
+func schemaBindForeignKeyReference(parsed *parsedConstraint, resource schema.Resource, resources map[string]schema.Resource) (bool, error) {
+	if resource.Kind != schema.KindForeignKey {
+		return false, nil
+	}
+	reference := parsed.constraint.GetPktable()
+	if reference == nil || reference.GetCatalogname() != "" || reference.GetRelname() == "" {
+		return false, unsupported(resource, "foreign key referenced table is not canonical")
+	}
+	target, err := foreignKeyReferencedTable(resource, reference, resources)
+	if err != nil {
+		return false, err
+	}
+	reference.Schemaname = target.Name.Schema
+	reference.Relname = target.Name.Name
+	return true, nil
+}
+
+func foreignKeyReferencedTable(resource schema.Resource, reference *pg_query.RangeVar, resources map[string]schema.Resource) (schema.Resource, error) {
+	seen := map[string]bool{}
+	var matches []schema.Resource
+	for _, dependency := range resource.Dependencies {
+		candidate, ok := resources[dependency.Target]
+		if dependency.Type == schema.DependencyReferences && ok && candidate.Kind == schema.KindTable && !seen[candidate.ID] {
+			seen[candidate.ID] = true
+			matches = append(matches, candidate)
+		}
+	}
+	if len(matches) != 1 {
+		return schema.Resource{}, unsupported(resource, "foreign key referenced table dependency is missing or ambiguous")
+	}
+	if reference.GetRelname() != matches[0].Name.Name || reference.GetSchemaname() != "" && reference.GetSchemaname() != matches[0].Name.Schema {
+		return schema.Resource{}, unsupported(resource, "foreign key referenced table does not match its exact references dependency")
+	}
+	return matches[0], nil
 }
 
 type parsedIndex struct {
@@ -92,7 +390,7 @@ func parseIndexDefinition(resource schema.Resource, resources map[string]schema.
 	if definition == "" {
 		return parsedIndex{}, unsupported(resource, "index definition is required")
 	}
-	parent, err := parentResource(resource, resources)
+	parent, err := indexParentResource(resource, resources)
 	if err != nil {
 		return parsedIndex{}, err
 	}
@@ -147,10 +445,38 @@ func parseIndexDefinition(resource schema.Resource, resources map[string]schema.
 	return parsedIndex{statement: statement, tree: parsed, SQL: sql}, nil
 }
 
-func parentResource(resource schema.Resource, resources map[string]schema.Resource) (schema.Resource, error) {
+func schemaBindIndexTypeCasts(parsed *parsedIndex, resource schema.Resource, resources map[string]schema.Resource) error {
+	managedType := false
+	for _, dependency := range resource.Dependencies {
+		target := resources[dependency.Target]
+		managedType = managedType || dependency.Type == schema.DependencyUses && (target.Kind == schema.KindEnum || target.Kind == schema.KindDomain || target.Kind == schema.KindComposite)
+	}
+	if !managedType {
+		return nil
+	}
+	if err := qualifyExpressionTypeCasts(parsed.statement.ProtoReflect(), resource.Name.Schema, resource, resources); err != nil {
+		return err
+	}
+	sql, err := pg_query.Deparse(parsed.tree)
+	if err != nil {
+		return unsupported(resource, "index definition could not be schema-bound")
+	}
+	parsed.SQL = sql
+	return nil
+}
+
+func constraintParentResource(resource schema.Resource, resources map[string]schema.Resource) (schema.Resource, error) {
 	parent, ok := resources[resource.Name.Parent]
 	if !ok || parent.Kind != schema.KindTable {
 		return schema.Resource{}, unsupported(resource, "containing table is missing")
+	}
+	return parent, nil
+}
+
+func indexParentResource(resource schema.Resource, resources map[string]schema.Resource) (schema.Resource, error) {
+	parent, ok := resources[resource.Name.Parent]
+	if !ok || parent.Kind != schema.KindTable && parent.Kind != schema.KindMaterializedView {
+		return schema.Resource{}, unsupported(resource, "containing table or materialized view is missing")
 	}
 	return parent, nil
 }
@@ -174,7 +500,7 @@ func validateConstraintIndexSpec(resource schema.Resource, resources map[string]
 	}
 }
 
-func validateIndexAvailability(resource schema.Resource, parsed parsedIndex, options map[string]string) error {
+func validateIndexAvailability(resource schema.Resource, parsed parsedIndex, resources map[string]schema.Resource, options map[string]string) error {
 	method := parsed.statement.GetAccessMethod()
 	if method == "" {
 		method = "btree"
@@ -205,9 +531,45 @@ func validateIndexAvailability(resource schema.Resource, parsed parsedIndex, opt
 		if len(parts) > 0 {
 			base = parts[len(parts)-1]
 		}
+		if base == "inet_ops" {
+			if err := validateBuiltinInetOpclass(resource, element, method, parts, resources); err != nil {
+				return err
+			}
+			continue
+		}
 		if !knownOpclasses[base] && !commaOptionContains(options, "available_index_opclasses", name) {
 			return unsupported(resource, fmt.Sprintf("index operator class %q is not declared available", name))
 		}
+	}
+	return nil
+}
+
+func validateBuiltinInetOpclass(resource schema.Resource, element *pg_query.IndexElem, method string, parts []string, resources map[string]schema.Resource) error {
+	if len(parts) != 1 && (len(parts) != 2 || parts[0] != "pg_catalog") {
+		return unsupported(resource, "inet_ops must be unqualified or explicitly pg_catalog-qualified")
+	}
+	if method != "btree" && method != "hash" && method != "gist" && method != "spgist" {
+		return unsupported(resource, fmt.Sprintf("inet_ops is unavailable for index access method %q", method))
+	}
+	if element.GetName() == "" || element.GetExpr() != nil {
+		return unsupported(resource, "inet_ops requires one direct inet or cidr column")
+	}
+	parent, err := indexParentResource(resource, resources)
+	if err != nil {
+		return err
+	}
+	var matches []schema.Resource
+	for _, candidate := range resources {
+		if candidate.Kind == schema.KindColumn && candidate.Name.Parent == parent.ID && candidate.Name.Name == element.GetName() {
+			matches = append(matches, candidate)
+		}
+	}
+	if len(matches) != 1 {
+		return unsupported(resource, "inet_ops index column is missing or ambiguous")
+	}
+	typ := postgresTypeAlias(stringValue(spec(matches[0]), "type"))
+	if typ != "inet" && typ != "cidr" {
+		return unsupported(resource, fmt.Sprintf("inet_ops requires inet or cidr, got %q", typ))
 	}
 	return nil
 }
@@ -223,7 +585,13 @@ func commaOptionContains(options map[string]string, key, wanted string) bool {
 
 func constraintIndexExpectedDependencies(resource schema.Resource, resources map[string]schema.Resource) ([]string, error) {
 	expected := []string{resource.Name.Parent}
-	parent, err := parentResource(resource, resources)
+	var parent schema.Resource
+	var err error
+	if resource.Kind == schema.KindIndex {
+		parent, err = indexParentResource(resource, resources)
+	} else {
+		parent, err = constraintParentResource(resource, resources)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -273,6 +641,13 @@ func constraintIndexExpectedDependencies(resource schema.Resource, resources map
 			return nil, unsupported(resource, "check and index expression routines must be immutable")
 		}
 	}
+	if resource.Kind == schema.KindCheckConstraint || resource.Kind == schema.KindIndex {
+		types, typeErr := expressionTypeDependencies(expressionRoot, resource.Name.Schema, resource, resources)
+		if typeErr != nil {
+			return nil, typeErr
+		}
+		expected = append(expected, types...)
+	}
 	if resource.Kind != schema.KindForeignKey {
 		return expected, nil
 	}
@@ -284,41 +659,36 @@ func constraintIndexExpectedDependencies(resource schema.Resource, resources map
 	if reference == nil || reference.GetCatalogname() != "" || reference.GetRelname() == "" {
 		return nil, unsupported(resource, "foreign key referenced table is not canonical")
 	}
-	schemaName := reference.GetSchemaname()
-	if schemaName == "" {
-		schemaName = resource.Name.Schema
+	target, err := foreignKeyReferencedTable(resource, reference, resources)
+	if err != nil {
+		return nil, err
 	}
-	for id, candidate := range resources {
-		if candidate.Kind == schema.KindTable && candidate.Name.Schema == schemaName && candidate.Name.Name == reference.GetRelname() {
-			expected = append(expected, id)
-			if err := addColumns(candidate, "referenced_columns"); err != nil {
-				return nil, err
-			}
-			var keys []string
-			for keyID, key := range resources {
-				if (key.Kind == schema.KindPrimaryKey || key.Kind == schema.KindUniqueConstraint) && key.Name.Parent == candidate.ID && slices.Equal(stringSlice(spec(key), "columns"), stringSlice(spec(resource), "referenced_columns")) {
-					keys = append(keys, keyID)
-				}
-			}
-			if len(keys) == 0 {
-				return nil, unsupported(resource, "foreign key has no matching referenced primary or unique constraint")
-			}
-			selected := ""
-			for _, dependency := range resource.Dependencies {
-				if slices.Contains(keys, dependency.Target) {
-					selected = dependency.Target
-					break
-				}
-			}
-			if selected == "" && len(keys) == 1 {
-				selected = keys[0]
-			}
-			if selected == "" {
-				return nil, unsupported(resource, "foreign key referenced key dependency is ambiguous")
-			}
-			expected = append(expected, selected)
-			return expected, nil
+	expected = append(expected, target.ID)
+	if err := addColumns(target, "referenced_columns"); err != nil {
+		return nil, err
+	}
+	var keys []string
+	for keyID, key := range resources {
+		if (key.Kind == schema.KindPrimaryKey || key.Kind == schema.KindUniqueConstraint) && key.Name.Parent == target.ID && slices.Equal(stringSlice(spec(key), "columns"), stringSlice(spec(resource), "referenced_columns")) {
+			keys = append(keys, keyID)
 		}
 	}
-	return nil, unsupported(resource, "foreign key referenced table is missing from the desired graph")
+	if len(keys) == 0 {
+		return nil, unsupported(resource, "foreign key has no matching referenced primary or unique constraint")
+	}
+	selected := ""
+	for _, dependency := range resource.Dependencies {
+		if slices.Contains(keys, dependency.Target) {
+			selected = dependency.Target
+			break
+		}
+	}
+	if selected == "" && len(keys) == 1 {
+		selected = keys[0]
+	}
+	if selected == "" {
+		return nil, unsupported(resource, "foreign key referenced key dependency is ambiguous")
+	}
+	expected = append(expected, selected)
+	return expected, nil
 }

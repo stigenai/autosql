@@ -6,6 +6,7 @@ import (
 	"autosql/pkg/schema"
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -56,6 +57,9 @@ func (f *fakeIsolation) Execute(ctx context.Context, _ plan.Plan) error {
 	}
 	if f.fail == "execute" {
 		return errors.New("secret execute")
+	}
+	if f.fail == "postgres" {
+		return &pgconn.PgError{Code: "42704", Message: `role "app_owner" does not exist`, Detail: "seeded secret detail"}
 	}
 	return nil
 }
@@ -135,6 +139,23 @@ func TestFingerprintMismatchAndRedaction(t *testing.T) {
 	_, e := Run(context.Background(), fakeFactory{iso: iso}, Request{Config: Config{DevelopmentURL: "postgres://user:seeded-secret@dev", ProductionIdentity: "prod/db"}, From: from, Plan: p})
 	if !errors.Is(e, ErrFingerprint) || contains(e.Error(), "seeded-secret") {
 		t.Fatalf("error=%v", e)
+	}
+}
+
+func TestPostgresCauseRetainsSQLStateWithoutSensitiveDetail(t *testing.T) {
+	from, to, p := plans(t)
+	iso := &fakeIsolation{actual: to, fail: "postgres"}
+	_, err := Run(context.Background(), fakeFactory{iso: iso}, Request{Config: Config{DevelopmentURL: "postgres://dev", ProductionIdentity: "prod/db"}, From: from, Plan: p})
+	var databaseError *PostgresError
+	if !errors.As(err, &databaseError) || databaseError.SQLState() != "42704" || !strings.Contains(err.Error(), `role "app_owner" does not exist`) || strings.Contains(err.Error(), "seeded secret") {
+		t.Fatalf("redacted PostgreSQL cause=%v", err)
+	}
+}
+
+func TestPostgresCauseRedactsSecretBearingPrimaryMessage(t *testing.T) {
+	err := RedactedCause(&pgconn.PgError{Code: "42704", Message: `role "postgres://user:secret@host/db" does not exist`})
+	if err == nil || !strings.Contains(err.Error(), "SQLSTATE 42704") || strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "://") {
+		t.Fatalf("redacted PostgreSQL message=%v", err)
 	}
 }
 

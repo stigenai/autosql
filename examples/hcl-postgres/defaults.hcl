@@ -194,3 +194,43 @@ resource "column" "flags" {
   spec_json = jsonencode({ type = "bit(4)", default = "'1010'::bit(4)", not_null = true, ordinal = 19 })
   deps_json = jsonencode([contains(table_id("defaults_demo", "widgets"))])
 }
+
+resource "column" "dbos_updated_at" {
+  schema = "defaults_demo"
+  parent = table_id("defaults_demo", "widgets")
+  spec_json = jsonencode({
+    type     = "bigint"
+    default  = "(extract(epoch from CURRENT_TIMESTAMP) OPERATOR(pg_catalog.*) 1000)::bigint"
+    not_null = true
+    ordinal  = 20
+  })
+  deps_json = jsonencode([contains(table_id("defaults_demo", "widgets"))])
+}
+
+resource "column" "client_network" {
+  schema = "defaults_demo"
+  parent = table_id("defaults_demo", "widgets")
+  spec_json = jsonencode({ type = "cidr", default = "'10.0.0.0/8'::cidr", not_null = true, ordinal = 21 })
+  deps_json = jsonencode([contains(table_id("defaults_demo", "widgets"))])
+}
+
+resource "column" "client_address" {
+  schema = "defaults_demo"
+  parent = table_id("defaults_demo", "widgets")
+  spec_json = jsonencode({ type = "inet", default = "'192.0.2.1/24'::inet", not_null = true, ordinal = 22 })
+  deps_json = jsonencode([contains(table_id("defaults_demo", "widgets"))])
+}
+
+resource "column" "client_mac" {
+  schema = "defaults_demo"
+  parent = table_id("defaults_demo", "widgets")
+  spec_json = jsonencode({ type = "macaddr", default = "'08:00:2b:01:02:03'::macaddr", not_null = true, ordinal = 23 })
+  deps_json = jsonencode([contains(table_id("defaults_demo", "widgets"))])
+}
+
+resource "column" "generated_text_id" {
+  schema = "defaults_demo"
+  parent = table_id("defaults_demo", "widgets")
+  spec_json = jsonencode({ type = "text", default = "pg_catalog.gen_random_uuid()::text", not_null = true, ordinal = 24 })
+  deps_json = jsonencode([contains(table_id("defaults_demo", "widgets"))])
+}

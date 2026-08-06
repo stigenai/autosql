@@ -7,7 +7,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 var ErrConfig = errors.New("invalid simulation configuration")
@@ -22,6 +25,63 @@ type Error struct {
 func (e *Error) Error() string           { return "simulation " + e.Code }
 func (e *Error) Unwrap() error           { return e.kind }
 func fail(code string, kind error) error { return &Error{Code: code, kind: kind} }
+
+// PostgresError retains the actionable, non-secret portion of a PostgreSQL
+// failure. Query text, connection strings, detail, hints, and context are
+// deliberately omitted at the simulation boundary.
+type PostgresError struct {
+	Code    string
+	Message string
+}
+
+func (e *PostgresError) Error() string {
+	return fmt.Sprintf("%s (SQLSTATE %s)", e.Message, e.Code)
+}
+
+func (e *PostgresError) SQLState() string { return e.Code }
+
+// RedactedCause returns only causes that are safe and useful to surface.
+func RedactedCause(err error) error {
+	if err == nil {
+		return nil
+	}
+	var safe *PostgresError
+	if errors.As(err, &safe) {
+		return safe
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		message := strings.Map(func(r rune) rune {
+			if r < ' ' || r == 0x7f {
+				return -1
+			}
+			return r
+		}, strings.TrimSpace(pgErr.Message))
+		if len(message) > 256 {
+			message = message[:256]
+		}
+		lower := strings.ToLower(message)
+		if message == "" || strings.Contains(message, "://") || strings.Contains(message, "@") || strings.Contains(lower, "password") || strings.Contains(lower, "secret") {
+			message = "PostgreSQL operation failed"
+		}
+		return &PostgresError{Code: pgErr.Code, Message: message}
+	}
+	if errors.Is(err, context.Canceled) {
+		return context.Canceled
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+func lifecycleFailure(code string, cause error) error {
+	primary := fail(code, ErrLifecycle)
+	if safe := RedactedCause(cause); safe != nil {
+		return errors.Join(primary, safe)
+	}
+	return primary
+}
 
 type Config struct {
 	DevelopmentURL, DevelopmentIdentity, ProductionIdentity string
@@ -61,7 +121,7 @@ func Run(ctx context.Context, f Factory, req Request) (result Result, err error)
 	}
 	iso, e := f.Create(ctx, req.Config)
 	if e != nil {
-		return result, fail("create", ErrLifecycle)
+		return result, lifecycleFailure("create", e)
 	}
 	result.IsolationIdentity = iso.Identity()
 	timeout := req.Config.CleanupTimeout
@@ -72,18 +132,18 @@ func Run(ctx context.Context, f Factory, req Request) (result Result, err error)
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 		defer cancel()
 		if ce := iso.Cleanup(cleanupCtx); ce != nil {
-			err = errors.Join(err, fail("cleanup", ErrLifecycle), ce)
+			err = errors.Join(err, lifecycleFailure("cleanup", ce))
 		}
 	}()
 	if e = iso.Materialize(ctx, req.From); e != nil {
-		return result, fail("materialize", ErrLifecycle)
+		return result, lifecycleFailure("materialize", e)
 	}
 	if e = iso.Execute(ctx, req.Plan); e != nil {
-		return result, fail("execute", ErrLifecycle)
+		return result, lifecycleFailure("execute", e)
 	}
 	actual, e := iso.Inspect(ctx)
 	if e != nil {
-		return result, fail("inspect", ErrLifecycle)
+		return result, lifecycleFailure("inspect", e)
 	}
 	got, e := schema.SemanticFingerprint(actual)
 	if e != nil || got != req.Plan.ToFingerprint {
@@ -98,9 +158,16 @@ func Redacted(err error) error {
 	if err == nil {
 		return nil
 	}
-	var e *Error
-	if errors.As(err, &e) {
-		return e
+	var out []error
+	var simulationError *Error
+	if errors.As(err, &simulationError) {
+		out = append(out, simulationError)
+	}
+	if cause := RedactedCause(err); cause != nil {
+		out = append(out, cause)
+	}
+	if len(out) != 0 {
+		return errors.Join(out...)
 	}
 	return fmt.Errorf("%w", ErrLifecycle)
 }

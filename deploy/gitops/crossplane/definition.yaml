@@ -1,0 +1,47 @@
+apiVersion: apiextensions.crossplane.io/v2
+kind: CompositeResourceDefinition
+metadata:
+  name: xautosqlschemas.autosql.io
+spec:
+  group: autosql.io
+  scope: Namespaced
+  names:
+    kind: XAutoSQLSchema
+    plural: xautosqlschemas
+  versions:
+    - name: v1alpha1
+      served: true
+      referenceable: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [kind, artifactDigest, sourceSecretName, sourceSecretKey, databaseSecretName, databaseSecretKey]
+              properties:
+                kind: {type: string, enum: [DeclarativeSchema, VersionedMigration]}
+                artifactDigest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+                sourceSecretName: {type: string, minLength: 1}
+                sourceSecretKey: {type: string, minLength: 1}
+                databaseSecretName: {type: string, minLength: 1}
+                databaseSecretKey: {type: string, minLength: 1}
+                suspend: {type: boolean, default: false}
+                adoptionPolicy: {type: string, enum: [IfEquivalent]}
+            status:
+              type: object
+              properties:
+                autosqlConditions:
+                  type: array
+                  items:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                appliedDigest:
+                  type: string
+                  pattern: '^sha256:[0-9a-f]{64}$'
+                appliedFingerprint:
+                  type: string
+                  pattern: '^sha256:[0-9a-f]{64}$'
+                retryCount:
+                  type: integer
+                  minimum: 0

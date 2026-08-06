@@ -3,6 +3,7 @@ package postgres
 import (
 	"fmt"
 	"slices"
+	"strings"
 
 	"autosql/pkg/schema"
 	pg_query "github.com/pganalyze/pg_query_go/v6"
@@ -31,13 +32,59 @@ func parseTriggerDefinition(resource schema.Resource, resources map[string]schem
 		return parsedTrigger{}, unsupported(resource, "trigger containing table or view is missing")
 	}
 	relation := statement.GetRelation()
-	if relation == nil || relation.GetCatalogname() != "" || relation.GetSchemaname() != parent.Name.Schema || relation.GetRelname() != parent.Name.Name {
+	if relation == nil || relation.GetCatalogname() != "" || relation.GetRelname() != parent.Name.Name || relation.GetSchemaname() != "" && relation.GetSchemaname() != parent.Name.Schema {
 		return parsedTrigger{}, unsupported(resource, "trigger target does not match its containing table")
 	}
+	// pg_get_triggerdef may omit the target schema even though inspection has
+	// already bound the trigger to an exact containing relation. Canonicalize
+	// that spelling in the parsed tree so execution never depends on search_path.
+	relation.Schemaname = parent.Name.Schema
 	if len(statement.GetFuncname()) < 1 || len(statement.GetFuncname()) > 2 {
 		return parsedTrigger{}, unsupported(resource, "trigger function identity is not canonical")
 	}
-	return parsedTrigger{statement: statement, SQL: definition}, nil
+	if err := schemaBindTriggerFunction(statement, resource, resources); err != nil {
+		return parsedTrigger{}, err
+	}
+	canonical, err := pg_query.Deparse(parsed)
+	if err != nil {
+		return parsedTrigger{}, unsupported(resource, "trigger definition cannot be rendered canonically")
+	}
+	return parsedTrigger{statement: statement, SQL: strings.TrimSuffix(strings.TrimSpace(canonical), ";")}, nil
+}
+
+// schemaBindTriggerFunction proves the executable routine target from the
+// trigger's exact function dependency before making the statement independent
+// of search_path. PostgreSQL inspection may emit a bare EXECUTE FUNCTION name
+// even though pg_depend has already identified the precise routine.
+func schemaBindTriggerFunction(statement *pg_query.CreateTrigStmt, resource schema.Resource, resources map[string]schema.Resource) error {
+	parts := statement.GetFuncname()
+	if len(parts) < 1 || len(parts) > 2 {
+		return unsupported(resource, "trigger function identity is not canonical")
+	}
+	for _, part := range parts {
+		if part.GetString_() == nil || part.GetString_().GetSval() == "" {
+			return unsupported(resource, "trigger function identity is not canonical")
+		}
+	}
+
+	target, err := triggerFunctionDependency(resource, resources)
+	if err != nil {
+		return err
+	}
+	wantName := stringValue(spec(target), "name")
+	gotSchema, gotName := "", parts[0].GetString_().GetSval()
+	if len(parts) == 2 {
+		gotSchema = parts[0].GetString_().GetSval()
+		gotName = parts[1].GetString_().GetSval()
+	}
+	if wantName == "" || gotName != wantName || gotSchema != "" && gotSchema != target.Name.Schema || stringValue(spec(target), "identity_arguments") != "" {
+		return unsupported(resource, "trigger function does not match its exact references dependency")
+	}
+	statement.Funcname = []*pg_query.Node{
+		{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: target.Name.Schema}}},
+		{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: wantName}}},
+	}
+	return nil
 }
 
 func validateTriggerSpec(resource schema.Resource, resources map[string]schema.Resource) error {
@@ -57,7 +104,7 @@ func validateTriggerSpec(resource schema.Resource, resources map[string]schema.R
 }
 
 func triggerExpectedDependencies(resource schema.Resource, resources map[string]schema.Resource) ([]string, error) {
-	parsed, err := parseTriggerDefinition(resource, resources)
+	_, err := parseTriggerDefinition(resource, resources)
 	if err != nil {
 		return nil, err
 	}
@@ -79,25 +126,28 @@ func triggerExpectedDependencies(resource schema.Resource, resources map[string]
 		}
 		expected = append(expected, found)
 	}
-	parts := parsed.statement.GetFuncname()
-	functionSchema, functionName := resource.Name.Schema, ""
-	if len(parts) == 1 {
-		functionName = parts[0].GetString_().GetSval()
-	} else {
-		functionSchema = parts[0].GetString_().GetSval()
-		functionName = parts[1].GetString_().GetSval()
+	function, err := triggerFunctionDependency(resource, resources)
+	if err != nil {
+		return nil, err
 	}
-	var functions []string
-	for id, candidate := range resources {
-		if candidate.Kind == schema.KindFunction && candidate.Name.Schema == functionSchema && stringValue(spec(candidate), "name") == functionName && stringValue(spec(candidate), "identity_arguments") == "" {
-			functions = append(functions, id)
+	expected = append(expected, function.ID)
+	return expected, nil
+}
+
+func triggerFunctionDependency(resource schema.Resource, resources map[string]schema.Resource) (schema.Resource, error) {
+	seen := map[string]bool{}
+	var functions []schema.Resource
+	for _, dependency := range resource.Dependencies {
+		candidate, ok := resources[dependency.Target]
+		if dependency.Type == schema.DependencyReferences && ok && candidate.Kind == schema.KindFunction && !seen[candidate.ID] {
+			seen[candidate.ID] = true
+			functions = append(functions, candidate)
 		}
 	}
 	if len(functions) != 1 {
-		return nil, unsupported(resource, "trigger function dependency is missing or ambiguous")
+		return schema.Resource{}, unsupported(resource, "trigger function dependency is missing or ambiguous")
 	}
-	expected = append(expected, functions[0])
-	return expected, nil
+	return functions[0], nil
 }
 
 func renderTriggerEnable(resource schema.Resource, resources map[string]schema.Resource) (string, error) {

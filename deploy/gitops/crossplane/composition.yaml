@@ -1,0 +1,78 @@
+apiVersion: apiextensions.crossplane.io/v1
+kind: Composition
+metadata:
+  name: xautosqlschemas.autosql.io
+spec:
+  compositeTypeRef:
+    apiVersion: autosql.io/v1alpha1
+    kind: XAutoSQLSchema
+  mode: Pipeline
+  pipeline:
+    - step: render-autosql-schema
+      functionRef:
+        name: function-patch-and-transform
+      input:
+        apiVersion: pt.fn.crossplane.io/v1beta1
+        kind: Resources
+        resources:
+          - name: schema
+            base:
+              apiVersion: autosql.io/v1alpha1
+              kind: AutoSQLSchema
+              metadata:
+                name: placeholder
+              spec:
+                kind: DeclarativeSchema
+                source:
+                  secretRef: {name: placeholder, key: schema.hcl}
+                artifactDigest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+                databaseURL: {name: placeholder, key: url}
+                suspend: false
+            patches:
+              - type: FromCompositeFieldPath
+                fromFieldPath: metadata.name
+                toFieldPath: metadata.name
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.kind
+                toFieldPath: spec.kind
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.artifactDigest
+                toFieldPath: spec.artifactDigest
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.sourceSecretName
+                toFieldPath: spec.source.secretRef.name
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.sourceSecretKey
+                toFieldPath: spec.source.secretRef.key
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.databaseSecretName
+                toFieldPath: spec.databaseURL.name
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.databaseSecretKey
+                toFieldPath: spec.databaseURL.key
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.suspend
+                toFieldPath: spec.suspend
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.adoptionPolicy
+                toFieldPath: spec.adoptionPolicy
+                policy:
+                  fromFieldPath: Optional
+              - type: ToCompositeFieldPath
+                fromFieldPath: status.conditions
+                toFieldPath: status.autosqlConditions
+              - type: ToCompositeFieldPath
+                fromFieldPath: status.appliedDigest
+                toFieldPath: status.appliedDigest
+                policy:
+                  fromFieldPath: Optional
+              - type: ToCompositeFieldPath
+                fromFieldPath: status.appliedFingerprint
+                toFieldPath: status.appliedFingerprint
+                policy:
+                  fromFieldPath: Optional
+              - type: ToCompositeFieldPath
+                fromFieldPath: status.retryCount
+                toFieldPath: status.retryCount
+                policy:
+                  fromFieldPath: Optional

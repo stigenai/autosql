@@ -1,0 +1,45 @@
+name: AutoSQL reusable deployment
+on:
+  workflow_call:
+    inputs:
+      mode: {type: string, required: true}
+      contract: {type: string, required: true}
+      contract_digest: {type: string, required: true}
+      environment: {type: string, required: false, default: production}
+      version: {type: string, required: true}
+      binary_sha256: {type: string, required: true}
+    secrets:
+      apply_config: {required: false}
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  autosql:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Check out caller repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out the exact AutoSQL action release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: stigenai/autosql
+          ref: ${{ inputs.version }}
+          path: .autosql-action
+          persist-credentials: false
+      - name: Materialize apply configuration
+        if: inputs.mode == 'run'
+        shell: bash
+        env:
+          AUTOSQL_APPLY_CONFIG_JSON: ${{ secrets.apply_config }}
+        run: |
+          umask 077
+          printf '%s' "$AUTOSQL_APPLY_CONFIG_JSON" > "$RUNNER_TEMP/autosql-apply.json"
+          echo "AUTOSQL_APPLY_CONFIG=$RUNNER_TEMP/autosql-apply.json" >> "$GITHUB_ENV"
+      - uses: ./.autosql-action
+        with:
+          mode: ${{ inputs.mode }}
+          contract: ${{ inputs.contract }}
+          contract-digest: ${{ inputs.contract_digest }}
+          version: ${{ inputs.version }}
+          binary-sha256: ${{ inputs.binary_sha256 }}

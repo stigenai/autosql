@@ -128,3 +128,17 @@ func TestPreflightBootstrapProvisioningBindsEveryAuthorityBeforeSQL(t *testing.T
 		t.Fatalf("report=%+v err=%v", report, err)
 	}
 }
+
+func TestValidateBootstrapAuthorityDoesNotSynthesizeRoutineOrExtensionApproval(t *testing.T) {
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "cell"}, `{}`)
+	extension := renderResource(schema.KindExtension, schema.Name{Schema: "cell", Name: "pgcrypto", Parent: ns.ID}, `{"version":"1.3","schema":"cell"}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	doc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, extension}}}
+	contract := bootstrap.Contract{Identities: []bootstrap.Identity{{Name: "operator", Subject: "postgres", Authentication: bootstrap.CurrentSession, Capabilities: []bootstrap.Capability{bootstrap.CreateDatabase, bootstrap.ManageExtensions, bootstrap.ManageSchema, bootstrap.TransferOwnership}}}, Assignments: []bootstrap.Assignment{{Responsibility: bootstrap.DatabaseCreation, Identity: "operator"}, {Responsibility: bootstrap.ExtensionSetup, Identity: "operator"}, {Responsibility: bootstrap.SchemaObjects, Identity: "operator"}, {Responsibility: bootstrap.OwnershipHandoff, Identity: "operator"}}}
+	bindings, err := ValidateBootstrapAuthority(doc, contract, true)
+	if err != nil || len(bindings) != 4 {
+		t.Fatalf("bindings=%+v err=%v", bindings, err)
+	}
+	if report, err := PreflightBootstrapProvisioning(context.Background(), doc, nil, contract, true); err != nil || report.Supported {
+		t.Fatalf("authority-only validation synthesized extension approval: report=%+v err=%v", report, err)
+	}
+}

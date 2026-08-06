@@ -1,0 +1,11 @@
+{
+  "version": "v1",
+  "rules": [
+    {
+      "name": "allow reviewed GitOps schema changes",
+      "target": "all",
+      "assert": {"eq": [true, true]},
+      "message": "GitOps release is allowed"
+    }
+  ]
+}

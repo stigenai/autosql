@@ -18,7 +18,7 @@ constitution for their exact meaning.
 | <!-- feature:database-security-and-reference-data --> Security as code and reference data | [Security](../docs/database-security.md), [reference data](../docs/reference-data.md) | `go test ./pkg/reference ./pkg/security` |
 | <!-- feature:delivery-and-developer-integrations --> CI, GitOps, ORM, IDE, deployment, and Terraform | [Integrations](../docs/integrations.md), [CI/CD](../docs/ci-cd-integrations.md) | `go test ./pkg/ci ./pkg/integration ./pkg/integrations/...` |
 | <!-- feature:database-test-environments --> Disposable database tests | [Database testing](../docs/database-testing.md) | `go test ./pkg/dbtest` |
-| <!-- feature:kubernetes-operator --> Kubernetes operator and CEL validation | [Operator](../docs/kubernetes-operator.md) | `go test ./pkg/operator ./internal/operatorcontroller` |
+| <!-- feature:kubernetes-operator --> Kubernetes operator, CEL validation, and signed GitOps artifact publishing | [Operator](../docs/kubernetes-operator.md), [GitOps artifacts](../docs/operator-gitops.md), [publish configuration](operator-gitops/publish-config.json) | `go test ./pkg/operator ./internal/operatorcontroller` |
 | <!-- feature:zero-downtime-migrations --> Expand/contract and zero-downtime migrations | [Format](../docs/zero-downtime-format.md), [compatibility](../docs/postgresql-zero-downtime-compatibility.md) | `go test ./pkg/zdm/... ./pkg/zerodowntime` |
 | <!-- feature:multi-dialect-contracts --> Multi-dialect capability contracts | [Multi-dialect](../docs/multi-dialect.md) | `go test ./pkg/dialect` |
 
@@ -26,6 +26,8 @@ constitution for their exact meaning.
 
 - [`hcl-postgres`](hcl-postgres/README.md) exercises HCL authoring, semantic
   planning, PostgreSQL inspection, every advertised PostgreSQL resource kind,
+  typed variables/modules, deterministic expansion, reviewed rename intent,
+  author/canonical formatting,
   default expressions, deterministic round trips, and a complete 1,000+-resource
   empty-database bootstrap through
   [`run-complete-bootstrap.sh`](hcl-postgres/run-complete-bootstrap.sh).
