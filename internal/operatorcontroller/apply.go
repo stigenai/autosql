@@ -327,6 +327,7 @@ func buildAdoptionPlan(ctx context.Context, tx pgx.Tx, schemas []string, desired
 	if err != nil {
 		return plan.Plan{}, errors.New("normalize adoption target")
 	}
+	current = executor.ExcludeBookkeeping(current)
 	generated, err := plan.Build(ctx, postgres.New(), current, desired, plan.Options{Render: operatorBootstrapRenderOptions(spec)})
 	if err != nil {
 		return plan.Plan{}, errors.New("compare adoption target with desired schema")
@@ -397,6 +398,11 @@ func verifyDeclarativeResource(ctx context.Context, resource operator.Resource, 
 	if err != nil {
 		return verifiedBootstrapPlan{}, errors.New("normalize declarative target")
 	}
+	// The executor's migration-history relation is runtime bookkeeping
+	// written into the target by every verified apply; it is never part of
+	// the desired schema, and leaving it in the recomputed plan would add
+	// spurious drops and fail the signed-plan digest check.
+	target = executor.ExcludeBookkeeping(target)
 	options := plan.Options{Render: operatorBootstrapRenderOptions(resource.Spec)}
 	generated, err := plan.Build(ctx, postgres.New(), target, desired, options)
 	for _, candidate := range desired.Graph.Resources {
