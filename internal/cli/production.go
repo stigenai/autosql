@@ -57,6 +57,11 @@ type migrationTrust struct {
 	SchemaPolicyResources    []policy.Resource
 	MigrationPolicyResources []policy.Resource
 	ApprovalIdentities       map[string]approval.Identity
+	// SafetySuppressions carries the publishing configuration's pre-approved
+	// safety findings so apply recomputes the identical guardrail bundle and
+	// its safety re-run reaches the same suppressed verdicts. Empty for
+	// artifacts published without suppressions.
+	SafetySuppressions []safety.Suppression
 }
 type staticAuthority struct {
 	actors   map[string]approval.Identity
@@ -336,7 +341,13 @@ func productionServicesWithURL(connector executor.Connector, databaseURLOverride
 		dynamicPolicyMu.Lock()
 		dynamicPolicies[digest] = p
 		dynamicPolicyMu.Unlock()
-	}, Guardrail: g, Input: input, Mutation: mutation, MutationLocked: mutationFor, MutationLockedAttempt: mutationForAttempt, NoEdits: c.NoEdits, LifecycleAudit: lifecycle, RepairAuthorization: repairAuthorization}
+	}, Guardrail: g, GuardrailFor: func(a artifact.Artifact) guardrail.Guardrail {
+		perArtifact := g
+		if trusted, ok := c.TrustedMigrations[a.Digest]; ok {
+			perArtifact.Safety.Suppressions = append([]safety.Suppression(nil), trusted.SafetySuppressions...)
+		}
+		return perArtifact
+	}, Input: input, Mutation: mutation, MutationLocked: mutationFor, MutationLockedAttempt: mutationForAttempt, NoEdits: c.NoEdits, LifecycleAudit: lifecycle, RepairAuthorization: repairAuthorization}
 	var editService PlanEditService
 	if c.EditorIdentity != "" {
 		if c.EditorIdentity == c.Author || c.EditorIdentity == c.Requester {

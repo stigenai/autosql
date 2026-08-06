@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -15,8 +16,10 @@ import (
 	"autosql/pkg/approval"
 	"autosql/pkg/bootstrap"
 	"autosql/pkg/plan"
+	"autosql/pkg/policy"
 	"autosql/pkg/postgres"
 	"autosql/pkg/precheck"
+	"autosql/pkg/safety"
 	"autosql/pkg/schema"
 	"autosql/pkg/simulate"
 	"autosql/pkg/source"
@@ -425,5 +428,78 @@ create table autosql_transition_app.widgets(id bigint primary key, label text no
 		Render: map[string]string{"postgres_version": "17"},
 	}); err != nil {
 		t.Fatalf("transition artifact for a schema with an extension: %v", err)
+	}
+}
+
+func TestGenerationGuardrailAppliesSafetySuppressions(t *testing.T) {
+	dropped := &schema.Resource{Kind: schema.KindTable, Name: schema.Name{Schema: "public", Name: "dead_table"}, Spec: []byte(`{}`)}
+	dropped.ID = schema.StableID(dropped.Kind, dropped.Name)
+	changes := schema.ChangeSet{Version: schema.ChangeVersion, Changes: []schema.Change{{ID: "drop-dead", Operation: schema.OperationDrop, ResourceID: dropped.ID, Before: dropped}}}
+	input := safety.Input{Changes: changes, Target: safety.Target{Engine: "postgresql", Version: 17}}
+
+	dropDiagnostic := func(ds []safety.Diagnostic) *safety.Diagnostic {
+		t.Helper()
+		for i := range ds {
+			if ds[i].Rule == safety.RuleDropObject {
+				return &ds[i]
+			}
+		}
+		t.Fatalf("no AUTOSQL001 diagnostic in %#v", ds)
+		return nil
+	}
+
+	// Without a suppression the drop is an error-severity diagnostic that
+	// fails artifact generation closed.
+	unsuppressed, err := generationGuardrail(GenerateRequest{Environment: "production"}).Safety.Run(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := dropDiagnostic(unsuppressed); d.Suppressed != nil || d.Severity != safety.SeverityError {
+		t.Fatalf("expected an unsuppressed error-severity AUTOSQL001, got %#v", d)
+	}
+
+	suppression := safety.Suppression{Rule: safety.RuleDropObject, ObjectID: dropped.ID, Reason: "approved by the schema-destructive gate"}
+	g := generationGuardrail(GenerateRequest{Environment: "production", SafetySuppressions: []safety.Suppression{suppression}})
+	if len(g.Safety.Suppressions) != 1 || g.Safety.Suppressions[0] != suppression {
+		t.Fatalf("guardrail did not carry the request suppressions: %#v", g.Safety.Suppressions)
+	}
+	suppressed, err := g.Safety.Run(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := dropDiagnostic(suppressed); d.Suppressed == nil || d.Suppressed.Reason != suppression.Reason {
+		t.Fatalf("expected the drop diagnostic suppressed with its reason, got %#v", d)
+	}
+
+	// A suppression naming a different object must not leak onto this drop.
+	other := generationGuardrail(GenerateRequest{Environment: "production", SafetySuppressions: []safety.Suppression{{Rule: safety.RuleDropObject, ObjectID: "table:000000000000000000000000", Reason: "unrelated"}}})
+	diags, err := other.Safety.Run(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := dropDiagnostic(diags); d.Suppressed != nil {
+		t.Fatalf("suppression leaked across object IDs: %#v", d)
+	}
+}
+
+func TestValidateGenerateRequestValidatesSafetySuppressions(t *testing.T) {
+	doc, err := source.LoadContext(context.Background(), source.Input{URI: "desired.sql", Format: source.FormatSQL, Data: []byte("CREATE SCHEMA app; CREATE TABLE app.widgets (id bigint);")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, generator, _ := ed25519.GenerateKey(rand.Reader)
+	_, signer, _ := ed25519.GenerateKey(rand.Reader)
+	now := time.Now().UTC()
+	r := GenerateRequest{Directory: t.TempDir(), Version: "1", Label: "create_widgets", Format: "sql", Desired: doc, DevelopmentURL: "postgres://example.invalid/dev", DevelopmentIdentity: "dev", ProductionIdentity: "prod", Environment: "test", DatabaseIdentity: "db", SourceRevision: "test-revision", Author: "author", Requester: "requester", PostgresVersion: 16, Policy: policy.Document{Version: policy.LanguageVersion, Rules: []policy.Rule{{Name: "allow", Target: "all", Assert: policy.Expression{Eq: []any{true, true}}, Message: "allowed"}}}, PolicyIdentity: "test-policy/v1", ApprovalPolicy: approval.Policy{Environments: map[string]approval.EnvironmentPolicy{"test": {Allowed: true}}}, Authority: generationTestAuthority{at: now, expires: now.Add(time.Hour)}, ApprovalAudit: &approval.Chain{Sink: &approval.FileSink{Path: filepath.Join(t.TempDir(), "approval.audit")}}, Approvals: []approval.Approval{{Approver: "reviewer", ApprovedAt: now, ExpiresAt: now.Add(time.Hour), Proof: "trusted-proof"}}, CreatedAt: now, ExpiresAt: now.Add(time.Hour), GeneratorKeyID: "generator", GeneratorPurpose: "migration-generator", SigningKeyID: "release", GeneratorPrivateKey: generator, SigningPrivateKey: signer}
+	if err := validateGenerateRequest(r); err != nil {
+		t.Fatalf("baseline request without suppressions: %v", err)
+	}
+	r.SafetySuppressions = []safety.Suppression{{Rule: safety.RuleDropObject, ObjectID: "table:abc", Reason: "approved destructive change"}}
+	if err := validateGenerateRequest(r); err != nil {
+		t.Fatalf("valid suppression rejected: %v", err)
+	}
+	r.SafetySuppressions = []safety.Suppression{{Rule: safety.RuleDropObject, ObjectID: "table:abc"}}
+	if err := validateGenerateRequest(r); err == nil {
+		t.Fatal("a suppression without a reason was accepted")
 	}
 }

@@ -45,6 +45,7 @@
   "SigningNotBefore": "2026-07-01T00:00:00Z",
   "SigningNotAfter": "2026-10-01T00:00:00Z",
   "OperatorArtifactDirectory": "/release/artifacts",
+  "SafetySuppressions": [],
   "Metadata": {
     "autosql.owner": "platform-engineering",
     "autosql.workflow": "flux"

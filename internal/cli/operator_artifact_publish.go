@@ -18,6 +18,7 @@ import (
 	"autosql/pkg/migrate"
 	"autosql/pkg/policy"
 	"autosql/pkg/postgres"
+	"autosql/pkg/safety"
 	"autosql/pkg/schema"
 	"autosql/pkg/secret"
 	"autosql/pkg/simulate"
@@ -45,7 +46,13 @@ type operatorPublishConfig struct {
 	SigningPrivateKeyReference                          string
 	SigningNotBefore, SigningNotAfter                   time.Time
 	OperatorArtifactDirectory                           string
-	Metadata                                            map[string]string
+	// SafetySuppressions pre-approves specific safety findings (for example
+	// human-approved destructive changes). Each entry names exactly one rule
+	// and one stable object ID with a mandatory reason; suppressed findings
+	// stay in the artifact's diagnostics and guardrail bundle so the approval
+	// trail is preserved.
+	SafetySuppressions []safety.Suppression
+	Metadata           map[string]string
 }
 
 type operatorReleaseManifest struct {
@@ -192,7 +199,7 @@ func runOperatorArtifactPublish(ctx context.Context, args []string, o output, re
 	if err = os.MkdirAll(filepath.Dir(config.GenerationApprovalAuditPath), 0o700); err != nil {
 		return &Error{Kind: "config", Message: "create generation approval audit directory failed", Code: ExitConfig}
 	}
-	generation := migrate.GenerateRequest{Desired: desired, DevelopmentURL: developmentURL, DevelopmentIdentity: developmentIdentity, ProductionIdentity: productionIdentity, Environment: config.Environment, DatabaseIdentity: config.DatabaseIdentity, SourceRevision: *sourceRevision, Author: config.Author, Requester: config.Requester, PostgresVersion: config.PostgresVersion, Policy: *policyDocument, PolicyIdentity: config.PolicyIdentity, ApprovalPolicy: config.ApprovalPolicy, ApprovalProvider: migrate.AutomationApprovalProvider{KeyID: config.AutomationApprovalKeyID, Identity: approval.Identity{ID: config.AutomationApprovalIdentity, Roles: append([]string(nil), config.AutomationApprovalRoles...)}, Actors: []approval.Identity{{ID: config.Author}, {ID: config.Requester}}, PrivateKey: approvalKey, TTL: approvalTTL}, ApprovalAudit: &approval.Chain{Sink: &approval.FileSink{Path: config.GenerationApprovalAuditPath}}, CreatedAt: now, ExpiresAt: now.Add(lifetime), GeneratorKeyID: config.GeneratorKeyID, GeneratorPurpose: config.GeneratorPurpose, SigningKeyID: config.SigningKeyID, GeneratorPrivateKey: generatorKey, SigningPrivateKey: signingKey, Metadata: config.Metadata}
+	generation := migrate.GenerateRequest{Desired: desired, DevelopmentURL: developmentURL, DevelopmentIdentity: developmentIdentity, ProductionIdentity: productionIdentity, Environment: config.Environment, DatabaseIdentity: config.DatabaseIdentity, SourceRevision: *sourceRevision, Author: config.Author, Requester: config.Requester, PostgresVersion: config.PostgresVersion, Policy: *policyDocument, PolicyIdentity: config.PolicyIdentity, ApprovalPolicy: config.ApprovalPolicy, ApprovalProvider: migrate.AutomationApprovalProvider{KeyID: config.AutomationApprovalKeyID, Identity: approval.Identity{ID: config.AutomationApprovalIdentity, Roles: append([]string(nil), config.AutomationApprovalRoles...)}, Actors: []approval.Identity{{ID: config.Author}, {ID: config.Requester}}, PrivateKey: approvalKey, TTL: approvalTTL}, ApprovalAudit: &approval.Chain{Sink: &approval.FileSink{Path: config.GenerationApprovalAuditPath}}, CreatedAt: now, ExpiresAt: now.Add(lifetime), GeneratorKeyID: config.GeneratorKeyID, GeneratorPurpose: config.GeneratorPurpose, SigningKeyID: config.SigningKeyID, GeneratorPrivateKey: generatorKey, SigningPrivateKey: signingKey, SafetySuppressions: append([]safety.Suppression(nil), config.SafetySuppressions...), Metadata: config.Metadata}
 	render := map[string]string{"postgres_version": fmt.Sprint(config.PostgresVersion)}
 	if *config.ConcurrentIndexes {
 		render["concurrent_indexes"] = "true"
@@ -206,7 +213,7 @@ func runOperatorArtifactPublish(ctx context.Context, args []string, o output, re
 		contexts[attestation.Stage] = attestation.ConfigDigest
 		attestations[attestation.Stage] = attestation
 	}
-	trust := migrationTrust{Expected: artifact.ExpectedBindings{PlanDigest: result.Artifact.Plan.Digest, GeneratedPlanDigest: result.Artifact.Plan.Digest, ChecksDigest: result.Artifact.Checks.Digest, GuardrailDigest: result.Artifact.GuardrailDigest, SourceRevision: result.Artifact.SourceRevision, Environment: result.Artifact.TargetEnvironment, DatabaseIdentity: result.Artifact.DatabaseIdentity, ApprovalIdentity: result.Artifact.Approval.Identity, ApprovalProofDigest: result.Artifact.Approval.ProofDigest}, ValidationContextDigests: contexts, ValidationAttestations: attestations, Schemas: append([]string(nil), config.Schemas...), Policy: *policyDocument, PolicyIdentity: config.PolicyIdentity, SchemaPolicyResources: result.SchemaPolicyResources, MigrationPolicyResources: result.MigrationPolicyResources, ApprovalIdentities: map[string]approval.Identity{result.Artifact.Approval.ProofDigest: {ID: config.AutomationApprovalIdentity, Roles: append([]string(nil), config.AutomationApprovalRoles...)}}}
+	trust := migrationTrust{Expected: artifact.ExpectedBindings{PlanDigest: result.Artifact.Plan.Digest, GeneratedPlanDigest: result.Artifact.Plan.Digest, ChecksDigest: result.Artifact.Checks.Digest, GuardrailDigest: result.Artifact.GuardrailDigest, SourceRevision: result.Artifact.SourceRevision, Environment: result.Artifact.TargetEnvironment, DatabaseIdentity: result.Artifact.DatabaseIdentity, ApprovalIdentity: result.Artifact.Approval.Identity, ApprovalProofDigest: result.Artifact.Approval.ProofDigest}, ValidationContextDigests: contexts, ValidationAttestations: attestations, Schemas: append([]string(nil), config.Schemas...), Policy: *policyDocument, PolicyIdentity: config.PolicyIdentity, SchemaPolicyResources: result.SchemaPolicyResources, MigrationPolicyResources: result.MigrationPolicyResources, ApprovalIdentities: map[string]approval.Identity{result.Artifact.Approval.ProofDigest: {ID: config.AutomationApprovalIdentity, Roles: append([]string(nil), config.AutomationApprovalRoles...)}}, SafetySuppressions: append([]safety.Suppression(nil), config.SafetySuppressions...)}
 	apply := applyConfig{DatabaseURL: string(config.ProductionURL), Environment: config.Environment, KeyID: config.SigningKeyID, PublicKey: base64.RawStdEncoding.EncodeToString(signingKey.Public().(ed25519.PublicKey)), Issuer: config.SigningIssuer, Signer: config.SigningIdentity, Author: config.Author, Requester: config.Requester, ApprovalAuditPath: config.ApprovalAuditPath, LifecycleAuditPath: config.LifecycleAuditPath, ArtifactDirectory: config.OperatorArtifactDirectory, PostgresVersion: config.PostgresVersion, KeyStatus: config.SigningStatus, KeyPurpose: config.SigningPurpose, KeyNotBefore: config.SigningNotBefore.UTC(), KeyNotAfter: config.SigningNotAfter.UTC(), NoEdits: true, GeneratorKeyID: config.GeneratorKeyID, GeneratorPublicKey: base64.RawStdEncoding.EncodeToString(generatorKey.Public().(ed25519.PublicKey)), GeneratorPurpose: config.GeneratorPurpose, TrustedMigrations: map[string]migrationTrust{result.Artifact.Digest: trust}, ApprovalPolicy: config.ApprovalPolicy}
 	manifest := operatorReleaseManifest{Version: "autosql.operator-release/v1", ArtifactDigest: result.Artifact.Digest, RegistryDigest: result.Artifact.Digest, ArtifactFile: filepath.ToSlash(filepath.Join("artifacts", result.Artifact.Digest+".json")), ApplyConfigFile: "apply-config.json", OCITag: strings.Replace(result.Artifact.Digest, ":", "-", 1), Environment: config.Environment, DatabaseIdentity: config.DatabaseIdentity, SourceRevision: *sourceRevision, Schemas: append([]string(nil), config.Schemas...), PostgresVersion: config.PostgresVersion, ConcurrentIndexes: *config.ConcurrentIndexes}
 	if *adoptMode {
@@ -230,6 +237,11 @@ func validateOperatorPublishConfig(config operatorPublishConfig, bootstrapMode, 
 	}
 	if _, ok := config.ApprovalPolicy.Environments[config.Environment]; !ok {
 		return errors.New("approval policy must define the configured environment")
+	}
+	for _, suppression := range config.SafetySuppressions {
+		if err := suppression.Validate(); err != nil {
+			return fmt.Errorf("invalid safety suppression: %w", err)
+		}
 	}
 	return nil
 }
