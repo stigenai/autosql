@@ -15,6 +15,7 @@ import (
 	"autosql/pkg/approval"
 	"autosql/pkg/artifact"
 	"autosql/pkg/bootstrap"
+	"autosql/pkg/executor"
 	"autosql/pkg/migrate"
 	"autosql/pkg/policy"
 	"autosql/pkg/postgres"
@@ -177,6 +178,10 @@ func runOperatorArtifactPublish(ctx context.Context, args []string, o output, re
 		if err != nil {
 			return &Error{Kind: "connection", Message: "inspect production database failed", Code: ExitConnection}
 		}
+		// The executor's migration-history relation is runtime bookkeeping,
+		// never part of the desired schema; without this the transition plan
+		// would drop it on every publish after the first verified apply.
+		current = executor.ExcludeBookkeeping(current)
 	}
 	generatorKey, err := resolveOperatorPrivateKey(ctx, resolver, config.GeneratorPrivateKeyReference, "generator")
 	if err != nil {

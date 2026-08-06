@@ -289,6 +289,11 @@ func productionServicesWithURL(connector executor.Connector, databaseURLOverride
 			if err != nil {
 				return executor.RuntimeState{}, err
 			}
+			// The executor's migration-history relation is written into the
+			// target during apply; it is never part of the desired schema, so
+			// exclude it or the postcondition fingerprint can never match the
+			// artifact's ToFingerprint once one apply has run.
+			doc = executor.ExcludeBookkeeping(doc)
 			fp, err := schema.SemanticFingerprint(doc)
 			return executor.RuntimeState{Fingerprint: fp, SourceRevision: a.SourceRevision, Environment: a.TargetEnvironment, DatabaseIdentity: a.DatabaseIdentity}, err
 		}
