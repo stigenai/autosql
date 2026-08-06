@@ -355,3 +355,75 @@ group by w.id;
 		t.Fatalf("adoption artifact was not a no-op: %+v", result.Artifact.Plan)
 	}
 }
+
+// TestOperatorTransitionArtifactAuthorizesExtensionsFromCurrentSchema covers the
+// transition path (neither BootstrapTarget nor Adopt), which is how an artifact
+// is published for a database that AutoSQL already manages.
+//
+// Bootstrap mode never materializes anything (current is empty) and adopt mode
+// authorizes from desired, so transition mode was the only path that reached the
+// replay renderer with an empty extension_allowlist. Materializing the current
+// schema then failed with "extension <name> is not present in extension_allowlist"
+// for any database using an extension -- which is every real one -- making
+// transition artifacts unpublishable.
+func TestOperatorTransitionArtifactAuthorizesExtensionsFromCurrentSchema(t *testing.T) {
+	developmentURL := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if developmentURL == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, developmentURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+
+	reset := `drop extension if exists btree_gist cascade; drop schema if exists autosql_transition_app cascade;`
+	if _, err = conn.Exec(ctx, reset+`
+create schema autosql_transition_app;
+create extension btree_gist with schema autosql_transition_app;
+create table autosql_transition_app.widgets(id bigint primary key, label text not null);
+`); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Exec(context.Background(), reset)
+
+	inspect := func() schema.Document {
+		t.Helper()
+		document, inspectErr := postgres.InspectURL(ctx, developmentURL, postgres.Options{Schemas: []string{"autosql_transition_app"}})
+		if inspectErr != nil {
+			t.Fatal(inspectErr)
+		}
+		document, inspectErr = postgres.New().Normalize(ctx, document)
+		if inspectErr != nil {
+			t.Fatal(inspectErr)
+		}
+		return document
+	}
+
+	// current: the live schema, extension included.
+	current := inspect()
+	// desired: current plus one table. Purely additive, so the safety analyzer
+	// raises no AUTOSQL001 "object is dropped" error and the run reaches the
+	// materialize step this test is about.
+	if _, err = conn.Exec(ctx, `create table autosql_transition_app.gadgets(id bigint primary key)`); err != nil {
+		t.Fatal(err)
+	}
+	desired := inspect()
+
+	request := generationFixture(t, t.TempDir(), developmentURL, developmentURL)
+	request.Desired = desired
+	request.PostgresVersion = 17
+	// The fixture resolves both identities from one URL; validateGenerateRequest
+	// rejects a request whose development and production identities are equal.
+	request.ProductionIdentity = "operator-transition/extension-fixture"
+	request.DatabaseIdentity = "extension-fixture"
+
+	if _, err = (GenerateService{}).BuildOperatorArtifact(ctx, OperatorArtifactRequest{
+		Generation: request, Current: current, Desired: desired,
+		Render: map[string]string{"postgres_version": "17"},
+	}); err != nil {
+		t.Fatalf("transition artifact for a schema with an extension: %v", err)
+	}
+}
