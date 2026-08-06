@@ -243,8 +243,20 @@ func (s GenerateService) BuildOperatorArtifact(ctx context.Context, request Oper
 	if request.Adopt {
 		options.Render = operatorAdoptionArtifactRender(desired, options.Render)
 	}
+	// Both replay paths below have to CREATE whatever the CURRENT schema already
+	// contains -- extensions, reviewed routines -- before the forward plan can be
+	// replayed on top of it. Bootstrap mode never reaches this (current is empty)
+	// and adopt mode is authorized just above, so transition mode was the only
+	// path handing the renderer an empty extension_allowlist, which then rejects
+	// any existing database that uses an extension.
+	//
+	// Authorize from `current` into a SEPARATE render map. `options` must keep
+	// rendering the forward plan with exactly the operator's own options
+	// (postgres_version + concurrent_indexes) or the plan digest stops matching
+	// what the operator recomputes at apply time, and it refuses the artifact.
+	replayRender := operatorAdoptionArtifactRender(current, options.Render)
 	factory := operatorSimulationFactory(request.BootstrapTarget, desired)
-	factory.Render = cloneStrings(options.Render)
+	factory.Render = cloneStrings(replayRender)
 	replayFactory := factory
 	replayFactory.NamePrefix = "autosql_sim_gen_replay"
 	workspace, err := createReplayWorkspace(ctx, r, replayFactory)
@@ -252,7 +264,9 @@ func (s GenerateService) BuildOperatorArtifact(ctx context.Context, request Oper
 		return OperatorArtifactResult{}, generationFailureCause("workspace", ErrGenerateStage, simulate.Redacted(err))
 	}
 	defer workspace.Close()
-	if err = materializeOperatorCurrent(ctx, workspace.URL, current, options); err != nil {
+	materializeOptions := options
+	materializeOptions.Render = replayRender
+	if err = materializeOperatorCurrent(ctx, workspace.URL, current, materializeOptions); err != nil {
 		return OperatorArtifactResult{}, generationFailureCause("materialize", ErrGenerateStage, simulate.RedactedCause(err))
 	}
 	metadata := cloneStrings(r.Metadata)
