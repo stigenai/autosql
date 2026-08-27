@@ -533,6 +533,30 @@ func orderChanges(changes []Change, current, desired Document) ([]Change, error)
 			}
 		}
 	}
+	// PostgreSQL can omit column references for table-scoped objects whose
+	// expressions are not represented by ordinary catalog dependencies (for
+	// example, an index predicate). Dropping or renaming such a column can make
+	// PostgreSQL remove the object before AutoSQL reaches its explicit DROP.
+	// Order every dropped, non-column table descendant before a dropped or
+	// renamed column on the same table. Exact cross-table dependency edges above
+	// remain authoritative; this only fills gaps within one table.
+	for _, column := range changes {
+		if column.Operation != OperationDrop && column.Operation != OperationRename {
+			continue
+		}
+		resource := column.Before
+		if resource == nil || resource.Kind != KindColumn || resource.Name.Parent == "" {
+			continue
+		}
+		for _, descendant := range changes {
+			if descendant.Operation != OperationDrop || descendant.Before == nil || descendant.Before.Kind == KindColumn {
+				continue
+			}
+			if descendant.Before.Name.Parent == resource.Name.Parent {
+				add(column.ID, descendant.ID)
+			}
+		}
+	}
 	// Grants, memberships, and default privileges are the explicit access
 	// handoff boundary. On convergence they run only after every other object
 	// has reached its desired owner/security state; on teardown their edges are

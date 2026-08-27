@@ -96,6 +96,40 @@ func TestCreateAndReverseDropDependencyOrder(t *testing.T) {
 	}
 }
 
+func TestDroppedTableObjectPrecedesColumnMutationWhenDependencyIsIncomplete(t *testing.T) {
+	table := res(schema.KindTable, "automation_cron_jobs", "", `{}`)
+	enabled := res(schema.KindColumn, "enabled", table.ID, `{"type":"boolean"}`,
+		schema.Dependency{Target: table.ID, Type: schema.DependencyContains})
+	nextRun := res(schema.KindColumn, "next_run_at", table.ID, `{"type":"timestamp"}`,
+		schema.Dependency{Target: table.ID, Type: schema.DependencyContains})
+	index := res(schema.KindIndex, "idx_automation_cron_jobs_next_run", table.ID,
+		`{"definition":"CREATE INDEX idx_automation_cron_jobs_next_run ON public.automation_cron_jobs (next_run_at) WHERE enabled = true"}`,
+		schema.Dependency{Target: table.ID, Type: schema.DependencyContains},
+		schema.Dependency{Target: nextRun.ID, Type: schema.DependencyReferences})
+
+	t.Run("drop", func(t *testing.T) {
+		changes, err := schema.Diff(doc(table, enabled, nextRun, index), doc(table, nextRun), schema.DiffOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertNames(t, changes, "idx_automation_cron_jobs_next_run", "enabled")
+	})
+
+	t.Run("rename", func(t *testing.T) {
+		renamed := res(schema.KindColumn, "is_enabled", table.ID, `{"type":"boolean"}`,
+			schema.Dependency{Target: table.ID, Type: schema.DependencyContains})
+		changes, err := schema.Diff(
+			doc(table, enabled, nextRun, index),
+			doc(table, renamed, nextRun),
+			schema.DiffOptions{RenameHints: []schema.RenameHint{{From: enabled.ID, To: renamed.ID}}},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertNames(t, changes, "idx_automation_cron_jobs_next_run", "is_enabled")
+	})
+}
+
 func TestAccessHandoffIsLastAndRevokedFirst(t *testing.T) {
 	role := res(schema.KindRole, "app_reader", "", `{}`)
 	namespace := res(schema.KindSchema, "app", "", `{}`)

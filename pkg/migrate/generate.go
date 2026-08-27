@@ -77,12 +77,12 @@ type GenerateRequest struct {
 	// is a narrow audit record: exactly one rule and one stable object ID,
 	// with a mandatory reason. Suppressed findings remain in the artifact's
 	// diagnostics and are bound into the guardrail bundle digest.
-	SafetySuppressions                                               []safety.Suppression
-	CreatedAt, ExpiresAt                                             time.Time
-	GeneratorKeyID, GeneratorPurpose, SigningKeyID                   string
-	GeneratorPrivateKey, SigningPrivateKey                           ed25519.PrivateKey
-	Metadata                                                         map[string]string
-	Stage                                                            func(string) error
+	SafetySuppressions                             []safety.Suppression
+	CreatedAt, ExpiresAt                           time.Time
+	GeneratorKeyID, GeneratorPurpose, SigningKeyID string
+	GeneratorPrivateKey, SigningPrivateKey         ed25519.PrivateKey
+	Metadata                                       map[string]string
+	Stage                                          func(string) error
 }
 
 // ApprovalProvider issues approval only after the exact guardrail bundle is
@@ -161,7 +161,7 @@ func (s GenerateService) Generate(ctx context.Context, r GenerateRequest) (Gener
 	metadata["autosql.migration.from"] = fromFP
 	metadata["autosql.migration.to"] = toFP
 	metadata["autosql.migration.rename_hints"] = canonicalHints
-	built, err := s.buildGeneratedArtifact(ctx, r, current, desired, workspace.URL, hints, plan.Options{}, nil, metadata, simulate.PostgresFactory{NamePrefix: "autosql_sim_generate"})
+	built, err := s.buildGeneratedArtifact(ctx, r, current, desired, workspace.URL, nil, hints, plan.Options{}, nil, metadata, simulate.PostgresFactory{NamePrefix: "autosql_sim_generate"})
 	if err != nil {
 		return out, err
 	}
@@ -190,7 +190,7 @@ type generatedArtifact struct {
 	SchemaPolicyResources, MigrationPolicyResources []policy.Resource
 }
 
-func (s GenerateService) buildGeneratedArtifact(ctx context.Context, r GenerateRequest, current, desired schema.Document, workspaceURL string, hints []schema.RenameHint, options plan.Options, prebuilt *plan.Plan, metadata map[string]string, simulationFactory simulate.Factory) (generatedArtifact, error) {
+func (s GenerateService) buildGeneratedArtifact(ctx context.Context, r GenerateRequest, current, desired schema.Document, workspaceURL string, prepareMutation func(context.Context) (string, func() error, error), hints []schema.RenameHint, options plan.Options, prebuilt *plan.Plan, metadata map[string]string, simulationFactory simulate.Factory) (generatedArtifact, error) {
 	var out generatedArtifact
 	fromFP, err := schema.SemanticFingerprint(current)
 	if err != nil {
@@ -257,7 +257,7 @@ func (s GenerateService) buildGeneratedArtifact(ctx context.Context, r GenerateR
 	if err != nil {
 		return out, generationFailure("guardrail_bindings", ErrGenerateStage)
 	}
-	mutation := &generationPlanMutation{url: workspaceURL, plan: p}
+	mutation := &generationPlanMutation{url: workspaceURL, plan: p, prepare: prepareMutation}
 	in := guardrail.Input{Changes: p.Changes, Safety: si, Policy: r.Policy, PolicyIdentity: r.PolicyIdentity, SchemaResources: schemaResources, MigrationResources: migrationResources, Precheck: checks, Approval: approval.Request{Plan: approval.Plan{Environment: r.Environment, Author: r.Author, ExpiresAt: r.ExpiresAt}, Approvals: append([]approval.Approval(nil), r.Approvals...), RequestedBy: r.Requester}, StatementBindings: bindings, Mutation: mutation}
 	if err = s.checkpoint(r, "guardrail"); err != nil {
 		return out, err

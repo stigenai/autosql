@@ -17,6 +17,7 @@ import (
 	"autosql/pkg/policy"
 	"autosql/pkg/postgres"
 	"autosql/pkg/precheck"
+	"autosql/pkg/safety"
 	"autosql/pkg/schema"
 	"autosql/pkg/simulate"
 
@@ -24,6 +25,11 @@ import (
 )
 
 const automationApprovalDomain = "autosql.approval.automation/v1\x00"
+
+// OperatorApprovedDroppedColumnsMetadata binds the exact column-drop
+// authorizations used for conservative transition planning into the signed
+// artifact metadata so the operator can reproduce the same plan.
+const OperatorApprovedDroppedColumnsMetadata = "autosql.operator.approved_dropped_columns"
 
 // AutomationApprovalProvider signs a fresh approval after the exact guardrail
 // digest is known. The signed claims bind the CI identity, environment,
@@ -123,9 +129,10 @@ type OperatorArtifactResult struct {
 }
 
 type generationPlanMutation struct {
-	url   string
-	plan  plan.Plan
-	cause error
+	url     string
+	plan    plan.Plan
+	prepare func(context.Context) (string, func() error, error)
+	cause   error
 }
 
 func (m *generationPlanMutation) ApplyAuthorized(ctx context.Context, checks precheck.Plan) (results []precheck.Result, err error) {
@@ -134,6 +141,18 @@ func (m *generationPlanMutation) ApplyAuthorized(ctx context.Context, checks pre
 			m.cause = simulate.RedactedCause(err)
 		}
 	}()
+	if m.prepare != nil {
+		var cleanup func() error
+		m.url, cleanup, err = m.prepare(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer func() {
+			if cleanup != nil {
+				err = errors.Join(err, cleanup())
+			}
+		}()
+	}
 	validation := checks
 	validation.Statements = nil
 	for index := range validation.Assertions {
@@ -204,6 +223,13 @@ func (s GenerateService) BuildOperatorArtifact(ctx context.Context, request Oper
 		// that the operator must reproduce from its locked live inspection.
 		current = desired
 	}
+	approvedDroppedColumns := approvedOperatorDroppedColumns(current, desired, r.SafetySuppressions, r.CreatedAt)
+	if request.BootstrapTarget == nil {
+		options.Render = OperatorDeclarativeArtifactRender(desired, options.Render)
+		if approvedDroppedColumns != "" {
+			options.Render[postgres.ApprovedDroppedColumnIDsOption] = approvedDroppedColumns
+		}
+	}
 	if request.BootstrapTarget != nil {
 		inventory, err := postgres.PrepareBootstrapAuthorizationInventory(ctx, *request.BootstrapTarget, desired, postgres.BootstrapAuthorizationInventoryOptions{Render: options.Render})
 		if err != nil {
@@ -240,9 +266,6 @@ func (s GenerateService) BuildOperatorArtifact(ctx context.Context, request Oper
 	if err != nil {
 		return OperatorArtifactResult{}, generationFailure("desired", ErrGenerateConfig)
 	}
-	if request.Adopt {
-		options.Render = operatorAdoptionArtifactRender(desired, options.Render)
-	}
 	// Both replay paths below have to CREATE whatever the CURRENT schema already
 	// contains -- extensions, reviewed routines -- before the forward plan can be
 	// replayed on top of it. Bootstrap mode never reaches this (current is empty)
@@ -254,22 +277,29 @@ func (s GenerateService) BuildOperatorArtifact(ctx context.Context, request Oper
 	// rendering the forward plan with exactly the operator's own options
 	// (postgres_version + concurrent_indexes) or the plan digest stops matching
 	// what the operator recomputes at apply time, and it refuses the artifact.
-	replayRender := operatorAdoptionArtifactRender(current, options.Render)
+	replayRender := OperatorDeclarativeArtifactRender(current, options.Render)
 	factory := operatorSimulationFactory(request.BootstrapTarget, desired)
 	factory.Render = cloneStrings(replayRender)
 	replayFactory := factory
 	replayFactory.NamePrefix = "autosql_sim_gen_replay"
-	workspace, err := createReplayWorkspace(ctx, r, replayFactory)
-	if err != nil {
-		return OperatorArtifactResult{}, generationFailureCause("workspace", ErrGenerateStage, simulate.Redacted(err))
-	}
-	defer workspace.Close()
 	materializeOptions := options
 	materializeOptions.Render = replayRender
-	if err = materializeOperatorCurrent(ctx, workspace.URL, current, materializeOptions); err != nil {
-		return OperatorArtifactResult{}, generationFailureCause("materialize", ErrGenerateStage, simulate.RedactedCause(err))
+	prepareMutation := func(prepareCtx context.Context) (string, func() error, error) {
+		workspace, workspaceErr := createReplayWorkspace(prepareCtx, r, replayFactory)
+		if workspaceErr != nil {
+			return "", nil, workspaceErr
+		}
+		cleanup := func() error { return workspace.Close() }
+		if materializeErr := materializeOperatorCurrent(prepareCtx, workspace.URL, current, materializeOptions); materializeErr != nil {
+			return "", cleanup, materializeErr
+		}
+		return workspace.URL, cleanup, nil
 	}
 	metadata := cloneStrings(r.Metadata)
+	delete(metadata, OperatorApprovedDroppedColumnsMetadata)
+	if approvedDroppedColumns != "" {
+		metadata[OperatorApprovedDroppedColumnsMetadata] = approvedDroppedColumns
+	}
 	metadata["autosql.operator.gitops"] = "v1"
 	metadata["autosql.operator.mode"] = "transition"
 	if request.BootstrapTarget != nil {
@@ -277,7 +307,7 @@ func (s GenerateService) BuildOperatorArtifact(ctx context.Context, request Oper
 	} else if request.Adopt {
 		metadata["autosql.operator.mode"] = "adopt"
 	}
-	built, err := s.buildGeneratedArtifact(ctx, r, current, desired, workspace.URL, nil, options, prebuilt, metadata, factory)
+	built, err := s.buildGeneratedArtifact(ctx, r, current, desired, "", prepareMutation, nil, options, prebuilt, metadata, factory)
 	if err != nil {
 		return OperatorArtifactResult{}, err
 	}
@@ -288,7 +318,7 @@ func (s GenerateService) BuildOperatorArtifact(ctx context.Context, request Oper
 }
 
 func operatorSimulationFactory(target *bootstrap.DatabaseTarget, desired schema.Document) simulate.PostgresFactory {
-	factory := simulate.PostgresFactory{NamePrefix: "autosql_sim_generate"}
+	factory := simulate.PostgresFactory{NamePrefix: "autosql_sim_generate", ManagedResources: append([]schema.Resource(nil), desired.Graph.Resources...)}
 	if target != nil && target.Normalize().Mode == bootstrap.ExternalDatabase {
 		factory.DropPublicSchema = true
 	}
@@ -364,12 +394,12 @@ func operatorBootstrapArtifactRender(inventory postgres.BootstrapAuthorizationIn
 	return render
 }
 
-// operatorAdoptionArtifactRender authorizes only the exact safe provisioning
-// inputs already bound into the normalized desired document. The normal
-// PostgreSQL renderer still rejects unsafe routine languages, privileged
-// routine bodies, and untrusted extensions unless those separate controls are
-// explicitly enabled.
-func operatorAdoptionArtifactRender(desired schema.Document, base map[string]string) map[string]string {
+// OperatorDeclarativeArtifactRender authorizes only the exact safe
+// provisioning inputs already bound into the normalized desired document.
+// The normal PostgreSQL renderer still rejects unsafe routine languages,
+// privileged routine bodies, and untrusted extensions unless those separate
+// controls are explicitly enabled.
+func OperatorDeclarativeArtifactRender(desired schema.Document, base map[string]string) map[string]string {
 	render := cloneStrings(base)
 	routineDigests, extensionNames := map[string]bool{}, map[string]bool{}
 	for _, resource := range desired.Graph.Resources {
@@ -399,6 +429,35 @@ func operatorAdoptionArtifactRender(desired schema.Document, base map[string]str
 	render["reviewed_routine_digests"] = sortedOperatorAuthorizationValues(routineDigests)
 	render["extension_allowlist"] = sortedOperatorAuthorizationValues(extensionNames)
 	return render
+}
+
+func approvedOperatorDroppedColumns(current, desired schema.Document, suppressions []safety.Suppression, at time.Time) string {
+	desiredResources := map[string]bool{}
+	for _, resource := range desired.Graph.Resources {
+		desiredResources[resource.ID] = true
+	}
+	approved := map[string]bool{}
+	for _, suppression := range suppressions {
+		if suppression.Rule != safety.RuleDropObject || suppression.Validate() != nil || (suppression.ExpiresAt != nil && !suppression.ExpiresAt.After(at.UTC())) {
+			continue
+		}
+		for _, resource := range current.Graph.Resources {
+			if resource.ID == suppression.ObjectID && resource.Kind == schema.KindColumn && !desiredResources[resource.ID] {
+				approved[resource.ID] = true
+				break
+			}
+		}
+	}
+	ids := make([]string, 0, len(approved))
+	for id := range approved {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	if len(ids) == 0 {
+		return ""
+	}
+	raw, _ := json.Marshal(ids)
+	return string(raw)
 }
 
 func sortedOperatorAuthorizationValues(values map[string]bool) string {

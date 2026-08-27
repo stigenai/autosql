@@ -19,6 +19,18 @@ type fakeFactory struct {
 	err error
 }
 
+func TestAdvancedInspectionTracksOnlyDeclaredClusterScopedSchemaKinds(t *testing.T) {
+	workspace := &PostgresWorkspace{}
+	resources := []schema.Resource{{ID: "table", Kind: schema.KindTable}, {ID: "owned-table", Kind: schema.KindTable, Dependencies: []schema.Dependency{{Target: "role:owner", Type: schema.DependencyReferences}}}}
+	for _, kind := range []schema.Kind{schema.KindRole, schema.KindGrant, schema.KindMembership, schema.KindDefaultPrivilege} {
+		resources = append(resources, schema.Resource{ID: string(kind), Kind: kind})
+	}
+	workspace.trackAdvancedResources(resources)
+	if workspace.advancedResourceIDs["table"] || !workspace.advancedResourceIDs["owned-table"] || len(workspace.advancedResourceIDs) != 5 {
+		t.Fatalf("tracked advanced resources=%v", workspace.advancedResourceIDs)
+	}
+}
+
 func (f fakeFactory) Create(context.Context, Config) (Isolation, error) {
 	if f.err != nil {
 		return nil, f.err
