@@ -54,6 +54,29 @@ func InspectURL(ctx context.Context, url string, opts Options) (schema.Document,
 	return inspect(ctx, request)
 }
 
+// InspectManagedURL inspects ordinary schema state plus only the advanced
+// role/ownership resources declared by managed. PostgreSQL advanced inspection
+// is cluster-wide; filtering to desired IDs avoids importing unrelated roles.
+func InspectManagedURL(ctx context.Context, url string, opts Options, managed schema.Document) (schema.Document, error) {
+	baseOptions := opts
+	baseOptions.Advanced = false
+	base, err := InspectURL(ctx, url, baseOptions)
+	if err != nil {
+		return schema.Document{}, err
+	}
+	ids := managedAdvancedResourceIDs(managed.Graph.Resources)
+	if len(ids) == 0 {
+		return base, nil
+	}
+	advancedOptions := opts
+	advancedOptions.Advanced = true
+	advanced, err := InspectURL(ctx, url, advancedOptions)
+	if err != nil {
+		return schema.Document{}, err
+	}
+	return mergeManagedAdvancedResources(base, advanced, ids), nil
+}
+
 // InspectConn inspects through the supplied session, preserving session locks.
 func InspectConn(ctx context.Context, conn *pgx.Conn, opts Options) (schema.Document, error) {
 	request := inspectRequest(opts)
@@ -68,6 +91,79 @@ func InspectTx(ctx context.Context, tx pgx.Tx, opts Options) (schema.Document, e
 		return schema.Document{}, errors.New("inspect PostgreSQL transaction: transaction is required")
 	}
 	return inspectSnapshot(ctx, tx, inspectRequest(opts))
+}
+
+// InspectManagedTx is the transaction-scoped counterpart of InspectManagedURL.
+func InspectManagedTx(ctx context.Context, tx pgx.Tx, opts Options, managed schema.Document) (schema.Document, error) {
+	baseOptions := opts
+	baseOptions.Advanced = false
+	base, err := InspectTx(ctx, tx, baseOptions)
+	if err != nil {
+		return schema.Document{}, err
+	}
+	ids := managedAdvancedResourceIDs(managed.Graph.Resources)
+	if len(ids) == 0 {
+		return base, nil
+	}
+	advancedOptions := opts
+	advancedOptions.Advanced = true
+	advanced, err := InspectTx(ctx, tx, advancedOptions)
+	if err != nil {
+		return schema.Document{}, err
+	}
+	return mergeManagedAdvancedResources(base, advanced, ids), nil
+}
+
+func managedAdvancedResourceIDs(resources []schema.Resource) map[string]bool {
+	ids := map[string]bool{}
+	for _, resource := range resources {
+		tracked := false
+		switch resource.Kind {
+		case schema.KindRole, schema.KindGrant, schema.KindMembership, schema.KindDefaultPrivilege:
+			tracked = true
+		}
+		for _, dependency := range resource.Dependencies {
+			if strings.HasPrefix(dependency.Target, string(schema.KindRole)+":") {
+				tracked = true
+				break
+			}
+		}
+		if tracked {
+			ids[resource.ID] = true
+		}
+	}
+	return ids
+}
+
+func mergeManagedAdvancedResources(base, advanced schema.Document, ids map[string]bool) schema.Document {
+	advancedByID := map[string]schema.Resource{}
+	for _, resource := range advanced.Graph.Resources {
+		if ids[resource.ID] && managedRoleDependencies(resource, ids) {
+			advancedByID[resource.ID] = resource
+		}
+	}
+	seen := map[string]bool{}
+	for index, resource := range base.Graph.Resources {
+		if replacement, ok := advancedByID[resource.ID]; ok {
+			base.Graph.Resources[index] = replacement
+			seen[resource.ID] = true
+		}
+	}
+	for id, resource := range advancedByID {
+		if !seen[id] {
+			base.Graph.Resources = append(base.Graph.Resources, resource)
+		}
+	}
+	return base
+}
+
+func managedRoleDependencies(resource schema.Resource, ids map[string]bool) bool {
+	for _, dependency := range resource.Dependencies {
+		if strings.HasPrefix(dependency.Target, string(schema.KindRole)+":") && !ids[dependency.Target] {
+			return false
+		}
+	}
+	return true
 }
 
 func inspectRequest(opts Options) plugin.InspectRequest {
@@ -161,6 +257,7 @@ func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Documen
 			r.Spec = normalized
 		}
 	}
+	canonicalizeManagedRoleDependencies(&doc)
 	if err := canonicalizeUsedTypes(&doc); err != nil {
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
@@ -192,6 +289,54 @@ func (*Driver) Normalize(_ context.Context, doc schema.Document) (schema.Documen
 		return schema.Document{}, fmt.Errorf("normalize PostgreSQL schema: %w", err)
 	}
 	return doc, nil
+}
+
+func canonicalizeManagedRoleDependencies(doc *schema.Document) {
+	roles := map[string]string{}
+	for _, resource := range doc.Graph.Resources {
+		if resource.Kind == schema.KindRole {
+			roles[resource.Name.Name] = resource.ID
+		}
+	}
+	add := func(resource *schema.Resource, role string, dependencyType schema.DependencyType) {
+		target := roles[strings.TrimSpace(role)]
+		if target == "" {
+			return
+		}
+		for _, dependency := range resource.Dependencies {
+			if dependency.Target == target && dependency.Type == dependencyType {
+				return
+			}
+		}
+		resource.Dependencies = append(resource.Dependencies, schema.Dependency{Target: target, Type: dependencyType})
+	}
+	for index := range doc.Graph.Resources {
+		resource := &doc.Graph.Resources[index]
+		specification := spec(*resource)
+		switch resource.Kind {
+		case schema.KindMembership:
+			for _, key := range []string{"parent", "member", "grantor"} {
+				add(resource, stringValue(specification, key), schema.DependencyReferences)
+			}
+		case schema.KindGrant:
+			for _, key := range []string{"grantee", "grantor"} {
+				add(resource, stringValue(specification, key), schema.DependencyReferences)
+			}
+		case schema.KindDefaultPrivilege:
+			for _, key := range []string{"owner", "grantee"} {
+				add(resource, stringValue(specification, key), schema.DependencyReferences)
+			}
+		case schema.KindPolicy:
+			if values, ok := specification["roles"].([]any); ok {
+				for _, value := range values {
+					role, _ := value.(string)
+					add(resource, role, schema.DependencyReferences)
+				}
+			}
+		default:
+			add(resource, stringValue(specification, "owner"), schema.DependencyOwns)
+		}
+	}
 }
 
 func canonicalizeTriggerDefinitions(doc *schema.Document) {

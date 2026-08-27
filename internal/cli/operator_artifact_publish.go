@@ -174,7 +174,7 @@ func runOperatorArtifactPublish(ctx context.Context, args []string, o output, re
 		if err != nil {
 			return &Error{Kind: "connection", Message: "resolve production database identity failed", Code: ExitConnection}
 		}
-		current, err = postgres.InspectURL(ctx, productionURL, postgres.Options{Schemas: config.Schemas})
+		current, err = postgres.InspectManagedURL(ctx, productionURL, postgres.Options{Schemas: config.Schemas}, desired)
 		if err != nil {
 			return &Error{Kind: "connection", Message: "inspect production database failed", Code: ExitConnection}
 		}

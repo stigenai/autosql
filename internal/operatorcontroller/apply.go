@@ -15,6 +15,7 @@ import (
 	"autosql/pkg/artifact"
 	"autosql/pkg/bootstrap"
 	"autosql/pkg/executor"
+	"autosql/pkg/migrate"
 	"autosql/pkg/operator"
 	"autosql/pkg/plan"
 	"autosql/pkg/postgres"
@@ -319,7 +320,7 @@ func lockAdoptionRelations(ctx context.Context, tx pgx.Tx, schemas []string) err
 }
 
 func buildAdoptionPlan(ctx context.Context, tx pgx.Tx, schemas []string, desired schema.Document, spec operator.Spec) (plan.Plan, error) {
-	current, err := postgres.InspectTx(ctx, tx, postgres.Options{Schemas: schemas})
+	current, err := postgres.InspectManagedTx(ctx, tx, postgres.Options{Schemas: schemas}, desired)
 	if err != nil {
 		return plan.Plan{}, errors.New("inspect adoption target")
 	}
@@ -328,7 +329,8 @@ func buildAdoptionPlan(ctx context.Context, tx pgx.Tx, schemas []string, desired
 		return plan.Plan{}, errors.New("normalize adoption target")
 	}
 	current = executor.ExcludeBookkeeping(current)
-	generated, err := plan.Build(ctx, postgres.New(), current, desired, plan.Options{Render: operatorBootstrapRenderOptions(spec)})
+	render := migrate.OperatorDeclarativeArtifactRender(desired, operatorBootstrapRenderOptions(spec))
+	generated, err := plan.Build(ctx, postgres.New(), current, desired, plan.Options{Render: render})
 	if err != nil {
 		return plan.Plan{}, errors.New("compare adoption target with desired schema")
 	}
@@ -390,7 +392,7 @@ func verifyDeclarativeResource(ctx context.Context, resource operator.Resource, 
 			schemas = append(schemas, name)
 		}
 	}
-	target, err := postgres.InspectURL(ctx, resource.ResolvedDatabaseURL, postgres.Options{Schemas: schemas})
+	target, err := postgres.InspectManagedURL(ctx, resource.ResolvedDatabaseURL, postgres.Options{Schemas: schemas}, desired)
 	if err != nil {
 		return verifiedBootstrapPlan{}, errors.New("inspect declarative target")
 	}
@@ -403,7 +405,11 @@ func verifyDeclarativeResource(ctx context.Context, resource operator.Resource, 
 	// the desired schema, and leaving it in the recomputed plan would add
 	// spurious drops and fail the signed-plan digest check.
 	target = executor.ExcludeBookkeeping(target)
-	options := plan.Options{Render: operatorBootstrapRenderOptions(resource.Spec)}
+	render := migrate.OperatorDeclarativeArtifactRender(desired, operatorBootstrapRenderOptions(resource.Spec))
+	if approved := strings.TrimSpace(a.Metadata[migrate.OperatorApprovedDroppedColumnsMetadata]); approved != "" {
+		render[postgres.ApprovedDroppedColumnIDsOption] = approved
+	}
+	options := plan.Options{Render: render}
 	generated, err := plan.Build(ctx, postgres.New(), target, desired, options)
 	for _, candidate := range desired.Graph.Resources {
 		if candidate.Kind != schema.KindDatabase {

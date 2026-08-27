@@ -247,7 +247,7 @@ func TestOperatorAdoptionArtifactRenderBindsExactSafeProvisioningInputs(t *testi
 		{Kind: schema.KindExtension, Name: schema.Name{Schema: "app", Name: "pg_trgm"}, Spec: []byte(`{"version":"1.6"}`)},
 		{Kind: schema.KindExtension, Name: schema.Name{Schema: "audit", Name: "btree_gist"}, Spec: []byte(`{"version":"1.7"}`)},
 	}}}
-	render := operatorAdoptionArtifactRender(desired, map[string]string{
+	render := OperatorDeclarativeArtifactRender(desired, map[string]string{
 		"postgres_version": "17", "reviewed_routine_digests": "sha256:stale", "extension_allowlist": "stale",
 	})
 	want := map[string]string{
@@ -271,6 +271,31 @@ func TestOperatorAdoptionArtifactRenderBindsExactSafeProvisioningInputs(t *testi
 		}
 	}
 }
+
+func TestApprovedOperatorDroppedColumnsRequiresExactLiveSuppression(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	column := schema.Resource{Kind: schema.KindColumn, Name: schema.Name{Schema: "public", Name: "legacy", Parent: "table:public.widgets"}, Spec: []byte(`{"type":"text"}`)}
+	column.ID = schema.StableID(column.Kind, column.Name)
+	table := schema.Resource{Kind: schema.KindTable, Name: schema.Name{Schema: "public", Name: "old_table"}, Spec: []byte(`{}`)}
+	table.ID = schema.StableID(table.Kind, table.Name)
+	current := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{column, table}}}
+	desired := schema.Document{Version: schema.SchemaVersion}
+	suppressions := []safety.Suppression{
+		{Rule: safety.RuleDropObject, ObjectID: table.ID, Reason: "approved table retirement"},
+		{Rule: safety.RuleDropObject, ObjectID: column.ID, Reason: "approved column retirement", ExpiresAt: ptrTime(now.Add(time.Hour))},
+		{Rule: safety.RuleDropObject, ObjectID: "column:other", Reason: "different column"},
+	}
+	want := `["` + column.ID + `"]`
+	if got := approvedOperatorDroppedColumns(current, desired, suppressions, now); got != want {
+		t.Fatalf("approved columns=%q want=%q", got, want)
+	}
+	suppressions[1].ExpiresAt = ptrTime(now)
+	if got := approvedOperatorDroppedColumns(current, desired, suppressions, now); got != "" {
+		t.Fatalf("expired approval accepted: %q", got)
+	}
+}
+
+func ptrTime(value time.Time) *time.Time { return &value }
 
 func TestOperatorAdoptionArtifactRoundTripsComplexHCL(t *testing.T) {
 	developmentURL := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
@@ -340,7 +365,7 @@ group by w.id;
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = materializeOperatorCurrent(ctx, workspace.URL(), desired, plan.Options{Render: operatorAdoptionArtifactRender(desired, map[string]string{"postgres_version": "17"})}); err != nil {
+	if err = materializeOperatorCurrent(ctx, workspace.URL(), desired, plan.Options{Render: OperatorDeclarativeArtifactRender(desired, map[string]string{"postgres_version": "17"})}); err != nil {
 		_ = workspace.Cleanup(context.Background())
 		t.Fatalf("materialize complex adoption schema: %v", err)
 	}

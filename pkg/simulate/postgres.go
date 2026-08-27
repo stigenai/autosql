@@ -31,6 +31,10 @@ type PostgresFactory struct {
 	// intentionally not managed by the schema document. Missing roles are
 	// leased as NOLOGIN roles for the lifetime of the isolated workspace.
 	RequiredRoles []string
+	// ManagedResources identifies exact cluster-scoped resources the plan may
+	// create. Roles absent before workspace creation are removed during cleanup
+	// so sequential replay and simulation cannot contaminate each other.
+	ManagedResources []schema.Resource
 	// Render carries provisioning authorizations that the caller already
 	// validated into scratch materialization. Controls absent from this map
 	// remain disabled by the PostgreSQL renderer.
@@ -43,6 +47,8 @@ var safeSimulationPrefix = regexp.MustCompile(`^autosql_sim(?:_[a-z0-9]+)*$`)
 type PostgresWorkspace struct {
 	adminURL, dbURL, name, identity string
 	schemas                         []string
+	advancedResourceIDs             map[string]bool
+	createdRoleNames                map[string]bool
 	roleLease                       *postgresRoleLease
 	render                          map[string]string
 }
@@ -151,7 +157,13 @@ func (f PostgresFactory) CreateWorkspace(ctx context.Context, c Config) (*Postgr
 	for key, value := range f.Render {
 		render[key] = value
 	}
-	return &PostgresWorkspace{adminURL: c.DevelopmentURL, dbURL: copy.String(), name: name, identity: actual + "/" + name, roleLease: roles, render: render}, nil
+	workspace := &PostgresWorkspace{adminURL: c.DevelopmentURL, dbURL: copy.String(), name: name, identity: actual + "/" + name, roleLease: roles, render: render}
+	if e = workspace.trackCreatedRoles(ctx, f.ManagedResources); e != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		defer cancel()
+		return nil, errors.Join(lifecycleFailure("prepare_managed_resources", e), workspace.Cleanup(cleanupCtx))
+	}
+	return workspace, nil
 }
 
 func preparePostgresDatabase(ctx context.Context, databaseURL string, dropPublic bool) error {
@@ -355,6 +367,10 @@ func sameResolvedEndpoint(dev *url.URL, production string) bool {
 }
 func (p *PostgresWorkspace) Identity() string { return p.identity }
 func (p *PostgresWorkspace) Materialize(ctx context.Context, doc schema.Document) error {
+	p.trackAdvancedResources(doc.Graph.Resources)
+	if err := p.trackCreatedRoles(ctx, doc.Graph.Resources); err != nil {
+		return err
+	}
 	seen := map[string]bool{}
 	for _, r := range doc.Graph.Resources {
 		if r.Kind == schema.KindSchema && !seen[r.Name.Name] {
@@ -396,10 +412,25 @@ func (p *PostgresWorkspace) Execute(ctx context.Context, pl plan.Plan) error {
 		seen[s] = true
 	}
 	for _, c := range pl.Changes.Changes {
+		if c.After != nil {
+			p.trackAdvancedResources([]schema.Resource{*c.After})
+		}
+		if c.Before != nil {
+			p.trackAdvancedResources([]schema.Resource{*c.Before})
+		}
 		if c.After != nil && c.After.Kind == schema.KindSchema && !seen[c.After.Name.Name] {
 			p.schemas = append(p.schemas, c.After.Name.Name)
 			seen[c.After.Name.Name] = true
 		}
+	}
+	roleResources := make([]schema.Resource, 0)
+	for _, change := range pl.Changes.Changes {
+		if change.After != nil && change.After.Kind == schema.KindRole {
+			roleResources = append(roleResources, *change.After)
+		}
+	}
+	if err := p.trackCreatedRoles(ctx, roleResources); err != nil {
+		return err
 	}
 	conn, e := pgx.Connect(ctx, p.dbURL)
 	if e != nil {
@@ -444,15 +475,124 @@ func (p *PostgresWorkspace) Inspect(ctx context.Context) (schema.Document, error
 	if e != nil {
 		return schema.Document{}, e
 	}
+	if len(p.advancedResourceIDs) > 0 {
+		advanced, advancedErr := postgres.InspectURL(ctx, p.dbURL, postgres.Options{Schemas: p.schemas, Advanced: true})
+		if advancedErr != nil {
+			return schema.Document{}, advancedErr
+		}
+		advancedByID := map[string]schema.Resource{}
+		for _, resource := range advanced.Graph.Resources {
+			if p.advancedResourceIDs[resource.ID] && workspaceManagedRoleDependencies(resource, p.advancedResourceIDs) {
+				advancedByID[resource.ID] = resource
+			}
+		}
+		seen := map[string]bool{}
+		for index, resource := range doc.Graph.Resources {
+			if replacement, ok := advancedByID[resource.ID]; ok {
+				doc.Graph.Resources[index] = replacement
+				seen[resource.ID] = true
+			}
+		}
+		for id, resource := range advancedByID {
+			if !seen[id] {
+				doc.Graph.Resources = append(doc.Graph.Resources, resource)
+			}
+		}
+	}
 	return postgres.New().Normalize(ctx, doc)
+}
+
+func workspaceManagedRoleDependencies(resource schema.Resource, ids map[string]bool) bool {
+	for _, dependency := range resource.Dependencies {
+		if strings.HasPrefix(dependency.Target, string(schema.KindRole)+":") && !ids[dependency.Target] {
+			return false
+		}
+	}
+	return true
+}
+
+func (p *PostgresWorkspace) trackAdvancedResources(resources []schema.Resource) {
+	for _, resource := range resources {
+		tracked := false
+		switch resource.Kind {
+		case schema.KindRole, schema.KindGrant, schema.KindMembership, schema.KindDefaultPrivilege:
+			tracked = true
+		}
+		for _, dependency := range resource.Dependencies {
+			if strings.HasPrefix(dependency.Target, string(schema.KindRole)+":") {
+				tracked = true
+				break
+			}
+		}
+		if tracked {
+			if p.advancedResourceIDs == nil {
+				p.advancedResourceIDs = map[string]bool{}
+			}
+			p.advancedResourceIDs[resource.ID] = true
+		}
+	}
+}
+
+func (p *PostgresWorkspace) trackCreatedRoles(ctx context.Context, resources []schema.Resource) error {
+	names := map[string]bool{}
+	for _, resource := range resources {
+		if resource.Kind == schema.KindRole && strings.TrimSpace(resource.Name.Name) != "" {
+			names[resource.Name.Name] = true
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	conn, err := pgx.Connect(ctx, p.adminURL)
+	if err != nil {
+		return err
+	}
+	defer conn.Close(context.Background())
+	for name := range names {
+		var exists bool
+		if err = conn.QueryRow(ctx, `select exists(select 1 from pg_roles where rolname=$1)`, name).Scan(&exists); err != nil {
+			return err
+		}
+		if !exists {
+			if p.createdRoleNames == nil {
+				p.createdRoleNames = map[string]bool{}
+			}
+			p.createdRoleNames[name] = true
+		}
+	}
+	return nil
 }
 func (p *PostgresWorkspace) Cleanup(ctx context.Context) error {
 	databaseErr := cleanupDatabase(ctx, p.adminURL, p.name)
+	managedRoleErr := cleanupCreatedRoles(ctx, p.adminURL, p.createdRoleNames)
 	roleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
 	roleErr := p.roleLease.Close(roleCtx)
 	p.roleLease = nil
-	return errors.Join(databaseErr, roleErr)
+	return errors.Join(databaseErr, managedRoleErr, roleErr)
+}
+
+func cleanupCreatedRoles(ctx context.Context, adminURL string, names map[string]bool) error {
+	if len(names) == 0 {
+		return nil
+	}
+	conn, err := pgx.Connect(ctx, adminURL)
+	if err != nil {
+		return err
+	}
+	defer conn.Close(context.Background())
+	ordered := make([]string, 0, len(names))
+	for name := range names {
+		ordered = append(ordered, name)
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(ordered)))
+	var cleanup error
+	for _, name := range ordered {
+		if _, dropErr := conn.Exec(ctx, "DROP ROLE IF EXISTS "+quote(name)); dropErr != nil {
+			cleanup = errors.Join(cleanup, dropErr)
+		}
+	}
+	return cleanup
 }
 func cleanupDatabase(ctx context.Context, adminURL, name string) error {
 	cycle := func(attemptCtx context.Context) (bool, error) {

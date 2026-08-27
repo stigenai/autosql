@@ -189,6 +189,106 @@ func TestConcurrentRenderingUsesNonTransactionalPhase(t *testing.T) {
 	}
 }
 
+func TestRetainedIndexWithExactDependenciesAllowsUnrelatedColumnDrop(t *testing.T) {
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "public"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "public", Name: "operations", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	provider := renderResource(schema.KindColumn, schema.Name{Schema: "public", Name: "provider", Parent: table.ID}, `{"not_null":false,"ordinal":1,"type":"text"}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains})
+	legacy := renderResource(schema.KindColumn, schema.Name{Schema: "public", Name: "legacy", Parent: table.ID}, `{"not_null":false,"ordinal":2,"type":"text"}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains})
+	index := renderResource(schema.KindIndex, schema.Name{Schema: "public", Name: "idx_operations_provider", Parent: table.ID}, `{"columns":["provider"],"definition":"CREATE INDEX idx_operations_provider ON public.operations USING btree (provider)","method":"btree","ready":true,"unique":false,"valid":true}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: provider.ID, Type: schema.DependencyReferences})
+	current := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, provider, legacy, index}}}
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, provider, index}}}
+	changes, err := schema.Diff(current, desired, schema.DiffOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Current: current, Desired: desired})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 1 || !strings.Contains(out[0].SQL, `DROP COLUMN "legacy"`) {
+		t.Fatalf("statements=%+v", out)
+	}
+}
+
+func TestRetainedConstraintWithExactDependenciesAllowsUnrelatedColumnDrop(t *testing.T) {
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "public"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "public", Name: "operations", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	state := renderResource(schema.KindColumn, schema.Name{Schema: "public", Name: "state", Parent: table.ID}, `{"not_null":false,"ordinal":1,"type":"text"}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains})
+	legacy := renderResource(schema.KindColumn, schema.Name{Schema: "public", Name: "legacy", Parent: table.ID}, `{"not_null":false,"ordinal":2,"type":"text"}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains})
+	check := renderResource(schema.KindCheckConstraint, schema.Name{Schema: "public", Name: "operations_state_check", Parent: table.ID}, `{"columns":["state"],"deferrable":false,"definition":"CHECK (state = 'active')","initially_deferred":false,"validated":true}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: state.ID, Type: schema.DependencyReferences})
+	current := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, state, legacy, check}}}
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, state, check}}}
+	changes, err := schema.Diff(current, desired, schema.DiffOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Current: current, Desired: desired}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRetainedOpaqueIndexStillBlocksColumnDrop(t *testing.T) {
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "public"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "public", Name: "operations", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	legacy := renderResource(schema.KindColumn, schema.Name{Schema: "public", Name: "legacy", Parent: table.ID}, `{"not_null":false,"ordinal":1,"type":"text"}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains})
+	index := renderResource(schema.KindIndex, schema.Name{Schema: "public", Name: "idx_operations_expression", Parent: table.ID}, `{"definition":"CREATE INDEX idx_operations_expression ON public.operations ((lower(legacy)))","method":"btree","ready":true,"unique":false,"valid":true}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains})
+	current := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, legacy, index}}}
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, index}}}
+	changes, err := schema.Diff(current, desired, schema.DiffOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Current: current, Desired: desired}); err == nil || !strings.Contains(err.Error(), "retained read-only object may depend on changed column") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestApprovedColumnDropAllowsRetainedOpaqueObject(t *testing.T) {
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "public"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "public", Name: "operations", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	legacy := renderResource(schema.KindColumn, schema.Name{Schema: "public", Name: "legacy", Parent: table.ID}, `{"not_null":false,"ordinal":1,"type":"text"}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains})
+	trigger := renderResource(schema.KindTrigger, schema.Name{Schema: "public", Name: "sync_operation_config_trigger", Parent: table.ID}, `{"definition":"CREATE TRIGGER sync_operation_config_trigger BEFORE UPDATE ON public.operations FOR EACH ROW EXECUTE FUNCTION public.sync_operation_config()","enabled":"O"}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains})
+	current := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, legacy, trigger}}}
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, trigger}}}
+	changes, err := schema.Diff(current, desired, schema.DiffOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := map[string]string{ApprovedDroppedColumnIDsOption: `["` + legacy.ID + `"]`}
+	if _, err = New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Current: current, Desired: desired, Options: options}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestApprovedColumnDropDoesNotAllowExactRetainedDependency(t *testing.T) {
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "public"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "public", Name: "operations", Parent: ns.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	legacy := renderResource(schema.KindColumn, schema.Name{Schema: "public", Name: "legacy", Parent: table.ID}, `{"not_null":false,"ordinal":1,"type":"text"}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains})
+	index := renderResource(schema.KindIndex, schema.Name{Schema: "public", Name: "idx_operations_legacy", Parent: table.ID}, `{"columns":["legacy"],"definition":"CREATE INDEX idx_operations_legacy ON public.operations USING btree (legacy)","method":"btree","ready":true,"unique":false,"valid":true}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: legacy.ID, Type: schema.DependencyReferences})
+	current := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, legacy, index}}}
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, table, index}}}
+	changes := schema.ChangeSet{Version: schema.ChangeVersion, Changes: []schema.Change{{ID: "drop-legacy", Operation: schema.OperationDrop, ResourceID: legacy.ID, Before: &legacy}}}
+	options := map[string]string{ApprovedDroppedColumnIDsOption: `["` + legacy.ID + `"]`}
+	if err := validateColumnDependentTransitions(plugin.RenderRequest{Changes: changes, Current: current, Desired: desired, Options: options}); err == nil || !strings.Contains(err.Error(), "retained read-only object may depend on changed column") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestApprovedColumnDropAuthorizationMustBeCanonical(t *testing.T) {
+	for _, raw := range []string{`not-json`, `[]`, `["b","a"]`, `["a","a"]`, `[""]`} {
+		approved, err := approvedDroppedColumnIDs(map[string]string{ApprovedDroppedColumnIDsOption: raw})
+		if raw == `[]` {
+			if err != nil || len(approved) != 0 {
+				t.Fatalf("raw=%q approved=%v err=%v", raw, approved, err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Fatalf("raw=%q unexpectedly accepted", raw)
+		}
+	}
+}
+
 func TestMaterializedViewAlterRequiresExplicitRebuild(t *testing.T) {
 	s := renderResource(schema.KindSchema, schema.Name{Name: "public"}, `{}`)
 	before := renderResource(schema.KindMaterializedView, schema.Name{Schema: "public", Name: "users_mv", Parent: s.ID}, `{"definition":"SELECT 1 AS value"}`, schema.Dependency{Target: s.ID, Type: schema.DependencyContains})
@@ -841,6 +941,32 @@ func TestManagedLifecycleMatrix(t *testing.T) {
 				t.Fatalf("out=%+v err=%v", out, err)
 			}
 		})
+	}
+}
+
+func TestTableAlterRendersOwnershipWithRLSChanges(t *testing.T) {
+	ns := renderResource(schema.KindSchema, schema.Name{Name: "public"}, `{}`)
+	owner := renderResource(schema.KindRole, schema.Name{Name: "infra_blocks_owner"}, `{}`)
+	before := renderResource(schema.KindTable, schema.Name{Schema: "public", Name: "operations", Parent: ns.ID},
+		`{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`,
+		schema.Dependency{Target: ns.ID, Type: schema.DependencyContains})
+	after := before
+	after.Spec = json.RawMessage(`{"partitioned":false,"persistence":"p","row_security":true,"force_row_security":true,"owner":"infra_blocks_owner"}`)
+	after.Dependencies = append(after.Dependencies, schema.Dependency{Target: owner.ID, Type: schema.DependencyOwns})
+	current := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, owner, before}}}
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{ns, owner, after}}}
+	changes, err := schema.Diff(current, desired, schema.DiffOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := New().Render(context.Background(), plugin.RenderRequest{Changes: changes, Current: current, Desired: desired})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 3 || out[0].SQL != `ALTER TABLE "public"."operations" ENABLE ROW LEVEL SECURITY;` ||
+		out[1].SQL != `ALTER TABLE "public"."operations" FORCE ROW LEVEL SECURITY;` ||
+		out[2].SQL != `ALTER TABLE "public"."operations" OWNER TO "infra_blocks_owner";` {
+		t.Fatalf("out=%+v", out)
 	}
 }
 func mapValues(values map[string]schema.Resource) []schema.Resource {

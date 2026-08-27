@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"slices"
@@ -970,6 +971,13 @@ func renderAlter(before, after schema.Resource, resources map[string]schema.Reso
 				action = " FORCE ROW LEVEL SECURITY"
 			}
 			out = append(out, "ALTER TABLE "+name+action)
+		}
+		if stringValue(bs, "owner") != stringValue(as, "owner") {
+			owner := stringValue(as, "owner")
+			if owner == "" {
+				return nil, unsupported(after, "owner removal is unsupported")
+			}
+			out = append(out, "ALTER TABLE "+name+" OWNER TO "+quote(owner))
 		}
 		if len(out) == 0 {
 			return nil, unsupported(after, "table alteration")
@@ -2225,6 +2233,10 @@ func validateParentRenameDependents(request plugin.RenderRequest) error {
 }
 func validateColumnDependentTransitions(request plugin.RenderRequest) error {
 	current, desired := resourceMapForRender(request.Current), resourceMapForRender(request.Desired)
+	approvedDrops, err := approvedDroppedColumnIDs(request.Options)
+	if err != nil {
+		return err
+	}
 	for _, change := range request.Changes.Changes {
 		if change.Before == nil || change.Before.Kind != schema.KindColumn || (change.Operation != schema.OperationDrop && change.Operation != schema.OperationRename) {
 			continue
@@ -2234,20 +2246,80 @@ func validateColumnDependentTransitions(request plugin.RenderRequest) error {
 			if dependent.Kind == schema.KindColumn {
 				continue
 			}
-			mayDepend := dependent.Name.Parent == table
+			mayDepend := false
+			exactDependency := false
+			exactColumnKind := dependent.Kind == schema.KindPrimaryKey ||
+				dependent.Kind == schema.KindUniqueConstraint ||
+				dependent.Kind == schema.KindCheckConstraint ||
+				dependent.Kind == schema.KindForeignKey ||
+				dependent.Kind == schema.KindIndex
+			exactColumns := false
+			referencesTable := false
 			for _, dep := range dependent.Dependencies {
-				if dep.Target == table && dep.Type == schema.DependencyReferences {
-					mayDepend = true
+				if dep.Type != schema.DependencyReferences {
+					continue
 				}
+				if dep.Target == change.Before.ID {
+					mayDepend = true
+					exactDependency = true
+					break
+				}
+				if exactColumnKind && current[dep.Target].Kind == schema.KindColumn {
+					exactColumns = true
+				}
+				if dep.Target == table {
+					referencesTable = true
+				}
+			}
+			// Inspected constraints and indexes include reference dependencies
+			// for every participating column. When those exact dependencies are
+			// present, an unrelated column drop cannot rewrite the retained
+			// object. Keep the conservative table-wide rejection for opaque
+			// definitions and every other read-only descendant.
+			if !mayDepend && (dependent.Name.Parent == table || referencesTable) {
+				mayDepend = !exactColumnKind || !exactColumns
 			}
 			if mayDepend {
 				if _, retained := desired[dependent.ID]; retained {
+					// An exact signed AUTOSQL001 suppression authorizes the
+					// otherwise unprovable relationship between a retained opaque
+					// object and this dropped column. Exact catalog dependencies
+					// remain fail-closed even when the drop itself is approved.
+					if change.Operation == schema.OperationDrop && approvedDrops[change.Before.ID] && !exactDependency {
+						continue
+					}
 					return unsupported(dependent, "retained read-only object may depend on changed column")
 				}
 			}
 		}
 	}
 	return nil
+}
+
+// ApprovedDroppedColumnIDsOption is an internal planning authorization bound
+// into signed operator artifacts. Its value is a canonical JSON string array
+// of column resource IDs with exact AUTOSQL001 safety suppressions.
+const ApprovedDroppedColumnIDsOption = "approved_dropped_column_ids"
+
+func approvedDroppedColumnIDs(options map[string]string) (map[string]bool, error) {
+	approved := map[string]bool{}
+	raw := strings.TrimSpace(options[ApprovedDroppedColumnIDsOption])
+	if raw == "" {
+		return approved, nil
+	}
+	var ids []string
+	if err := json.Unmarshal([]byte(raw), &ids); err != nil {
+		return nil, errors.New("invalid approved dropped column authorization")
+	}
+	previous := ""
+	for _, id := range ids {
+		if strings.TrimSpace(id) == "" || id <= previous {
+			return nil, errors.New("invalid approved dropped column authorization")
+		}
+		approved[id] = true
+		previous = id
+	}
+	return approved, nil
 }
 func validateCoreColumnOrdinals(resources map[string]schema.Resource) error {
 	groups := map[string][]schema.Resource{}
