@@ -83,6 +83,28 @@ func InspectConn(ctx context.Context, conn *pgx.Conn, opts Options) (schema.Docu
 	return inspectConn(ctx, conn, request)
 }
 
+// InspectManagedConn inspects ordinary schema state plus only the advanced
+// role/ownership resources declared by managed while preserving session locks.
+func InspectManagedConn(ctx context.Context, conn *pgx.Conn, opts Options, managed schema.Document) (schema.Document, error) {
+	baseOptions := opts
+	baseOptions.Advanced = false
+	base, err := InspectConn(ctx, conn, baseOptions)
+	if err != nil {
+		return schema.Document{}, err
+	}
+	ids := managedAdvancedResourceIDs(managed.Graph.Resources)
+	if len(ids) == 0 {
+		return base, nil
+	}
+	advancedOptions := opts
+	advancedOptions.Advanced = true
+	advanced, err := InspectConn(ctx, conn, advancedOptions)
+	if err != nil {
+		return schema.Document{}, err
+	}
+	return mergeManagedAdvancedResources(base, advanced, ids), nil
+}
+
 // InspectTx inspects the schema visible inside an existing transaction. It is
 // used to prove an exact post-mutation fingerprint before DDL and its durable
 // revision evidence are committed together.

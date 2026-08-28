@@ -63,6 +63,37 @@ type migrationTrust struct {
 	// artifacts published without suppressions.
 	SafetySuppressions []safety.Suppression
 }
+
+// managedInspectionDocument reconstructs the signed desired-resource scope
+// needed to include only managed roles, grants, and ownership during live
+// fingerprint checks. Policy resources are release-bound and already carry
+// canonical IDs and dependencies from the desired schema document.
+func managedInspectionDocument(resources []policy.Resource) (schema.Document, error) {
+	doc := schema.Document{Version: schema.SchemaVersion}
+	for _, resource := range resources {
+		id, _ := resource.Attributes["id"].(string)
+		if id == "" {
+			return schema.Document{}, errors.New("trusted schema resource ID is required")
+		}
+		var dependencies []schema.Dependency
+		encoded, err := json.Marshal(resource.Attributes["dependencies"])
+		if err != nil {
+			return schema.Document{}, errors.New("encode trusted schema resource dependencies")
+		}
+		if string(encoded) != "null" {
+			if err = json.Unmarshal(encoded, &dependencies); err != nil {
+				return schema.Document{}, errors.New("decode trusted schema resource dependencies")
+			}
+		}
+		doc.Graph.Resources = append(doc.Graph.Resources, schema.Resource{
+			ID:           id,
+			Kind:         schema.Kind(resource.Kind),
+			Dependencies: dependencies,
+		})
+	}
+	return doc, nil
+}
+
 type staticAuthority struct {
 	actors   map[string]approval.Identity
 	verified map[string]approval.Identity
@@ -271,16 +302,30 @@ func productionServicesWithURL(connector executor.Connector, databaseURLOverride
 	mutationForAttempt := func(v artifact.VerifiedArtifact, locked executor.Session, tx executor.Tx, attempt int) (guardrail.AuthorizedMutation, error) {
 		a, _ := v.Payload()
 		schemas := append([]string(nil), c.Schemas...)
+		managed := schema.Document{}
 		if trusted, ok := c.TrustedMigrations[a.Digest]; ok && len(trusted.Schemas) > 0 {
 			schemas = append([]string(nil), trusted.Schemas...)
+			managedDoc, managedErr := managedInspectionDocument(trusted.SchemaPolicyResources)
+			if managedErr != nil {
+				return nil, managedErr
+			}
+			managed = managedDoc
 		}
 		state := func(ctx context.Context, conn executor.Session) (executor.RuntimeState, error) {
 			var doc schema.Document
 			var err error
 			if rawTx := executor.RawPGXTx(tx); rawTx != nil {
-				doc, err = postgres.InspectTx(ctx, rawTx, postgres.Options{Schemas: schemas})
+				if len(managed.Graph.Resources) > 0 {
+					doc, err = postgres.InspectManagedTx(ctx, rawTx, postgres.Options{Schemas: schemas}, managed)
+				} else {
+					doc, err = postgres.InspectTx(ctx, rawTx, postgres.Options{Schemas: schemas})
+				}
 			} else {
-				doc, err = postgres.InspectConn(ctx, conn.Raw(), postgres.Options{Schemas: schemas})
+				if len(managed.Graph.Resources) > 0 {
+					doc, err = postgres.InspectManagedConn(ctx, conn.Raw(), postgres.Options{Schemas: schemas}, managed)
+				} else {
+					doc, err = postgres.InspectConn(ctx, conn.Raw(), postgres.Options{Schemas: schemas})
+				}
 			}
 			if err != nil {
 				return executor.RuntimeState{}, err
