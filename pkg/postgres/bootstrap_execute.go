@@ -540,6 +540,17 @@ func verifyBootstrapState(ctx context.Context, conn *pgx.Conn, whole bootstrap.P
 	managedIDs := map[string]bool{}
 	expected := map[string]schema.Resource{}
 	forbidden := map[string]bool{}
+	for _, resource := range whole.Preconditions {
+		managedIDs[resource.ID] = true
+		for _, dependency := range resource.Dependencies {
+			managedIDs[dependency.Target] = true
+		}
+		expected[resource.ID] = resource
+		switch resource.Kind {
+		case schema.KindRole, schema.KindGrant, schema.KindMembership, schema.KindDefaultPrivilege:
+			advanced = true
+		}
+	}
 	allCreate := true
 	for _, change := range whole.SchemaPlan.Changes.Changes {
 		allCreate = allCreate && change.Operation == schema.OperationCreate
@@ -612,9 +623,18 @@ func verifyBootstrapState(ctx context.Context, conn *pgx.Conn, whole bootstrap.P
 		sort.Strings(mismatches)
 		return fmt.Errorf("%w: %d managed resource postconditions differ (first %s)", ErrBootstrapIdentity, len(mismatches), mismatches[0])
 	}
-	emptyDocument, _ := New().Normalize(ctx, schema.Document{Version: schema.SchemaVersion})
-	emptyFingerprint, _ := schema.SemanticFingerprint(emptyDocument)
-	if !allCreate || !strings.EqualFold(whole.SchemaPlan.FromFingerprint, emptyFingerprint) {
+	preconditionDocument, err := New().Normalize(ctx, schema.Document{
+		Version: schema.SchemaVersion,
+		Graph:   schema.Graph{Resources: append([]schema.Resource(nil), whole.Preconditions...)},
+	})
+	if err != nil {
+		return fmt.Errorf("normalize bootstrap preconditions: %w", err)
+	}
+	preconditionFingerprint, err := schema.SemanticFingerprint(preconditionDocument)
+	if err != nil {
+		return fmt.Errorf("fingerprint bootstrap preconditions: %w", err)
+	}
+	if !allCreate || !strings.EqualFold(whole.SchemaPlan.FromFingerprint, preconditionFingerprint) {
 		return nil
 	}
 	var filtered []schema.Resource

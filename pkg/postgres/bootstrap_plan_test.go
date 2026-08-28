@@ -97,6 +97,40 @@ func TestManagedBootstrapAdoptsIntrinsicPublicSchema(t *testing.T) {
 	}
 }
 
+func TestManagedBootstrapBindsDeclaredOwnerRoleAsPrecondition(t *testing.T) {
+	owner := renderResource(schema.KindRole, schema.Name{Name: "app_owner"}, `{"bypass_rls":false,"configuration":[],"connection_limit":-1,"create_database":false,"create_role":false,"inherit":true,"login":true,"replication":false,"superuser":false}`)
+	desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: []schema.Resource{owner}}}
+	target := bootstrap.DatabaseTarget{
+		Mode:                bootstrap.ManagedDatabase,
+		Endpoint:            bootstrap.ServerEndpoint{Host: "db.internal", TLSMode: "verify-full"},
+		MaintenanceDatabase: "postgres", Name: "app", Owner: owner.Name.Name,
+		ConnectionLimit: -1, AllowConnections: true,
+	}
+
+	whole, err := PlanDatabaseBootstrap(context.Background(), target, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(whole.Preconditions) != 1 || whole.Preconditions[0].ID != owner.ID {
+		t.Fatalf("preconditions=%+v", whole.Preconditions)
+	}
+	for _, step := range whole.SchemaPlan.Steps {
+		if strings.Contains(step.SQL, `CREATE ROLE "app_owner"`) {
+			t.Fatal("managed bootstrap attempted to create its prerequisite database owner")
+		}
+	}
+	if err := whole.Validate(); err != nil {
+		t.Fatalf("validate signed prerequisite plan: %v", err)
+	}
+
+	tampered := whole
+	tampered.Preconditions = append([]schema.Resource(nil), whole.Preconditions...)
+	tampered.Preconditions[0].Spec = []byte(`{"bypass_rls":false}`)
+	if err := tampered.Validate(); err == nil {
+		t.Fatal("precondition tampering did not invalidate bootstrap plan digest")
+	}
+}
+
 func TestManagedBootstrapOrdersEnumBeforeDependentAddedColumn(t *testing.T) {
 	namespace := renderResource(schema.KindSchema, schema.Name{Name: "global"}, `{}`)
 	table := renderResource(schema.KindTable, schema.Name{Schema: "global", Name: "cells", Parent: namespace.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
