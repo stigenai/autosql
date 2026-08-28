@@ -23,38 +23,50 @@ func PlanDatabaseBootstrap(ctx context.Context, target bootstrap.DatabaseTarget,
 	if err != nil {
 		return bootstrap.Plan{}, err
 	}
+	preconditions := managedBootstrapIntrinsicResources(target, desired)
 	current := schema.Document{
 		Version: desired.Version,
 		Graph: schema.Graph{
-			Resources: managedBootstrapIntrinsicResources(target, desired),
+			Resources: preconditions,
 			Extra:     desired.Graph.Extra,
 		},
 		Annotations: desired.Annotations,
 		Extra:       desired.Extra,
 	}
-	return PlanDatabaseTransition(ctx, target, current, desired, options)
+	whole, err := PlanDatabaseTransition(ctx, target, current, desired, options)
+	if err != nil {
+		return bootstrap.Plan{}, err
+	}
+	if len(preconditions) == 0 {
+		return whole, nil
+	}
+	return whole.WithPreconditions(preconditions)
 }
 
-// managedBootstrapIntrinsicResources models objects PostgreSQL creates as part
-// of CREATE DATABASE. The public schema is always present in a fresh managed
-// target, so planning it from an entirely empty graph would emit a conflicting
-// CREATE SCHEMA. Only the empty namespace is adopted here; comments, ownership,
-// and every child resource remain explicit desired-state transitions.
+// managedBootstrapIntrinsicResources models resources that must exist before
+// in-database bootstrap begins. PostgreSQL creates public with CREATE DATABASE.
+// A custom database owner must exist before CREATE DATABASE and, when declared
+// as a managed role, is an exact signed prerequisite rather than a CREATE ROLE
+// step that could only run after the database already exists.
 func managedBootstrapIntrinsicResources(target bootstrap.DatabaseTarget, desired schema.Document) []schema.Resource {
 	if target.Mode != bootstrap.ManagedDatabase {
 		return nil
 	}
+	var intrinsic []schema.Resource
 	for _, resource := range desired.Graph.Resources {
-		if resource.Kind == schema.KindSchema && resource.Name.Name == "public" && resource.Name.Schema == "" {
-			return []schema.Resource{{
+		switch {
+		case resource.Kind == schema.KindSchema && resource.Name.Name == "public" && resource.Name.Schema == "":
+			intrinsic = append(intrinsic, schema.Resource{
 				ID:   schema.StableID(schema.KindSchema, resource.Name),
 				Kind: schema.KindSchema,
 				Name: resource.Name,
 				Spec: []byte(`{}`),
-			}}
+			})
+		case resource.Kind == schema.KindRole && resource.Name.Schema == "" && resource.Name.Name == target.Owner:
+			intrinsic = append(intrinsic, resource)
 		}
 	}
-	return nil
+	return intrinsic
 }
 
 // PlanDatabaseTransition lifts any in-database convergence or teardown into

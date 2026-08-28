@@ -136,6 +136,87 @@ func TestWholeDatabaseBootstrapExecutionResumeAndReconcile(t *testing.T) {
 	}
 }
 
+func TestManagedBootstrapRequiresExactDeclaredOwnerRole(t *testing.T) {
+	maintenanceURL := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if maintenanceURL == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	config, err := pgx.ParseConfig(maintenanceURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin, err := pgx.ConnectConfig(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close(context.Background())
+
+	for _, test := range []struct {
+		name            string
+		connectionLimit int
+		wantIdentityErr bool
+	}{
+		{name: "exact", connectionLimit: -1},
+		{name: "mismatched", connectionLimit: 7, wantIdentityErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			roleName := fmt.Sprintf("autosql_bootstrap_owner_%d", time.Now().UnixNano())
+			quotedRole := pgx.Identifier{roleName}.Sanitize()
+			if _, err := admin.Exec(ctx, "CREATE ROLE "+quotedRole+" LOGIN CONNECTION LIMIT "+fmt.Sprint(test.connectionLimit)); err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				_, _ = admin.Exec(context.Background(), "DROP ROLE IF EXISTS "+quotedRole)
+			}()
+
+			target := bootstrapExecutionTarget(t, ctx, maintenanceURL, "autosql_bootstrap_owner")
+			target.Owner = roleName
+			defer DropDatabaseURL(context.Background(), maintenanceURL, target.Name, true)
+			_ = DropDatabaseURL(ctx, maintenanceURL, target.Name, true)
+
+			owner := renderResource(schema.KindRole, schema.Name{Name: roleName}, `{"bypass_rls":false,"configuration":[],"connection_limit":-1,"create_database":false,"create_role":false,"inherit":true,"login":true,"replication":false,"superuser":false}`)
+			desired := bootstrapExecutionDocument(t, "owner_app")
+			desired.Graph.Resources = append(desired.Graph.Resources, owner)
+			whole, err := PlanDatabaseBootstrap(ctx, target, desired, plan.Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(whole.Preconditions) != 1 || whole.Preconditions[0].ID != owner.ID {
+				t.Fatalf("preconditions=%+v", whole.Preconditions)
+			}
+
+			result, err := ExecuteDatabaseBootstrapURL(ctx, maintenanceURL, whole, BootstrapExecutionHooks{})
+			if test.wantIdentityErr {
+				if !errors.Is(err, ErrBootstrapIdentity) || result.AppliedSteps != 0 {
+					t.Fatalf("mismatched owner result=%+v err=%v", result, err)
+				}
+				targetConfig := config.Copy()
+				targetConfig.Database = target.Name
+				targetConn, connectErr := pgx.ConnectConfig(ctx, targetConfig)
+				if connectErr != nil {
+					t.Fatal(connectErr)
+				}
+				defer targetConn.Close(context.Background())
+				var tableExists bool
+				if err := targetConn.QueryRow(ctx, `select to_regclass('owner_app.items') is not null`).Scan(&tableExists); err != nil || tableExists {
+					t.Fatalf("managed table exists=%t err=%v", tableExists, err)
+				}
+				return
+			}
+			if err != nil || !result.Completed {
+				t.Fatalf("exact owner result=%+v err=%v", result, err)
+			}
+			var ownerName string
+			if err := admin.QueryRow(ctx, `select pg_get_userbyid(datdba) from pg_database where datname=$1`, target.Name).Scan(&ownerName); err != nil || ownerName != roleName {
+				t.Fatalf("database owner=%q err=%v", ownerName, err)
+			}
+		})
+	}
+}
+
 func TestManagedBootstrapExecutesIntoIntrinsicPublicSchema(t *testing.T) {
 	maintenanceURL := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
 	if maintenanceURL == "" {

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"autosql/pkg/plan"
@@ -67,12 +68,16 @@ type BootstrapPhase struct {
 // Plan is the complete, credential-free execution contract for preparing a
 // database and converging every managed resource inside it.
 type Plan struct {
-	Version               string           `json:"version"`
-	Target                DatabaseTarget   `json:"target"`
-	SchemaPlan            plan.Plan        `json:"schema_plan"`
-	Steps                 []BootstrapStep  `json:"steps"`
-	Phases                []BootstrapPhase `json:"phases"`
-	Digest                string           `json:"digest"`
+	Version    string         `json:"version"`
+	Target     DatabaseTarget `json:"target"`
+	SchemaPlan plan.Plan      `json:"schema_plan"`
+	// Preconditions are managed resources that must already exist exactly as
+	// declared before the first in-database schema step. They are part of the
+	// signed plan identity but are not rendered as mutations.
+	Preconditions         []schema.Resource `json:"preconditions,omitempty"`
+	Steps                 []BootstrapStep   `json:"steps"`
+	Phases                []BootstrapPhase  `json:"phases"`
+	Digest                string            `json:"digest"`
 	runtimeAuthorizations []runtimeAuthorization
 }
 
@@ -133,6 +138,23 @@ func ComposePlan(target DatabaseTarget, schemaPlan plan.Plan) (Plan, error) {
 	return result, result.Validate()
 }
 
+// WithPreconditions binds already-existing managed resources into the plan
+// identity. Callers provide normalized resources; this method fixes their
+// canonical order before signing.
+func (p Plan) WithPreconditions(resources []schema.Resource) (Plan, error) {
+	p.Preconditions = append([]schema.Resource(nil), resources...)
+	sort.Slice(p.Preconditions, func(i, j int) bool {
+		return p.Preconditions[i].ID < p.Preconditions[j].ID
+	})
+	p.Digest = ""
+	digest, err := digestBootstrapPlan(p)
+	if err != nil {
+		return Plan{}, err
+	}
+	p.Digest = digest
+	return p, p.Validate()
+}
+
 func (p Plan) Validate() error {
 	if p.Version != PlanVersion || p.Digest == "" {
 		return fmt.Errorf("%w: incomplete identity", ErrInvalidBootstrapPlan)
@@ -142,6 +164,20 @@ func (p Plan) Validate() error {
 	}
 	if err := p.SchemaPlan.Validate(); err != nil {
 		return fmt.Errorf("%w: schema plan: %v", ErrInvalidBootstrapPlan, err)
+	}
+	if len(p.Preconditions) > 0 {
+		doc := schema.Document{
+			Version: schema.SchemaVersion,
+			Graph:   schema.Graph{Resources: append([]schema.Resource(nil), p.Preconditions...)},
+		}
+		if err := doc.Validate(); err != nil {
+			return fmt.Errorf("%w: preconditions: %v", ErrInvalidBootstrapPlan, err)
+		}
+		for i := 1; i < len(p.Preconditions); i++ {
+			if p.Preconditions[i-1].ID >= p.Preconditions[i].ID {
+				return fmt.Errorf("%w: preconditions are not in unique stable ID order", ErrInvalidBootstrapPlan)
+			}
+		}
 	}
 	want := compose(p.Target, p.SchemaPlan)
 	gotGraph, _ := json.Marshal(struct {
@@ -155,7 +191,7 @@ func (p Plan) Validate() error {
 	if string(gotGraph) != string(wantGraph) {
 		return fmt.Errorf("%w: step, dependency, phase, or checkpoint topology", ErrInvalidBootstrapPlan)
 	}
-	digest, err := digestBootstrapPlan(Plan{Version: p.Version, Target: p.Target, SchemaPlan: p.SchemaPlan, Steps: p.Steps, Phases: p.Phases})
+	digest, err := digestBootstrapPlan(Plan{Version: p.Version, Target: p.Target, SchemaPlan: p.SchemaPlan, Preconditions: p.Preconditions, Steps: p.Steps, Phases: p.Phases})
 	if err != nil || digest != p.Digest {
 		return fmt.Errorf("%w: digest mismatch", ErrInvalidBootstrapPlan)
 	}
