@@ -2862,11 +2862,14 @@ func inspectMembershipNamed(t *testing.T, ctx context.Context, url string, roleN
 			continue
 		}
 		if resource.Kind == schema.KindMembership {
-			all := true
+			managedDependencies := make([]schema.Dependency, 0, 2)
 			for _, dependency := range resource.Dependencies {
-				all = all && roleIDs[dependency.Target]
+				if roleIDs[dependency.Target] {
+					managedDependencies = append(managedDependencies, dependency)
+				}
 			}
-			if all {
+			if len(managedDependencies) == 2 {
+				resource.Dependencies = managedDependencies
 				filtered.Graph.Resources = append(filtered.Graph.Resources, resource)
 			}
 		}
