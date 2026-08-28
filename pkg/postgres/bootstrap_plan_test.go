@@ -31,6 +31,68 @@ func TestProjectInspectedBootstrapResourceDoesNotMutateSnapshot(t *testing.T) {
 	}
 }
 
+func TestProjectInspectedBootstrapExtensionOwnerSemantics(t *testing.T) {
+	actual := renderResource(
+		schema.KindExtension,
+		schema.Name{Schema: "public", Name: "pg_trgm"},
+		`{"version":"1.6","owner":"bootstrap_admin"}`,
+	)
+
+	t.Run("empty owner is unmanaged", func(t *testing.T) {
+		desired := actual
+		desired.Spec = []byte(`{"version":"1.6","owner":""}`)
+
+		projected := projectInspectedBootstrapResource(actual, desired, map[string]bool{actual.ID: true}, nil, nil)
+		actualFingerprint, err := schema.ResourceFingerprint(projected)
+		if err != nil {
+			t.Fatal(err)
+		}
+		desiredFingerprint, err := schema.ResourceFingerprint(desired)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if actualFingerprint != desiredFingerprint {
+			t.Fatalf("empty extension owner remained managed: projected=%s desired=%s", projected.Spec, desired.Spec)
+		}
+	})
+
+	t.Run("omitted owner is unmanaged", func(t *testing.T) {
+		desired := actual
+		desired.Spec = []byte(`{"version":"1.6"}`)
+
+		projected := projectInspectedBootstrapResource(actual, desired, map[string]bool{actual.ID: true}, nil, nil)
+		actualFingerprint, err := schema.ResourceFingerprint(projected)
+		if err != nil {
+			t.Fatal(err)
+		}
+		desiredFingerprint, err := schema.ResourceFingerprint(desired)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if actualFingerprint != desiredFingerprint {
+			t.Fatalf("omitted extension owner remained managed: projected=%s desired=%s", projected.Spec, desired.Spec)
+		}
+	})
+
+	t.Run("declared owner remains managed", func(t *testing.T) {
+		desired := actual
+		desired.Spec = []byte(`{"version":"1.6","owner":"app_owner"}`)
+
+		projected := projectInspectedBootstrapResource(actual, desired, map[string]bool{actual.ID: true}, nil, nil)
+		actualFingerprint, err := schema.ResourceFingerprint(projected)
+		if err != nil {
+			t.Fatal(err)
+		}
+		desiredFingerprint, err := schema.ResourceFingerprint(desired)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if actualFingerprint == desiredFingerprint {
+			t.Fatal("explicit extension owner mismatch was projected away")
+		}
+	})
+}
+
 func TestProjectInspectedBootstrapCheckConstraintUsesSemanticBinding(t *testing.T) {
 	namespace := renderResource(schema.KindSchema, schema.Name{Name: "global"}, `{}`)
 	table := renderResource(schema.KindTable, schema.Name{Schema: "global", Name: "cells", Parent: namespace.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})

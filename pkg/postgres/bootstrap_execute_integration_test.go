@@ -669,6 +669,126 @@ func TestWholeDatabaseBootstrapRejectsUntrackedManagedCollision(t *testing.T) {
 	}
 }
 
+func TestBootstrapExtensionOwnerProjectionFromLiveCatalog(t *testing.T) {
+	maintenanceURL := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if maintenanceURL == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	target := bootstrapExecutionTarget(t, ctx, maintenanceURL, "autosql_extension_owner")
+	_ = DropDatabaseURL(ctx, maintenanceURL, target.Name, true)
+	roleName := fmt.Sprintf("autosql_extension_owner_%d", time.Now().UnixNano())
+	quotedRole := pgx.Identifier{roleName}.Sanitize()
+
+	maintenance, err := pgx.Connect(ctx, maintenanceURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := maintenance.Exec(ctx, "create role "+quotedRole); err != nil {
+		maintenance.Close(ctx)
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = DropDatabaseURL(context.Background(), maintenanceURL, target.Name, true)
+		cleanup, cleanupErr := pgx.Connect(context.Background(), maintenanceURL)
+		if cleanupErr == nil {
+			_, _ = cleanup.Exec(context.Background(), "drop role if exists "+quotedRole)
+			cleanup.Close(context.Background())
+		}
+	}()
+	if _, err := maintenance.Exec(ctx, "create database "+pgx.Identifier{target.Name}.Sanitize()+" owner "+quotedRole); err != nil {
+		maintenance.Close(ctx)
+		t.Fatal(err)
+	}
+	maintenance.Close(ctx)
+
+	config, err := pgx.ParseConfig(maintenanceURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.Database = target.Name
+	conn, err := pgx.ConnectConfig(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	if _, err := conn.Exec(ctx, "set role "+quotedRole+`; create extension pg_trgm with schema public; reset role`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Recovery plans that manage roles enable advanced inspection, which keeps
+	// the concrete extension owner in the inspected postcondition snapshot.
+	inspected, err := InspectConn(ctx, conn, Options{Advanced: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspected, err = New().Normalize(ctx, inspected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var actual schema.Resource
+	for _, resource := range inspected.Graph.Resources {
+		if resource.Kind == schema.KindExtension && resource.Name.Name == "pg_trgm" {
+			actual = resource
+			break
+		}
+	}
+	if actual.ID == "" {
+		t.Fatal("pg_trgm was not present in inspected catalog")
+	}
+	managed := map[string]bool{actual.ID: true}
+	for _, dependency := range actual.Dependencies {
+		managed[dependency.Target] = true
+	}
+
+	var desiredSpec map[string]any
+	if err := json.Unmarshal(actual.Spec, &desiredSpec); err != nil {
+		t.Fatal(err)
+	}
+	if owner, _ := desiredSpec["owner"].(string); owner == "" {
+		t.Fatalf("live extension owner was not inspected: %s", actual.Spec)
+	}
+
+	desiredSpec["owner"] = ""
+	desired := actual
+	desired.Spec, err = json.Marshal(desiredSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projected := projectInspectedBootstrapResource(actual, desired, managed, nil, nil)
+	actualFingerprint, err := schema.ResourceFingerprint(projected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desiredFingerprint, err := schema.ResourceFingerprint(desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if actualFingerprint != desiredFingerprint {
+		t.Fatalf("empty live extension owner remained managed: projected=%s desired=%s", projected.Spec, desired.Spec)
+	}
+
+	desiredSpec["owner"] = "different_owner"
+	desired.Spec, err = json.Marshal(desiredSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projected = projectInspectedBootstrapResource(actual, desired, managed, nil, nil)
+	actualFingerprint, err = schema.ResourceFingerprint(projected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desiredFingerprint, err = schema.ResourceFingerprint(desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if actualFingerprint == desiredFingerprint {
+		t.Fatal("explicit live extension owner mismatch was projected away")
+	}
+}
+
 func TestWholeDatabaseBootstrapExtensionReadinessFailsBeforeTargetMutation(t *testing.T) {
 	maintenanceURL := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
 	if maintenanceURL == "" {

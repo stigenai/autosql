@@ -746,6 +746,11 @@ func projectInspectedBootstrapResource(actual, desired schema.Resource, desiredI
 				delete(actualSpec, key)
 			}
 		}
+		if actual.Kind == schema.KindExtension {
+			if desiredOwner, specified := desiredSpec["owner"].(string); specified && desiredOwner == "" {
+				actualSpec["owner"] = desiredOwner
+			}
+		}
 		if actual.Kind == schema.KindFunction || actual.Kind == schema.KindProcedure {
 			actualDefinition, actualOK := actualSpec["definition"].(string)
 			desiredDefinition, desiredOK := desiredSpec["definition"].(string)
