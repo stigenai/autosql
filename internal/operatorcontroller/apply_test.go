@@ -73,6 +73,59 @@ func TestDeclarativePlanVerificationAgainstPostgres(t *testing.T) {
 	if err := verifyDeclarativePlan(ctx, "create schema "+schemaName+";", url, artifact.Artifact{Plan: p}, nil, false); err == nil {
 		t.Fatal("mismatched declarative source was accepted")
 	}
+	if _, err := conn.Exec(ctx, desiredSQL); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyDeclarativePlan(ctx, resource.ResolvedSource, resource.ResolvedDatabaseURL, artifact.Artifact{Plan: p}, nil, false); err != nil {
+		t.Fatalf("already-converged signed target rejected after credential re-verification: %v", err)
+	}
+	if _, err := conn.Exec(ctx, "alter table "+pgx.Identifier{schemaName}.Sanitize()+".orders add column drifted text"); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyDeclarativePlan(ctx, resource.ResolvedSource, resource.ResolvedDatabaseURL, artifact.Artifact{Plan: p}, nil, false); err == nil {
+		t.Fatal("drifted target was accepted as the signed goal")
+	}
+}
+
+func TestDeclarativeTargetMatchesSignedGoal(t *testing.T) {
+	document := func(names ...string) schema.Document {
+		resources := make([]schema.Resource, 0, len(names))
+		for _, name := range names {
+			resource := schema.Resource{Kind: schema.KindSchema, Name: schema.Name{Name: name}, Spec: []byte(`{}`)}
+			resource.ID = schema.StableID(resource.Kind, resource.Name)
+			resources = append(resources, resource)
+		}
+		doc := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: resources}}
+		doc.Normalize()
+		return doc
+	}
+	desired := document("app")
+	fingerprint, err := schema.SemanticFingerprint(desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := map[string]struct {
+		target, source schema.Document
+		to             string
+		want           bool
+	}{
+		"exact signed goal": {target: desired, source: desired, to: fingerprint, want: true},
+		"live drift":        {target: document("app", "drifted"), source: desired, to: fingerprint},
+		"source drift":      {target: desired, source: document("app", "changed"), to: fingerprint},
+		"different target":  {target: desired, source: desired, to: "sha256:" + strings.Repeat("f", 64)},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			got, err := declarativeTargetMatchesSignedGoal(test.target, test.source, plan.Plan{ToFingerprint: test.to})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want {
+				t.Fatalf("matches=%v want=%v", got, test.want)
+			}
+		})
+	}
 }
 
 func TestArtifactApplyAdoptsWithoutCallingMutationService(t *testing.T) {
