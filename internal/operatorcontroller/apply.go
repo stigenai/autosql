@@ -426,10 +426,32 @@ func verifyDeclarativeResource(ctx context.Context, resource operator.Resource, 
 		generated, err = transition.SchemaPlan, nil
 		break
 	}
-	if err != nil || generated.Digest != a.Plan.Digest {
-		return verifiedBootstrapPlan{}, errors.New("declarative source does not match approved plan")
+	if err == nil && generated.Digest == a.Plan.Digest {
+		return verifiedBootstrapPlan{}, nil
 	}
-	return verifiedBootstrapPlan{}, nil
+	// A Secret rotation changes the operator apply key even when it only changes
+	// credentials. Re-verification then observes the already-applied target and
+	// necessarily generates a no-op plan rather than the original transition.
+	// Accept that state only when both the live target and current declarative
+	// source exactly match the signed plan's target fingerprint. The executor
+	// independently repeats this locked live-state check before returning no-op.
+	if converged, fingerprintErr := declarativeTargetMatchesSignedGoal(target, desired, a.Plan); fingerprintErr == nil && converged {
+		return verifiedBootstrapPlan{}, nil
+	}
+	return verifiedBootstrapPlan{}, errors.New("declarative source does not match approved plan")
+}
+
+func declarativeTargetMatchesSignedGoal(target, desired schema.Document, approved plan.Plan) (bool, error) {
+	targetFingerprint, err := schema.SemanticFingerprint(target)
+	if err != nil {
+		return false, err
+	}
+	desiredFingerprint, err := schema.SemanticFingerprint(desired)
+	if err != nil {
+		return false, err
+	}
+	return strings.EqualFold(targetFingerprint, approved.ToFingerprint) &&
+		strings.EqualFold(desiredFingerprint, approved.ToFingerprint), nil
 }
 
 func loadOperatorDeclarativeSource(ctx context.Context, raw, declaredFormat string) (schema.Document, error) {
