@@ -8,15 +8,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
 
 type fakeRead struct {
-	from, to schema.Document
-	p        plan.Plan
-	planErr  error
-	loads    int
+	from, to       schema.Document
+	p              plan.Plan
+	planErr        error
+	loads          int
+	planOptions    plan.Options
+	planOptionsSet bool
 }
 
 func (f *fakeRead) Load(_ context.Context, r LoadRequest) (schema.Document, error) {
@@ -29,7 +33,8 @@ func (f *fakeRead) Load(_ context.Context, r LoadRequest) (schema.Document, erro
 func (f *fakeRead) Diff(_ context.Context, a, b schema.Document) (schema.ChangeSet, error) {
 	return schema.Diff(a, b, schema.DiffOptions{})
 }
-func (f *fakeRead) Plan(context.Context, schema.Document, schema.Document) (plan.Plan, error) {
+func (f *fakeRead) Plan(_ context.Context, _, _ schema.Document, options plan.Options) (plan.Plan, error) {
+	f.planOptions, f.planOptionsSet = options, true
 	return f.p, f.planErr
 }
 
@@ -95,6 +100,189 @@ func TestPlanFailureSurfacesActionableReasonInHumanAndJSONOutput(t *testing.T) {
 		}
 	}
 }
+func TestPlanThreadsPostgresVersionToRenderOptions(t *testing.T) {
+	r, _ := workflowFixture(t)
+	code, _, stderr := invoke(t, []string{"plan", "--from", "from", "--to", "to", "--postgres-version", "17", "--json"}, "", false, Services{ReadPlan: r})
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr)
+	}
+	if !r.planOptionsSet {
+		t.Fatal("Plan was never called")
+	}
+	if got := r.planOptions.Render["postgres_version"]; got != "17" {
+		t.Fatalf("postgres_version=%q, want 17", got)
+	}
+
+	r2, _ := workflowFixture(t)
+	code, _, stderr = invoke(t, []string{"plan", "--from", "from", "--to", "to", "--json"}, "", false, Services{ReadPlan: r2})
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr)
+	}
+	if !r2.planOptionsSet {
+		t.Fatal("Plan was never called")
+	}
+	if _, ok := r2.planOptions.Render["postgres_version"]; ok {
+		t.Fatalf("render=%v, want no postgres_version key when the flag is unset", r2.planOptions.Render)
+	}
+}
+
+func TestPlanRejectsBadPostgresVersionBeforeLoad(t *testing.T) {
+	for _, value := range []string{"abc", "13", "19"} {
+		t.Run(value, func(t *testing.T) {
+			r, _ := workflowFixture(t)
+			code, _, stderr := invoke(t, []string{"plan", "--from", "from", "--to", "to", "--postgres-version", value, "--json"}, "", false, Services{ReadPlan: r})
+			if code != int(ExitUsage) {
+				t.Fatalf("value=%q code=%d stderr=%s, want ExitUsage", value, code, stderr)
+			}
+			if r.loads != 0 {
+				t.Fatalf("value=%q loads=%d, want 0: a bad flag must refuse before any Load", value, r.loads)
+			}
+		})
+	}
+}
+
+const inheritMembershipFromHCL = `schema "app" {}
+
+role "app_reader" {
+  login       = false
+  superuser   = false
+  create_role = false
+  create_database = false
+  inherit     = true
+}
+
+role "app_writer" {
+  login       = false
+  superuser   = false
+  create_role = false
+  create_database = false
+  inherit     = true
+}
+`
+
+const inheritMembershipToHCL = inheritMembershipFromHCL + `
+resource "membership" "app_writer_to_reader" {
+  spec_json = jsonencode({
+    parent  = "app_reader"
+    member  = "app_writer"
+    admin   = false
+    inherit = true
+    set     = false
+  })
+  deps_json = jsonencode([
+    references(resource_id("role", "", "", "app_reader")),
+    references(resource_id("role", "", "", "app_writer")),
+  ])
+}
+`
+
+func writeHCLFixture(t *testing.T, name, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestDefaultReadPlanRequiresPostgresVersionForInheritMembership exercises
+// the real DefaultReadPlan end to end (HCL load, diff, and PostgreSQL
+// render), not a fake. It reproduces stigen-flux-tc9: a new membership
+// resource with inherit=true needs postgres_version>=16 to render. With no
+// flag, or with --postgres-version 15, 'plan' must refuse with the same
+// INHERIT error pkg/postgres/render.go's requirePostgresMajor raises.
+// With --postgres-version 17, 'plan' must succeed with exactly one step.
+func TestDefaultReadPlanRequiresPostgresVersionForInheritMembership(t *testing.T) {
+	from := writeHCLFixture(t, "from.hcl", inheritMembershipFromHCL)
+	to := writeHCLFixture(t, "to.hcl", inheritMembershipToHCL)
+	for name, fixture := range map[string]struct {
+		flags      []string
+		wantCode   int
+		wantSubstr string
+	}{
+		"unset":   {nil, int(ExitMigration), "INHERIT option requires postgres_version"},
+		"too_old": {[]string{"--postgres-version", "15"}, int(ExitMigration), "INHERIT option requires postgres_version"},
+		"ok":      {[]string{"--postgres-version", "17"}, int(ExitOK), `"status":"planned"`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			args := append([]string{"plan", "--from", "hcl:" + from, "--to", "hcl:" + to, "--json"}, fixture.flags...)
+			var out, stderr bytes.Buffer
+			code := Run(context.Background(), args, Streams{Out: &out, Err: &stderr})
+			combined := out.String() + stderr.String()
+			if code != fixture.wantCode || !strings.Contains(combined, fixture.wantSubstr) || (fixture.wantCode == int(ExitMigration) && !strings.Contains(combined, "16")) {
+				t.Fatalf("code=%d want=%d output=%s", code, fixture.wantCode, combined)
+			}
+			if fixture.wantCode == int(ExitOK) && !strings.Contains(combined, `"steps":1`) && !strings.Contains(out.String(), `"step_count\":1`) {
+				var envelope struct {
+					Data struct {
+						Plan struct {
+							Steps []any `json:"steps"`
+						} `json:"plan"`
+					} `json:"data"`
+				}
+				if err := json.Unmarshal(out.Bytes(), &envelope); err != nil {
+					t.Fatalf("decode envelope: %v (%s)", err, out.String())
+				}
+				if len(envelope.Data.Plan.Steps) != 1 {
+					t.Fatalf("steps=%d, want 1: %s", len(envelope.Data.Plan.Steps), out.String())
+				}
+			}
+		})
+	}
+}
+
+// TestPlanDigestIsUnaffectedByPostgresVersionWhenNoFeatureIsGated proves A4:
+// for a diff that never reaches requirePostgresMajor, the computed plan
+// digest, status and step count are identical whether or not
+// --postgres-version is set. The flag only ever changes whether a
+// version-gated render is refused; pkg/ itself does not change.
+func TestPlanDigestIsUnaffectedByPostgresVersionWhenNoFeatureIsGated(t *testing.T) {
+	from := writeHCLFixture(t, "from.hcl", `schema "app" {}
+`)
+	to := writeHCLFixture(t, "to.hcl", `schema "app" {}
+
+table "widgets" {
+  schema = "app"
+  column "id" {
+    type     = "bigint"
+    nullable = false
+    ordinal  = 1
+  }
+}
+`)
+	run := func(flags ...string) (int, map[string]any) {
+		args := append([]string{"plan", "--from", "hcl:" + from, "--to", "hcl:" + to, "--json"}, flags...)
+		var out, stderr bytes.Buffer
+		code := Run(context.Background(), args, Streams{Out: &out, Err: &stderr})
+		if code != int(ExitOK) {
+			t.Fatalf("flags=%v code=%d stderr=%s", flags, code, stderr.String())
+		}
+		var envelope struct {
+			Data map[string]any `json:"data"`
+		}
+		if err := json.Unmarshal(out.Bytes(), &envelope); err != nil {
+			t.Fatalf("decode envelope: %v (%s)", err, out.String())
+		}
+		return code, envelope.Data
+	}
+	_, withoutFlag := run()
+	_, withFlag := run("--postgres-version", "17")
+	planWithout, _ := withoutFlag["plan"].(map[string]any)
+	planWith, _ := withFlag["plan"].(map[string]any)
+	if planWithout["digest"] == "" || planWithout["digest"] != planWith["digest"] {
+		t.Fatalf("digest without=%v with=%v, want equal and nonempty", planWithout["digest"], planWith["digest"])
+	}
+	if withoutFlag["status"] != withFlag["status"] {
+		t.Fatalf("status without=%v with=%v, want equal", withoutFlag["status"], withFlag["status"])
+	}
+}
+
+func TestUsageDocumentsPlanPostgresVersionFlag(t *testing.T) {
+	if !strings.Contains(usage(), "plan --from source --to source [--postgres-version version]") {
+		t.Fatalf("plan usage does not document --postgres-version: %s", usage())
+	}
+}
+
 func TestApplyPromptsAndExplicitModes(t *testing.T) {
 	for name, fixture := range map[string]struct {
 		in              string
