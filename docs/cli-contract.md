@@ -111,6 +111,17 @@ or provider inputs reject selectors. An omitted `--max-changes` is unlimited,
 while an explicit zero permits only a no-op. Diff, plan, and `apply --dry-run`
 receive no mutation capability.
 
+`plan` takes an optional flag: `--postgres-version version`. `version` must
+be `<major>[.<minor>]`, with `major` from 14 to 18. This is the same range
+as `database bootstrap prepare --postgres-version`. The flag sets the
+render option that a version-gated feature checks. For example, a
+membership's `INHERIT` or `SET` option needs PostgreSQL 16 or newer. If a
+caller does not set the flag, `plan` keeps its old behavior: it passes no
+`postgres_version` render option, so a version-gated feature still
+refuses. The flag changes only this refusal. It never changes the rendered
+SQL or the plan digest of a feature with no version gate. `apply` has no
+`--postgres-version` flag.
+
 Interactive apply prints the exact plan digest and requires it to be typed on a
 TTY. Noninteractive apply requires `--approve-digest DIGEST`, which must exactly
 match the computed plan. `--dry-run`, `--approve-digest`, and `--artifact` are

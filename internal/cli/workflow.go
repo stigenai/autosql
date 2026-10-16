@@ -25,7 +25,7 @@ type LoadRequest struct {
 type ReadPlanService interface {
 	Load(context.Context, LoadRequest) (schema.Document, error)
 	Diff(context.Context, schema.Document, schema.Document) (schema.ChangeSet, error)
-	Plan(context.Context, schema.Document, schema.Document) (plan.Plan, error)
+	Plan(context.Context, schema.Document, schema.Document, plan.Options) (plan.Plan, error)
 }
 type ApplyRequest struct {
 	Plan           plan.Plan
@@ -56,6 +56,24 @@ func validateSelectors(from, to string, r LoadRequest) error {
 		return usageError(errors.New("--schema, --include, and --exclude are supported only when both sources are live"))
 	}
 	return nil
+}
+
+// renderOptionsForPostgresVersion checks --postgres-version and builds the
+// render map plan.Options needs. An empty value means the caller did not
+// set the flag. The function then returns no postgres_version key, so old
+// callers see the old behavior. A set value must match <major>[.<minor>],
+// major between 14 and 18.
+func renderOptionsForPostgresVersion(value string) (map[string]string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+	majorText, _, _ := strings.Cut(value, ".")
+	major, err := strconv.Atoi(majorText)
+	if err != nil || major < 14 || major > 18 {
+		return nil, fmt.Errorf("--postgres-version must be empty or <major>[.<minor>] with major between 14 and 18, got %q", value)
+	}
+	return map[string]string{"postgres_version": value}, nil
 }
 
 type ApplyResult struct {
@@ -140,8 +158,8 @@ func (d DefaultReadPlan) Load(ctx context.Context, r LoadRequest) (schema.Docume
 func (DefaultReadPlan) Diff(_ context.Context, a, b schema.Document) (schema.ChangeSet, error) {
 	return schema.Diff(a, b, schema.DiffOptions{})
 }
-func (DefaultReadPlan) Plan(ctx context.Context, a, b schema.Document) (plan.Plan, error) {
-	return plan.Build(ctx, postgres.New(), a, b, plan.Options{})
+func (DefaultReadPlan) Plan(ctx context.Context, a, b schema.Document, options plan.Options) (plan.Plan, error) {
+	return plan.Build(ctx, postgres.New(), a, b, options)
 }
 func runSchemaDiff(ctx context.Context, args []string, o output, r ReadPlanService) error {
 	fs := newFlags("schema diff", o.streams.Err)
@@ -193,7 +211,7 @@ func runSchemaDiff(ctx context.Context, args []string, o output, r ReadPlanServi
 	raw, _ := changes.MarshalCanonical()
 	return o.success(data, string(raw))
 }
-func loadPlanInputs(ctx context.Context, from, to string, filter LoadRequest, r ReadPlanService) (schema.Document, schema.Document, plan.Plan, error) {
+func loadPlanInputs(ctx context.Context, from, to string, filter LoadRequest, r ReadPlanService, options plan.Options) (schema.Document, schema.Document, plan.Plan, error) {
 	filter.Spec = from
 	a, e := r.Load(ctx, filter)
 	if e != nil {
@@ -204,13 +222,14 @@ func loadPlanInputs(ctx context.Context, from, to string, filter LoadRequest, r 
 	if e != nil {
 		return a, b, plan.Plan{}, e
 	}
-	p, e := r.Plan(ctx, a, b)
+	p, e := r.Plan(ctx, a, b, options)
 	return a, b, p, e
 }
 func runPlan(ctx context.Context, args []string, o output, r ReadPlanService) error {
 	fs := newFlags("plan", o.streams.Err)
 	from := fs.String("from", "", "source")
 	to := fs.String("to", "", "target")
+	postgresVersion := fs.String("postgres-version", "", "target PostgreSQL major version")
 	var max optionalInt
 	fs.Var(&max, "max-changes", "maximum changes")
 	jsonFlag := fs.Bool("json", false, "JSON")
@@ -227,12 +246,16 @@ func runPlan(ctx context.Context, args []string, o output, r ReadPlanService) er
 	if *from == "" || *to == "" {
 		return usageError(errors.New("--from and --to required"))
 	}
+	render, e := renderOptionsForPostgresVersion(*postgresVersion)
+	if e != nil {
+		return usageError(e)
+	}
 	o.json = *jsonFlag
 	filter := LoadRequest{Schemas: schemas.value(), Include: include.value(), Exclude: exclude.value()}
 	if e := validateSelectors(*from, *to, filter); e != nil {
 		return e
 	}
-	_, _, p, e := loadPlanInputs(ctx, *from, *to, filter, r)
+	_, _, p, e := loadPlanInputs(ctx, *from, *to, filter, r, plan.Options{Render: render})
 	if e != nil {
 		return planningFailure(e)
 	}
@@ -304,7 +327,7 @@ func runApply(ctx context.Context, args []string, o output, s Services, tty bool
 	if e := validateSelectors(*from, *to, filter); e != nil {
 		return e
 	}
-	_, _, p, e := loadPlanInputs(ctx, *from, *to, filter, s.ReadPlan)
+	_, _, p, e := loadPlanInputs(ctx, *from, *to, filter, s.ReadPlan, plan.Options{})
 	if e != nil {
 		return planningFailure(e)
 	}
