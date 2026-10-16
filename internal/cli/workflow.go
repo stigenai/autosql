@@ -25,7 +25,7 @@ type LoadRequest struct {
 type ReadPlanService interface {
 	Load(context.Context, LoadRequest) (schema.Document, error)
 	Diff(context.Context, schema.Document, schema.Document) (schema.ChangeSet, error)
-	Plan(context.Context, schema.Document, schema.Document) (plan.Plan, error)
+	Plan(context.Context, schema.Document, schema.Document, plan.Options) (plan.Plan, error)
 }
 type ApplyRequest struct {
 	Plan           plan.Plan
@@ -140,8 +140,32 @@ func (d DefaultReadPlan) Load(ctx context.Context, r LoadRequest) (schema.Docume
 func (DefaultReadPlan) Diff(_ context.Context, a, b schema.Document) (schema.ChangeSet, error) {
 	return schema.Diff(a, b, schema.DiffOptions{})
 }
-func (DefaultReadPlan) Plan(ctx context.Context, a, b schema.Document) (plan.Plan, error) {
-	return plan.Build(ctx, postgres.New(), a, b, plan.Options{})
+func (DefaultReadPlan) Plan(ctx context.Context, a, b schema.Document, options plan.Options) (plan.Plan, error) {
+	return plan.Build(ctx, postgres.New(), a, b, options)
+}
+
+// minSupportedPostgresMajor and maxSupportedPostgresMajor bound the
+// --postgres-version flag accepted by plan and apply: the same range the
+// operator publish pipeline already validates (operator_artifact_publish.go).
+const (
+	minSupportedPostgresMajor = 14
+	maxSupportedPostgresMajor = 18
+)
+
+// postgresVersionRenderOptions turns the --postgres-version flag into render
+// options for plan.Build. An empty raw value returns the zero plan.Options
+// (Render stays nil) so planning without the flag renders exactly as before
+// this flag existed.
+func postgresVersionRenderOptions(raw string) (plan.Options, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return plan.Options{}, nil
+	}
+	major, err := strconv.Atoi(raw)
+	if err != nil || major < minSupportedPostgresMajor || major > maxSupportedPostgresMajor {
+		return plan.Options{}, fmt.Errorf("--postgres-version must be an integer between %d and %d", minSupportedPostgresMajor, maxSupportedPostgresMajor)
+	}
+	return plan.Options{Render: map[string]string{"postgres_version": raw}}, nil
 }
 func runSchemaDiff(ctx context.Context, args []string, o output, r ReadPlanService) error {
 	fs := newFlags("schema diff", o.streams.Err)
@@ -193,7 +217,7 @@ func runSchemaDiff(ctx context.Context, args []string, o output, r ReadPlanServi
 	raw, _ := changes.MarshalCanonical()
 	return o.success(data, string(raw))
 }
-func loadPlanInputs(ctx context.Context, from, to string, filter LoadRequest, r ReadPlanService) (schema.Document, schema.Document, plan.Plan, error) {
+func loadPlanInputs(ctx context.Context, from, to string, filter LoadRequest, options plan.Options, r ReadPlanService) (schema.Document, schema.Document, plan.Plan, error) {
 	filter.Spec = from
 	a, e := r.Load(ctx, filter)
 	if e != nil {
@@ -204,7 +228,7 @@ func loadPlanInputs(ctx context.Context, from, to string, filter LoadRequest, r 
 	if e != nil {
 		return a, b, plan.Plan{}, e
 	}
-	p, e := r.Plan(ctx, a, b)
+	p, e := r.Plan(ctx, a, b, options)
 	return a, b, p, e
 }
 func runPlan(ctx context.Context, args []string, o output, r ReadPlanService) error {
@@ -214,6 +238,7 @@ func runPlan(ctx context.Context, args []string, o output, r ReadPlanService) er
 	var max optionalInt
 	fs.Var(&max, "max-changes", "maximum changes")
 	jsonFlag := fs.Bool("json", false, "JSON")
+	postgresVersion := fs.String("postgres-version", "", "target PostgreSQL major version (14-18) used to render version-gated SQL")
 	var schemas, include, exclude stringList
 	fs.Var(&schemas, "schema", "schema")
 	fs.Var(&include, "include", "include")
@@ -227,12 +252,16 @@ func runPlan(ctx context.Context, args []string, o output, r ReadPlanService) er
 	if *from == "" || *to == "" {
 		return usageError(errors.New("--from and --to required"))
 	}
+	renderOptions, e := postgresVersionRenderOptions(*postgresVersion)
+	if e != nil {
+		return usageError(e)
+	}
 	o.json = *jsonFlag
 	filter := LoadRequest{Schemas: schemas.value(), Include: include.value(), Exclude: exclude.value()}
 	if e := validateSelectors(*from, *to, filter); e != nil {
 		return e
 	}
-	_, _, p, e := loadPlanInputs(ctx, *from, *to, filter, r)
+	_, _, p, e := loadPlanInputs(ctx, *from, *to, filter, renderOptions, r)
 	if e != nil {
 		return planningFailure(e)
 	}
@@ -257,6 +286,7 @@ func runApply(ctx context.Context, args []string, o output, s Services, tty bool
 	var max optionalInt
 	fs.Var(&max, "max-changes", "maximum changes")
 	jsonFlag := fs.Bool("json", false, "JSON")
+	postgresVersion := fs.String("postgres-version", "", "target PostgreSQL major version (14-18) used to render version-gated SQL")
 	var schemas, include, exclude stringList
 	fs.Var(&schemas, "schema", "schema")
 	fs.Var(&include, "include", "include")
@@ -266,6 +296,10 @@ func runApply(ctx context.Context, args []string, o output, s Services, tty bool
 	}
 	if fs.NArg() != 0 {
 		return usageError(errors.New("unexpected positional arguments"))
+	}
+	renderOptions, e := postgresVersionRenderOptions(*postgresVersion)
+	if e != nil {
+		return usageError(e)
 	}
 	o.json = *jsonFlag
 	modeCount := 0
@@ -304,7 +338,7 @@ func runApply(ctx context.Context, args []string, o output, s Services, tty bool
 	if e := validateSelectors(*from, *to, filter); e != nil {
 		return e
 	}
-	_, _, p, e := loadPlanInputs(ctx, *from, *to, filter, s.ReadPlan)
+	_, _, p, e := loadPlanInputs(ctx, *from, *to, filter, renderOptions, s.ReadPlan)
 	if e != nil {
 		return planningFailure(e)
 	}

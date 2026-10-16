@@ -111,6 +111,16 @@ or provider inputs reject selectors. An omitted `--max-changes` is unlimited,
 while an explicit zero permits only a no-op. Diff, plan, and `apply --dry-run`
 receive no mutation capability.
 
+`plan` and `apply` accept `--postgres-version N` (14-18) to supply the
+`postgres_version` render option the PostgreSQL driver uses to gate
+version-dependent SQL, for example the role `membership` `INHERIT`/`SET`
+options, which require PostgreSQL 16+ (`pkg/postgres/render.go`'s
+`requirePostgresMajor`). Omitting the flag renders with no `postgres_version`
+option, exactly as before the flag existed: any transition that needs a
+minimum version then fails planning with `exit code 7` naming the required
+version. An out-of-range or non-integer value is a usage error (`exit code 2`)
+before any source is loaded.
+
 Interactive apply prints the exact plan digest and requires it to be typed on a
 TTY. Noninteractive apply requires `--approve-digest DIGEST`, which must exactly
 match the computed plan. `--dry-run`, `--approve-digest`, and `--artifact` are

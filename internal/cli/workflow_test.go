@@ -13,10 +13,12 @@ import (
 )
 
 type fakeRead struct {
-	from, to schema.Document
-	p        plan.Plan
-	planErr  error
-	loads    int
+	from, to    schema.Document
+	p           plan.Plan
+	planErr     error
+	loads       int
+	planCalls   int
+	lastOptions plan.Options
 }
 
 func (f *fakeRead) Load(_ context.Context, r LoadRequest) (schema.Document, error) {
@@ -29,7 +31,9 @@ func (f *fakeRead) Load(_ context.Context, r LoadRequest) (schema.Document, erro
 func (f *fakeRead) Diff(_ context.Context, a, b schema.Document) (schema.ChangeSet, error) {
 	return schema.Diff(a, b, schema.DiffOptions{})
 }
-func (f *fakeRead) Plan(context.Context, schema.Document, schema.Document) (plan.Plan, error) {
+func (f *fakeRead) Plan(_ context.Context, _, _ schema.Document, options plan.Options) (plan.Plan, error) {
+	f.planCalls++
+	f.lastOptions = options
 	return f.p, f.planErr
 }
 
