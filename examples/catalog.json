@@ -38,6 +38,16 @@
           "level": "example",
           "path": "examples/hcl-postgres/author-modules/main.hcl",
           "command": "go test ./examples/hcl-postgres -run AuthorLanguageModule"
+        },
+        {
+          "level": "contract",
+          "path": "pkg/source/inline_plan_test.go",
+          "command": "go test ./pkg/source -run TestInline"
+        },
+        {
+          "level": "live",
+          "path": "pkg/dbtest/suite_integration_test.go",
+          "command": "go test -race ./pkg/dbtest -run '^TestSuiteLiveInlineConstraintSemantics$' -count=1 -v"
         }
       ]
     },
@@ -63,8 +73,8 @@
           "level": "integration",
           "path": "pkg/postgres/integration_test.go",
           "command": "AUTOSQL_TEST_POSTGRES_URL='postgres://user:password@127.0.0.1:5432/disposable?sslmode=disable' go test ./pkg/postgres -run Integration"
-        }
-        ,{
+        },
+        {
           "level": "integration",
           "path": "pkg/postgres/database_target_test.go",
           "command": "AUTOSQL_TEST_POSTGRES_URL='postgres://user:password@127.0.0.1:5432/postgres?sslmode=disable' go test ./pkg/postgres -run DatabaseTarget"
@@ -201,8 +211,98 @@
       "id": "cli-configuration-and-secrets",
       "title": "CLI contracts, configuration, and secret references",
       "packages": ["cmd/autosql", "internal/cli", "pkg/config", "pkg/secret"],
-      "docs": ["docs/cli-contract.md", "docs/schema-sources.md"],
+      "docs": [
+        "docs/cli-contract.md",
+        "docs/schema-sources.md",
+        "docs/project-configuration.md",
+        "examples/project-testing/README.md"
+      ],
       "evidence": [
+        {
+          "level": "example",
+          "path": "examples/project-testing/autosql.hcl",
+          "command": "go run ./cmd/autosql config validate --config examples/project-testing/autosql.hcl --env production --json"
+        },
+        {
+          "level": "integration",
+          "path": "examples/project-testing/example_test.go",
+          "command": "go test ./examples/project-testing"
+        },
+        {
+          "level": "contract",
+          "path": "pkg/config/project_test.go",
+          "command": "go test ./pkg/config -run TestProject"
+        },
+        {
+          "level": "contract",
+          "path": "pkg/config/identity_test.go",
+          "command": "go test ./pkg/config -run TestProjectIdentity"
+        },
+        {
+          "level": "integration",
+          "path": "pkg/config/input_files_test.go",
+          "command": "go test ./pkg/config -run TestProjectInputFiles"
+        },
+        {
+          "level": "contract",
+          "path": "pkg/config/input_manifest_test.go",
+          "command": "go test ./pkg/config -run TestEffectiveInputs"
+        },
+        {
+          "level": "contract",
+          "path": "pkg/migrate/snapshot_read_test.go",
+          "command": "go test ./pkg/migrate -run 'TestInspectSnapshot|TestPrefixSnapshot'"
+        },
+        {
+          "level": "contract",
+          "path": "pkg/artifact/project_inputs_test.go",
+          "command": "go test ./pkg/artifact -run TestProject"
+        },
+        {
+          "level": "contract",
+          "path": "pkg/guardrail/project_inputs_test.go",
+          "command": "go test ./pkg/guardrail -run TestProjectInputs"
+        },
+        {
+          "level": "contract",
+          "path": "pkg/migrate/project_inputs_test.go",
+          "command": "go test ./pkg/migrate -run TestProjectGeneration"
+        },
+        {
+          "level": "contract",
+          "path": "pkg/migrate/generate_directory_test.go",
+          "command": "go test ./pkg/migrate -run TestGenerationPinnedDirectory"
+        },
+        {
+          "level": "contract",
+          "path": "internal/cli/project_release_test.go",
+          "command": "go test ./internal/cli -run 'TestProjectGeneration|TestProjectReleaseVerification|TestProjectReleaseAllows'"
+        },
+        {
+          "level": "contract",
+          "path": "internal/cli/generation_approval_test.go",
+          "command": "go test ./internal/cli -run 'TestGenerationAutomationApproval|TestCompletionApprovalRequiresOriginalSignedClaims'"
+        },
+        {
+          "level": "integration",
+          "path": "internal/cli/project_release_integration_test.go",
+          "command": "go test -race ./internal/cli -run '^TestProjectReleaseLive' -count=1 -v"
+        },
+        {
+          "level": "contract",
+          "path": "internal/cli/project_sources_test.go",
+          "command": "go test ./internal/cli -run TestProjectSchemaLoad"
+        },
+        {
+          "level": "contract",
+          "path": "internal/cli/project_plan_test.go",
+          "command": "go test ./internal/cli -run TestProjectPlan"
+        },
+        {
+          "level": "integration",
+          "path": "cmd/autosql/main_test.go",
+          "command": "go test ./cmd/autosql -run TestBuiltBinaryRunsDocumentedOperatorCLISubcommands"
+        },
         {
           "level": "integration",
           "path": "internal/cli/migrate_apply_e2e_test.go",
@@ -232,6 +332,16 @@
           "level": "integration",
           "path": "pkg/migrate/apply/apply_integration_test.go",
           "command": "go test ./pkg/artifact ./pkg/migrate/..."
+        },
+        {
+          "level": "contract",
+          "path": "pkg/artifact/observation_test.go",
+          "command": "go test ./pkg/artifact ./internal/cli -run 'Test(Observation|ProductionObservation)'"
+        },
+        {
+          "level": "contract",
+          "path": "internal/cli/artifact_snapshot_test.go",
+          "command": "go test ./internal/cli -run TestApplyRevalidatesVerifiedSnapshot"
         }
       ]
     },
@@ -257,6 +367,11 @@
           "level": "contract",
           "path": "pkg/guardrail/guardrail_test.go",
           "command": "go test ./pkg/approval ./pkg/guardrail ./pkg/policy ./pkg/precheck ./pkg/safety ./pkg/simulate"
+        },
+        {
+          "level": "contract",
+          "path": "pkg/guardrail/observation_test.go",
+          "command": "go test ./pkg/approval ./pkg/guardrail ./internal/cli -run 'Test(ObservationAuthorization|CompletionApproval|ProductionObservation)'"
         }
       ]
     },
@@ -270,13 +385,39 @@
           "level": "integration",
           "path": "pkg/executor/executor_integration_test.go",
           "command": "go test ./pkg/auditlog ./pkg/backup ./pkg/executor"
+        },
+        {
+          "level": "contract",
+          "path": "pkg/executor/completion_test.go",
+          "command": "go test ./pkg/executor -run 'Test(CompletionObservation|FileAuditReadExecution)'"
+        },
+        {
+          "level": "contract",
+          "path": "pkg/executor/audit_completion_test.go",
+          "command": "go test ./pkg/executor -run TestCompletionAudit"
+        },
+        {
+          "level": "live",
+          "path": "pkg/executor/execution_start_test.go",
+          "command": "scripts/test-live-serial.sh ./pkg/executor -run '^TestExecutionStart' -count=1"
+        },
+        {
+          "level": "live",
+          "path": "pkg/executor/completion_postgres_test.go",
+          "command": "scripts/test-live-serial.sh ./pkg/executor -run '^TestCompletionObservationLive' -timeout 3m"
         }
       ]
     },
     {
       "id": "inventory-observability-and-analytics",
       "title": "Inventory, drift, monitoring, schema docs, and analytics",
-      "packages": ["pkg/analytics", "pkg/drift", "pkg/inventory", "pkg/monitor", "pkg/schemadoc"],
+      "packages": [
+        "pkg/analytics",
+        "pkg/drift",
+        "pkg/inventory",
+        "pkg/monitor",
+        "pkg/schemadoc"
+      ],
       "docs": [
         "docs/inventory.md",
         "docs/schema-registry-observability.md",
@@ -363,25 +504,168 @@
       "id": "database-test-environments",
       "title": "Disposable database tests and reproducible test evidence",
       "packages": ["pkg/dbtest"],
-      "docs": ["docs/database-testing.md", "docs/integration-testing.md"],
+      "docs": [
+        "docs/database-testing.md",
+        "docs/integration-testing.md",
+        "examples/project-testing/README.md"
+      ],
       "evidence": [
         {
           "level": "integration",
           "path": "pkg/dbtest/postgres_integration_test.go",
           "command": "go test ./pkg/dbtest"
+        },
+        {
+          "level": "contract",
+          "path": "pkg/dbtest/lease_test.go",
+          "command": "go test -race ./pkg/dbtest -run \"Test(Lease|AdminFactoryRefusal)\""
+        },
+        {
+          "level": "live",
+          "path": "pkg/dbtest/admin_integration_test.go",
+          "command": "go test -race ./pkg/dbtest -run '^TestAdminFactoryLive' -count=1 -v"
+        },
+        {
+          "level": "live",
+          "path": "internal/cli/database_dev_integration_test.go",
+          "command": "go test -race ./internal/cli -run '^TestDatabaseDevLive' -count=1 -v"
+        },
+        {
+          "level": "integration",
+          "path": "examples/project-testing/development.hcl",
+          "command": "go test ./examples/project-testing"
+        },
+        {
+          "level": "contract",
+          "path": "pkg/dbtest/container_test.go",
+          "command": "go test -race ./pkg/dbtest -run \"Test(ContainerFactoryRefuses|Docker|ContainerOwnership|ContainerCleanup)\""
+        },
+        {
+          "level": "live",
+          "path": "pkg/dbtest/container_integration_test.go",
+          "command": "go test -race ./pkg/dbtest -run '^TestContainerFactoryLive' -count=1 -v"
+        },
+        {
+          "level": "live",
+          "path": "scripts/test-dbtest-postgres-matrix.sh",
+          "command": "scripts/test-dbtest-postgres-matrix.sh images.tsv"
+        },
+        {
+          "level": "integration",
+          "path": "examples/project-testing/container.hcl",
+          "command": "go test ./examples/project-testing"
+        },
+        {
+          "level": "contract",
+          "path": "pkg/dbtest/language_test.go",
+          "command": "go test -race ./pkg/dbtest -run 'Test(ParseTestFile|BindMigrations|StrictPostgresScalar|ExpectedSQLState)' -count=1"
+        },
+        {
+          "level": "live",
+          "path": "pkg/dbtest/language_integration_test.go",
+          "command": "go test -race ./pkg/dbtest -run '^TestLanguageLive' -count=1 -v"
+        },
+        {
+          "level": "integration",
+          "path": "examples/project-testing/tests/schema.test.hcl",
+          "command": "go test ./examples/project-testing -run TestTestLanguageExamples"
+        },
+        {
+          "level": "contract",
+          "path": "internal/cli/project_test_command_test.go",
+          "command": "go test -race ./internal/cli -run 'Test(ProjectTest|TestReports|JUnit)' -count=1"
+        },
+        {
+          "level": "contract",
+          "path": "pkg/config/input_verify_test.go",
+          "command": "go test -race ./pkg/config -run 'Test(VerifyCurrent|CaptureConfiguration)' -count=1"
+        },
+        {
+          "level": "live",
+          "path": "internal/cli/project_test_integration_test.go",
+          "command": "go test -race ./pkg/dbtest ./internal/cli -run '^(TestSuiteLive|TestProjectTestLive)' -count=1 -v"
+        },
+        {
+          "level": "live",
+          "path": "examples/project-testing/live_test.go",
+          "command": "go test -race ./examples/project-testing -run '^TestProjectExampleLive' -count=1 -v"
+        },
+        {
+          "level": "integration",
+          "path": "examples/project-testing/failures/regression.test.hcl",
+          "command": "go test ./examples/project-testing"
         }
       ]
     },
     {
       "id": "kubernetes-operator",
       "title": "Kubernetes CRDs, CEL validation, and reconciliation",
-      "packages": ["internal/operatorcontroller", "pkg/bootstrap", "pkg/operator"],
+      "packages": [
+        "internal/operatorcontroller",
+        "pkg/bootstrap",
+        "pkg/operator"
+      ],
       "docs": ["docs/kubernetes-operator.md"],
       "evidence": [
         {
           "level": "integration",
           "path": "internal/operatorcontroller/controller_test.go",
           "command": "go test ./pkg/operator ./internal/operatorcontroller"
+        },
+        {
+          "level": "contract",
+          "path": "pkg/operator/store_test.go",
+          "command": "go test ./pkg/operator -run 'Test(StoreRecordsAreIsolated|FileStoreFailedSavePreservesRecords|FileStorePersistsRecords)$'"
+        },
+        {
+          "level": "contract",
+          "path": "pkg/operator/persistence_test.go",
+          "command": "go test ./pkg/operator -run TestOperatorReliability"
+        },
+        {
+          "level": "contract",
+          "path": "pkg/operator/completion_test.go",
+          "command": "go test ./pkg/operator -run 'TestOperator(Completion|Checkpoint)'"
+        },
+        {
+          "level": "contract",
+          "path": "pkg/operator/execution_probe_test.go",
+          "command": "go test ./pkg/operator -run TestOperatorProbe"
+        },
+        {
+          "level": "contract",
+          "path": "internal/operatorcontroller/completion_test.go",
+          "command": "go test ./internal/operatorcontroller -run 'Test(CompletionStatus|ControllerCompletion|CompletionPublication)'"
+        },
+        {
+          "level": "live",
+          "path": "internal/operatorcontroller/completion_envtest_test.go",
+          "command": "AUTOSQL_OPERATOR_ENVTEST=1 go test ./internal/operatorcontroller -run TestEnvtestCompletionTimestampSchema -count=1"
+        },
+        {
+          "level": "live",
+          "path": "internal/operatorcontroller/completion_publish_integration_test.go",
+          "command": "scripts/test-live-serial.sh ./internal/operatorcontroller -run '^TestGitOpsPublishBundleIsAcceptedAndAppliedByOperator$' -count=1"
+        },
+        {
+          "level": "live",
+          "path": "internal/operatorcontroller/completion_controller_integration_test.go",
+          "command": "AUTOSQL_OPERATOR_ENVTEST=1 scripts/test-live-serial.sh ./internal/operatorcontroller -run '^TestGitOpsPublishBundleIsAcceptedAndAppliedByOperator$' -count=1"
+        },
+        {
+          "level": "contract",
+          "path": "internal/operatorcontroller/diagnostics_test.go",
+          "command": "go test -race ./internal/operatorcontroller -run 'Test(Managed|OperatorMetric|OperatorHealth|ReferenceChange)'"
+        },
+        {
+          "level": "live",
+          "path": "internal/operatorcontroller/diagnostics_envtest_test.go",
+          "command": "AUTOSQL_OPERATOR_ENVTEST=1 go test -race ./internal/operatorcontroller -run '^TestOperatorDiagnosticsTwoReplicas$' -count=1"
+        },
+        {
+          "level": "contract",
+          "path": "deploy/helm/autosql-operator/tests/render.sh",
+          "command": "sh deploy/helm/autosql-operator/tests/render.sh"
         }
       ]
     },
@@ -412,6 +696,16 @@
           "level": "integration",
           "path": "pkg/zdm/backfill/backfill_integration_test.go",
           "command": "go test ./pkg/zdm/... ./pkg/zerodowntime"
+        },
+        {
+          "level": "live",
+          "path": "pkg/zdm/expandplan/live_integration_test.go",
+          "command": "AUTOSQL_LIVE_COUNT=20 scripts/test-live-serial.sh ./pkg/zdm/expandplan -run '^TestLive(ConcurrentDDLWaitsAndPlanRefusesFreshSnapshot|PlanningIsReadOnlyAndFencedToBaseline)$' -timeout 3m"
+        },
+        {
+          "level": "live",
+          "path": "pkg/zdm/expandplan/concurrency_integration_test.go",
+          "command": "scripts/test-live-serial.sh ./pkg/zdm/expandplan -timeout 3m"
         }
       ]
     },

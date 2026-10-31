@@ -17,10 +17,10 @@ import (
 // provide trusted verification policy, the exact bound guardrail input, and an
 // executor mutation factory. No raw plan or SQL execution path exists here.
 type VerifiedArtifactApplyService struct {
-	Policy                artifact.VerifyPolicy
-	PolicyFor             func(artifact.Artifact) (artifact.VerifyPolicy, error)
-	InstallPolicy         func(string, artifact.VerifyPolicy)
-	Guardrail             guardrail.Guardrail
+	Policy        artifact.VerifyPolicy
+	PolicyFor     func(artifact.Artifact) (artifact.VerifyPolicy, error)
+	InstallPolicy func(string, artifact.VerifyPolicy)
+	Guardrail     guardrail.Guardrail
 	// GuardrailFor returns the guardrail configured for one artifact — in
 	// particular carrying the trusted release manifest's safety suppressions
 	// so the recomputed bundle and the safety re-run match the published
@@ -75,7 +75,11 @@ func (s VerifiedArtifactApplyService) ApplyVersionedAttempt(ctx context.Context,
 		return out, err
 	}
 	in.Mutation = mutation
-	if _, err = s.Guardrail.Apply(ctx, in); err != nil {
+	effectiveGuardrail := s.Guardrail
+	if s.GuardrailFor != nil {
+		effectiveGuardrail = s.GuardrailFor(p)
+	}
+	if _, err = effectiveGuardrail.Apply(ctx, in); err != nil {
 		if x, ok := mutation.(*executor.PostgreSQL); ok {
 			if tx != nil {
 				out = x.ExternalExecution()
@@ -131,15 +135,21 @@ func (s VerifiedArtifactApplyService) VerifyArtifactForApply(a artifact.Artifact
 	return a.VerifyTrusted(p)
 }
 
+// VerifyArtifactForObservation shares the execution policy without producing an
+// execution token. External approval and completion evidence remain required.
+func (s VerifiedArtifactApplyService) VerifyArtifactForObservation(a artifact.Artifact, mandatoryNoEdits bool) (artifact.VerifiedObservation, error) {
+	p, err := s.verificationPolicy(a, mandatoryNoEdits)
+	if err != nil {
+		return artifact.VerifiedObservation{}, err
+	}
+	return a.VerifyForObservation(p)
+}
+
 func (s VerifiedArtifactApplyService) Apply(ctx context.Context, request ApplyRequest) (ApplyResult, error) {
-	if request.ApprovalMode != "artifact" || request.ArtifactPath == "" || s.Input == nil || s.Mutation == nil {
+	if request.ApprovalMode != "artifact" || (request.ArtifactPath == "" && request.VerifiedArtifact.Digest() == "") || s.Input == nil || s.Mutation == nil {
 		return ApplyResult{Status: "refused"}, errors.New("verified artifact apply configuration required")
 	}
-	raw, err := os.ReadFile(request.ArtifactPath)
-	if err != nil {
-		return ApplyResult{Status: "refused"}, errors.New("read migration artifact")
-	}
-	a, err := artifact.Parse(raw)
+	a, err := loadApplyArtifact(request)
 	if err != nil {
 		return ApplyResult{Status: "refused"}, err
 	}
@@ -204,4 +214,15 @@ func (s VerifiedArtifactApplyService) Apply(ctx context.Context, request ApplyRe
 		status = "no_op"
 	}
 	return ApplyResult{Status: status, AppliedSteps: appliedSteps}, nil
+}
+
+func loadApplyArtifact(request ApplyRequest) (artifact.Artifact, error) {
+	if request.VerifiedArtifact.Digest() != "" {
+		return request.VerifiedArtifact.Payload()
+	}
+	raw, err := os.ReadFile(request.ArtifactPath)
+	if err != nil {
+		return artifact.Artifact{}, errors.New("read migration artifact")
+	}
+	return artifact.Parse(raw)
 }

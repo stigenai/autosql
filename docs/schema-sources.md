@@ -26,3 +26,15 @@ Unsupported statements fail with a source-located diagnostic. They are never
 silently ignored. Resource-specific database features that are not yet
 structurally interpreted remain in the resource's normalized `definition` or
 `options` field so the source stays reviewable and deterministic.
+
+Inline primary, unique, foreign-key and check constraints retain their column
+metadata, explicit names and PostgreSQL definitions. Primary keys also make the
+column non-null. Deferrability, initially-deferred timing and referential actions
+are preserved. Explicit referenced columns and an unambiguous referenced key in
+the same SQL source are bound before rendering. Unresolved or ambiguous reference
+graphs remain subject to the renderer's existing refusal checks.
+
+Compatibility: corrected inline definitions and column metadata can change the
+canonical graph, plan and input fingerprints compared with the earlier incomplete
+parser output. Regenerate affected plans and approvals; old digests are not
+reinterpreted. Existing table-level declarations keep their source representation.

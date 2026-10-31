@@ -20,6 +20,7 @@ import (
 
 type LoadRequest struct {
 	Spec                      string
+	BaseDir                   string
 	Schemas, Include, Exclude []string
 }
 type ReadPlanService interface {
@@ -28,11 +29,14 @@ type ReadPlanService interface {
 	Plan(context.Context, schema.Document, schema.Document, plan.Options) (plan.Plan, error)
 }
 type ApplyRequest struct {
-	Plan           plan.Plan
-	ArtifactPath   string
-	AssertedDigest string
-	ApprovalMode   string
-	NoEdits        bool
+	Plan         plan.Plan
+	ArtifactPath string
+	// VerifiedArtifact preserves a controller-authenticated immutable snapshot.
+	// Apply revalidates it against current policy before constructing mutation.
+	VerifiedArtifact artifact.VerifiedArtifact
+	AssertedDigest   string
+	ApprovalMode     string
+	NoEdits          bool
 }
 
 type optionalInt struct {
@@ -135,6 +139,7 @@ func (d DefaultReadPlan) Load(ctx context.Context, r LoadRequest) (schema.Docume
 		}
 		resolver := secret.NewResolver()
 		resolver.Redactor = d.Redactor
+		resolver.BaseDir = r.BaseDir
 		var url string
 		url, e = resolver.Resolve(ctx, ref)
 		if e == nil {
@@ -227,6 +232,8 @@ func loadPlanInputs(ctx context.Context, from, to string, filter LoadRequest, r 
 }
 func runPlan(ctx context.Context, args []string, o output, r ReadPlanService) error {
 	fs := newFlags("plan", o.streams.Err)
+	project := fs.String("config", "", "project JSON or HCL file")
+	environment := fs.String("env", "", "named project environment")
 	from := fs.String("from", "", "source")
 	to := fs.String("to", "", "target")
 	postgresVersion := fs.String("postgres-version", "", "target PostgreSQL major version")
@@ -243,8 +250,11 @@ func runPlan(ctx context.Context, args []string, o output, r ReadPlanService) er
 	if fs.NArg() != 0 {
 		return usageError(errors.New("unexpected positional arguments"))
 	}
-	if *from == "" || *to == "" {
+	if *project == "" && (*from == "" || *to == "") {
 		return usageError(errors.New("--from and --to required"))
+	}
+	if *project == "" && *environment != "" {
+		return usageError(errors.New("--env requires --config"))
 	}
 	render, e := renderOptionsForPostgresVersion(*postgresVersion)
 	if e != nil {
@@ -252,6 +262,9 @@ func runPlan(ctx context.Context, args []string, o output, r ReadPlanService) er
 	}
 	o.json = *jsonFlag
 	filter := LoadRequest{Schemas: schemas.value(), Include: include.value(), Exclude: exclude.value()}
+	if *project != "" {
+		return runProjectPlan(ctx, projectPlanRequest{Path: *project, Environment: *environment, From: *from, To: *to, Filter: filter, Render: render, Max: max}, o, r)
+	}
 	if e := validateSelectors(*from, *to, filter); e != nil {
 		return e
 	}

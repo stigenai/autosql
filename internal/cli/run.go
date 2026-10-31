@@ -57,6 +57,10 @@ func RunWithServices(ctx context.Context, args []string, streams Streams, servic
 		err = runVersion(args[1:], o)
 	case len(args) >= 2 && args[0] == "config" && args[1] == "validate":
 		err = runConfigValidate(ctx, args[2:], o, redactor)
+	case len(args) >= 2 && args[0] == "schema" && args[1] == "test":
+		err = runProjectTests(ctx, "schema", args[2:], &o)
+	case len(args) >= 2 && args[0] == "migrate" && args[1] == "test":
+		err = runProjectTests(ctx, "migration", args[2:], &o)
 	case len(args) >= 2 && args[0] == "migrate" && args[1] == "generate":
 		trusted := false
 		for _, arg := range args[2:] {
@@ -99,6 +103,8 @@ func RunWithServices(ctx context.Context, args []string, streams Streams, servic
 		err = runIntegration(ctx, args[2:], o, services, false)
 	case len(args) >= 2 && args[0] == "integration" && args[1] == "run":
 		err = runIntegration(ctx, args[2:], o, services, true)
+	case len(args) >= 2 && args[0] == "database" && args[1] == "dev":
+		err = runDatabaseDev(ctx, args[2:], o)
 	case len(args) >= 2 && args[0] == "database" && args[1] == "prepare":
 		err = runDatabasePrepare(ctx, args[2:], o, redactor)
 	case len(args) >= 2 && args[0] == "database" && args[1] == "bootstrap":
@@ -224,6 +230,8 @@ func runSchemaInspect(parent context.Context, args []string, o output, redactor 
 
 func runSchemaLoad(parent context.Context, args []string, o output) error {
 	fs := newFlags("schema load", o.streams.Err)
+	project := fs.String("config", "", "project JSON or HCL file")
+	environment := fs.String("env", "", "named project environment")
 	timeout := fs.Duration("timeout", 30*time.Second, "maximum command duration")
 	jsonFlag := fs.Bool("json", false, "emit JSON envelope")
 	var sources stringList
@@ -234,10 +242,22 @@ func runSchemaLoad(parent context.Context, args []string, o output) error {
 	if fs.NArg() != 0 {
 		return usageError(fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " ")))
 	}
-	if *timeout <= 0 || len(sources.values) == 0 {
-		return usageError(fmt.Errorf("at least one --source and a positive --timeout are required"))
+	if *timeout <= 0 || (*project == "" && len(sources.values) == 0) {
+		return usageError(fmt.Errorf("--config or at least one --source, and a positive --timeout are required"))
+	}
+	if *project == "" && *environment != "" {
+		return usageError(fmt.Errorf("--env requires --config"))
 	}
 	o.json = *jsonFlag
+	if *project != "" {
+		var timeoutOverride string
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "timeout" {
+				timeoutOverride = timeout.String()
+			}
+		})
+		return runProjectSchemaLoad(parent, *project, *environment, sources.value(), timeoutOverride, o)
+	}
 	ctx, cancel := context.WithTimeout(parent, *timeout)
 	defer cancel()
 	inputs := make([]source.Input, 0, len(sources.values))
@@ -332,6 +352,14 @@ func runConfigValidate(parent context.Context, args []string, o output, redactor
 		return &Error{Kind: "config", Message: err.Error(), Code: ExitConfig, Cause: err}
 	}
 	data := map[string]any{"valid": true, "environment": c.Environment, "preflight": *preflight}
+	if c.Version == config.CurrentVersion {
+		data["effective"] = c.Effective()
+		identity, err := c.Identity()
+		if err != nil {
+			return &Error{Kind: "config", Message: err.Error(), Code: ExitConfig, Cause: err}
+		}
+		data["identity"] = identity
+	}
 	if *preflight {
 		resolver := secret.NewResolver()
 		resolver.Redactor = redactor
@@ -359,11 +387,11 @@ func usageError(err error) *Error {
 	return &Error{Kind: "usage", Message: err.Error(), Code: ExitUsage, Cause: err}
 }
 func usageBase() string {
-	return "usage: autosql <command>\n\ncommands:\n  version [--json]\n  config validate [--config path] [--env name] [--preflight] [--json]\n  database prepare --target-hcl path --maintenance-url env://NAME|file://path [--json]\n  migrate generate --dir path --from source --to source --version semver --label name [--rename-hints value] [--json]\n  migrate checkpoint create|verify --dir path [--json]\n  migrate validate-online --file path --format json|yaml [--json]\n  migrate expand-plan --file path --url env://NAME --public-key env://NAME --plan-signing-key env://NAME --plan-key-id id --target id --env name --expected-fingerprint digest --schema name [--json]\n  migrate virtual-schema-apply|virtual-schema-status --file path --url env://NAME --target id --env name [--json]\n  migrate shadow-sync apply|status|remove --file path --url env://NAME --target id --env name [--allow-lossy] [--allow-non-reversible] [--json]\n  migrate backfill run|status|pause|resume|cancel --file path --url env://NAME --target id --env name [--batch-size n] [--json]\n  migrate metadata-init|metadata-status --url env://NAME [--metadata-schema name] [--json]\n  migrate metadata-baseline --url env://NAME --id id --target id --env name --operator id --schema name [--json]\n  migrate status [--config path --env name | --url env://NAME --migration-dir path] [--revision-schema name] [--json]\n  migrate apply|baseline [--config path | --url env://NAME --migration-dir path] [--from version] [--to version] [--count n] [--dry-run] [--json]\n  migrate down --to version [--dry-run] [--json]\n  migrate diagnose --url env://NAME --migration-dir path [--json]\n  migrate repair mark|remove|reconcile --url env://NAME --proposal file --operator-public-key env://NAME --audit path [--json]\n  schema load --source sql:path|json:path|hcl:path [--source ...] [--json]\n  schema inspect --url env://NAME|file://path [--format native|sql|json|hcl]\n  schema diff --from source --to source [--max-changes n] [--json]\n  plan --from source --to source [--postgres-version version] [--max-changes n] [--json]\n  plan edit --artifact file --sql file --editor id --reason text --output file\n  plan review --artifact file [--json]\n  plan revalidate --draft file --output file [--json]\n  plan publish --attested file --output file [--json]\n  apply --from source --to source [--dry-run|--approve-digest digest|--artifact path] [--no-edits] [--json]"
+	return "usage: autosql <command>\n\ncommands:\n  version [--json]\n  config validate [--config path] [--env name] [--preflight] [--json]\n  database dev create --config path --env name --postgres-version 14..18 [--lease-dir path] [--json]\n  database dev cleanup --lease path [--json]\n  database prepare --target-hcl path --maintenance-url env://NAME|file://path [--json]\n  migrate generate --dir path --from source --to source --version semver --label name [--rename-hints value] [--json]\n  migrate generate --config path [--env name] --version semver --label name --generation-config path [--to source] [--dir path] [--json]\n  migrate checkpoint create|verify --dir path [--json]\n  migrate validate-online --file path --format json|yaml [--json]\n  migrate expand-plan --file path --url env://NAME --public-key env://NAME --plan-signing-key env://NAME --plan-key-id id --target id --env name --expected-fingerprint digest --schema name [--json]\n  migrate virtual-schema-apply|virtual-schema-status --file path --url env://NAME --target id --env name [--json]\n  migrate shadow-sync apply|status|remove --file path --url env://NAME --target id --env name [--allow-lossy] [--allow-non-reversible] [--json]\n  migrate backfill run|status|pause|resume|cancel --file path --url env://NAME --target id --env name [--batch-size n] [--json]\n  migrate metadata-init|metadata-status --url env://NAME [--metadata-schema name] [--json]\n  migrate metadata-baseline --url env://NAME --id id --target id --env name --operator id --schema name [--json]\n  migrate status [--config path --env name | --url env://NAME --migration-dir path] [--revision-schema name] [--json]\n  migrate apply|baseline [--config path | --url env://NAME --migration-dir path] [--from version] [--to version] [--count n] [--dry-run] [--json]\n  migrate down --to version [--dry-run] [--json]\n  migrate diagnose --url env://NAME --migration-dir path [--json]\n  migrate repair mark|remove|reconcile --url env://NAME --proposal file --operator-public-key env://NAME --audit path [--json]\n  schema load --source sql:path|json:path|hcl:path [--source ...] [--json]\n  schema load --config path [--env name] [--source ...] [--json]\n  schema inspect --url env://NAME|file://path [--format native|sql|json|hcl]\n  schema diff --from source --to source [--max-changes n] [--json]\n  plan --from source --to source [--postgres-version version] [--max-changes n] [--json]\n  plan --config path [--env name] [--from source] [--to source] [--postgres-version version] [--max-changes n] [--json]\n  plan edit --artifact file --sql file --editor id --reason text --output file\n  plan review --artifact file [--json]\n  plan revalidate --draft file --output file [--json]\n  plan publish --attested file --output file [--json]\n  apply --from source --to source [--dry-run|--approve-digest digest|--artifact path] [--no-edits] [--json]"
 }
 func usage() string {
 	base := strings.Replace(usageBase(), "\n  migrate generate", "\n  database bootstrap prepare --file path [--include-routine-source] [--json|--hcl]\n  database bootstrap preflight --file path --maintenance-url env://NAME --extension-allowlist names --extension-version name=version --extension-schema name=schema [--json]\n  database bootstrap authorize --file path --authorization-signing-key env://NAME --authorization-key-id id --authorization-issuer issuer --authorization-signer signer --output path [--json]\n  database bootstrap --file path --maintenance-url env://NAME|file://path [--authorization-manifest path --authorization-public-key env://NAME --authorization-issuer issuer --authorization-signer signer] [--json]\n  migrate generate", 1)
-	return base + "\n  integration verify|run --contract path --contract-digest sha256:... [--json]\n  operator key generate --private-output path --public-output path [--json]\n  operator artifact publish --file path --config path --output-dir path --source-revision revision [--bootstrap|--adopt] [--json]\n  migrate start-status --file path --url env://NAME --target id --env name [--json]"
+	return base + "\n  schema test --config path [--env name] [--filter file::case] [--parallel 1..32] [--json] [--junit path]\n  migrate test --config path [--env name] [--filter file::case] [--parallel 1..32] [--json] [--junit path]\n  integration verify|run --contract path --contract-digest sha256:... [--json]\n  operator key generate --private-output path --public-output path [--json]\n  operator artifact publish --file path --config path --output-dir path --source-revision revision [--bootstrap|--adopt] [--json]\n  migrate start-status --file path --url env://NAME --target id --env name [--json]"
 }
 func contains(args []string, want string) bool {
 	for _, a := range args {
@@ -375,6 +403,12 @@ func contains(args []string, want string) bool {
 }
 
 func commandName(args []string) string {
+	if len(args) >= 2 && args[0] == "schema" && args[1] == "test" {
+		return "schema test"
+	}
+	if len(args) >= 3 && args[0] == "database" && args[1] == "dev" {
+		return "database dev " + args[2]
+	}
 	if len(args) == 0 {
 		return ""
 	}

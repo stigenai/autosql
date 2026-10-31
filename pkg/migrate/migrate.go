@@ -752,7 +752,7 @@ func openRegularAt(parent int, name string) (int, error) {
 	if filepath.Base(name) != name || strings.Contains(name, "..") {
 		return -1, ErrInvalid
 	}
-	fd, e := unix.Openat(parent, name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	fd, e := unix.Openat(parent, name, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if e != nil {
 		return -1, e
 	}

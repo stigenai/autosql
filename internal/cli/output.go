@@ -2,10 +2,13 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"regexp"
 
+	"autosql/pkg/config"
+	"autosql/pkg/dbtest"
 	"autosql/pkg/secret"
 )
 
@@ -26,14 +29,16 @@ type Envelope struct {
 }
 
 type EnvelopeError struct {
-	Kind             string `json:"kind"`
-	Message          string `json:"message"`
-	ExitCode         int    `json:"exit_code"`
-	Status           string `json:"status,omitempty"`
-	PendingStep      string `json:"pending_step,omitempty"`
-	ExecutionID      string `json:"execution_id,omitempty"`
-	RecoveryGuidance string `json:"recovery_guidance,omitempty"`
-	AppliedSteps     int    `json:"applied_steps"`
+	Location         *config.SourceRange `json:"location,omitempty"`
+	Field            string              `json:"field,omitempty"`
+	Kind             string              `json:"kind"`
+	Message          string              `json:"message"`
+	ExitCode         int                 `json:"exit_code"`
+	Status           string              `json:"status,omitempty"`
+	PendingStep      string              `json:"pending_step,omitempty"`
+	ExecutionID      string              `json:"execution_id,omitempty"`
+	RecoveryGuidance string              `json:"recovery_guidance,omitempty"`
+	AppliedSteps     int                 `json:"applied_steps"`
 }
 
 type output struct {
@@ -93,7 +98,28 @@ func sanitizeOutput(redactor *secret.Redactor, value string) string {
 func (o output) failure(e *Error) {
 	message := sanitizeOutput(o.redactor, e.Message)
 	if o.json {
-		_ = json.NewEncoder(o.streams.Out).Encode(Envelope{SchemaVersion: OutputSchemaVersion, Command: o.command, OK: false, Error: &EnvelopeError{Kind: e.Kind, Message: message, ExitCode: int(e.Code), Status: e.Status, PendingStep: sanitizeOutput(o.redactor, e.PendingStep), ExecutionID: sanitizeOutput(o.redactor, e.ExecutionID), RecoveryGuidance: sanitizeOutput(o.redactor, e.RecoveryGuidance), AppliedSteps: e.AppliedSteps}})
+		var location *config.SourceRange
+		field := ""
+		var located *config.LocatedError
+		if errors.As(e, &located) {
+			at := located.Range
+			at.Filename = sanitizeOutput(o.redactor, at.Filename)
+			location = &at
+			field = sanitizeOutput(o.redactor, located.Field)
+		}
+		var language *dbtest.LanguageError
+		if errors.As(e, &language) {
+			at := language.Range
+			at.Filename = sanitizeTestText(o.redactor, at.Filename)
+			location = &at
+		}
+		var suite *dbtest.SuiteError
+		if errors.As(e, &suite) && suite.Failure.Range.StartLine > 0 {
+			at := suite.Failure.Range
+			at.Filename = sanitizeTestText(o.redactor, at.Filename)
+			location = &at
+		}
+		_ = json.NewEncoder(o.streams.Out).Encode(Envelope{SchemaVersion: OutputSchemaVersion, Command: o.command, OK: false, Data: safeFailureData(o.redactor, e.Data), Error: &EnvelopeError{Location: location, Field: field, Kind: e.Kind, Message: message, ExitCode: int(e.Code), Status: e.Status, PendingStep: sanitizeOutput(o.redactor, e.PendingStep), ExecutionID: sanitizeOutput(o.redactor, e.ExecutionID), RecoveryGuidance: sanitizeOutput(o.redactor, e.RecoveryGuidance), AppliedSteps: e.AppliedSteps}})
 		return
 	}
 	fmt.Fprintf(o.streams.Err, "autosql: %s: %s", e.Kind, message)
@@ -113,4 +139,19 @@ func (o output) failure(e *Error) {
 		fmt.Fprintf(o.streams.Err, "; %s", sanitizeOutput(o.redactor, e.RecoveryGuidance))
 	}
 	fmt.Fprintln(o.streams.Err)
+}
+
+func safeFailureData(redactor *secret.Redactor, data any) any {
+	if data == nil {
+		return nil
+	}
+	raw, err := json.Marshal(data)
+	if err != nil {
+		return nil
+	}
+	var safe any
+	if err := json.Unmarshal(raw, &safe); err != nil {
+		return nil
+	}
+	return sanitizeJSON(redactor, safe)
 }

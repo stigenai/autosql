@@ -144,6 +144,257 @@ immediately enqueue dependent resources after rotation or deletion, and
 successful authorization is requeued before its expiry. No resolved value is
 stored in the fingerprint.
 
+## State-store failure behavior
+
+The operator's file store replaces its state file atomically before publishing
+new records in memory. If serialization, directory creation, temporary-file
+writing, or replacement fails, the last committed records stay intact; a later
+successful save does not persist entries from an earlier failed save. Both file
+and memory stores copy condition slices on save and load, so changing a returned
+record cannot change the saved checkpoint.
+
+The reconciler checks every required checkpoint write. A failed write before
+apply prevents execution. A failed write after apply reports
+`StatePersistenceFailed`, preserves the previous successful generation, digest,
+fingerprint, and observation time, and never publishes Ready for that attempt.
+Failure messages omit filesystem paths and backend error details.
+
+The reconciliation core accepts a completion observer for ordinary declarative
+resources. Before an uncached ordinary apply, a read-only start check examines
+the managed state, all history states/attempts, and existing lifecycle audit.
+An original-state match with no history and no execution event can continue
+through normal apply authorization. A desired-state match, prior history, an
+execution event, or ambiguity selects observation; refused or unavailable
+evidence cannot fall through to apply. Suspension and required approval are
+checked before either database path. Once a checkpoint records a possible
+attempt, retry also requires an existing audit with valid pre-execution events;
+a missing or emptied audit cannot reset that attempt to a fresh start. Known
+uncertainty always enters completion verification and never the fresh-start path.
+Proven completion must be saved before returning Ready/`CompletionRecovered`.
+Its optional `completionObservedAt` records when completion was observed, not
+when SQL originally finished. Checkpoints include the resource UID so a
+replacement object cannot inherit an earlier object's execution key. Both CRD
+copies accept the timestamp; apply CRD updates before upgrading the operator.
+
+Recovered status publication refreshes the resource and its runtime references.
+UID, generation, spec, approval annotation, or reference version/content changes
+discard the old result. Conflicts retry publication and current authorization
+checks only; they do not repeat observation or SQL. The controller requires an
+authorization recheck before publishing recovered readiness.
+
+The production controller now connects the observer and publication checks for
+ordinary declarative resources. Expired releases enter observation only after
+current authorization succeeds, before runtime references are resolved. A
+missing local checkpoint with matching Kubernetes completion status also
+selects observation. When both stores are empty, the read-only start check
+rediscovers a completed target and requires full proof. Changing references for
+an already-applied release re-observes the new target rather than executing the
+release again. Recovery requires resolvable inline, Secret, ConfigMap, or
+immutable registry input; mutable URL content is not fetched or assumed to match
+the signed goal. Fresh URL-source apply behavior remains unchanged. The original
+signed artifact snapshot is carried into apply;
+current signature, expiry, policy, and approval checks still run before mutation.
+
+New operator release bundles preserve the original automation approval proof
+and its public verification key. Recovery checks the signed expiry, current
+identity/roles, policy, safety settings, release key, and validation evidence.
+It never substitutes the artifact expiry for the signed approval expiry.
+Legacy bundles without the original proof are refused for recovery. Older
+operator binaries reject the new apply-configuration fields, so upgrade the
+controller before publishing bundles with this publisher. The current
+publisher bounds approvals before artifact expiry and validation evidence at
+artifact expiry, so its expired releases remain refused; publish a fresh
+approved release when those windows have elapsed.
+
+The observation path rechecks the source fingerprint and current authorization,
+reads the exact database and audit evidence, then durably appends one
+`completion_observed` event per resource UID, metadata generation, artifact, and
+execution attempt. It does not fabricate the original execution completion.
+An audit or checkpoint write failure prevents recovered readiness. A later
+publication authorization failure clears previously recovered Ready status
+while preserving historical successful fields.
+
+The live scenario uses the real CLI publisher and generated signatures, applies
+to owned disposable databases, injects a completion checkpoint failure, and
+recovers without calling Apply again. It verifies unchanged database history,
+one observation event across retries, and refusals for missing proof, revoked
+keys, removed roles, changed source, missing audit, and expired published
+validation evidence. It also clears both state stores, replaces the controller,
+changes a Secret version, and retries conflicting status publications without
+repeating database work. With `AUTOSQL_OPERATOR_ENVTEST=1`, those publications
+use a disposable Kubernetes 1.35 API server and actual resource-version
+conflicts; without it, the fixture uses a fake API client and injected conflicts.
+Prerequisites are a local Go toolchain and
+`AUTOSQL_TEST_POSTGRES_URL` pointing at a disposable PostgreSQL administration
+target with database-creation permission. The fixture creates and removes only
+its own databases and temporary files:
+
+```sh
+go test -race ./internal/operatorcontroller \
+  -run '^TestGitOpsPublishBundleIsAcceptedAndAppliedByOperator$' -count=1
+```
+
+For the combined PostgreSQL and Kubernetes test, also set
+`KUBEBUILDER_ASSETS` to the local Kubernetes 1.35 envtest binaries and run:
+
+```sh
+AUTOSQL_OPERATOR_ENVTEST=1 go test -race ./internal/operatorcontroller \
+  -run '^TestGitOpsPublishBundleIsAcceptedAndAppliedByOperator$' -count=1
+```
+
+The API server is local and disposable. The diagnostics test below separately
+qualifies two-manager leader election. Release and deployed-controller
+qualification remain separate acceptance gates.
+
+Run the deterministic contract scenarios without PostgreSQL or Kubernetes:
+
+```sh
+go test ./pkg/operator \
+  -run 'Test(StoreRecordsAreIsolated|FileStoreFailedSavePreservesRecords|FileStorePersistsRecords)$'
+go test ./pkg/operator -run 'TestOperator(Reliability|Completion|Checkpoint|Probe)'
+go test ./internal/operatorcontroller -run TestCompletionStatusRoundTripAndLegacyCompatibility
+go test ./internal/operatorcontroller -run 'Test(ControllerCompletion|CompletionPublication)'
+```
+
+The scenarios use temporary directories, prove preservation across failed writes
+and file replacement, verify cleanup and reopening, and test record ownership
+for both store implementations. Additional scenarios cover pre/post-apply write
+failures, observation without repeat apply, bounded rejection diagnostics,
+recovery write failure, current authorization expiry, suspension, resource UID,
+and optional-status compatibility. They modify no application database.
+
+With local Kubernetes 1.35 envtest binaries available, run the API validation:
+
+```sh
+AUTOSQL_OPERATOR_ENVTEST=1 go test ./internal/operatorcontroller \
+  -run TestEnvtestCompletionTimestampSchema -count=1
+```
+
+Set `KUBEBUILDER_ASSETS` to the directory containing those binaries. This starts
+and stops a disposable API server, verifies both CRD copies are identical, and
+checks that the optional timestamp survives status writes and rejects malformed
+values. It does not connect to a cluster or database.
+
+## Diagnostics, metrics, and health
+
+The operator initializes JSON logging before manager creation. Each attempted
+reconciliation emits start/result records with namespace, name, generation,
+validated release digest, outcome, reason and duration. Completion observations
+include their stable audit `event_id` and recovery result. Connection strings,
+SQL, artifact payloads and raw errors are excluded from diagnostics. Status API
+failures remain visible in logs and metrics even when Kubernetes rejects status.
+
+Transient errors retry from one second with exponential backoff and up to 10%
+positive jitter, capped at 60 seconds. Deterministic evidence, drift, expiry and
+authorization refusals recheck after five minutes. Generation, annotation and
+watched Secret/ConfigMap changes permit immediate evaluation; suspension takes
+priority. An unchanged warning is suppressed for five minutes, while a changed
+reason or evidence category emits immediately. Retries are failures of
+reconciliation, not counts of SQL executions. `retryCount` retains the largest
+known cumulative count from local state, Kubernetes status and this process;
+if both durable writes fail, that process-only increment cannot survive restart.
+
+```sh
+autosql operator --leader-election \
+  --metrics-bind-address=:8080 --health-probe-bind-address=:8081
+```
+
+Both addresses accept `0` to disable their endpoints. `/metrics` exposes the
+controller-runtime metrics plus the following initialized series:
+
+| Metric | Labels and values |
+| --- | --- |
+| `autosql_operator_reconciliations_total` | `outcome`: success, failure, suspended; `reason`: bounded code below |
+| `autosql_operator_reconcile_duration_seconds` | `outcome`: success, failure, suspended |
+| `autosql_operator_completion_observations_total` | `outcome`: recovered, ineligible, refused, retryable |
+| `autosql_operator_state_persistence_failures_total` | `stage`: pre_apply, post_apply, recovery |
+
+Reason codes are `Applied`, `Adopted`, `CompletionRecovered`, `Suspended`,
+`AwaitingApproval`, `ArtifactExpired`, `RecoveryEvidenceInvalid`,
+`RecoveryStateDrifted`, `RecoveryAuditUnavailable`, `StatePersistenceFailed`,
+`ReleaseAuthorizationInvalid`, `DependencyUnavailable`, `StatusPublicationFailed`,
+`Invalid`, `ApplyFailed`, `Missing`, `Stale`, `Accepted`, `InputsChanged`,
+`NotFound`, and `other`. Unknown codes map to `other`. Resource identities,
+digests, targets and error strings never become metric labels. Deferred queue
+entries log their deferral and do not count as fresh reconciliation attempts.
+Observation counters count observer invocations, including a retry when
+publication fails; they do not count database executions. Counters are per
+process and reset on restart. Use increases/rates together with scrape health.
+
+`/healthz` checks the running manager; `/readyz` checks cache synchronization.
+Neither depends on a schema being Ready or the replica holding leadership.
+A blocked schema therefore does not cause a healthy standby or leader to restart.
+The Helm chart defaults to internal ports 8080/8081 and a ClusterIP metrics
+Service with scrape annotations. Set `metrics.enabled=false` or
+`healthProbe.enabled=false` to disable endpoints; `metrics.port` and
+`healthProbe.port` customize distinct ports. `metrics.service.enabled=false`
+disables only the Service. The standalone deployment and metrics Service expose
+the same ports and probes. No public Ingress or additional operator RBAC is added.
+
+Use an image built from this change before enabling these new flags/probes.
+The checked-in release image pin is updated only during release qualification;
+older binaries do not implement the new flags. Do not apply the new deployment
+examples with the older pinned image. Keep the CRD upgrade ordering described above.
+
+### Collection and a five-minute runbook
+
+[The Prometheus example](../deploy/operator/prometheus.yaml) discovers each Pod's
+named metrics port, covering Helm and standalone labels. Adjust its namespace
+and label selector if the installation name differs. Merge the job into an
+existing in-cluster collector with Pod discovery access and network access to
+that port. Use either this job or Service-annotation discovery to avoid duplicate
+scrapes. Do not scrape a load-balanced Service address as if it were one process.
+The example follows [Prometheus Kubernetes discovery and relabeling](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#kubernetes_sd_config).
+Production owners choose collector credentials and network policy.
+
+Within five minutes of a failure, follow these checks in order:
+
+1. Read the resource conditions, `recoveryGuidance`, generation and artifact
+   digest. Match the namespace/name and digest to a structured result log.
+2. For `ArtifactExpired` or `ReleaseAuthorizationInvalid`, inspect the current
+   approval/trust lifetimes and publish a fresh approved release when required.
+   For `RecoveryEvidenceInvalid`, preserve history and investigate its exact
+   mismatch. For `RecoveryStateDrifted`, inspect managed-schema drift.
+3. For `RecoveryAuditUnavailable`, repair access to existing durable audit
+   evidence. For `StatePersistenceFailed`, restore writable checkpoint storage.
+   For `DependencyUnavailable`, restore the named dependency. For
+   `StatusPublicationFailed`, restore Kubernetes status access. None of these
+   repairs calls for replaying SQL to repair bookkeeping.
+4. Check `/healthz` and `/readyz` on each replica and confirm that only the
+   elected leader is processing resources. Match an observation's `event_id`
+   to the existing audit chain. A failed resource can coexist with healthy Pods.
+5. Inspect the collector's actual target selector and the following queries.
+   Confirm expected targets are present; an empty query is missing evidence.
+
+```promql
+up{job="autosql-operator"}
+sum by (outcome, reason) (increase(autosql_operator_reconciliations_total[30m]))
+sum by (outcome) (increase(autosql_operator_completion_observations_total[30m]))
+sum by (stage) (increase(autosql_operator_state_persistence_failures_total[30m]))
+```
+
+A successful endpoint scrape proves local emission. Production qualification
+must separately capture backend ingestion and a 30-minute window without gaps
+longer than two collection intervals. Record the image digest, target selection,
+query window and result; do not infer uptime or SQL counts from a quiet counter.
+
+Reproduce the supported and rejected diagnostic scenarios locally:
+
+```sh
+go test -race ./internal/operatorcontroller \
+  -run 'Test(Managed|OperatorMetric|OperatorHealth|ReferenceChange)'
+sh deploy/helm/autosql-operator/tests/render.sh
+AUTOSQL_OPERATOR_ENVTEST=1 go test -race ./internal/operatorcontroller \
+  -run '^TestOperatorDiagnosticsTwoReplicas$' -count=1
+```
+
+The last command requires local Kubernetes 1.35 envtest binaries through
+`KUBEBUILDER_ASSETS`. It starts two separate operator processes, scrapes both,
+verifies refusal/health behavior and leadership handover, then stops all owned
+processes. Its injected observer never calls Apply. Real PostgreSQL recovery
+and byte-identical history are covered by the separate signed-publisher fixture
+above. These local checks do not claim production ingestion or a released image.
+
 ## CRD validation and CEL
 
 The `v1alpha1` CRD now uses a structural schema plus CEL validation to reject

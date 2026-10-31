@@ -114,6 +114,16 @@ func (a automationApprovalAuthority) VerifyApproval(_ context.Context, item appr
 	return approval.VerifiedApproval{Identity: a.identity, PlanDigest: claims.PlanDigest, Environment: claims.Environment, ApprovedAt: claims.ApprovedAt.UTC(), ExpiresAt: claims.ExpiresAt.UTC()}, nil
 }
 
+// VerifyAutomationApproval authenticates the original signed approval claims
+// using the current trusted key and identity. Lifetimes are enforced by the
+// approval gate; transport timestamps never replace the signed timestamps.
+func VerifyAutomationApproval(item approval.Approval, keyID string, public ed25519.PublicKey, identity approval.Identity) (approval.VerifiedApproval, error) {
+	if keyID == "" || len(public) != ed25519.PublicKeySize || identity.ID == "" || item.Approver != identity.ID {
+		return approval.VerifiedApproval{}, approval.ErrDenied
+	}
+	return (automationApprovalAuthority{keyID: keyID, public: public, identity: identity}).VerifyApproval(context.Background(), item)
+}
+
 type OperatorArtifactRequest struct {
 	Generation       GenerateRequest
 	Current, Desired schema.Document
@@ -126,6 +136,7 @@ type OperatorArtifactResult struct {
 	Artifact                                        artifact.Artifact
 	Bytes                                           []byte
 	SchemaPolicyResources, MigrationPolicyResources []policy.Resource
+	ApprovalEvidence                                []approval.Approval
 }
 
 type generationPlanMutation struct {
@@ -314,7 +325,7 @@ func (s GenerateService) BuildOperatorArtifact(ctx context.Context, request Oper
 	if request.Adopt && (built.Artifact.Plan.FromFingerprint != built.Artifact.Plan.ToFingerprint || len(built.Artifact.Plan.Changes.Changes) != 0 || len(built.Artifact.Plan.Steps) != 0 || len(built.Artifact.Plan.Phases) != 0 || len(built.Artifact.Plan.Replay) != 0) {
 		return OperatorArtifactResult{}, generationFailure("adoption_plan", ErrGenerateStage)
 	}
-	return OperatorArtifactResult{Artifact: built.Artifact, Bytes: built.Bytes, SchemaPolicyResources: built.SchemaPolicyResources, MigrationPolicyResources: built.MigrationPolicyResources}, nil
+	return OperatorArtifactResult{Artifact: built.Artifact, Bytes: built.Bytes, SchemaPolicyResources: built.SchemaPolicyResources, MigrationPolicyResources: built.MigrationPolicyResources, ApprovalEvidence: built.ApprovalEvidence}, nil
 }
 
 func operatorSimulationFactory(target *bootstrap.DatabaseTarget, desired schema.Document) simulate.PostgresFactory {

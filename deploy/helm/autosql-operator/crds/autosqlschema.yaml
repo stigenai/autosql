@@ -229,6 +229,7 @@ spec:
                 retryCount: {type: integer, minimum: 0}
                 appliedFingerprint: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
                 authorizationExpiresAt: {type: string, format: date-time}
+                completionObservedAt: { type: string, format: date-time }
                 conditions:
                   type: array
                   x-kubernetes-list-type: map

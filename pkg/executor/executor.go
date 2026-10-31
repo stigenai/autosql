@@ -306,30 +306,19 @@ func confirmedStepsAttempt(ctx context.Context, conn Session, a artifact.Artifac
 	}
 	defer rows.Close()
 	out := map[string]bool{}
-	steps := map[string]plan.Step{}
-	phases := map[string]plan.Phase{}
-	for _, s := range a.Plan.Steps {
-		steps[s.ID] = s
-	}
-	for _, p := range a.Plan.Phases {
-		for _, id := range p.StepIDs {
-			phases[id] = p
-		}
-	}
+	steps, phases := historyBindings(a)
 	for rows.Next() {
-		var id, hash, phaseID, mode, executionID, target, planDigest, bundleDigest string
-		if err := rows.Scan(&id, &hash, &phaseID, &mode, &executionID, &target, &planDigest, &bundleDigest); err != nil {
+		var b historyBinding
+		if err := rows.Scan(&b.ID, &b.Hash, &b.PhaseID, &b.Mode, &b.ExecutionID, &b.Target, &b.PlanDigest, &b.BundleDigest); err != nil {
 			return nil, errors.New("read confirmed migration history")
 		}
-		s, ok := steps[id]
-		p, pok := phases[id]
-		if !ok || !pok || s.Kind == plan.StepTopology || hash != stepHash(s) || phaseID != p.ID || mode != string(p.Transaction) || executionID != a.Digest || target != a.DatabaseIdentity+"/"+a.TargetEnvironment || planDigest != a.Plan.Digest || bundleDigest != a.GuardrailDigest {
+		if !b.matches(a, steps[b.ID], phases[b.ID]) {
 			return nil, errors.New("migration history binding conflict")
 		}
-		if out[id] {
+		if out[b.ID] {
 			return nil, errors.New("duplicate confirmed migration history")
 		}
-		out[id] = true
+		out[b.ID] = true
 	}
 	return out, rows.Err()
 }

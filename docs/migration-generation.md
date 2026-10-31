@@ -38,3 +38,59 @@ any migration-directory byte or metadata timestamp.
 There is no legacy publication mode. The shipped command requires a trusted
 generation configuration; invocation without it refuses before reading or
 writing migration state.
+
+## Project inputs and automation approvals
+
+Add `--config project.hcl --env NAME` to select version-2 project inputs; `--dir`
+and `--to` become optional explicit replacements. See
+[project release generation](project-configuration.md#project-release-generation-and-verification)
+for the input manifest, trusted Apply entry, and supported combinations.
+
+The existing trusted generation configuration can optionally include:
+
+```json
+{
+  "AutomationApproval": {
+    "KeyID": "ci-approval",
+    "Identity": "release-automation",
+    "Roles": ["release-automation"],
+    "PrivateKeyReference": "env://AUTOSQL_CI_APPROVAL_KEY",
+    "TTL": "10m"
+  }
+}
+```
+
+This is a fragment of `generation.json`, not a complete configuration. The
+provider signs the exact computed bundle and environment after planning,
+simulation, and policy checks. It uses the same approval implementation as the
+operator publisher. Its identity must differ from `Author` and `Requester`; its
+key ID must differ from generator and release key IDs. Configure an
+`ApprovalPolicy` that authorizes its roles. The approval TTL must be positive and
+shorter than `Lifetime`. Do not combine it with `Approvals` or
+`VerifiedApprovals`; omitting it preserves the existing precomputed-approval
+path. Private keys remain secret references and are never returned.
+
+The trusted Apply configuration carries `AutomationApprovalKeyID`,
+`AutomationApprovalPublicKey`, and the original `ApprovalEvidence` alongside
+`ApprovalIdentities` in the per-artifact release entry. Project releases verify
+that original signature and expiry before Apply and again through the approval
+gate. Editing the transported expiry or dropping required proof does not extend
+authorization. This is independent of the release artifact's later expiry.
+
+## Disposable integration proof
+
+With `AUTOSQL_PROJECT_TEST_DSN` set to a disposable PostgreSQL 17 administrator
+URL (including a username and password field), run:
+
+```sh
+go test -race ./internal/cli -run '^TestProjectReleaseLive' -count=1 -v
+```
+
+The test creates and removes uniquely named development and target databases,
+invokes project generation with real signatures, builds the trusted Apply
+configuration, refuses changed inputs before execution, refuses a rotated
+reference pointing to another database, and applies the valid release after a
+report-path move. It checks target schema state and audit-file absence for
+input refusals. Without that environment variable it reports a skip; a skipped
+run is not live qualification. It does not use production endpoints or prove a
+released binary or production deployment.

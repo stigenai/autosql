@@ -164,6 +164,9 @@ type VerifyPolicy struct {
 	GeneratorPurpose                 string
 	ExpectedValidationContextDigests map[string]string
 	ExpectedValidationAttestations   map[string]ValidationAttestation
+	// Recomputed from trusted current project inputs; never copied from the
+	// artifact's own metadata or an unsigned report.
+	ExpectedProjectInputDigest string
 }
 type VerifiedArtifact struct {
 	artifact Artifact
@@ -243,68 +246,89 @@ func (a Artifact) Verify(keys map[string]ed25519.PublicKey, now time.Time) error
 	return fail("trusted_policy_required", ErrInvalid)
 }
 func (a Artifact) VerifyTrusted(policy VerifyPolicy) (VerifiedArtifact, error) {
+	immutable, err := a.verifyTrusted(policy, verifyExecution)
+	if err != nil {
+		return VerifiedArtifact{}, err
+	}
+	return VerifiedArtifact{artifact: immutable, marker: verifiedMarker(immutable)}, nil
+}
+
+type verificationPurpose uint8
+
+const (
+	verifyExecution verificationPurpose = iota
+	verifyObservation
+)
+
+func (a Artifact) verifyTrusted(policy VerifyPolicy, purpose verificationPurpose) (Artifact, error) {
 	if policy.Now == nil {
-		return VerifiedArtifact{}, fail("policy", ErrInvalid)
+		return Artifact{}, fail("policy", ErrInvalid)
 	}
 	now := policy.Now().UTC()
+	if err := a.verifyProjectInputs(policy.ExpectedProjectInputDigest); err != nil {
+		return Artifact{}, err
+	}
 	if policy.NoEdits {
 		generated := policy.Expected.GeneratedPlanDigest
 		record, ok := policy.GeneratorKeys[a.Origin.KeyID]
 		sig, decodeErr := base64.RawStdEncoding.Strict().DecodeString(a.Origin.Signature)
 		if a.EditProvenance != nil || a.Origin.Kind != "generated" || generated == "" || a.Origin.PlanDigest != generated || a.Plan.Digest != generated || policy.GeneratorPurpose == "" || a.Origin.Purpose != policy.GeneratorPurpose || !ok || record.Purpose != policy.GeneratorPurpose || len(record.PublicKey) != ed25519.PublicKeySize || decodeErr != nil || !ed25519.Verify(record.PublicKey, []byte("autosql.artifact.generator/v1\x00"+a.Origin.GeneratorHash), sig) {
-			return VerifiedArtifact{}, fail("edits_forbidden", ErrInvalid)
+			return Artifact{}, fail("edits_forbidden", ErrInvalid)
 		}
 	}
 	attestations := a.ValidationAttestations
 	if a.EditProvenance != nil {
 		attestations = a.EditProvenance.Attestations
 	}
+	if purpose == verifyObservation && !observationAttestationsCurrent(attestations, now) {
+		return Artifact{}, fail("attestation_time", ErrInvalid)
+	}
 	if len(attestations) > 0 && len(policy.ExpectedValidationContextDigests) > 0 {
 		seen := map[string]bool{}
 		for _, att := range attestations {
 			expected, ok := policy.ExpectedValidationContextDigests[att.Stage]
 			if !ok || expected != att.ConfigDigest {
-				return VerifiedArtifact{}, fail("validation_context", ErrInvalid)
+				return Artifact{}, fail("validation_context", ErrInvalid)
 			}
 			seen[att.Stage] = true
 		}
 		if len(seen) != len(policy.ExpectedValidationContextDigests) {
-			return VerifiedArtifact{}, fail("validation_context", ErrInvalid)
+			return Artifact{}, fail("validation_context", ErrInvalid)
 		}
 	}
 	if len(attestations) > 0 && len(policy.ExpectedValidationAttestations) == 0 {
-		return VerifiedArtifact{}, fail("validation_attestation_manifest", ErrInvalid)
+		return Artifact{}, fail("validation_attestation_manifest", ErrInvalid)
 	}
 	if len(attestations) > 0 {
 		seen := map[string]bool{}
 		for _, got := range attestations {
 			want, ok := policy.ExpectedValidationAttestations[got.Stage]
 			if !ok || !reflect.DeepEqual(got.Simulation, want.Simulation) || !reflect.DeepEqual(got.Safety, want.Safety) || !reflect.DeepEqual(got.Policy, want.Policy) || !reflect.DeepEqual(got.Precheck, want.Precheck) || !reflect.DeepEqual(got.Editor, want.Editor) {
-				return VerifiedArtifact{}, fail("validation_attestation", ErrInvalid)
+				return Artifact{}, fail("validation_attestation", ErrInvalid)
 			}
 			seen[got.Stage] = true
 		}
 		if len(seen) != len(policy.ExpectedValidationAttestations) {
-			return VerifiedArtifact{}, fail("validation_attestation", ErrInvalid)
+			return Artifact{}, fail("validation_attestation", ErrInvalid)
 		}
 	}
 	if err := a.validateUnsigned(); err != nil {
-		return VerifiedArtifact{}, fail("structure", ErrInvalid)
+		return Artifact{}, fail("structure", ErrInvalid)
 	}
 	want, err := digest(a)
 	if err != nil || want != a.Digest {
-		return VerifiedArtifact{}, fail("digest", ErrInvalid)
+		return Artifact{}, fail("digest", ErrInvalid)
 	}
 	expected := policy.Expected
 	if expected.PlanDigest == "" || expected.ChecksDigest == "" || expected.GuardrailDigest == "" || expected.SourceRevision == "" || expected.Environment == "" || expected.DatabaseIdentity == "" || expected.ApprovalIdentity == "" || a.Plan.Digest != expected.PlanDigest || a.Checks.Digest != expected.ChecksDigest || a.GuardrailDigest != expected.GuardrailDigest || a.SourceRevision != expected.SourceRevision || a.TargetEnvironment != expected.Environment || a.DatabaseIdentity != expected.DatabaseIdentity || a.Approval.Identity != expected.ApprovalIdentity {
-		return VerifiedArtifact{}, fail("binding", ErrInvalid)
+		return Artifact{}, fail("binding", ErrInvalid)
 	}
 	if expected.ApprovalProofDigest != "" && a.Approval.ProofDigest != expected.ApprovalProofDigest {
-		return VerifiedArtifact{}, fail("approval_proof", ErrInvalid)
+		return Artifact{}, fail("approval_proof", ErrInvalid)
 	}
 	changeDigest, ce := guardrail.ChangeDigest(a.Plan.Changes)
 	if ce != nil || changeDigest != a.Checks.ChangeDigest {
-		return VerifiedArtifact{}, fail("changes", ErrInvalid)
+		return Artifact{}, fail("changes", ErrInvalid)
 	}
 	var sql []string
 	for _, s := range a.Plan.Steps {
@@ -313,29 +337,29 @@ func (a Artifact) VerifyTrusted(policy VerifyPolicy) (VerifiedArtifact, error) {
 		}
 	}
 	if len(sql) != len(a.Checks.Statements) {
-		return VerifiedArtifact{}, fail("statements", ErrInvalid)
+		return Artifact{}, fail("statements", ErrInvalid)
 	}
 	for i := range sql {
 		if strings.TrimSuffix(a.Checks.Statements[i], ";") != sql[i] {
-			return VerifiedArtifact{}, fail("statements", ErrInvalid)
+			return Artifact{}, fail("statements", ErrInvalid)
 		}
 	}
 	if a.Signature.KeyID == "" || policy.Issuer == "" || policy.Identity == "" || policy.Purpose == "" {
-		return VerifiedArtifact{}, fail("identity", ErrInvalid)
+		return Artifact{}, fail("identity", ErrInvalid)
 	}
 	record, ok := policy.Keys[a.Signature.KeyID]
 	if !ok || len(record.PublicKey) != ed25519.PublicKeySize || record.Status != "active" || record.Issuer != policy.Issuer || record.Identity != policy.Identity || record.Environment != a.TargetEnvironment || record.Purpose != policy.Purpose || record.NotBefore.Location() != time.UTC || record.NotAfter.Location() != time.UTC || !record.NotAfter.After(record.NotBefore) || now.Before(record.NotBefore) || !now.Before(record.NotAfter) {
-		return VerifiedArtifact{}, fail("key", ErrInvalid)
+		return Artifact{}, fail("key", ErrInvalid)
 	}
 	if a.Approval.ApprovedAt.After(a.CreatedAt) || a.Approval.ApprovedAt.After(now) {
-		return VerifiedArtifact{}, fail("approval_time", ErrInvalid)
+		return Artifact{}, fail("approval_time", ErrInvalid)
 	}
 	if a.Signature.Algorithm != "Ed25519" {
-		return VerifiedArtifact{}, fail("algorithm", ErrInvalid)
+		return Artifact{}, fail("algorithm", ErrInvalid)
 	}
 	sig, e := base64.RawStdEncoding.Strict().DecodeString(a.Signature.Value)
 	if e != nil || !ed25519.Verify(record.PublicKey, []byte(signatureDomain+a.Digest), sig) {
-		return VerifiedArtifact{}, fail("signature", ErrInvalid)
+		return Artifact{}, fail("signature", ErrInvalid)
 	}
 	// Freshness is validated last, after every authenticity check (bindings,
 	// signing-key record/status/validity, and signature). An ErrExpired result
@@ -343,22 +367,23 @@ func (a Artifact) VerifyTrusted(policy VerifyPolicy) (VerifiedArtifact, error) {
 	// current policy — a revoked key or tampered signature returns ErrInvalid
 	// here, never ErrExpired — so callers may treat a lapsed lifetime, and only a
 	// lapsed lifetime, as non-fatal for an already-applied no-op.
-	if now.Before(a.CreatedAt) || !now.Before(a.ExpiresAt) {
-		return VerifiedArtifact{}, fail("time", ErrExpired)
+	if now.Before(a.CreatedAt) || purpose == verifyExecution && !now.Before(a.ExpiresAt) {
+		return Artifact{}, fail("time", ErrExpired)
 	}
 	b, marshalErr := a.MarshalCanonical()
 	if marshalErr != nil {
-		return VerifiedArtifact{}, fail("clone", ErrInvalid)
+		return Artifact{}, fail("clone", ErrInvalid)
 	}
 	immutable, parseErr := Parse(b)
 	if parseErr != nil || immutable.validateStored() != nil {
-		return VerifiedArtifact{}, fail("clone", ErrInvalid)
+		return Artifact{}, fail("clone", ErrInvalid)
 	}
-	v := VerifiedArtifact{artifact: immutable}
-	v.marker = verifiedMarker(immutable)
-	return v, nil
+	return immutable, nil
 }
 func (a Artifact) validateUnsigned() error {
+	if _, _, err := a.ProjectInputDigest(); err != nil {
+		return err
+	}
 	if a.Version != Version || a.SourceRevision == "" || a.TargetEnvironment == "" || a.DatabaseIdentity == "" || a.GuardrailDigest == "" || a.Approval.Identity == "" || a.Metadata == nil || a.CreatedAt.IsZero() || !a.ExpiresAt.After(a.CreatedAt) || a.Approval.ApprovedAt.IsZero() || a.Approval.ApprovedAt.After(a.CreatedAt) || a.CreatedAt.Location() != time.UTC || a.ExpiresAt.Location() != time.UTC || a.Approval.ApprovedAt.Location() != time.UTC || (a.Origin.Kind != "unattested" && a.Origin.Kind != "generated" && a.Origin.Kind != "edited") || a.Origin.PlanDigest != a.Plan.Digest || a.Origin.Generator == "" || a.Origin.GeneratorHash != originHash(a.Origin) {
 		return fmt.Errorf("%w: required metadata", ErrInvalid)
 	}

@@ -94,6 +94,9 @@ type Guardrail struct {
 }
 
 type Input struct {
+	// ProjectInputDigest binds current inspected project inputs to approval.
+	// Empty retains the exact legacy bundle representation.
+	ProjectInputDigest string
 	Changes            schema.ChangeSet
 	Safety             safety.Input
 	Policy             policy.Document
@@ -158,6 +161,7 @@ type enforcementBundle struct {
 	Suppressions       []safety.Suppression `json:"suppressions"`
 	ApprovalPolicy     approval.Policy      `json:"approval_policy"`
 	Statements         []StatementBinding   `json:"statements"`
+	ProjectInputDigest string               `json:"project_input_digest,omitempty"`
 }
 type canonicalExpiry struct {
 	Set bool   `json:"set"`
@@ -172,6 +176,9 @@ type analyzerIdentity struct{ Name, Concrete, Version, ConfigDigest string }
 
 // BundleDigest returns the one digest that approval.Plan.Digest must equal.
 func (g Guardrail) BundleDigest(in Input) (string, error) {
+	if in.ProjectInputDigest != "" && !validSHA256(in.ProjectInputDigest) {
+		return "", &BindingError{Field: "project input digest"}
+	}
 	if err := validateProduction(g, in); err != nil {
 		return "", err
 	}
@@ -190,6 +197,7 @@ func (g Guardrail) BundleDigest(in Input) (string, error) {
 		return "", err
 	}
 	bundle := enforcementBundle{Version: "autosql.guardrail.bundle/v1", ChangeDigest: changeDigest, PrecheckDigest: in.Precheck.Digest, Environment: g.Config.Environment, Author: in.Approval.Plan.Author, Requester: in.Approval.RequestedBy, PlanExpiry: canonicalPlanExpiry(in.Approval.Plan.ExpiresAt), Override: canonicalEmergencyOverride(in.Approval.Override), PolicyIdentity: in.PolicyIdentity, Policy: in.Policy, PolicyLimits: g.Policy.Limits, SchemaResources: in.SchemaResources, MigrationResources: in.MigrationResources, FailOn: g.Config.FailOn, Risk: g.Config.Risk, Target: in.Safety.Target, Thresholds: in.Safety.Thresholds, Analyzers: names, Suppressions: g.Safety.Suppressions, ApprovalPolicy: g.Approval.Policy, Statements: in.StatementBindings}
+	bundle.ProjectInputDigest = in.ProjectInputDigest
 	raw, err := json.Marshal(bundle)
 	if err != nil {
 		return "", fmt.Errorf("%w: bundle is not canonical JSON", ErrBinding)
@@ -339,10 +347,9 @@ func writeField(h hash.Hash, value string) {
 	_, _ = h.Write([]byte(value))
 }
 
-// Apply evaluates immutable/static controls first. Approval.Gate durably audits
-// authorization before invoking its callback; only that callback may begin the
-// database transaction, acquire the lock, run checks, and execute statements.
-func (g Guardrail) Apply(ctx context.Context, in Input) (Result, error) {
+// evaluate checks the exact signed bundle, safety, and policy without database
+// access or approval audit writes. Both apply and observation use these checks.
+func (g Guardrail) evaluate(ctx context.Context, in Input) (Result, error) {
 	var result Result
 	if err := ctx.Err(); err != nil {
 		return result, err
@@ -412,6 +419,32 @@ func (g Guardrail) Apply(ctx context.Context, in Input) (Result, error) {
 	}
 	if len(violations) > 0 {
 		return result, &PolicyError{Count: len(violations)}
+	}
+	return result, nil
+}
+
+// ObserveAuthorization rechecks current authorization without granting an
+// execution capability. It never invokes Database or Mutation, even if supplied.
+func (g Guardrail) ObserveAuthorization(ctx context.Context, in Input) (Result, error) {
+	result, err := g.evaluate(ctx, in)
+	if err != nil {
+		return result, err
+	}
+	req := in.Approval
+	req.Plan.Risk = result.Risk
+	if _, err := g.Approval.EvaluateForObservation(ctx, req); err != nil {
+		return result, stageError(ErrApproval, "observation authorization", err)
+	}
+	return result, nil
+}
+
+// Apply evaluates immutable/static controls first. Approval.Gate durably audits
+// authorization before invoking its callback; only that callback may begin the
+// database transaction, acquire the lock, run checks, and execute statements.
+func (g Guardrail) Apply(ctx context.Context, in Input) (Result, error) {
+	result, err := g.evaluate(ctx, in)
+	if err != nil {
+		return result, err
 	}
 	if in.Database == nil && in.Mutation == nil {
 		return result, stageError(ErrConfig, "database", nil)

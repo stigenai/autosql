@@ -22,6 +22,7 @@ const (
 )
 
 type Error struct {
+	Data                                       any
 	Kind                                       string
 	Message                                    string
 	Code                                       ExitCode
@@ -36,10 +37,10 @@ func (e *Error) Unwrap() error { return e.Cause }
 
 func classify(err error, fallback *Error) *Error {
 	if errors.Is(err, context.DeadlineExceeded) {
-		return &Error{Kind: "timeout", Message: "operation timed out", Code: ExitTimeout, Cause: err}
+		return contextualError(err, "timeout", "operation timed out", ExitTimeout)
 	}
 	if errors.Is(err, context.Canceled) {
-		return &Error{Kind: "canceled", Message: "operation canceled", Code: ExitCanceled, Cause: err}
+		return contextualError(err, "canceled", "operation canceled", ExitCanceled)
 	}
 	var ce *Error
 	if errors.As(err, &ce) {
@@ -53,4 +54,16 @@ func classify(err error, fallback *Error) *Error {
 		return fallback
 	}
 	return &Error{Kind: "internal", Message: "internal error", Code: ExitInternal, Cause: err}
+}
+
+// Preserve structured outcomes and recovery paths when cancellation determines
+// the exit status after partial execution and cleanup.
+func contextualError(err error, kind, message string, code ExitCode) *Error {
+	result := Error{}
+	var existing *Error
+	if errors.As(err, &existing) {
+		result = *existing
+	}
+	result.Kind, result.Message, result.Code, result.Cause = kind, message, code, err
+	return &result
 }
