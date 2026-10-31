@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -135,6 +136,7 @@ type Status struct {
 	RetryCount             int         `json:"retryCount,omitempty"`
 	AppliedFingerprint     string      `json:"appliedFingerprint,omitempty"`
 	AuthorizationExpiresAt time.Time   `json:"authorizationExpiresAt,omitempty"`
+	CompletionObservedAt   time.Time   `json:"completionObservedAt,omitempty"`
 }
 type RuntimeReferenceBinding struct {
 	ResourceVersion string `json:"resourceVersion,omitempty"`
@@ -142,6 +144,7 @@ type RuntimeReferenceBinding struct {
 }
 type Resource struct {
 	Name               string
+	UID                string
 	MetadataGeneration int64
 	Spec               Spec
 	Status             Status
@@ -158,15 +161,28 @@ type Resource struct {
 	MaintenanceDatabaseBinding     RuntimeReferenceBinding   `json:"-"`
 	AuthorizationManifestBinding   RuntimeReferenceBinding   `json:"-"`
 	AuthorizationPublicKeyBinding  RuntimeReferenceBinding   `json:"-"`
+	// CompletionRequired selects observation only, never a new execution. The
+	// controller sets it after authenticating an elapsed release or lost status.
+	CompletionRequired bool `json:"-"`
+	// ExecutionMayHaveStarted requires intact pre-execution audit for a fresh retry.
+	ExecutionMayHaveStarted bool `json:"-"`
 }
 type Record struct {
 	Status                  Status
 	ApplyingKey, AppliedKey string
 }
 type Store interface {
+	// Load returns an independent snapshot that callers may modify.
 	Load(string) (Record, bool)
+	// Save takes its own snapshot; an error must leave the prior record intact.
 	Save(string, Record) error
 }
+
+func cloneRecord(record Record) Record {
+	record.Status.Conditions = slices.Clone(record.Status.Conditions)
+	return record
+}
+
 type MemoryStore struct {
 	mu sync.Mutex
 	m  map[string]Record
@@ -177,12 +193,12 @@ func (s *MemoryStore) Load(k string) (Record, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r, ok := s.m[k]
-	return r, ok
+	return cloneRecord(r), ok
 }
 func (s *MemoryStore) Save(k string, r Record) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.m[k] = r
+	s.m[k] = cloneRecord(r)
 	return nil
 }
 
@@ -210,11 +226,13 @@ type ApplyResult struct {
 
 type ApplyFunc func(context.Context, Resource, string) (ApplyResult, error)
 type Reconciler struct {
-	Store  Store
-	Leader Leader
-	Apply  ApplyFunc
-	Now    func() time.Time
-	mu     sync.Mutex
+	Store   Store
+	Leader  Leader
+	Apply   ApplyFunc
+	Observe CompletionFunc
+	Probe   ExecutionProbe
+	Now     func() time.Time
+	mu      sync.Mutex
 }
 
 func (r *Reconciler) Reconcile(ctx context.Context, obj Resource, approved bool) (Status, error) {
@@ -233,53 +251,77 @@ func (r *Reconciler) Reconcile(ctx context.Context, obj Resource, approved bool)
 	if r.Now != nil {
 		now = r.Now().UTC()
 	}
+	generation := resourceGeneration(obj)
 	key := applyKey(obj)
-	old, _ := r.Store.Load(obj.Name)
+	old, exists := r.Store.Load(obj.Name)
+	if !exists {
+		// Preserve historical status without trusting it as an execution key.
+		old.Status = obj.Status
+	}
+	if obj.Status.RetryCount > old.Status.RetryCount {
+		old.Status.RetryCount = obj.Status.RetryCount
+	}
 	st := old.Status
 	if obj.Spec.Suspend {
-		st.ObservedGeneration = obj.Spec.Generation
-		if obj.MetadataGeneration > 0 {
-			st.ObservedGeneration = obj.MetadataGeneration
-		}
-		st = condition(st, Ready, "Suspended", "reconciliation is suspended", obj.Spec.Generation, now)
-		_ = r.Store.Save(obj.Name, Record{Status: st, AppliedKey: old.AppliedKey, ApplyingKey: old.ApplyingKey})
-		return st, nil
+		st.ObservedGeneration = generation
+		st = condition(st, Ready, "Suspended", "reconciliation is suspended", generation, now)
+		return r.saveCheckpoint(obj, Record{Status: st, AppliedKey: old.AppliedKey, ApplyingKey: old.ApplyingKey}, old, PersistencePreApply, now)
 	}
-	if old.AppliedKey == key && (st.AuthorizationExpiresAt.IsZero() || now.Before(st.AuthorizationExpiresAt)) {
-		if len(st.Conditions) > 0 && st.Conditions[len(st.Conditions)-1].Type == Ready && st.Conditions[len(st.Conditions)-1].Reason == "Suspended" {
+	if !obj.CompletionRequired && (!obj.Spec.RequireApproval || approved) && old.AppliedKey == key && (st.AuthorizationExpiresAt.IsZero() || now.Before(st.AuthorizationExpiresAt)) {
+		if resumedCheckpoint(st) {
 			reason, message := "Applied", "resource is converged"
-			if obj.Spec.AdoptionPolicy == AdoptIfEquivalent {
+			if !st.CompletionObservedAt.IsZero() {
+				reason, message = "CompletionRecovered", "completed execution verified; no SQL executed"
+			} else if obj.Spec.AdoptionPolicy == AdoptIfEquivalent {
 				reason, message = "Adopted", "existing database matches desired schema; no SQL executed"
 			}
-			st = condition(st, Ready, reason, message, obj.Spec.Generation, now)
-			_ = r.Store.Save(obj.Name, Record{Status: st, AppliedKey: old.AppliedKey, ApplyingKey: old.ApplyingKey})
+			st = condition(st, Ready, reason, message, generation, now)
+			return r.saveCheckpoint(obj, Record{Status: st, AppliedKey: old.AppliedKey, ApplyingKey: old.ApplyingKey}, old, PersistencePreApply, now)
 		}
 		return st, nil
 	}
 	if err := validate(obj.Spec); err != nil {
+		st.RetryCount++
 		var authorizationErr *AuthorizationError
 		if errors.As(err, &authorizationErr) {
-			st = condition(st, Authorization, string(authorizationErr.State), authorizationErr.Error(), obj.Spec.Generation, now)
+			st = condition(st, Authorization, authorizationErr.Reason(), authorizationErr.Error(), generation, now)
 		} else {
-			st = condition(st, Failed, "Invalid", err.Error(), obj.Spec.Generation, now)
+			st = condition(st, Failed, "Invalid", "correct the resource configuration", generation, now)
 		}
-		_ = r.Store.Save(obj.Name, Record{Status: st})
-		return st, err
+		saved, saveErr := r.saveCheckpoint(obj, Record{Status: st, AppliedKey: old.AppliedKey, ApplyingKey: old.ApplyingKey}, old, PersistencePreApply, now)
+		return saved, errors.Join(err, saveErr)
 	}
-	st = condition(st, Planning, "PlanReady", "resource accepted", obj.Spec.Generation, now)
+	st = condition(st, Planning, "PlanReady", "resource accepted", generation, now)
 	if obj.Spec.RequireApproval && !approved {
-		st = condition(st, Approval, "AwaitingApproval", "approval is required", obj.Spec.Generation, now)
-		_ = r.Store.Save(obj.Name, Record{Status: st, ApplyingKey: key})
-		return st, nil
+		st = condition(st, Approval, "AwaitingApproval", "approval is required", generation, now)
+		return r.saveCheckpoint(obj, Record{Status: st, AppliedKey: old.AppliedKey, ApplyingKey: key}, old, PersistencePreApply, now)
+	}
+	parts := strings.SplitN(old.ApplyingKey, "/", 4)
+	attemptMatches := len(parts) == 4 && parts[2] == obj.Spec.ArtifactDigest
+	obj.ExecutionMayHaveStarted = obj.ExecutionMayHaveStarted || attemptMatches && (old.Status.RecoveryState == "pending" || old.Status.RecoveryState == "uncertain") || old.Status.ExecutionID == obj.Spec.ArtifactDigest
+	recover := r.Observe != nil && ordinaryDeclarative(obj) && (old.Status.AppliedDigest == obj.Spec.ArtifactDigest || obj.ExecutionMayHaveStarted && old.Status.RecoveryState == "uncertain" || r.Probe == nil && old.ApplyingKey == key && (old.Status.RecoveryState == "pending" || old.Status.RecoveryState == "uncertain" || !old.Status.CompletionObservedAt.IsZero()))
+	if obj.CompletionRequired || recover {
+		return r.recoverCompletion(ctx, obj, old, now)
+	}
+	if ordinaryDeclarative(obj) && r.Probe != nil {
+		check := r.Probe(ctx, obj)
+		if check.Failure.Outcome != "" {
+			return r.completionFailure(obj, old, check.Failure, now)
+		}
+		if check.Started {
+			return r.recoverCompletion(ctx, obj, old, now)
+		}
 	}
 	applyingReason, applyingMessage := "ApplyStarted", "applying artifact"
 	if obj.Spec.AdoptionPolicy == AdoptIfEquivalent {
 		applyingReason, applyingMessage = "AdoptionStarted", "verifying existing database against desired schema"
 	}
-	st = condition(st, Applying, applyingReason, applyingMessage, obj.Spec.Generation, now)
+	st = condition(st, Applying, applyingReason, applyingMessage, generation, now)
 	st.OperationID = operationID(key)
 	st.RecoveryState = "pending"
-	_ = r.Store.Save(obj.Name, Record{Status: st, ApplyingKey: key})
+	if saved, err := r.saveCheckpoint(obj, Record{Status: st, AppliedKey: old.AppliedKey, ApplyingKey: key}, old, PersistencePreApply, now); err != nil {
+		return saved, err
+	}
 	outcome, err := r.Apply(ctx, obj, obj.Spec.ArtifactDigest)
 	st.PlanDigest = outcome.PlanDigest
 	st.TargetIdentity = outcome.TargetIdentity
@@ -291,38 +333,35 @@ func (r *Reconciler) Reconcile(ctx context.Context, obj Resource, approved bool)
 		st.RecoveryState = "uncertain"
 	}
 	if outcome.AuthorizationState == AuthorizationAccepted {
-		st = condition(st, Authorization, string(AuthorizationAccepted), "bootstrap authorization accepted", obj.Spec.Generation, now)
+		st = condition(st, Authorization, string(AuthorizationAccepted), "bootstrap authorization accepted", generation, now)
 	}
 	if err != nil {
+		st.RetryCount++
 		var authorizationErr *AuthorizationError
 		if errors.As(err, &authorizationErr) {
-			st = condition(st, Authorization, string(authorizationErr.State), authorizationErr.Error(), obj.Spec.Generation, now)
-			_ = r.Store.Save(obj.Name, Record{Status: st, ApplyingKey: key})
-			return st, err
+			st = condition(st, Authorization, authorizationErr.Reason(), authorizationErr.Error(), generation, now)
+			saved, saveErr := r.saveCheckpoint(obj, Record{Status: st, AppliedKey: old.AppliedKey, ApplyingKey: key}, old, PersistencePostApply, now)
+			return saved, errors.Join(err, saveErr)
 		}
-		st.RetryCount++
-		st = condition(st, Failed, "ApplyFailed", err.Error(), obj.Spec.Generation, now)
-		_ = r.Store.Save(obj.Name, Record{Status: st, ApplyingKey: key})
-		return st, err
+		st = condition(st, Failed, "ApplyFailed", "application did not complete; inspect execution evidence before retrying", generation, now)
+		saved, saveErr := r.saveCheckpoint(obj, Record{Status: st, AppliedKey: old.AppliedKey, ApplyingKey: key}, old, PersistencePostApply, now)
+		return saved, errors.Join(err, saveErr)
 	}
-	st.ObservedGeneration = obj.Spec.Generation
-	if obj.MetadataGeneration > 0 {
-		st.ObservedGeneration = obj.MetadataGeneration
-	}
+	st.ObservedGeneration = generation
 	st.AppliedDigest = obj.Spec.ArtifactDigest
 	if st.PlanDigest == "" {
 		st.PlanDigest = obj.Spec.ArtifactDigest
 	}
 	st.RecoveryState = "none"
 	st.AuthorizationExpiresAt = outcome.AuthorizationExpiresAt.UTC()
+	st.CompletionObservedAt = time.Time{}
 	st.AppliedFingerprint = appliedFingerprint(obj, outcome)
 	readyReason, readyMessage := "Applied", "resource is converged"
 	if obj.Spec.AdoptionPolicy == AdoptIfEquivalent {
 		readyReason, readyMessage = "Adopted", "existing database matches desired schema; no SQL executed"
 	}
-	st = condition(st, Ready, readyReason, readyMessage, obj.Spec.Generation, now)
-	_ = r.Store.Save(obj.Name, Record{Status: st, AppliedKey: key, ApplyingKey: key})
-	return st, nil
+	st = condition(st, Ready, readyReason, readyMessage, generation, now)
+	return r.saveCheckpoint(obj, Record{Status: st, AppliedKey: key, ApplyingKey: key}, old, PersistencePostApply, now)
 }
 
 func operationID(key string) string {
@@ -445,6 +484,7 @@ func exactNonEmpty(values ...string) bool {
 
 func applyKey(obj Resource) string {
 	raw, _ := json.Marshal(struct {
+		UID                    string                     `json:"uid,omitempty"`
 		Kind                   ResourceKind               `json:"kind"`
 		Generation             int64                      `json:"generation"`
 		Source                 Source                     `json:"source"`
@@ -459,13 +499,14 @@ func applyKey(obj Resource) string {
 		AdoptionPolicy         AdoptionPolicy             `json:"adoption_policy,omitempty"`
 		PostgresVersion        int                        `json:"postgres_version,omitempty"`
 		ConcurrentIndexes      bool                       `json:"concurrent_indexes,omitempty"`
+		RequireApproval        bool                       `json:"require_approval,omitempty"`
 		MetadataGeneration     int64                      `json:"metadata_generation"`
 		SourceBinding          RuntimeReferenceBinding    `json:"source_binding,omitempty"`
 		DatabaseBinding        RuntimeReferenceBinding    `json:"database_binding,omitempty"`
 		MaintenanceBinding     RuntimeReferenceBinding    `json:"maintenance_binding,omitempty"`
 		ManifestBinding        RuntimeReferenceBinding    `json:"manifest_binding,omitempty"`
 		PublicKeyBinding       RuntimeReferenceBinding    `json:"public_key_binding,omitempty"`
-	}{obj.Spec.Kind, obj.Spec.Generation, obj.Spec.Source, obj.Spec.ArtifactDigest, obj.Spec.DatabaseURL, obj.Spec.DatabaseIdentity, obj.Spec.MaintenanceDatabaseURL, obj.Spec.DatabaseTarget, obj.Spec.BootstrapAuthority, obj.Spec.BootstrapAuthorization, obj.Spec.CreateDatabase, obj.Spec.AdoptionPolicy, obj.Spec.PostgresVersion, obj.Spec.ConcurrentIndexes, obj.MetadataGeneration, obj.SourceBinding, obj.DatabaseBinding, obj.MaintenanceDatabaseBinding, obj.AuthorizationManifestBinding, obj.AuthorizationPublicKeyBinding})
+	}{obj.UID, obj.Spec.Kind, obj.Spec.Generation, obj.Spec.Source, obj.Spec.ArtifactDigest, obj.Spec.DatabaseURL, obj.Spec.DatabaseIdentity, obj.Spec.MaintenanceDatabaseURL, obj.Spec.DatabaseTarget, obj.Spec.BootstrapAuthority, obj.Spec.BootstrapAuthorization, obj.Spec.CreateDatabase, obj.Spec.AdoptionPolicy, obj.Spec.PostgresVersion, obj.Spec.ConcurrentIndexes, obj.Spec.RequireApproval, obj.MetadataGeneration, obj.SourceBinding, obj.DatabaseBinding, obj.MaintenanceDatabaseBinding, obj.AuthorizationManifestBinding, obj.AuthorizationPublicKeyBinding})
 	digest := sha256.Sum256(raw)
 	return fmt.Sprintf("%s/%d/%s/%s", obj.Spec.Kind, obj.Spec.Generation, obj.Spec.ArtifactDigest, hex.EncodeToString(digest[:]))
 }
@@ -504,4 +545,21 @@ func condition(s Status, typ ConditionType, reason, msg string, g int64, at time
 	}
 	s.Conditions = append(conditions, next)
 	return s
+}
+
+func resumedCheckpoint(status Status) bool {
+	if len(status.Conditions) == 0 {
+		return false
+	}
+	last := status.Conditions[len(status.Conditions)-1]
+	return last.Type == Ready && last.Reason == "Suspended" || last.Type == Approval
+}
+
+func (e *AuthorizationError) Reason() string {
+	switch e.State {
+	case AuthorizationMissing, AuthorizationInvalid, AuthorizationStale, AuthorizationAccepted:
+		return string(e.State)
+	default:
+		return string(AuthorizationInvalid)
+	}
 }

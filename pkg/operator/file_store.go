@@ -39,14 +39,18 @@ func (s *FileStore) Load(key string) (Record, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r, ok := s.records[key]
-	return r, ok
+	return cloneRecord(r), ok
 }
 
 func (s *FileStore) Save(key string, record Record) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.records[key] = record
-	raw, err := json.Marshal(s.records)
+	records := make(map[string]Record, len(s.records)+1)
+	for k, v := range s.records {
+		records[k] = v
+	}
+	records[key] = cloneRecord(record)
+	raw, err := json.Marshal(records)
 	if err != nil {
 		return err
 	}
@@ -68,5 +72,9 @@ func (s *FileStore) Save(key string, record Record) error {
 	if err != nil {
 		return err
 	}
-	return os.Rename(tmpName, s.path)
+	if err := os.Rename(tmpName, s.path); err != nil {
+		return err
+	}
+	s.records = records
+	return nil
 }

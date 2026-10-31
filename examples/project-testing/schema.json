@@ -1,0 +1,77 @@
+{
+  "graph": {
+    "resources": [
+      {
+        "dependencies": [
+          {
+            "target": "table:c655bab8c209f0653b0e207c",
+            "type": "contains"
+          }
+        ],
+        "id": "column:7a0802ebd058e84aeaec1cc8",
+        "kind": "column",
+        "name": {
+          "name": "id",
+          "parent": "table:c655bab8c209f0653b0e207c",
+          "schema": "project_demo"
+        },
+        "spec": {
+          "not_null": true,
+          "ordinal": 1,
+          "type": "bigint"
+        }
+      },
+      {
+        "dependencies": [
+          {
+            "target": "table:c655bab8c209f0653b0e207c",
+            "type": "contains"
+          }
+        ],
+        "id": "column:f118ed7ac7e860a8405a59b3",
+        "kind": "column",
+        "name": {
+          "name": "label",
+          "parent": "table:c655bab8c209f0653b0e207c",
+          "schema": "project_demo"
+        },
+        "spec": {
+          "default": "'preserved'",
+          "not_null": true,
+          "ordinal": 2,
+          "type": "text"
+        }
+      },
+      {
+        "id": "schema:d31b0b2f211f9a5e9a4ea6d0",
+        "kind": "schema",
+        "name": {
+          "name": "project_demo"
+        },
+        "spec": {}
+      },
+      {
+        "dependencies": [
+          {
+            "target": "schema:d31b0b2f211f9a5e9a4ea6d0",
+            "type": "contains"
+          }
+        ],
+        "id": "table:c655bab8c209f0653b0e207c",
+        "kind": "table",
+        "name": {
+          "name": "accounts",
+          "parent": "schema:d31b0b2f211f9a5e9a4ea6d0",
+          "schema": "project_demo"
+        },
+        "spec": {
+          "force_row_security": false,
+          "partitioned": false,
+          "persistence": "p",
+          "row_security": false
+        }
+      }
+    ]
+  },
+  "version": "autosql.schema/v1"
+}

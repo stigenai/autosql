@@ -37,6 +37,7 @@ type applyConfig struct {
 	KeyNotBefore, KeyNotAfter                                                                                                                                                 time.Time
 	NoEdits                                                                                                                                                                   bool
 	GeneratorKeyID, GeneratorPublicKey, GeneratorPurpose                                                                                                                      string
+	AutomationApprovalKeyID, AutomationApprovalPublicKey                                                                                                                      string
 	ExpectedValidationContextDigests                                                                                                                                          map[string]string
 	ExpectedValidationAttestations                                                                                                                                            map[string]artifact.ValidationAttestation
 	EditorIdentity, EditSigningKeyID, EditSigningKeyReference, DevelopmentURLReference, FreshApprovalIdentity, FreshApprovalProofDigest                                       string
@@ -48,6 +49,7 @@ type applyConfig struct {
 	WorkloadIdentity                                                                                                                                                          *workloadidentity.Binding
 }
 type migrationTrust struct {
+	Project                  *projectReleaseVerification
 	Expected                 artifact.ExpectedBindings
 	ValidationContextDigests map[string]string
 	ValidationAttestations   map[string]artifact.ValidationAttestation
@@ -57,6 +59,7 @@ type migrationTrust struct {
 	SchemaPolicyResources    []policy.Resource
 	MigrationPolicyResources []policy.Resource
 	ApprovalIdentities       map[string]approval.Identity
+	ApprovalEvidence         []approval.Approval
 	// SafetySuppressions carries the publishing configuration's pre-approved
 	// safety findings so apply recomputes the identical guardrail bundle and
 	// its safety re-run reaches the same suppressed verdicts. Empty for
@@ -134,7 +137,7 @@ func ProductionServicesForURL(databaseURL string) (Services, error) {
 // credential. This is used by controllers that must authenticate immutable
 // release input before reading runtime Secrets.
 func VerifyProductionArtifactForApply(a artifact.Artifact, mandatoryNoEdits bool) (artifact.VerifiedArtifact, error) {
-	services, err := ProductionServicesForURL("postgres://autosql-verification.invalid/postgres")
+	services, err := productionVerificationServices()
 	if err != nil {
 		return artifact.VerifiedArtifact{}, err
 	}
@@ -145,6 +148,22 @@ func VerifyProductionArtifactForApply(a artifact.Artifact, mandatoryNoEdits bool
 		return artifact.VerifiedArtifact{}, errors.New("production artifact verification service is unavailable")
 	}
 	return verifier.VerifyArtifactForApply(a, mandatoryNoEdits)
+}
+
+// VerifyProductionArtifactForObservation authenticates a release for inspection
+// through the current production policy without resolving database credentials.
+func VerifyProductionArtifactForObservation(a artifact.Artifact, mandatoryNoEdits bool) (artifact.VerifiedObservation, error) {
+	services, err := productionVerificationServices()
+	if err != nil {
+		return artifact.VerifiedObservation{}, err
+	}
+	verifier, ok := services.Apply.(interface {
+		VerifyArtifactForObservation(artifact.Artifact, bool) (artifact.VerifiedObservation, error)
+	})
+	if !ok {
+		return artifact.VerifiedObservation{}, errors.New("production observation verification service is unavailable")
+	}
+	return verifier.VerifyArtifactForObservation(a, mandatoryNoEdits)
 }
 
 func productionServices(connector executor.Connector) (Services, error) {
@@ -203,6 +222,14 @@ func resolveApplyDatabaseURL(ctx context.Context, c applyConfig, override string
 }
 
 func productionServicesWithURL(connector executor.Connector, databaseURLOverride string) (Services, error) {
+	return productionServicesForMode(connector, databaseURLOverride, false)
+}
+
+func productionVerificationServices() (Services, error) {
+	return productionServicesForMode(executor.PGXConnector{}, "postgres://autosql-verification.invalid/postgres", true)
+}
+
+func productionServicesForMode(connector executor.Connector, databaseURLOverride string, verificationOnly bool) (Services, error) {
 	path := os.Getenv("AUTOSQL_APPLY_CONFIG")
 	if path == "" {
 		return Services{ReadPlan: DefaultReadPlan{}, Apply: refusingApply{}}, nil
@@ -241,7 +268,7 @@ func productionServicesWithURL(connector executor.Connector, databaseURLOverride
 	g := guardrail.Guardrail{Config: guardrail.Config{Environment: c.Environment, FailOn: safety.SeverityError, Risk: guardrail.RiskConfig{Baseline: approval.RiskLow}}, Safety: safety.Runner{Analyzers: safety.Builtins()}, Policy: policy.Evaluator{}, Approval: approval.Gate{Policy: ap, Authority: authority, Audit: &approval.Chain{Sink: &approval.FileSink{Path: c.ApprovalAuditPath}}}}
 	dynamicPolicies := map[string]artifact.VerifyPolicy{}
 	var dynamicPolicyMu sync.RWMutex
-	policyFor := func(a artifact.Artifact) (artifact.VerifyPolicy, error) {
+	basePolicyFor := func(a artifact.Artifact) (artifact.VerifyPolicy, error) {
 		dynamicPolicyMu.RLock()
 		dynamic, dynamicOK := dynamicPolicies[a.Digest]
 		dynamicPolicyMu.RUnlock()
@@ -274,6 +301,18 @@ func productionServicesWithURL(connector executor.Connector, databaseURLOverride
 		}
 		return vp, nil
 	}
+	policyFor := func(a artifact.Artifact) (artifact.VerifyPolicy, error) {
+		vp, err := basePolicyFor(a)
+		if err != nil {
+			return artifact.VerifyPolicy{}, err
+		}
+		trusted := c.TrustedMigrations[a.Digest]
+		vp.ExpectedProjectInputDigest, err = verifyCurrentProjectRelease(a, trusted.Project, path, c.PostgresVersion, trusted.Policy)
+		if err == nil {
+			err = verifyProjectApprovalLifetime(a, c, trusted)
+		}
+		return vp, err
+	}
 	input := func(a artifact.Artifact) (guardrail.Input, error) {
 		doc := policy.Document{Version: policy.LanguageVersion, Rules: []policy.Rule{{Name: "configured apply", Target: "all", Assert: policy.Expression{Eq: []any{true, true}}, Message: "apply allowed"}}}
 		policyIdentity := "production-config/v1"
@@ -291,12 +330,19 @@ func productionServicesWithURL(connector executor.Connector, databaseURLOverride
 				approvals = append(approvals, approval.Approval{Approver: identity, ApprovedAt: a.Approval.ApprovedAt, ExpiresAt: a.ExpiresAt, Proof: a.Approval.ProofDigest, PlanDigest: a.GuardrailDigest, Environment: a.TargetEnvironment})
 			}
 		}
+		if trusted, ok := c.TrustedMigrations[a.Digest]; ok && trusted.Project != nil && len(trusted.ApprovalEvidence) != 0 {
+			approvals = append([]approval.Approval(nil), trusted.ApprovalEvidence...)
+		}
 		si := safety.Input{Statements: a.Plan.SafetyStatements(), Target: safety.Target{Engine: "postgresql", Version: c.PostgresVersion}}
 		bindings, err := guardrail.BuildStatementBindings(a.Plan.Changes, si.Statements)
 		if err != nil {
 			return guardrail.Input{}, err
 		}
-		return guardrail.Input{Changes: a.Plan.Changes, Safety: si, Policy: doc, PolicyIdentity: policyIdentity, SchemaResources: schemaResources, MigrationResources: migrationResources, Precheck: a.Checks, Approval: approval.Request{Plan: approval.Plan{Digest: a.GuardrailDigest, Environment: a.TargetEnvironment, Author: c.Author, ExpiresAt: a.ExpiresAt}, Approvals: approvals, RequestedBy: c.Requester}, StatementBindings: bindings}, nil
+		projectDigest, _, err := a.ProjectInputDigest()
+		if err != nil {
+			return guardrail.Input{}, err
+		}
+		return guardrail.Input{ProjectInputDigest: projectDigest, Changes: a.Plan.Changes, Safety: si, Policy: doc, PolicyIdentity: policyIdentity, SchemaResources: schemaResources, MigrationResources: migrationResources, Precheck: a.Checks, Approval: approval.Request{Plan: approval.Plan{Digest: a.GuardrailDigest, Environment: a.TargetEnvironment, Author: c.Author, ExpiresAt: a.ExpiresAt}, Approvals: approvals, RequestedBy: c.Requester}, StatementBindings: bindings}, nil
 	}
 	lifecycle := &executor.FileAudit{Path: c.LifecycleAuditPath}
 	mutationForAttempt := func(v artifact.VerifiedArtifact, locked executor.Session, tx executor.Tx, attempt int) (guardrail.AuthorizedMutation, error) {
@@ -312,6 +358,9 @@ func productionServicesWithURL(connector executor.Connector, databaseURLOverride
 			managed = managedDoc
 		}
 		state := func(ctx context.Context, conn executor.Session) (executor.RuntimeState, error) {
+			if err := verifyProjectRuntimeTarget(ctx, a, conn); err != nil {
+				return executor.RuntimeState{}, err
+			}
 			var doc schema.Document
 			var err error
 			if rawTx := executor.RawPGXTx(tx); rawTx != nil {
@@ -395,9 +444,13 @@ func productionServicesWithURL(connector executor.Connector, databaseURLOverride
 		perArtifact := g
 		if trusted, ok := c.TrustedMigrations[a.Digest]; ok {
 			perArtifact.Safety.Suppressions = append([]safety.Suppression(nil), trusted.SafetySuppressions...)
+			perArtifact = projectApprovalGuardrail(a, c, trusted, perArtifact)
 		}
 		return perArtifact
 	}, Input: input, Mutation: mutation, MutationLocked: mutationFor, MutationLockedAttempt: mutationForAttempt, NoEdits: c.NoEdits, LifecycleAudit: lifecycle, RepairAuthorization: repairAuthorization}
+	if verificationOnly {
+		return Services{Apply: resolvingApply{verified: verified, completionConfig: &c}}, nil
+	}
 	var editService PlanEditService
 	if c.EditorIdentity != "" {
 		if c.EditorIdentity == c.Author || c.EditorIdentity == c.Requester {
@@ -436,8 +489,9 @@ func productionServicesWithURL(connector executor.Connector, databaseURLOverride
 }
 
 type resolvingApply struct {
-	verified  VerifiedArtifactApplyService
-	directory string
+	verified         VerifiedArtifactApplyService
+	directory        string
+	completionConfig *applyConfig
 }
 
 func (s resolvingApply) VerifyArtifact(a artifact.Artifact) (artifact.VerifiedArtifact, error) {
@@ -445,6 +499,9 @@ func (s resolvingApply) VerifyArtifact(a artifact.Artifact) (artifact.VerifiedAr
 }
 func (s resolvingApply) VerifyArtifactForApply(a artifact.Artifact, mandatoryNoEdits bool) (artifact.VerifiedArtifact, error) {
 	return s.verified.VerifyArtifactForApply(a, mandatoryNoEdits)
+}
+func (s resolvingApply) VerifyArtifactForObservation(a artifact.Artifact, mandatoryNoEdits bool) (artifact.VerifiedObservation, error) {
+	return s.verified.VerifyArtifactForObservation(a, mandatoryNoEdits)
 }
 func (s resolvingApply) ApplyVersioned(ctx context.Context, v artifact.VerifiedArtifact, session executor.Session, tx executor.Tx) (executor.ExternalExecution, error) {
 	return s.verified.ApplyVersioned(ctx, v, session, tx)

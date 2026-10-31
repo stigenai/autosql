@@ -32,6 +32,11 @@ func live(t *testing.T) (context.Context, *pgx.Conn, string, string, *zdm.Store)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = c.Close(cleanup)
+	})
 	if _, err = c.Exec(ctx, `select pg_catalog.pg_advisory_lock(pg_catalog.hashtextextended('autosql.expandplan.live-tests/v1',0::bigint))`); err != nil {
 		t.Fatal(err)
 	}
@@ -42,14 +47,16 @@ func live(t *testing.T) (context.Context, *pgx.Conn, string, string, *zdm.Store)
 	meta := fmt.Sprintf("ep_%d_%s", time.Now().UnixNano()%1e7, suffix)
 	app := meta + "_app"
 	q := func(s ...string) string { return pgx.Identifier(s).Sanitize() }
+	t.Cleanup(func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := c.Exec(cleanup, "drop schema if exists "+q(meta)+" cascade; drop schema if exists "+q(app)+" cascade"); err != nil {
+			t.Error(err)
+		}
+	})
 	if _, err = c.Exec(ctx, "create schema "+q(app)+"; create table "+q(app, "accounts")+"(id bigint primary key,name text); insert into "+q(app, "accounts")+" values(1,'a')"); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		_, _ = c.Exec(context.Background(), "drop schema if exists "+q(meta)+" cascade; drop schema if exists "+q(app)+" cascade")
-		_, _ = c.Exec(context.Background(), `select pg_catalog.pg_advisory_unlock(pg_catalog.hashtextextended('autosql.expandplan.live-tests/v1',0::bigint))`)
-		c.Close(context.Background())
-	})
 	s, err := zdm.Open(zdm.Config{URL: url, Schema: meta})
 	if err != nil {
 		t.Fatal(err)
@@ -65,7 +72,7 @@ func live(t *testing.T) (context.Context, *pgx.Conn, string, string, *zdm.Store)
 
 func TestLivePlanningIsReadOnlyAndFencedToBaseline(t *testing.T) {
 	ctx, c, meta, app, _ := live(t)
-	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	url := trackedPlanningURL(t, c, os.Getenv("AUTOSQL_TEST_POSTGRES_URL"))
 	var before int
 	if err := c.QueryRow(ctx, `select count(*) from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid=c.relnamespace where n.nspname=any($1)`, []string{meta, app}).Scan(&before); err != nil {
 		t.Fatal(err)
@@ -161,51 +168,113 @@ func TestLiveAdvisoryDomainExactlyCoordinatesMetadataSchema(t *testing.T) {
 func TestLiveConcurrentDDLWaitsAndPlanRefusesFreshSnapshot(t *testing.T) {
 	ctx, c, meta, app, _ := live(t)
 	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	hook := queuedDDLHook(t, ctx, c, url, app, "accounts")
+	_, err := expandplan.InspectLive(ctx, expandplan.InspectRequest{URL: trackedPlanningURL(t, c, url), MetadataSchema: meta, Target: "primary", Environment: "test", ArtifactDigest: "sha256:artifact", Schemas: []string{app}, BeforeFinalInspection: hook, Policy: livePolicy()})
+	if !errors.Is(err, expandplan.ErrRefused) || !strings.Contains(err.Error(), "conflicting relation change queued") {
+		t.Fatalf("concurrent DDL was not refused at the queued-change boundary: %v", err)
+	}
+}
+
+func queuedDDLHook(t *testing.T, ctx context.Context, c *pgx.Conn, url, app, relation string) func(context.Context) error {
+	t.Helper()
 	other, err := pgx.Connect(ctx, url)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = other.Close(context.Background()) })
+	ddlCtx, cancelDDL := context.WithCancel(context.Background())
+	finished := make(chan struct{})
+	started := false
+	// Register cancellation and joining before any assertion can terminate the
+	// test. Closing a connection during Exec races inside pgx.
+	t.Cleanup(func() {
+		cancelDDL()
+		if started {
+			select {
+			case <-finished:
+			case <-time.After(5 * time.Second):
+				t.Error("concurrent DDL goroutine did not terminate")
+				return
+			}
+		}
+		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = other.Close(cleanup)
+	})
 	var pid int
 	if err = other.QueryRow(ctx, "select pg_backend_pid()").Scan(&pid); err != nil {
 		t.Fatal(err)
 	}
-	done := make(chan error, 1)
-	ddlCtx, cancelDDL := context.WithCancel(context.Background())
-	hook := func(_ context.Context) error {
+	return func(hold context.Context) error {
+		started = true
 		go func() {
-			_, e := other.Exec(ddlCtx, "alter table "+pgx.Identifier{app, "accounts"}.Sanitize()+" add column concurrent_ddl text")
-			done <- e
+			defer close(finished)
+			_, _ = other.Exec(ddlCtx, "alter table "+pgx.Identifier{app, relation}.Sanitize()+" add column concurrent_ddl text")
 		}()
-		deadline := time.Now().Add(5 * time.Second)
-		for time.Now().Before(deadline) {
-			var waiting bool
-			e := c.QueryRow(ctx, `select coalesce(wait_event_type='Lock',false) from pg_catalog.pg_stat_activity where pid=$1`, pid).Scan(&waiting)
-			if e == nil && waiting {
-				return nil
+		return waitRelationLock(hold, c, pid, app, relation)
+	}
+}
+
+// Every connection opened by InspectLive inherits this application name. Check
+// its sessions are gone on all exits; session closure releases transaction locks.
+func trackedPlanningURL(t *testing.T, observer *pgx.Conn, raw string) string {
+	t.Helper()
+	u, err := neturl.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := fmt.Sprintf("autosql-planning-%d", time.Now().UnixNano())
+	query := u.Query()
+	query.Set("application_name", name)
+	u.RawQuery = query.Encode()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			var count int
+			if err := observer.QueryRow(ctx, `select count(*) from pg_catalog.pg_stat_activity where application_name=$1`, name).Scan(&count); err != nil {
+				t.Error(err)
+				return
 			}
-			time.Sleep(10 * time.Millisecond)
+			if count == 0 {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				t.Errorf("planning leaked %d sessions", count)
+				return
+			case <-ticker.C:
+			}
 		}
-		return fmt.Errorf("concurrent DDL did not wait on planning relation lock")
+	})
+	return u.String()
+}
+
+func waitRelationLock(ctx context.Context, c *pgx.Conn, pid int, namespace, relation string) error {
+	wait, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var waiting bool
+		err := c.QueryRow(wait, `select exists(select 1 from pg_catalog.pg_locks l join pg_catalog.pg_class r on r.oid=l.relation join pg_catalog.pg_namespace n on n.oid=r.relnamespace where l.database=(select oid from pg_catalog.pg_database where datname=current_database()) and l.pid=$1 and n.nspname=$2 and r.relname=$3 and l.locktype='relation' and l.mode='AccessExclusiveLock' and not l.granted)`, pid, namespace, relation).Scan(&waiting)
+		if err != nil {
+			return err
+		}
+		if waiting {
+			return nil
+		}
+		select {
+		case <-wait.Done():
+			return fmt.Errorf("concurrent DDL did not queue against the inspected relation: %w", wait.Err())
+		case <-ticker.C:
+		}
 	}
-	_, err = expandplan.InspectLive(ctx, expandplan.InspectRequest{URL: url, MetadataSchema: meta, Target: "primary", Environment: "test", ArtifactDigest: "sha256:artifact", Schemas: []string{app}, BeforeFinalInspection: hook, Policy: livePolicy()})
-	if err == nil {
-		t.Fatal("concurrent DDL produced a stale plan")
-	}
-	// Cancel the in-flight command, await its goroutine, and only then allow the
-	// connection cleanup to close the socket. Closing while Exec is active races
-	// inside pgx and does not model production cancellation.
-	cancelDDL()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("concurrent DDL goroutine did not terminate")
-	}
-	_ = other.Close(ctx)
 }
 
 func TestLivePlanningLockTimeoutIsActuallyBounded(t *testing.T) {
-	ctx, _, meta, app, _ := live(t)
+	ctx, c, meta, app, _ := live(t)
 	url := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
 	blocker, err := pgx.Connect(ctx, url)
 	if err != nil {
@@ -223,7 +292,7 @@ func TestLivePlanningLockTimeoutIsActuallyBounded(t *testing.T) {
 	policy := livePolicy()
 	policy.MaxLockMS = 25
 	started := time.Now()
-	_, err = expandplan.InspectLive(ctx, expandplan.InspectRequest{URL: url, MetadataSchema: meta, Target: "primary", Environment: "test", ArtifactDigest: "sha256:held", Schemas: []string{app}, Policy: policy})
+	_, err = expandplan.InspectLive(ctx, expandplan.InspectRequest{URL: trackedPlanningURL(t, c, url), MetadataSchema: meta, Target: "primary", Environment: "test", ArtifactDigest: "sha256:held", Schemas: []string{app}, Policy: policy})
 	elapsed := time.Since(started)
 	if err == nil || elapsed > time.Second || !strings.Contains(strings.ToLower(err.Error()), "lock timeout") {
 		t.Fatalf("bounded refusal elapsed=%v err=%v", elapsed, err)
@@ -237,36 +306,44 @@ func TestLivePlanningTotalHoldDeadlineReleasesCompetingDDL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer other.Close(ctx)
+	ddlCtx, cancelDDL := context.WithCancel(context.Background())
+	finished := make(chan struct{})
+	startedDDL := false
+	t.Cleanup(func() {
+		cancelDDL()
+		if startedDDL {
+			select {
+			case <-finished:
+			case <-time.After(5 * time.Second):
+				t.Error("deadline test leaked DDL goroutine")
+				return
+			}
+		}
+		_ = other.Close(context.Background())
+	})
 	var pid int
 	if err = other.QueryRow(ctx, "select pg_backend_pid()").Scan(&pid); err != nil {
 		t.Fatal(err)
 	}
 	done := make(chan error, 1)
 	hook := func(hold context.Context) error {
+		startedDDL = true
 		go func() {
-			_, e := other.Exec(context.Background(), "alter table "+pgx.Identifier{app, "accounts"}.Sanitize()+" add column hold_probe text")
+			defer close(finished)
+			_, e := other.Exec(ddlCtx, "alter table "+pgx.Identifier{app, "accounts"}.Sanitize()+" add column hold_probe text")
 			done <- e
 		}()
-		for {
-			select {
-			case <-hold.Done():
-				return hold.Err()
-			default:
-			}
-			var waiting bool
-			if e := c.QueryRow(ctx, `select coalesce(wait_event_type='Lock',false) from pg_catalog.pg_stat_activity where pid=$1`, pid).Scan(&waiting); e == nil && waiting {
-				<-hold.Done()
-				return hold.Err()
-			}
-			time.Sleep(5 * time.Millisecond)
+		if err := waitRelationLock(hold, c, pid, app, "accounts"); err != nil {
+			return err
 		}
+		<-hold.Done()
+		return hold.Err()
 	}
 	policy := livePolicy()
 	policy.MaxLockMS = 1000
 	policy.MaxLockHoldMS = 300
 	started := time.Now()
-	_, err = expandplan.InspectLive(ctx, expandplan.InspectRequest{URL: url, MetadataSchema: meta, Target: "primary", Environment: "test", ArtifactDigest: "sha256:hold", Schemas: []string{app}, Policy: policy, BeforeFinalInspection: hook})
+	_, err = expandplan.InspectLive(ctx, expandplan.InspectRequest{URL: trackedPlanningURL(t, c, url), MetadataSchema: meta, Target: "primary", Environment: "test", ArtifactDigest: "sha256:hold", Schemas: []string{app}, Policy: policy, BeforeFinalInspection: hook})
 	elapsed := time.Since(started)
 	var ddlErr error
 	select {
@@ -320,18 +397,22 @@ func TestLiveNonSuperuserIndexPlanningMatchesSchemaPermissionRefusal(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer admin.Close(ctx)
+	t.Cleanup(func() { _ = admin.Close(context.Background()) })
 	suffix := fmt.Sprint(time.Now().UnixNano() % 1e7)
 	role := "ep_role_" + suffix
 	meta := "ep_meta_" + suffix
 	app := "ep_app_" + suffix
 	q := func(s ...string) string { return pgx.Identifier(s).Sanitize() }
+	t.Cleanup(func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := admin.Exec(cleanup, "drop schema if exists "+q(meta)+" cascade; drop schema if exists "+q(app)+" cascade; drop role if exists "+q(role)); err != nil {
+			t.Error(err)
+		}
+	})
 	if _, err = admin.Exec(ctx, "create role "+q(role)+" login password 'ep_password'; create schema "+q(app)+"; revoke create on schema "+q(app)+" from public; create table "+q(app, "items")+"(id bigint primary key,name text); alter table "+q(app, "items")+" owner to "+q(role)+"; grant usage on schema "+q(app)+" to "+q(role)+"; revoke create on schema "+q(app)+" from "+q(role)); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		_, _ = admin.Exec(context.Background(), "drop schema if exists "+q(meta)+" cascade; drop schema if exists "+q(app)+" cascade; drop role if exists "+q(role))
-	})
 	store, err := zdm.Open(zdm.Config{URL: url, Schema: meta})
 	if err != nil {
 		t.Fatal(err)
@@ -355,7 +436,7 @@ func TestLiveNonSuperuserIndexPlanningMatchesSchemaPermissionRefusal(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer roleConn.Close(ctx)
+	t.Cleanup(func() { _ = roleConn.Close(context.Background()) })
 	var connectedAs string
 	var super bool
 	if err = roleConn.QueryRow(ctx, `select current_user,r.rolsuper from pg_catalog.pg_roles r where r.rolname=current_user`).Scan(&connectedAs, &super); err != nil || connectedAs != role || super {
@@ -364,7 +445,8 @@ func TestLiveNonSuperuserIndexPlanningMatchesSchemaPermissionRefusal(t *testing.
 	if _, err = roleConn.Exec(ctx, "create index "+q(app, "should_refuse")+" on "+q(app, "items")+"(name)"); err == nil {
 		t.Fatal("database unexpectedly allowed CREATE INDEX without schema CREATE")
 	}
-	snap, err := expandplan.InspectLive(ctx, expandplan.InspectRequest{URL: roleURL, MetadataSchema: meta, Target: "primary", Environment: "test", ArtifactDigest: "pending", Schemas: []string{app}, Policy: livePolicy()})
+	request := expandplan.InspectRequest{URL: trackedPlanningURL(t, admin, roleURL), MetadataSchema: meta, Target: "primary", Environment: "test", ArtifactDigest: "pending", Schemas: []string{app}, Policy: livePolicy()}
+	snap, err := expandplan.InspectLive(ctx, request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -379,5 +461,11 @@ func TestLiveNonSuperuserIndexPlanningMatchesSchemaPermissionRefusal(t *testing.
 	snap.ArtifactDigest = m.Digest
 	if _, err = expandplan.Build(expandplan.Request{Migration: m, Snapshot: snap, ExpectedFingerprint: snap.Fingerprint, Target: "primary", Environment: "test", Policy: expandplan.Policy{MaxLockMS: 100, MaxLockHoldMS: 1000, MaxStatementMS: 1000, MaxTransactionMS: 1000, AllowTableScan: true, AllowNonTransactional: true}, Verify: func(zerodowntime.Migration) error { return nil }}); !errors.Is(err, expandplan.ErrRefused) || !strings.Contains(err.Error(), "CREATE privilege") {
 		t.Fatalf("planner refusal=%v", err)
+	}
+	// This role has no monitoring membership or superuser capability. Lock
+	// identities remain visible even when another role's query text is hidden.
+	request.BeforeFinalInspection = queuedDDLHook(t, ctx, roleConn, url, app, "items")
+	if _, err = expandplan.InspectLive(ctx, request); !errors.Is(err, expandplan.ErrRefused) || !strings.Contains(err.Error(), "conflicting relation change queued") {
+		t.Fatalf("minimum-role queued-change refusal: %v", err)
 	}
 }

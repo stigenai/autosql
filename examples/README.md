@@ -22,6 +22,12 @@ constitution for their exact meaning.
 | <!-- feature:zero-downtime-migrations --> Expand/contract and zero-downtime migrations | [Format](../docs/zero-downtime-format.md), [compatibility](../docs/postgresql-zero-downtime-compatibility.md) | `go test ./pkg/zdm/... ./pkg/zerodowntime` |
 | <!-- feature:multi-dialect-contracts --> Multi-dialect capability contracts | [Multi-dialect](../docs/multi-dialect.md) | `go test ./pkg/dialect` |
 
+For a configuration-only example without services or credentials, see the
+[local/CI/production project](project-testing/README.md) and the
+[version-2 field contract](../docs/project-configuration.md).
+Run `go test ./examples/project-testing` to check equivalent JSON/HCL inputs and
+important rejection cases.
+
 ## Full live demos
 
 - [`hcl-postgres`](hcl-postgres/README.md) exercises HCL authoring, semantic

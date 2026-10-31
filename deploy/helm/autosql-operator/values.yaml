@@ -36,6 +36,14 @@ securityContext:
   runAsGroup: 65532
 
 leaderElection: true
+metrics:
+  enabled: true
+  port: 8080
+  service:
+    enabled: true
+healthProbe:
+  enabled: true
+  port: 8081
 watchNamespace: ""
 rbac:
   clusterWide: false

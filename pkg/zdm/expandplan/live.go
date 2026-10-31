@@ -12,6 +12,7 @@ import (
 	"autosql/pkg/postgres"
 	"autosql/pkg/schema"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 type InspectRequest struct {
@@ -34,12 +35,20 @@ func InspectLive(ctx context.Context, r InspectRequest) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("connect target: %w", err)
 	}
-	defer c.Close(context.WithoutCancel(ctx))
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_ = c.Close(cleanup)
+	}()
 	tx, err := c.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return Snapshot{}, err
 	}
-	defer tx.Rollback(context.WithoutCancel(ctx))
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_ = tx.Rollback(cleanup)
+	}()
 	if _, err = tx.Exec(ctx, `set local search_path=pg_catalog`); err != nil {
 		return Snapshot{}, err
 	}
@@ -239,19 +248,73 @@ func InspectLive(ctx context.Context, r InspectRequest) (Snapshot, error) {
 	if err != nil || finalFP != fp {
 		return Snapshot{}, refuse("schema changed during planning")
 	}
+	// Repeatable read cannot see a catalog commit after its first snapshot.
+	// Check queued conflicts before opening a fresh snapshot: otherwise that
+	// reader can itself wait behind DDL blocked by our ACCESS SHARE lock.
+	if err = rejectQueuedPlanningChange(holdCtx, tx, r.Schemas); err != nil {
+		return Snapshot{}, err
+	}
+	if err = compareFreshPlanningSchema(holdCtx, r, fp); err != nil {
+		return Snapshot{}, err
+	}
+	if err = rejectQueuedPlanningChange(holdCtx, tx, r.Schemas); err != nil {
+		return Snapshot{}, err
+	}
 	if err = tx.Commit(holdCtx); err != nil {
 		if errors.Is(holdCtx.Err(), context.DeadlineExceeded) {
 			return Snapshot{}, refuse("planning lock hold deadline exceeded")
 		}
 		return Snapshot{}, err
 	}
-	fresh, err := postgres.InspectURL(holdCtx, r.URL, postgres.Options{Schemas: r.Schemas})
-	if err != nil {
+	if err = compareFreshPlanningSchema(holdCtx, r, fp); err != nil {
 		return Snapshot{}, err
 	}
-	freshFP, err := schema.SemanticFingerprint(fresh)
-	if err != nil || freshFP != fp {
-		return Snapshot{}, refuse("schema changed at planning fence")
-	}
 	return s, nil
+}
+
+// Only ACCESS EXCLUSIVE conflicts with planning's ACCESS SHARE relation locks.
+// pg_locks exposes this evidence to ordinary roles; no query text or monitoring
+// privilege is needed. Relation OIDs are meaningful only in their database.
+func rejectQueuedPlanningChange(ctx context.Context, tx pgx.Tx, schemas []string) error {
+	var waiting bool
+	err := tx.QueryRow(ctx, `select exists (
+		select 1 from pg_catalog.pg_locks held
+		join pg_catalog.pg_locks waiting on waiting.database=held.database and waiting.relation=held.relation
+		join pg_catalog.pg_class c on c.oid=held.relation
+		join pg_catalog.pg_namespace n on n.oid=c.relnamespace
+		where held.database=(select oid from pg_catalog.pg_database where datname=current_database())
+		and held.pid=pg_backend_pid() and held.granted and held.locktype='relation' and held.mode='AccessShareLock'
+		and waiting.pid<>held.pid and not waiting.granted and waiting.locktype='relation' and waiting.mode='AccessExclusiveLock'
+		and n.nspname=any($1)
+	)`, schemas).Scan(&waiting)
+	if err != nil {
+		return planningInspectionFailure(ctx, err)
+	}
+	if waiting {
+		return refuse("conflicting relation change queued during planning; retry after schema changes finish")
+	}
+	return nil
+}
+
+func compareFreshPlanningSchema(ctx context.Context, r InspectRequest, expected string) error {
+	fresh, err := postgres.InspectURL(ctx, r.URL, postgres.Options{Schemas: r.Schemas})
+	if err != nil {
+		return planningInspectionFailure(ctx, err)
+	}
+	freshFP, err := schema.SemanticFingerprint(fresh)
+	if err != nil || freshFP != expected {
+		return refuse("schema changed at planning fence; refresh the trusted baseline before planning")
+	}
+	return nil
+}
+
+func planningInspectionFailure(ctx context.Context, err error) error {
+	if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
+		return errors.Join(refuse("planning inspection canceled"), context.Canceled)
+	}
+	var pgErr *pgconn.PgError
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) || errors.As(err, &pgErr) && (pgErr.Code == "57014" || pgErr.Code == "55P03") {
+		return refuse("planning inspection timeout; retry after conflicting activity finishes")
+	}
+	return refuse("planning inspection unavailable; restore database access before retrying")
 }

@@ -187,6 +187,7 @@ func parseSQL(ctx context.Context, uri, sqlText string, validate bool) (schema.D
 		}
 	}
 	ensureImplicitSchemas(resources)
+	bindInlineForeignKeys(resources)
 	for _, r := range resources {
 		doc.Graph.Resources = append(doc.Graph.Resources, r)
 	}
@@ -323,35 +324,24 @@ func parseCreateTable(rest string, loc *schema.SourceLocation) ([]schema.Resourc
 		if typeName == "" {
 			return nil, fmt.Errorf("column %s has no type", cn.Name)
 		}
-		nullable := !containsWords(attrs, "NOT NULL")
+		constraints, notNull, e := readInlineConstraints(item)
+		if e != nil {
+			return nil, e
+		}
+		nullable := !notNull
 		spec := map[string]any{"type": normalizeSpace(typeName), "nullable": nullable, "ordinal": ordinal}
-		if def := clauseValue(attrs, "DEFAULT", []string{"NOT NULL", "NULL", "PRIMARY KEY", "UNIQUE", "REFERENCES", "CHECK", "GENERATED"}); def != "" {
+		if def := clauseValue(attrs, "DEFAULT", []string{"NOT NULL", "NULL", "PRIMARY KEY", "UNIQUE", "REFERENCES", "CHECK", "GENERATED", "CONSTRAINT"}); def != "" {
 			spec["default"] = def
 		}
 		name := schema.Name{Schema: q.Schema, Name: cn.Name, Parent: table.ID}
 		col := newResource(schema.KindColumn, name, spec, loc, []schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}})
 		columns[cn.Name] = col.ID
 		out = append(out, col)
-		inline := []struct {
-			phrase string
-			kind   schema.Kind
-			suffix string
-		}{
-			{"PRIMARY KEY", schema.KindPrimaryKey, "pkey"},
-			{"UNIQUE", schema.KindUniqueConstraint, "key"},
-			{"REFERENCES", schema.KindForeignKey, "fkey"},
-			{"CHECK", schema.KindCheckConstraint, "check"},
+		resources, e := inlineConstraintResources(constraints, q, table, col, loc)
+		if e != nil {
+			return nil, e
 		}
-		for _, candidate := range inline {
-			if !containsWords(attrs, candidate.phrase) {
-				continue
-			}
-			constraintName := q.Name + "_" + cn.Name + "_" + candidate.suffix
-			out = append(out, newResource(candidate.kind,
-				schema.Name{Schema: q.Schema, Name: constraintName, Parent: table.ID},
-				map[string]any{"definition": normalizeSpace(candidate.phrase + " " + attrs)}, loc,
-				[]schema.Dependency{{Target: table.ID, Type: schema.DependencyContains}, {Target: col.ID, Type: schema.DependencyReferences}}))
-		}
+		out = append(out, resources...)
 	}
 	for _, item := range items {
 		item = strings.TrimSpace(item)
@@ -569,7 +559,7 @@ func splitTopLevel(s string, sep byte) []string {
 	return append(out, s[start:])
 }
 
-var columnClause = regexp.MustCompile(`(?i)\s+(NOT\s+NULL|NULL|DEFAULT|PRIMARY\s+KEY|UNIQUE|REFERENCES|CHECK|GENERATED)\b`)
+var columnClause = regexp.MustCompile(`(?i)\s+(NOT\s+NULL|NULL|DEFAULT|CONSTRAINT|PRIMARY\s+KEY|UNIQUE|REFERENCES|CHECK|GENERATED)\b`)
 
 func splitColumnType(s string) (string, string) {
 	s = strings.TrimSpace(s)

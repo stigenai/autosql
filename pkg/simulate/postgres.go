@@ -337,6 +337,19 @@ func runtimeIdentity(ctx context.Context, conn *pgx.Conn) (string, error) {
 	}
 	return net.JoinHostPort(address, fmt.Sprint(port)) + "/" + database + "#" + system, nil
 }
+
+// ResolvePostgresConnectionIdentity checks the already connected database,
+// including its cluster identity. It never resolves credentials or reconnects.
+func ResolvePostgresConnectionIdentity(ctx context.Context, conn *pgx.Conn) (string, error) {
+	if conn == nil {
+		return "", fail("identity_connection", ErrConfig)
+	}
+	id, err := runtimeIdentity(ctx, conn)
+	if err != nil {
+		return "", fail("identity_query", ErrLifecycle)
+	}
+	return id, nil
+}
 func sameResolvedEndpoint(dev *url.URL, production string) bool {
 	p, e := url.Parse(production)
 	if e != nil || p.Scheme == "" {

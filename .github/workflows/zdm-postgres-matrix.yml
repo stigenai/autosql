@@ -29,6 +29,19 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: scripts/test-live-serial.sh ./pkg/zdm/... ./internal/cli
+      - name: Test isolated schema and migration suites
+        env:
+          AUTOSQL_DBTEST_ADMIN_DSN: postgres://postgres:postgres@127.0.0.1:5432/autosql?sslmode=disable
+          AUTOSQL_DBTEST_DOCKER_ENDPOINT: unix:///var/run/docker.sock
+          AUTOSQL_DBTEST_POSTGRES_MAJOR: ${{ matrix.version }}
+        run: |
+          set -eu
+          AUTOSQL_DBTEST_POSTGRES_IMAGE="$(docker image inspect 'postgres:${{ matrix.version }}' --format '{{index .RepoDigests 0}}')"
+          export AUTOSQL_DBTEST_POSTGRES_IMAGE
+          printf 'Pinned fixture image: %s\n' "$AUTOSQL_DBTEST_POSTGRES_IMAGE"
+          go test -race ./pkg/dbtest ./internal/cli ./examples/project-testing -run '^(TestLanguageLive|TestSuiteLive|TestProjectTestLive|TestProjectExampleLive)' -count=1 -v -timeout 5m
+      - name: Qualify coordinated planning conflicts and stable controls
+        run: AUTOSQL_LIVE_COUNT=20 scripts/test-live-serial.sh ./pkg/zdm/expandplan -run '^TestLive(ConcurrentDDLWaitsAndPlanRefusesFreshSnapshot|PlanningIsReadOnlyAndFencedToBaseline)$' -timeout 3m
       - name: Test PostgreSQL default-expression matrix
         run: scripts/test-live-serial.sh ./pkg/postgres -run '^TestDefaultExpressionMatrixAdoptProvisionAndIncrement$'
       - name: Test PostgreSQL managed-comment lifecycle

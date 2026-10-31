@@ -4,7 +4,6 @@ import (
 	"autosql/pkg/approval"
 	"autosql/pkg/artifact"
 	"autosql/pkg/migrate"
-	"autosql/pkg/policy"
 	"autosql/pkg/precheck"
 	"autosql/pkg/secret"
 	"autosql/pkg/simulate"
@@ -18,8 +17,10 @@ import (
 
 func runMigrateGenerate(ctx context.Context, args []string, o output, reader ReadPlanService) error {
 	fs := newFlags("migrate generate", o.streams.Err)
+	project := fs.String("config", "", "version-2 project configuration")
+	environment := fs.String("env", "", "named project environment")
 	dir := fs.String("dir", "", "migration directory")
-	_ = fs.String("from", "", "deprecated untrusted current source")
+	from := fs.String("from", "", "deprecated untrusted current source")
 	to := fs.String("to", "", "desired source")
 	version := fs.String("version", "", "version")
 	label := fs.String("label", "", "label")
@@ -30,13 +31,20 @@ func runMigrateGenerate(ctx context.Context, args []string, o output, reader Rea
 	if e := fs.Parse(args); e != nil {
 		return usageError(e)
 	}
+	if fs.NArg() != 0 || (*environment != "" && *project == "") {
+		return usageError(errors.New("unexpected positional arguments or --env without --config"))
+	}
+	if *project != "" && *from != "" {
+		return usageError(errors.New("project generation replays the verified migration directory; --from is unsupported"))
+	}
 	if *trustedConfig != "" {
-		return runTrustedMigrateGenerate(ctx, trustedGenerateArgs{dir: *dir, to: *to, version: *version, label: *label, format: *format, hints: *hints, json: *jf, config: *trustedConfig}, o, reader)
+		return runTrustedMigrateGenerate(ctx, trustedGenerateArgs{project: *project, environment: *environment, dir: *dir, to: *to, version: *version, label: *label, format: *format, hints: *hints, json: *jf, config: *trustedConfig}, o, reader)
 	}
 	return &Error{Kind: "config", Message: "trusted --generation-config is required; untrusted generation cannot publish", Code: ExitConfig}
 }
 
 type trustedGenerateArgs struct {
+	project, environment                           string
 	dir, to, version, label, format, hints, config string
 	json                                           bool
 }
@@ -46,6 +54,7 @@ type generationConfig struct {
 	PostgresVersion                                                                                          int
 	PolicyFile, PolicyIdentity                                                                               string
 	ApprovalPolicy                                                                                           approval.Policy
+	AutomationApproval                                                                                       *generationAutomationApproval
 	Actors                                                                                                   map[string]approval.Identity
 	VerifiedApprovals                                                                                        map[string]approval.VerifiedApproval
 	Approvals                                                                                                []approval.Approval
@@ -83,8 +92,9 @@ func (a configuredGenerationAuthority) VerifyApproval(_ context.Context, p appro
 }
 
 func runTrustedMigrateGenerate(ctx context.Context, a trustedGenerateArgs, o output, reader ReadPlanService) error {
-	if reader == nil || a.dir == "" || a.to == "" || a.version == "" || a.label == "" || a.format != "sql" {
-		return usageError(errors.New("--dir, --to, --version, --label, --format=sql and --generation-config required"))
+	started := time.Now()
+	if reader == nil || a.version == "" || a.label == "" || a.format != "sql" || (a.project == "" && (a.dir == "" || a.to == "")) {
+		return usageError(errors.New("--config or --dir/--to, plus --version, --label, --format=sql and --generation-config required"))
 	}
 	raw, err := os.ReadFile(a.config)
 	if err != nil {
@@ -96,19 +106,29 @@ func runTrustedMigrateGenerate(ctx context.Context, a trustedGenerateArgs, o out
 	if err = d.Decode(&c); err != nil {
 		return &Error{Kind: "config", Message: "parse generation configuration failed", Code: ExitConfig}
 	}
-	policyRaw, err := os.ReadFile(c.PolicyFile)
-	if err != nil {
-		return &Error{Kind: "config", Message: "read generation policy failed", Code: ExitConfig}
+	lifetime, err := time.ParseDuration(c.Lifetime)
+	if err != nil || lifetime <= 0 {
+		return &Error{Kind: "config", Message: "positive generation lifetime required", Code: ExitConfig}
 	}
-	doc, err := policy.Parse(policyRaw)
-	if err != nil {
-		return &Error{Kind: "config", Message: "parse generation policy failed", Code: ExitConfig}
+	if err := validateGenerationApproval(c, lifetime); err != nil {
+		return err
 	}
-	desired, err := reader.Load(ctx, LoadRequest{Spec: a.to})
+	inputs, err := loadGenerationInputs(ctx, a, c, reader)
 	if err != nil {
-		return &Error{Kind: "validation", Message: "load desired schema failed", Code: ExitValidation}
+		return err
 	}
+	defer inputs.close()
 	resolver := secret.NewResolver()
+	if inputs.Project != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, started.Add(projectTimeout(inputs.Project.Config)))
+		defer cancel()
+		resolver.BaseDir = inputs.Project.Root
+		c.Metadata, err = projectReleaseMetadata(c.Metadata, inputs.Project.Manifest)
+		if err != nil {
+			return err
+		}
+	}
 	dev, err := resolver.Resolve(ctx, c.DevelopmentURL)
 	if err != nil {
 		return &Error{Kind: "secret", Message: "resolve development database failed", Code: ExitSecret}
@@ -141,12 +161,19 @@ func runTrustedMigrateGenerate(ctx context.Context, a trustedGenerateArgs, o out
 	if err != nil {
 		return &Error{Kind: "config", Message: "decode signing key failed", Code: ExitConfig}
 	}
-	lifetime, err := time.ParseDuration(c.Lifetime)
-	if err != nil || lifetime <= 0 {
-		return &Error{Kind: "config", Message: "positive generation lifetime required", Code: ExitConfig}
+	approvalProvider, err := resolveGenerationApproval(ctx, c, resolver)
+	if err != nil {
+		return err
 	}
 	now := time.Now().UTC()
-	result, err := (migrate.GenerateService{}).Generate(ctx, migrate.GenerateRequest{Directory: a.dir, Version: a.version, Label: a.label, Format: a.format, RenameHints: a.hints, Desired: desired, DevelopmentURL: dev, DevelopmentIdentity: devID, ProductionIdentity: prodID, Environment: c.Environment, DatabaseIdentity: c.DatabaseIdentity, SourceRevision: c.SourceRevision, Author: c.Author, Requester: c.Requester, PostgresVersion: c.PostgresVersion, Policy: *doc, PolicyIdentity: c.PolicyIdentity, ApprovalPolicy: c.ApprovalPolicy, Authority: configuredGenerationAuthority{actors: c.Actors, verified: c.VerifiedApprovals}, ApprovalAudit: &approval.Chain{Sink: &approval.FileSink{Path: c.ApprovalAuditPath}}, Approvals: c.Approvals, PrecheckAssertions: c.Prechecks, CreatedAt: now, ExpiresAt: now.Add(lifetime), GeneratorKeyID: c.GeneratorKeyID, GeneratorPurpose: c.GeneratorPurpose, SigningKeyID: c.SigningKeyID, GeneratorPrivateKey: genKey, SigningPrivateKey: signKey, Metadata: c.Metadata})
+	request := migrate.GenerateRequest{Directory: inputs.Directory, Version: a.version, Label: a.label, Format: a.format, RenameHints: a.hints, Desired: inputs.Desired, DevelopmentURL: dev, DevelopmentIdentity: devID, ProductionIdentity: prodID, Environment: c.Environment, DatabaseIdentity: c.DatabaseIdentity, SourceRevision: c.SourceRevision, Author: c.Author, Requester: c.Requester, PostgresVersion: c.PostgresVersion, Policy: inputs.Policy, PolicyIdentity: c.PolicyIdentity, ApprovalPolicy: c.ApprovalPolicy, Authority: configuredGenerationAuthority{actors: c.Actors, verified: c.VerifiedApprovals}, ApprovalAudit: &approval.Chain{Sink: &approval.FileSink{Path: c.ApprovalAuditPath}}, Approvals: c.Approvals, PrecheckAssertions: c.Prechecks, CreatedAt: now, ExpiresAt: now.Add(lifetime), GeneratorKeyID: c.GeneratorKeyID, GeneratorPurpose: c.GeneratorPurpose, SigningKeyID: c.SigningKeyID, GeneratorPrivateKey: genKey, SigningPrivateKey: signKey, Metadata: c.Metadata}
+	request.ApprovalProvider = approvalProvider
+	if inputs.Project != nil {
+		request.DirectoryHandle = inputs.Project.directory
+		request.ProjectInputDigest = inputs.Project.Manifest.EffectiveInputDigest
+		request.ExpectedProjectMigrationDigest = inputs.Project.Manifest.Migrations.ManifestDigest
+	}
+	result, err := (migrate.GenerateService{}).Generate(ctx, request)
 	if err != nil {
 		code := ExitMigration
 		kind := "migration"
@@ -160,6 +187,9 @@ func runTrustedMigrateGenerate(ctx context.Context, a trustedGenerateArgs, o out
 	human := result.File
 	if result.Status == "no_op" {
 		human = "no migration generated"
+	}
+	if inputs.Project != nil {
+		return o.success(map[string]any{"generation": result, "environment": inputs.Project.Config.Environment, "input_manifest": inputs.Project.Manifest, "project_verification": inputs.Verification, "release_evidence": result.Evidence}, human)
 	}
 	return o.success(result, human)
 }

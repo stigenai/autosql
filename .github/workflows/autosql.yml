@@ -21,7 +21,7 @@ jobs:
           KUBEBUILDER_ASSETS="$(setup-envtest use -p path 1.35.x)"
           export KUBEBUILDER_ASSETS
           AUTOSQL_OPERATOR_ENVTEST=1 go test -count=1 ./internal/operatorcontroller \
-            -run TestEnvtestReconcilesCRAndWritesStatus
+            -run 'Test(Envtest|OperatorDiagnosticsTwoReplicas)'
   release-conformance:
     runs-on: ubuntu-24.04
     steps:

@@ -326,6 +326,17 @@ func (g Gate) Evaluate(ctx context.Context, req Request) (Decision, error) {
 }
 
 func (g Gate) evaluateAt(ctx context.Context, req Request, instant time.Time) (Decision, error) {
+	return g.evaluateFor(ctx, req, instant, false)
+}
+
+// EvaluateForObservation checks current identities, policy, and approval
+// lifetimes for completion observation. Only plan expiry is ignored. It writes
+// no approval audit and cannot invoke mutation; GuardedApply still checks expiry.
+func (g Gate) EvaluateForObservation(ctx context.Context, req Request) (Decision, error) {
+	return g.evaluateFor(ctx, req, g.now(), true)
+}
+
+func (g Gate) evaluateFor(ctx context.Context, req Request, instant time.Time, observation bool) (Decision, error) {
 	deny := func(reason string) (Decision, error) {
 		return Decision{Reason: reason}, fmt.Errorf("%w: %s", ErrDenied, reason)
 	}
@@ -355,7 +366,7 @@ func (g Gate) evaluateAt(ctx context.Context, req Request, instant time.Time) (D
 	if !ok || !ep.Allowed {
 		return deny(fmt.Sprintf("environment %q is not allowed", req.Plan.Environment))
 	}
-	if !req.Plan.ExpiresAt.IsZero() && !req.Plan.ExpiresAt.After(instant) {
+	if !observation && !req.Plan.ExpiresAt.IsZero() && !req.Plan.ExpiresAt.After(instant) {
 		return deny("plan has expired")
 	}
 	if req.Override != nil {

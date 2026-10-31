@@ -22,6 +22,48 @@ adds:
   ownership of its application schema, but without superuser, `CREATEDB`, or
   `CREATEROLE`.
 
+## Planning during concurrent schema changes
+
+Planning holds shared advisory and `ACCESS SHARE` relation locks in a read-only
+repeatable-read transaction. Before releasing those locks, it rejects an
+`ACCESS EXCLUSIVE` request queued against an inspected relation in the same
+database. It also compares a separate, fresh catalog snapshot before release
+and retains the existing comparison after release. A queued schema change
+therefore cannot be accepted merely because it has not committed yet.
+
+The lock check uses relation identity, database identity, lock mode, and process
+identity from [`pg_locks`](https://www.postgresql.org/docs/14/view-pg-locks.html).
+It does not read another session's SQL text or require monitoring privileges.
+PostgreSQL's [lock compatibility rules](https://www.postgresql.org/docs/14/explicit-locking.html)
+allow ordinary data writes alongside these planning locks; unrelated schema
+activity is outside the inspected relation set.
+
+Queued conflicts return the existing `ErrRefused` category with guidance to
+retry after schema changes finish. A changed fingerprint asks for a refreshed
+trusted baseline. An unavailable or timed-out inspection refuses the plan.
+Connection rollback and closure are bounded even after caller cancellation.
+These checks cover interference detected through the final validation boundary;
+they cannot prevent later schema changes. Existing apply-time preflight checks
+remain required.
+
+On each PostgreSQL major 14–18, the CI matrix runs 20 coordinated conflict trials
+and stable controls. Reproduce that qualification against a disposable database:
+
+```sh
+AUTOSQL_LIVE_COUNT=20 scripts/test-live-serial.sh ./pkg/zdm/expandplan \
+  -run '^TestLive(ConcurrentDDLWaitsAndPlanRefusesFreshSnapshot|PlanningIsReadOnlyAndFencedToBaseline)$' \
+  -timeout 3m
+scripts/test-live-serial.sh ./pkg/zdm/expandplan -timeout 3m
+```
+
+Set `AUTOSQL_TEST_POSTGRES_URL` as described in the live-test setup. Fixtures
+create isolated schemas, tables, and a restricted test role, then remove them.
+They wait for the exact relation lock to queue and register worker cleanup
+before assertions. Additional cases cover committed catalog changes, unrelated
+activity, minimum-role permissions, cancellation, lock/hold deadlines, and
+session cleanup. No test changes production data or weakens the stale-plan
+refusal assertion.
+
 ## Version notes
 
 PostgreSQL 14 qualifies columns when deparsing simple views differently from

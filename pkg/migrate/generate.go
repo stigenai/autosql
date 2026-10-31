@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -59,7 +60,10 @@ func generationFailureCause(stage string, kind, cause error) error {
 }
 
 type GenerateRequest struct {
-	Directory, Version, Label, Format, RenameHints                   string
+	Directory, Version, Label, Format, RenameHints string
+	// DirectoryHandle optionally pins a project-confined directory across
+	// replay and publication. The caller retains ownership of the handle.
+	DirectoryHandle                                                  *os.File
 	Desired                                                          schema.Document
 	DevelopmentURL, DevelopmentIdentity, ProductionIdentity          string
 	Environment, DatabaseIdentity, SourceRevision, Author, Requester string
@@ -82,7 +86,11 @@ type GenerateRequest struct {
 	GeneratorKeyID, GeneratorPurpose, SigningKeyID string
 	GeneratorPrivateKey, SigningPrivateKey         ed25519.PrivateKey
 	Metadata                                       map[string]string
-	Stage                                          func(string) error
+	// ProjectInputDigest binds the captured project input manifest into both
+	// approval and validation attestations. The expected snapshot prevents
+	// generation from replaying a different migration input after capture.
+	ProjectInputDigest, ExpectedProjectMigrationDigest string
+	Stage                                              func(string) error
 }
 
 // ApprovalProvider issues approval only after the exact guardrail bundle is
@@ -95,6 +103,15 @@ type ApprovalProvider interface {
 type GenerateResult struct {
 	Status, File, ArtifactFile, ManifestDigest, PlanDigest, ChecksDigest, BundleDigest string
 	Changes                                                                            int
+	// Evidence is returned only by project-aware command adapters. Keeping it
+	// out of the legacy JSON result preserves that command's output shape.
+	Evidence *GenerateEvidence `json:"-"`
+}
+
+type GenerateEvidence struct {
+	ApprovalEvidence         []approval.Approval `json:"approval_evidence"`
+	SchemaPolicyResources    []policy.Resource   `json:"schema_policy_resources"`
+	MigrationPolicyResources []policy.Resource   `json:"migration_policy_resources"`
 }
 
 type GenerateService struct{ Ops Ops }
@@ -118,9 +135,12 @@ func (s GenerateService) Generate(ctx context.Context, r GenerateRequest) (Gener
 	if err := s.checkpoint(r, "snapshot"); err != nil {
 		return out, err
 	}
-	snap, err := LoadSnapshot(r.Directory)
+	snap, err := generationSnapshot(r)
 	if err != nil {
 		return out, generationFailure("snapshot", ErrGenerateConflict)
+	}
+	if r.ProjectInputDigest != "" && r.ExpectedProjectMigrationDigest != snap.Manifest.Digest {
+		return out, generationFailure("project_snapshot", ErrGenerateConflict)
 	}
 	if err = linearHead(snap.Manifest); err != nil {
 		return out, err
@@ -174,11 +194,11 @@ func (s GenerateService) Generate(ctx context.Context, r GenerateRequest) (Gener
 	if err = s.checkpoint(r, "publish"); err != nil {
 		return out, err
 	}
-	man, err := UpdateWithOps(r.Directory, UpdateRequest{Files: files, ManifestVersion: ManifestVersion, ExpectedManifestDigest: snap.Manifest.Digest}, s.Ops)
+	man, err := s.publishGeneration(r, UpdateRequest{Files: files, ManifestVersion: ManifestVersion, ExpectedManifestDigest: snap.Manifest.Digest})
 	if err != nil {
 		return out, generationFailure("publish", ErrGenerateConflict)
 	}
-	return GenerateResult{Status: "generated", File: name, ArtifactFile: artifactName, ManifestDigest: man.Digest, PlanDigest: p.Digest, ChecksDigest: checks.Digest, BundleDigest: bundle, Changes: len(p.Changes.Changes)}, nil
+	return GenerateResult{Status: "generated", File: name, ArtifactFile: artifactName, ManifestDigest: man.Digest, PlanDigest: p.Digest, ChecksDigest: checks.Digest, BundleDigest: bundle, Changes: len(p.Changes.Changes), Evidence: &GenerateEvidence{ApprovalEvidence: built.ApprovalEvidence, SchemaPolicyResources: built.SchemaPolicyResources, MigrationPolicyResources: built.MigrationPolicyResources}}, nil
 }
 
 type generatedArtifact struct {
@@ -188,6 +208,7 @@ type generatedArtifact struct {
 	BundleDigest                                    string
 	Bytes                                           []byte
 	SchemaPolicyResources, MigrationPolicyResources []policy.Resource
+	ApprovalEvidence                                []approval.Approval
 }
 
 func (s GenerateService) buildGeneratedArtifact(ctx context.Context, r GenerateRequest, current, desired schema.Document, workspaceURL string, prepareMutation func(context.Context) (string, func() error, error), hints []schema.RenameHint, options plan.Options, prebuilt *plan.Plan, metadata map[string]string, simulationFactory simulate.Factory) (generatedArtifact, error) {
@@ -259,6 +280,7 @@ func (s GenerateService) buildGeneratedArtifact(ctx context.Context, r GenerateR
 	}
 	mutation := &generationPlanMutation{url: workspaceURL, plan: p, prepare: prepareMutation}
 	in := guardrail.Input{Changes: p.Changes, Safety: si, Policy: r.Policy, PolicyIdentity: r.PolicyIdentity, SchemaResources: schemaResources, MigrationResources: migrationResources, Precheck: checks, Approval: approval.Request{Plan: approval.Plan{Environment: r.Environment, Author: r.Author, ExpiresAt: r.ExpiresAt}, Approvals: append([]approval.Approval(nil), r.Approvals...), RequestedBy: r.Requester}, StatementBindings: bindings, Mutation: mutation}
+	in.ProjectInputDigest = r.ProjectInputDigest
 	if err = s.checkpoint(r, "guardrail"); err != nil {
 		return out, err
 	}
@@ -307,6 +329,11 @@ func (s GenerateService) buildGeneratedArtifact(ctx context.Context, r GenerateR
 	if err = a.SetValidationAttestations(atts); err != nil {
 		return out, generationFailure("attest", ErrGenerateStage)
 	}
+	if r.ProjectInputDigest != "" {
+		if err := a.BindProjectInputs(r.ProjectInputDigest); err != nil {
+			return out, generationFailure("project_attest", ErrGenerateStage)
+		}
+	}
 	if err = a.Sign(r.SigningKeyID, r.SigningPrivateKey); err != nil {
 		return out, generationFailure("sign", ErrGenerateStage)
 	}
@@ -314,10 +341,13 @@ func (s GenerateService) buildGeneratedArtifact(ctx context.Context, r GenerateR
 	if err != nil {
 		return out, generationFailure("artifact_encode", ErrGenerateStage)
 	}
-	return generatedArtifact{Artifact: a, Plan: p, Checks: checks, BundleDigest: bundle, Bytes: encoded, SchemaPolicyResources: schemaResources, MigrationPolicyResources: migrationResources}, nil
+	return generatedArtifact{Artifact: a, Plan: p, Checks: checks, BundleDigest: bundle, Bytes: encoded, SchemaPolicyResources: schemaResources, MigrationPolicyResources: migrationResources, ApprovalEvidence: append([]approval.Approval(nil), in.Approval.Approvals...)}, nil
 }
 
 func validateGenerateRequest(r GenerateRequest) error {
+	if err := validateProjectGeneration(r); err != nil {
+		return err
+	}
 	if r.Directory == "" || r.Version == "" || r.Label == "" || r.Format != "sql" || r.DevelopmentURL == "" || r.DevelopmentIdentity == "" || r.ProductionIdentity == "" || r.DevelopmentIdentity == r.ProductionIdentity || r.Environment == "" || r.DatabaseIdentity == "" || r.SourceRevision == "" || r.Author == "" || r.Requester == "" || r.Author == r.Requester || r.PolicyIdentity == "" || r.PostgresVersion <= 0 || r.CreatedAt.IsZero() || !r.ExpiresAt.After(r.CreatedAt) || len(r.GeneratorPrivateKey) != ed25519.PrivateKeySize || len(r.SigningPrivateKey) != ed25519.PrivateKeySize || r.GeneratorKeyID == "" || r.GeneratorPurpose == "" || r.SigningKeyID == "" || r.ApprovalAudit == nil || (r.ApprovalProvider == nil && (r.Authority == nil || len(r.Approvals) == 0)) {
 		return generationFailure("config", ErrGenerateConfig)
 	}

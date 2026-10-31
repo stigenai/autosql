@@ -251,7 +251,16 @@ resource "function" "identity(value integer)" {
 	}
 	t.Setenv("AUTOSQL_APPLY_CONFIG", filepath.Join(bundleDir, "apply-config.json"))
 	t.Setenv("AUTOSQL_OPERATOR_ARTIFACT_DIR", filepath.Join(bundleDir, "artifacts"))
-	resource := operator.Resource{Spec: operator.Spec{Kind: operator.Declarative, Source: operator.Source{Format: "hcl", Inline: desired}, ArtifactDigest: envelope.Data.ArtifactDigest, PostgresVersion: 16, ConcurrentIndexes: true}, ResolvedSource: desired, ResolvedDatabaseURL: productionURL}
+	resource := operator.Resource{Name: "test/gitops", UID: "gitops-resource", MetadataGeneration: 1, Spec: operator.Spec{Generation: 1, DatabaseURL: &operator.SecretKeyRef{Name: "db", Key: "url"}, Kind: operator.Declarative, Source: operator.Source{Format: "hcl", Inline: desired}, ArtifactDigest: envelope.Data.ArtifactDigest, PostgresVersion: 16, ConcurrentIndexes: true}, ResolvedSource: desired, ResolvedDatabaseURL: productionURL}
+	if check := ProbeArtifactExecution(ctx, resource); check.Started || check.Failure.Outcome != "" {
+		t.Fatalf("fresh published release failed unstarted check: %+v", check)
+	}
+	urlSource := resource
+	urlSource.Spec.Source = operator.Source{URL: "https://schema.example.invalid/desired.sql"}
+	urlSource.ResolvedSource = urlSource.Spec.Source.URL
+	if check := ProbeArtifactExecution(ctx, urlSource); check.Started || check.Failure.Outcome != "" {
+		t.Fatalf("existing unstarted URL-source apply behavior changed: %+v", check)
+	}
 	result, err := ArtifactApply(ctx, resource, envelope.Data.ArtifactDigest)
 	if err != nil {
 		t.Fatalf("operator apply result=%+v err=%v", result, err)
@@ -266,6 +275,7 @@ resource "function" "identity(value integer)" {
 	if len(document.Graph.Resources) < 4 {
 		t.Fatalf("operator did not apply complete schema: %d resources", len(document.Graph.Resources))
 	}
+	assertPublishedCompletionRecovery(t, ctx, resource, published, filepath.Join(bundleDir, "apply-config.json"))
 	_ = developmentName
 }
 

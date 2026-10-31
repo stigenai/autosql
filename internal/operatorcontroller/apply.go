@@ -171,10 +171,18 @@ func ArtifactApply(ctx context.Context, resource operator.Resource, digest strin
 	if services.Apply == nil {
 		return operator.ApplyResult{}, errors.New("production artifact apply service is unavailable")
 	}
+	verified := resource.VerifiedReleaseArtifact
+	if verified.Digest() == "" {
+		verified, err = cli.VerifyProductionArtifactForApply(a, true)
+		if err != nil {
+			return operator.ApplyResult{}, errors.New("operator artifact verification failed")
+		}
+	}
 	result, err := services.Apply.Apply(ctx, cli.ApplyRequest{
-		ArtifactPath: artifactPath,
-		ApprovalMode: "artifact",
-		NoEdits:      true,
+		ArtifactPath:     artifactPath,
+		VerifiedArtifact: verified,
+		ApprovalMode:     "artifact",
+		NoEdits:          true,
 	})
 	outcome := operator.ApplyResult{Status: result.Status, PlanDigest: a.Plan.Digest, TargetIdentity: a.DatabaseIdentity, ExecutionID: result.ExecutionID, PendingStep: result.PendingStep, RecoveryGuidance: result.RecoveryGuidance, AppliedSteps: result.AppliedSteps}
 	if err != nil {
