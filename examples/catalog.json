@@ -594,6 +594,21 @@
           "level": "integration",
           "path": "examples/project-testing/failures/regression.test.hcl",
           "command": "go test ./examples/project-testing"
+        },
+        {
+          "level": "contract",
+          "path": "examples/project-testing/qualification_evidence_test.go",
+          "command": "go test ./examples/project-testing -run '^TestPackagedWorkflowEvidence' -count=1"
+        },
+        {
+          "level": "live",
+          "path": "scripts/test-project-workflow.sh",
+          "command": "scripts/test-project-workflow.sh \"$AUTOSQL_PROJECT_TEST_BINARY\" \"$AUTOSQL_PROJECT_TEST_BINARY_SHA256\" \"$AUTOSQL_PROJECT_TEST_VERSION\" \"$AUTOSQL_PROJECT_TEST_OUTPUT\""
+        },
+        {
+          "level": "contract",
+          "path": ".github/workflows/project-workflow.yml",
+          "command": "actionlint .github/workflows/project-workflow.yml .github/workflows/release.yml"
         }
       ]
     },

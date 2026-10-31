@@ -345,3 +345,20 @@ Go 1.26. Unit permission tests also pass under an ordinary Linux user; container
 root bypasses chmod-based write denial and is not a valid context for that one
 unit check. No amd64, remote-daemon or remote GitHub CI qualification is claimed
 by this local run.
+
+### Packaged workflow evidence
+
+The [project example](../examples/project-testing/README.md#packaged-binary-qualification)
+has a separate driver for a checksum-verified native packaged binary. It checks
+actual required cases, both factory modes, JSON/JUnit equivalence, secret
+redaction, independent cleanup, SQL/JSON/HCL source parity and current input
+identities. Its default mode requires a clean checkout at the published tag;
+the explicit candidate mode records its source snapshot and remains local-only
+evidence. The manual `project-workflow.yml` workflow runs the released Linux
+matrix. macOS uses the same driver with a separately approved development daemon.
+
+Required case semantics and shared source bytes must agree across runs. Changed
+factory endpoints or pinned PostgreSQL images change execution identities and
+remain visible in the raw reports; they are not normalized away to fabricate an
+identical input digest. A successful fixture run does not replace the separate
+real-signature integration evidence, release CI, rollout, or monitoring gates.

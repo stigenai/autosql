@@ -1,0 +1,90 @@
+name: released project workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Published AutoSQL tag containing the project workflow driver
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  packaged:
+    name: Linux ${{ matrix.arch }} / PostgreSQL ${{ matrix.postgres }}
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: [14, 15, 16, 17, 18]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+        arch: [amd64, arm64]
+    runs-on: ${{ matrix.runner }}
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_PASSWORD: autosql-workflow-ci-only-password
+          POSTGRES_DB: postgres
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.version }}
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify and exercise published binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          ARCH: ${{ matrix.arch }}
+          AUTOSQL_DBTEST_POSTGRES_MAJOR: ${{ matrix.postgres }}
+          AUTOSQL_DBTEST_ADMIN_DSN: postgres://postgres:autosql-workflow-ci-only-password@127.0.0.1:5432/postgres?sslmode=disable
+          AUTOSQL_DBTEST_DOCKER_ENDPOINT: unix:///var/run/docker.sock
+        run: |
+          set -eu
+          printf '%s\n' "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9.-]+)?$'
+          name="autosql-${VERSION}-linux-${ARCH}"
+          assets="$RUNNER_TEMP/released-assets"
+          mkdir "$assets"
+          gh release download "$VERSION" --repo "$GITHUB_REPOSITORY" --pattern "${name}.tar.gz" --pattern "${name}.sha256" --dir "$assets"
+          (cd "$assets" && sha256sum --check "${name}.sha256" && tar -xzf "${name}.tar.gz")
+          expected="$(sha256sum "$assets/$name" | cut -d ' ' -f 1)"
+          AUTOSQL_DBTEST_POSTGRES_IMAGE="$(docker image inspect "postgres:${AUTOSQL_DBTEST_POSTGRES_MAJOR}" --format '{{index .RepoDigests 0}}')"
+          export AUTOSQL_DBTEST_POSTGRES_IMAGE
+          scripts/test-project-workflow.sh "$assets/$name" "$expected" "$VERSION" "$RUNNER_TEMP/project-workflow"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: project-workflow-linux-${{ matrix.arch }}-pg${{ matrix.postgres }}
+          path: ${{ runner.temp }}/project-workflow
+          if-no-files-found: error
+
+  compare:
+    needs: packaged
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.version }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: project-workflow-linux-*
+          path: evidence
+      - name: Compare required outcomes and input identities
+        run: |
+          set -eu
+          for tuple in evidence/project-workflow-linux-*; do
+            scripts/compare-project-workflow.sh evidence/project-workflow-linux-amd64-pg14 "$tuple"
+          done

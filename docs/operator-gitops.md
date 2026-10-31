@@ -1,5 +1,10 @@
 # GitOps operator artifacts
 
+The [roadmap qualification record](roadmap-qualification.md) separates local
+candidate evidence from remote CI, publication, authorized rollout and backend
+monitoring. Those promotion gates also apply to bundles using project inputs or
+completion recovery; a successful fixture test is not release authorization.
+
 `autosql operator artifact publish` is the supported non-interactive path from
 committed HCL to the immutable artifact required by `AutoSQLSchema`. It performs
 the complete production ceremony in one process: load and normalize HCL,

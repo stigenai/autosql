@@ -40,6 +40,19 @@ go run ./cmd/autosql config validate --config examples/project-testing/autosql.h
 The CLI returns configuration exit code 3 with a located error. `go run` itself
 returns its wrapper exit status; use a built binary when asserting CLI codes.
 
+`schema.hcl`, `schema.sql`, and the native AutoSQL `schema.json` describe the
+same desired schema. Each can be selected explicitly without resolving the
+project target:
+
+```sh
+autosql schema load --config examples/project-testing/autosql.hcl --env local --source json:schema.json --json
+autosql plan --config examples/project-testing/autosql.hcl --env local --from sql:current.sql --to sql:schema.sql --json
+```
+
+The qualification driver checks that all three formats produce the same target
+fingerprint. A JSON project configuration and a native JSON schema are different
+file contracts; `autosql.json` is the configuration, and `schema.json` is a source.
+
 The `tests/` directory contains executable schema and seed-before-upgrade cases.
 The migration snapshot includes versions 1 and 2, and the parser example verifies
 its binding without connecting to a database. Configuration validation alone does
@@ -129,3 +142,76 @@ JUnit contains a failure and an error for the same case. The owned database and
 container still close. The normal `local` selection excludes this regression.
 The live example test verifies schema success, upgrade success and this failure
 through the same CLI entrypoint on a copied fixture.
+
+## Packaged binary qualification
+
+From a clean checkout at the published version tag, use
+[`scripts/test-project-workflow.sh`](../../scripts/test-project-workflow.sh).
+It needs Go 1.25 or later, a C compiler, Git, jq, Docker CLI, a native packaged
+binary, an approved daemon and a disposable development administrator server.
+It runs the binary as a separate process; Go only drives the checks and the
+separate real-signature integration scenario.
+
+Set these inputs through your development environment or secret provider:
+
+- `AUTOSQL_DBTEST_DOCKER_ENDPOINT`: explicitly approved Docker endpoint.
+- `AUTOSQL_DBTEST_POSTGRES_IMAGE`: matching PostgreSQL image pinned by digest.
+- `AUTOSQL_DBTEST_POSTGRES_MAJOR`: one major from 14 through 18.
+- `AUTOSQL_DBTEST_ADMIN_DSN`: approved disposable development administrator URL.
+
+Download the selected published binary and checksum outside the clean checkout,
+verify the archive, then supply the binary's SHA-256 and exact version:
+
+```sh
+version="$AUTOSQL_RELEASE_VERSION"
+name="autosql-${version}-darwin-arm64"
+assets="$(mktemp -d)"
+gh release download "$version" --repo stigenai/autosql \
+  --pattern "${name}.tar.gz" --pattern "${name}.sha256" --dir "$assets"
+(cd "$assets" && shasum -a 256 --check "${name}.sha256" && tar -xzf "${name}.tar.gz")
+expected="$(shasum -a 256 "$assets/$name" | cut -d ' ' -f 1)"
+scripts/test-project-workflow.sh "$assets/$name" "$expected" "$version" "$assets/evidence"
+```
+
+Use `linux-arm64` or `linux-amd64` for the corresponding native Linux binary.
+The driver refuses an unsupported or emulated platform, mismatched binary
+checksum/version, dirty checkout, wrong release tag, missing required case or
+skipped required case. The evidence directory must be new. It validates local,
+CI and production configuration without resolving those target credentials;
+only the selected development factories can allocate resources.
+
+Each tuple executes 16 cases through both factories, including schema and upgrade
+success at parallelism 1 and 2, the intentional regression, a database-error
+redaction probe, report-write refusal and human output. It also refuses empty,
+all-skipped, production and changed-migration selections before case execution.
+JSON and JUnit results are compared, and the JSON cases' released resources are
+checked independently through catalog queries or Docker inventory. The suite
+tests separately qualify ten concurrent same-named cases and cancellation.
+PostgreSQL 17 additionally runs the existing signed generation/apply integration
+and changed-input refusal with real ephemeral keys. That is separate integration
+evidence; the file-based fixture runner does not grant production authority.
+
+Keep each platform/major tuple's evidence. Compare a macOS run with a Linux run:
+
+```sh
+scripts/compare-project-workflow.sh /absolute/macos-evidence /absolute/linux-evidence
+```
+
+Comparison requires successful runs, identical required case semantics, matching
+reference-only configuration identities and identical shared input bytes.
+Runtime factory URLs and image digests differ across tuples, so their complete
+configuration and test-input digests stay in the raw reports instead of being
+misrepresented as equal. Timing, run IDs and resource names are excluded only
+from the separate semantic comparison files.
+
+The manual **released project workflow** GitHub Actions workflow accepts a
+published version and runs both factories on Linux amd64/arm64 and PostgreSQL
+14–18. macOS arm64 runs use the same driver locally with an approved Docker
+daemon; hosted macOS execution is not claimed. All tuples and the separate
+signature evidence are required for the bounded release gate.
+
+During development, `--candidate` permits an uncommitted checkout and labels its
+evidence `local-candidate`. It also requires
+`AUTOSQL_PROJECT_TEST_SOURCE_MANIFEST_SHA256` for the source snapshot used to
+build that binary. Candidate results do not satisfy the published-version or
+clean-checkout gates. v0.1.53 predates these commands and has no macOS asset.
