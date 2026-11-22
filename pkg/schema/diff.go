@@ -557,6 +557,22 @@ func orderChanges(changes []Change, current, desired Document) ([]Change, error)
 			}
 		}
 	}
+	// PostgreSQL assigns attnum in ADD COLUMN statement order. The sort key
+	// orders new columns by ordinal only among changes that are ready at the
+	// same time. A column that waits for a new type can then run after a
+	// higher-ordinal column. Chain the new columns of each table by ordinal.
+	createdColumns := map[string][]Change{}
+	for _, c := range changes {
+		if c.Operation == OperationCreate && c.After != nil && c.After.Kind == KindColumn && c.After.Name.Parent != "" {
+			createdColumns[c.After.Name.Parent] = append(createdColumns[c.After.Name.Parent], c)
+		}
+	}
+	for _, columns := range createdColumns {
+		sort.SliceStable(columns, func(i, j int) bool { return changeSortKey(columns[i]) < changeSortKey(columns[j]) })
+		for i := 1; i < len(columns); i++ {
+			add(columns[i].ID, columns[i-1].ID)
+		}
+	}
 	// Grants, memberships, and default privileges are the explicit access
 	// handoff boundary. On convergence they run only after every other object
 	// has reached its desired owner/security state; on teardown their edges are

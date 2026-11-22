@@ -377,3 +377,23 @@ func TestDiffDeterministicAcrossResourcePermutations(t *testing.T) {
 		}
 	}
 }
+
+// PostgreSQL assigns attnum in ADD COLUMN statement order. A new column that
+// waits for a new type must not let a higher-ordinal column run first.
+func TestCreatedColumnsKeepOrdinalOrderAcrossTypeDependencies(t *testing.T) {
+	s := res(schema.KindSchema, "public", "", `{}`)
+	contains := func(id string) schema.Dependency {
+		return schema.Dependency{Target: id, Type: schema.DependencyContains}
+	}
+	table := res(schema.KindTable, "blocks", s.ID, `{}`, contains(s.ID))
+	id := res(schema.KindColumn, "id", table.ID, `{"type":"bigint","ordinal":1}`, contains(table.ID))
+	mode := res(schema.KindEnum, "mode_t", s.ID, `{"values":["a"]}`, contains(s.ID))
+	modeCol := res(schema.KindColumn, "mode", table.ID, `{"type":"mode_t","ordinal":2}`,
+		contains(table.ID), schema.Dependency{Target: mode.ID, Type: schema.DependencyReferences})
+	gen := res(schema.KindColumn, "generation", table.ID, `{"type":"bigint","ordinal":3}`, contains(table.ID))
+	cs, err := schema.Diff(doc(s, table, id), doc(s, table, id, mode, modeCol, gen), schema.DiffOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNames(t, cs, "mode_t", "mode", "generation")
+}
