@@ -201,6 +201,7 @@ func TestLiveTrustedManifestRejectsEveryMaterialDeviation(t *testing.T) {
 		"collation":        `alter table %s alter column active_version type text collate "C"`,
 		"storage":          `alter table %s alter column active_version set storage plain`,
 		"compression":      `alter table %s alter column active_version set compression pglz`,
+		"column_options":   `alter table %s alter column active_version set (n_distinct=1)`,
 		"dropped_physical": `alter table %s add column discarded text; alter table %s drop column discarded`,
 	}
 	for name, format := range cases {
