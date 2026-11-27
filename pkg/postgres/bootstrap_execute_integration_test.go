@@ -1124,3 +1124,79 @@ func bootstrapExecutionDocument(t *testing.T, namespaceName string) schema.Docum
 	}
 	return document
 }
+
+// Issue #31 repro: inspect a database whose CHECK and index predicate cast to an
+// enum on a text column, bootstrap a new database from it, and converge.
+func TestManagedBootstrapRoundTripsEnumCastsOnTextColumn(t *testing.T) {
+	maintenanceURL := os.Getenv("AUTOSQL_TEST_POSTGRES_URL")
+	if maintenanceURL == "" {
+		t.Skip("AUTOSQL_TEST_POSTGRES_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	source := bootstrapExecutionTarget(t, ctx, maintenanceURL, "autosql_issue31_source")
+	defer DropDatabaseURL(context.Background(), maintenanceURL, source.Name, true)
+	admin, err := pgx.Connect(ctx, maintenanceURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close(context.Background())
+	if _, err := admin.Exec(ctx, "CREATE DATABASE "+quote(source.Name)); err != nil {
+		t.Fatal(err)
+	}
+	config, err := pgx.ParseConfig(maintenanceURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connectTo := func(name string) *pgx.Conn {
+		t.Helper()
+		database := config.Copy()
+		database.Database = name
+		conn, connectErr := pgx.ConnectConfig(ctx, database)
+		if connectErr != nil {
+			t.Fatal(connectErr)
+		}
+		t.Cleanup(func() { _ = conn.Close(context.Background()) })
+		return conn
+	}
+	if _, err := connectTo(source.Name).Exec(ctx, `
+CREATE SCHEMA issue31;
+SET search_path = issue31;
+CREATE TYPE e AS ENUM ('a', 'b');
+CREATE TABLE t (id int PRIMARY KEY, v text,
+  CONSTRAINT c CHECK (v = ANY (ARRAY['x'::text]) OR 'a'::e = 'a'::e));
+CREATE INDEX t_v_idx ON t (v) WHERE 'a'::e = 'a'::e;`); err != nil {
+		t.Fatal(err)
+	}
+	inspect := func(name string) schema.Document {
+		t.Helper()
+		inspected, inspectErr := InspectConn(ctx, connectTo(name), Options{Schemas: []string{"issue31"}})
+		if inspectErr != nil {
+			t.Fatal(inspectErr)
+		}
+		normalized, normalizeErr := New().Normalize(ctx, inspected)
+		if normalizeErr != nil {
+			t.Fatal(normalizeErr)
+		}
+		return normalized
+	}
+	desired := inspect(source.Name)
+
+	target := bootstrapExecutionTarget(t, ctx, maintenanceURL, "autosql_issue31_target")
+	defer DropDatabaseURL(context.Background(), maintenanceURL, target.Name, true)
+	whole, err := PlanDatabaseBootstrap(ctx, target, desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := ExecuteDatabaseBootstrapURL(ctx, maintenanceURL, whole, BootstrapExecutionHooks{})
+	if err != nil || !result.Completed {
+		t.Fatalf("issue #31 bootstrap result=%+v err=%v", result, err)
+	}
+	noOp, err := plan.Build(ctx, New(), inspect(target.Name), desired, plan.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(noOp.Changes.Changes) != 0 || len(noOp.Steps) != 0 {
+		t.Fatalf("issue #31 bootstrap did not converge: changes=%+v steps=%+v", noOp.Changes.Changes, noOp.Steps)
+	}
+}
