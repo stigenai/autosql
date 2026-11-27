@@ -108,6 +108,8 @@ jobs:
         run: scripts/test-live-serial.sh ./pkg/postgres -run '^TestManagedAndExternalDatabaseTargetLifecycle$'
       - name: Test semantic bootstrap fidelity and synthetic scale recovery
         run: scripts/test-live-serial.sh ./pkg/postgres -timeout 30m -run '^(TestSyntheticScaleBootstrapInventoryManifest|TestSemanticCellSignedDirectBootstrapInterruptionResume|TestSemanticCellCLISignedBootstrapAgainstNewPostgresDatabase|TestSemanticCellProductionOperatorSignedBootstrapAgainstNewPostgresDatabase|TestWholeDatabaseBootstrap)'
+      - name: Test managed bootstrap ordering and search-path binding
+        run: scripts/test-live-serial.sh ./pkg/postgres -run '^TestManagedBootstrap'
       - name: Test operator empty-database bootstrap reconciliation
         run: scripts/test-live-serial.sh ./pkg/operator -run '^TestOperatorWholeDatabaseBootstrapAgainstNewPostgresDatabase$'
       - name: Test production operator signed-artifact bootstrap

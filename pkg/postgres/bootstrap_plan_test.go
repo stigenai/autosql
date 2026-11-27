@@ -393,3 +393,56 @@ func containsBootstrapID(values []string, want string) bool {
 	}
 	return false
 }
+
+// Issue #31: an enum cast inside an expression is a type dependency even when
+// no referenced column has the enum type.
+func TestManagedBootstrapOrdersEnumBeforeExpressionCastOnTextColumn(t *testing.T) {
+	namespace := renderResource(schema.KindSchema, schema.Name{Name: "app"}, `{}`)
+	table := renderResource(schema.KindTable, schema.Name{Schema: "app", Name: "t", Parent: namespace.ID}, `{"partitioned":false,"persistence":"p","row_security":false,"force_row_security":false}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
+	enum := renderResource(schema.KindEnum, schema.Name{Schema: "app", Name: "e", Parent: namespace.ID}, `{"values":["a","b"]}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})
+	plain := renderResource(schema.KindColumn, schema.Name{Schema: "app", Name: "v", Parent: table.ID}, `{"type":"text","not_null":false,"ordinal":1}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains})
+	cases := []struct {
+		name      string
+		resources []schema.Resource
+		dependent string
+	}{
+		{"check", []schema.Resource{plain, renderResource(schema.KindCheckConstraint, schema.Name{Schema: "app", Name: "c", Parent: table.ID}, `{"definition":"CHECK (((v = ANY (ARRAY['x'::text])) OR ('a'::e = 'a'::e)))","columns":["v"],"deferrable":false,"initially_deferred":false,"validated":true}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: plain.ID, Type: schema.DependencyReferences})}, `ADD CONSTRAINT "c"`},
+		{"index predicate", []schema.Resource{plain, renderResource(schema.KindIndex, schema.Name{Schema: "app", Name: "t_v_idx", Parent: table.ID}, `{"definition":"CREATE INDEX t_v_idx ON app.t USING btree (v) WHERE ('a'::e = 'a'::e)","method":"btree","unique":false,"valid":true,"ready":true,"columns":["v"]}`, schema.Dependency{Target: table.ID, Type: schema.DependencyContains}, schema.Dependency{Target: plain.ID, Type: schema.DependencyReferences})}, `t_v_idx`},
+		{"routine argument", []schema.Resource{plain, renderResource(schema.KindFunction, schema.Name{Schema: "app", Name: "is_a(app.e)", Parent: namespace.ID}, `{"name":"is_a","identity_arguments":"value app.e","arguments":"value app.e","result":"boolean","language":"sql","volatility":"i","security_definer":false,"definition":"CREATE FUNCTION app.is_a(value app.e) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$ SELECT value = 'a'::app.e $$"}`, schema.Dependency{Target: namespace.ID, Type: schema.DependencyContains})}, `FUNCTION app.is_a`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			desired := schema.Document{Version: schema.SchemaVersion, Graph: schema.Graph{Resources: append(append([]schema.Resource{}, tc.resources...), table, enum, namespace)}}
+			target := bootstrap.DatabaseTarget{Mode: bootstrap.ManagedDatabase, Endpoint: bootstrap.ServerEndpoint{Host: "db.internal", TLSMode: "verify-full"}, MaintenanceDatabase: "postgres", Name: "app", Owner: "postgres", ConnectionLimit: -1, AllowConnections: true}
+			desired, err := New().Normalize(context.Background(), desired)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var digests []string
+			for _, resource := range desired.Graph.Resources {
+				if digest := stringValue(spec(resource), "body_digest"); digest != "" {
+					digests = append(digests, digest)
+				}
+			}
+			whole, err := PlanDatabaseBootstrap(context.Background(), target, desired, plan.Options{Render: map[string]string{"reviewed_routine_digests": strings.Join(digests, ",")}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			typePosition, dependentPosition := -1, -1
+			for position, step := range whole.SchemaPlan.Steps {
+				switch {
+				case strings.Contains(step.SQL, `CREATE TYPE "app"."e"`):
+					typePosition = position
+				case strings.Contains(step.SQL, tc.dependent) && dependentPosition < 0:
+					dependentPosition = position
+				}
+			}
+			if typePosition < 0 || dependentPosition < 0 || typePosition >= dependentPosition {
+				for _, step := range whole.SchemaPlan.Steps {
+					t.Log(step.SQL)
+				}
+				t.Fatalf("enum type position=%d dependent position=%d", typePosition, dependentPosition)
+			}
+		})
+	}
+}
