@@ -3,16 +3,35 @@ on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    # Weekly run against the floating major tags. It finds new minor images
+    # before a pin update does.
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      latest:
+        description: Test the floating major tags instead of the pinned digests
+        type: boolean
+        default: false
 jobs:
   postgres:
+    name: postgres (${{ matrix.version }})
     strategy:
       fail-fast: false
       matrix:
-        version: [14, 15, 16, 17, 18]
+        # Pinned images, multi-arch index digests. Keep in sync with
+        # project-workflow.yml. To update, run the weekly job, then copy the
+        # digests from its "Pinned fixture image" lines.
+        include:
+          - {version: 14, minor: '14.25', digest: 'sha256:c0e9c0e9bac7e4c1834b698217a03ee5c708de30d313c84a506972de0e24b059'}
+          - {version: 15, minor: '15.20', digest: 'sha256:868b5ee219026c0f34c99d696d4494ccb3705cf1a18bed1e0b9de64d9c011ccd'}
+          - {version: 16, minor: '16.16', digest: 'sha256:ce81150802644ddfac1db4da9e63be6f2a3818aa6ee98a7a28838aeea65dc37a'}
+          - {version: 17, minor: '17.12', digest: 'sha256:97fb53376be3e4fb1a8a61421daa69dcc3bf2fa39bda3259f5245f9a455af1a9'}
+          - {version: 18, minor: '18.7', digest: 'sha256:64c8b0d31e4ab6ea665e8426ea406a94bf52de3c05b3a4a8bf713704eefa9328'}
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:${{ matrix.version }}
+        image: ${{ (github.event_name == 'schedule' || inputs.latest) && format('postgres:{0}', matrix.version) || format('postgres@{0}', matrix.digest) }}
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: autosql
@@ -21,6 +40,7 @@ jobs:
           --health-cmd "pg_isready -U postgres -d autosql"
           --health-interval 5s --health-timeout 5s --health-retries 20
     env:
+      PG_IMAGE: ${{ (github.event_name == 'schedule' || inputs.latest) && format('postgres:{0}', matrix.version) || format('postgres@{0}', matrix.digest) }}
       AUTOSQL_TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/autosql?sslmode=disable
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -36,7 +56,7 @@ jobs:
           AUTOSQL_DBTEST_POSTGRES_MAJOR: ${{ matrix.version }}
         run: |
           set -eu
-          AUTOSQL_DBTEST_POSTGRES_IMAGE="$(docker image inspect 'postgres:${{ matrix.version }}' --format '{{index .RepoDigests 0}}')"
+          AUTOSQL_DBTEST_POSTGRES_IMAGE="$(docker image inspect "$PG_IMAGE" --format '{{index .RepoDigests 0}}')"
           export AUTOSQL_DBTEST_POSTGRES_IMAGE
           printf 'Pinned fixture image: %s\n' "$AUTOSQL_DBTEST_POSTGRES_IMAGE"
           go test -race ./pkg/dbtest ./internal/cli ./examples/project-testing -run '^(TestLanguageLive|TestSuiteLive|TestProjectTestLive|TestProjectExampleLive)' -count=1 -v -timeout 5m
@@ -115,3 +135,17 @@ jobs:
             zdm-bench.txt
             zdm-coverage.out
             zdm-coverage.txt
+  report-new-minor-failure:
+    needs: postgres
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "Weekly PostgreSQL latest-minor matrix failed" \
+            --body "The scheduled matrix against the floating postgres major tags failed: $RUN_URL. A new minor image can change catalog behaviour. Fix AutoSQL, then update the pinned digests in zdm-postgres-matrix.yml and project-workflow.yml."

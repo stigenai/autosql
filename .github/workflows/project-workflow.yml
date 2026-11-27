@@ -19,6 +19,13 @@ jobs:
       matrix:
         postgres: [14, 15, 16, 17, 18]
         include:
+          # Pinned images, multi-arch index digests. Keep in sync with
+          # zdm-postgres-matrix.yml.
+          - {postgres: 14, digest: 'sha256:c0e9c0e9bac7e4c1834b698217a03ee5c708de30d313c84a506972de0e24b059'}
+          - {postgres: 15, digest: 'sha256:868b5ee219026c0f34c99d696d4494ccb3705cf1a18bed1e0b9de64d9c011ccd'}
+          - {postgres: 16, digest: 'sha256:ce81150802644ddfac1db4da9e63be6f2a3818aa6ee98a7a28838aeea65dc37a'}
+          - {postgres: 17, digest: 'sha256:97fb53376be3e4fb1a8a61421daa69dcc3bf2fa39bda3259f5245f9a455af1a9'}
+          - {postgres: 18, digest: 'sha256:64c8b0d31e4ab6ea665e8426ea406a94bf52de3c05b3a4a8bf713704eefa9328'}
           - arch: amd64
             runner: ubuntu-24.04
           - arch: arm64
@@ -27,7 +34,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     services:
       postgres:
-        image: postgres:${{ matrix.postgres }}
+        image: postgres@${{ matrix.digest }}
         env:
           POSTGRES_PASSWORD: autosql-workflow-ci-only-password
           POSTGRES_DB: postgres
@@ -50,6 +57,7 @@ jobs:
           VERSION: ${{ inputs.version }}
           ARCH: ${{ matrix.arch }}
           AUTOSQL_DBTEST_POSTGRES_MAJOR: ${{ matrix.postgres }}
+          AUTOSQL_DBTEST_POSTGRES_IMAGE: postgres@${{ matrix.digest }}
           AUTOSQL_DBTEST_ADMIN_DSN: postgres://postgres:autosql-workflow-ci-only-password@127.0.0.1:5432/postgres?sslmode=disable
           AUTOSQL_DBTEST_DOCKER_ENDPOINT: unix:///var/run/docker.sock
         run: |
@@ -61,8 +69,6 @@ jobs:
           gh release download "$VERSION" --repo "$GITHUB_REPOSITORY" --pattern "${name}.tar.gz" --pattern "${name}.sha256" --dir "$assets"
           (cd "$assets" && sha256sum --check "${name}.sha256" && tar -xzf "${name}.tar.gz")
           expected="$(sha256sum "$assets/$name" | cut -d ' ' -f 1)"
-          AUTOSQL_DBTEST_POSTGRES_IMAGE="$(docker image inspect "postgres:${AUTOSQL_DBTEST_POSTGRES_MAJOR}" --format '{{index .RepoDigests 0}}')"
-          export AUTOSQL_DBTEST_POSTGRES_IMAGE
           scripts/test-project-workflow.sh "$assets/$name" "$expected" "$VERSION" "$RUNNER_TEMP/project-workflow"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
