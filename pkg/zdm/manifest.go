@@ -70,8 +70,11 @@ func (s *Store) validateLayout(ctx context.Context, db catalogReader) error {
 	if len(tables) != len(metadataColumns) || !sequence {
 		return corrupt("reserved namespace relation set differs from trusted manifest")
 	}
+	// Newer PostgreSQL minor releases (seen on 17.12) set a server-managed
+	// pg_attver entry in attoptions on every new column. Ignore that entry
+	// only; any other column option still fails the contract.
 	for table, want := range metadataColumns {
-		rows, err = db.Query(ctx, `select a.attname,format_type(a.atttypid,a.atttypmod),not a.attnotnull,coalesce(pg_get_expr(d.adbin,d.adrelid),''),a.attidentity::text,coalesce(coll.collname,''),a.attstorage::text,a.attcompression::text,a.attgenerated::text,coalesce(a.attstattarget,-1),a.attoptions is null,a.attfdwoptions is null from pg_attribute a join pg_class c on c.oid=a.attrelid join pg_namespace n on n.oid=c.relnamespace left join pg_attrdef d on d.adrelid=a.attrelid and d.adnum=a.attnum left join pg_collation coll on coll.oid=a.attcollation where n.nspname=$1 and c.relname=$2 and a.attnum>0 and not a.attisdropped order by a.attnum`, s.cfg.Schema, table)
+		rows, err = db.Query(ctx, `select a.attname,format_type(a.atttypid,a.atttypmod),not a.attnotnull,coalesce(pg_get_expr(d.adbin,d.adrelid),''),a.attidentity::text,coalesce(coll.collname,''),a.attstorage::text,a.attcompression::text,a.attgenerated::text,coalesce(a.attstattarget,-1),cardinality(array(select o from unnest(a.attoptions) o where o not like 'pg\_attver=%')) = 0,a.attfdwoptions is null from pg_attribute a join pg_class c on c.oid=a.attrelid join pg_namespace n on n.oid=c.relnamespace left join pg_attrdef d on d.adrelid=a.attrelid and d.adnum=a.attnum left join pg_collation coll on coll.oid=a.attcollation where n.nspname=$1 and c.relname=$2 and a.attnum>0 and not a.attisdropped order by a.attnum`, s.cfg.Schema, table)
 		if err != nil {
 			return err
 		}
